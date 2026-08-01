@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use dormant_core::config::schema::StreamMode;
+use std::fmt;
 use time::OffsetDateTime;
 
 /// Stable fallback reason when sampling needs a new portal grant.
@@ -119,7 +120,7 @@ pub struct Transition {
 }
 
 /// Borrowed consent record data needed to open a saved portal stream.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct ConsentBinding<'a> {
     /// Opaque portal restore token.
     pub token: &'a str,
@@ -141,7 +142,7 @@ pub struct DisplayExpectation {
 }
 
 /// Metadata from a connected portal stream.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ConnectedStream {
     /// Portal-private `PipeWire` node identifier.
     pub node_id: u32,
@@ -155,13 +156,33 @@ pub struct ConnectedStream {
     pub height: u32,
 }
 
+impl fmt::Debug for ConnectedStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectedStream")
+            .field("node_id", &self.node_id)
+            .field("persistent_id", &self.persistent_id)
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Successful explicit portal grant.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Grant {
     /// Stream metadata returned by the portal.
     pub stream: ConnectedStream,
     /// Wall-clock timestamp used only for consent-record status reporting.
     pub granted_at: OffsetDateTime,
+}
+
+impl fmt::Debug for Grant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Grant")
+            .field("stream", &self.stream)
+            .field("granted_at", &self.granted_at)
+            .finish()
+    }
 }
 
 /// Raw portal frame before privacy-preserving block reduction.

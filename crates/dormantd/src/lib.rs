@@ -11,6 +11,7 @@ mod audio_policy;
 pub mod audio_source;
 pub mod boot;
 pub mod boot_guard;
+pub mod screencast_consent;
 
 mod coordination_poll;
 pub mod direct_switch;

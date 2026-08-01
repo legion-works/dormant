@@ -328,7 +328,7 @@ async fn run_draft(args: &DoctorArgs) -> Result<DoctorOutcome> {
                 config_ok,
                 displays: dormant_doctor::build_display_inventory(&cfg),
                 probes: results.clone(),
-                secrets: dormant_doctor::SecretSet::collect(&cfg, &creds),
+                secrets: dormant_doctor::SecretSet::collect(&cfg, &creds, None),
             };
             (ctx, results)
         }

@@ -178,6 +178,12 @@ pub struct SecretSet {
     secrets: Vec<String>,
 }
 
+/// Secret-bearing values supplied by optional runtime subsystems.
+pub trait ConsentSecrets {
+    fn token(&self) -> &str;
+    fn persistent_ids(&self) -> &[String];
+}
+
 /// Secrets shorter than this are not redacted — see [`SecretSet`] docs.
 const MIN_SECRET_LEN: usize = 4;
 
@@ -189,7 +195,11 @@ impl SecretSet {
     /// credential (HA token, per-host Samsung tokens, per-broker MQTT
     /// username + password).
     #[must_use]
-    pub fn collect(cfg: &Config, creds: &Credentials) -> Self {
+    pub fn collect(
+        cfg: &Config,
+        creds: &Credentials,
+        consent: Option<&dyn ConsentSecrets>,
+    ) -> Self {
         let mut secrets = Vec::new();
 
         for display in cfg.displays.values() {
@@ -221,6 +231,10 @@ impl SecretSet {
         for cred in creds.mqtt.values() {
             secrets.push(cred.username.clone());
             secrets.push(cred.password.clone());
+        }
+        if let Some(consent) = consent {
+            secrets.push(consent.token().to_string());
+            secrets.extend(consent.persistent_ids().iter().cloned());
         }
 
         // MQTT usernames are credential-derived values that can appear in
@@ -824,7 +838,7 @@ mod tests {
 
         let ctx = DraftContext {
             displays: build_display_inventory(&cfg),
-            secrets: SecretSet::collect(&cfg, &creds),
+            secrets: SecretSet::collect(&cfg, &creds, None),
             ..sample_ctx()
         };
 
@@ -903,7 +917,7 @@ mod tests {
         );
 
         let mut ctx = sample_ctx();
-        ctx.secrets = SecretSet::collect(&cfg, &creds);
+        ctx.secrets = SecretSet::collect(&cfg, &creds, None);
         ctx.probes = vec![
             ProbeResult::fail(
                 format!("mqtt {secret_broker}"),
@@ -971,7 +985,7 @@ mod tests {
             },
         );
 
-        let set = SecretSet::collect(&cfg, &creds);
+        let set = SecretSet::collect(&cfg, &creds, None);
 
         // The short username must be in the SecretSet so redaction can
         // catch it in probe detail strings like
@@ -1000,12 +1014,45 @@ mod tests {
         let mut creds = Credentials::default();
         creds.samsung.insert("abc".to_string(), "xy".to_string());
         let cfg = config_with_displays(IndexMap::new());
-        let set = SecretSet::collect(&cfg, &creds);
+        let set = SecretSet::collect(&cfg, &creds, None);
         assert!(
             set.secrets.is_empty(),
             "values under MIN_SECRET_LEN must not be collected: {:?}",
             set.secrets
         );
+    }
+
+    struct TestConsent {
+        token: String,
+        ids: Vec<String>,
+    }
+
+    impl ConsentSecrets for TestConsent {
+        fn token(&self) -> &str {
+            &self.token
+        }
+
+        fn persistent_ids(&self) -> &[String] {
+            &self.ids
+        }
+    }
+
+    #[test]
+    fn drafts_redact_consent_token_and_all_long_persistent_ids() {
+        let cfg = config_with_displays(IndexMap::new());
+        let creds = Credentials::default();
+        let consent = TestConsent {
+            token: "portal-restore-token-secret".into(),
+            ids: vec!["persistent-id-alpha".into(), "persistent-id-beta".into()],
+        };
+        let set = SecretSet::collect(&cfg, &creds, Some(&consent));
+        let text = format!("{} {} {}", consent.token, consent.ids[0], consent.ids[1]);
+        let out = redact(&set, &text);
+        assert!(!out.contains(&consent.token));
+        for id in &consent.ids {
+            assert!(!out.contains(id));
+        }
+        assert!(out.matches(REDACTED).count() >= 3);
     }
 
     #[test]

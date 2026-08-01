@@ -480,6 +480,7 @@ async fn apply_actions(
                 display,
                 total_on_hours,
                 sample_count,
+                attribution_mode: _,
             } => {
                 let _ = ctl_tx
                     .send(ControlMsg::PublishDaemonEvent(DaemonEvent::WearSnapshot {
@@ -747,6 +748,7 @@ enum TrackerAction {
         display: DisplayId,
         span: Duration,
         norm: f64,
+        mode: WearAttributionMode,
     },
     /// Persist `display`'s ledger to disk now.
     Persist { display: DisplayId },
@@ -755,6 +757,7 @@ enum TrackerAction {
         display: DisplayId,
         total_on_hours: f64,
         sample_count: u64,
+        attribution_mode: WearAttributionMode,
     },
     /// Publish a `CompensationAdvisory` event for `display`.
     EmitAdvisory {
@@ -763,6 +766,15 @@ enum TrackerAction {
     },
     /// Seed `display`'s freshly created ledger with `read_usage_hours()`.
     Seed { display: DisplayId },
+}
+
+/// Attribution method used for a tracker tick's published observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WearAttributionMode {
+    /// The ledger received a uniform brightness-weighted attribution.
+    Uniform,
+    /// The ledger received a spatially sampled, luma-weighted attribution.
+    Sampled,
 }
 
 /// Reason a sample was filtered before entering pure tracker logic.
@@ -858,6 +870,7 @@ fn screensaver_uniform_fallback(
         display: display_id.clone(),
         span,
         norm,
+        mode: WearAttributionMode::Uniform,
     });
 }
 
@@ -906,6 +919,8 @@ fn tick(
         }
 
         let stage_kind = stage_literal(&dsnap.phase, dsnap.stage.as_ref());
+        let mut sampled_grid = None;
+        let mut attribution_mode = WearAttributionMode::Uniform;
 
         // ── Attribution ──────────────────────────────────────────────────
         let elapsed_s = ledger
@@ -940,6 +955,8 @@ fn tick(
                                 display: display_id.clone(),
                                 sample: sample.clone(),
                             });
+                            sampled_grid = Some(sample.grid.clone());
+                            attribution_mode = WearAttributionMode::Sampled;
                         }
                         AttributionSelection::Uniform(fallback) => {
                             actions.push(TrackerAction::UniformSelection {
@@ -1050,6 +1067,7 @@ fn tick(
                             display: display_id.clone(),
                             span: slice.span,
                             norm,
+                            mode: WearAttributionMode::Uniform,
                         });
                     }
                 }
@@ -1066,11 +1084,26 @@ fn tick(
             }
         } else {
             fallback_latches.insert(display_id.clone(), false);
-            ledger.attribute_uniform(span, norm);
+            if let Some(sampled) = sampled_grid {
+                let cells = resample_area(
+                    &sampled.cells,
+                    LUMA_GRID_ROWS,
+                    LUMA_GRID_COLS,
+                    ledger.grid_rows,
+                    ledger.grid_cols,
+                )
+                .expect("LumaGrid always has the pinned 16x9 dimensions");
+                ledger
+                    .attribute_spatial(span, norm, &cells)
+                    .expect("resampled luma always matches the ledger grid");
+            } else {
+                ledger.attribute_uniform(span, norm);
+            }
             actions.push(TrackerAction::Attribute {
                 display: display_id.clone(),
                 span,
                 norm,
+                mode: attribution_mode,
             });
         }
         ledger.last_sample_at_epoch_s = Some(now_epoch_s);
@@ -1135,6 +1168,7 @@ fn tick(
                 display: display_id.clone(),
                 total_on_hours: ledger.total_on_hours,
                 sample_count: ledger.sample_count,
+                attribution_mode,
             });
             state
                 .last_persist_epoch_s
@@ -1431,6 +1465,7 @@ mod tests {
                 display: d,
                 span,
                 norm,
+                ..
             } if d == display => Some((*span, *norm)),
             _ => None,
         })
@@ -1656,6 +1691,235 @@ mod tests {
                     if selected == &display && selected_sample == &sample
             )));
         }
+    }
+
+    #[test]
+    fn sampled_grid_resamples_before_spatial_attribution_for_non_default_ledger() {
+        let display = DisplayId("mon".into());
+        let source_cells = (0..LUMA_GRID_ROWS)
+            .flat_map(|_| {
+                (0..LUMA_GRID_COLS).map(|column| match column {
+                    0..=3 => 0.0,
+                    4..=7 => 0.25,
+                    8..=11 => 0.5,
+                    _ => 1.0,
+                })
+            })
+            .collect::<Vec<_>>();
+        let grid = LumaGrid::new(source_cells).expect("16x9 source grid");
+        let resampled = resample_area(&grid.cells, LUMA_GRID_ROWS, LUMA_GRID_COLS, 3, 4)
+            .expect("valid source grid resamples");
+        assert_eq!(resampled.len(), 3 * 4);
+
+        let mut state = TrackerState::default();
+        state.ledgers.insert(
+            display.clone(),
+            WearLedger::new(
+                WearIdentity {
+                    key: display.0.clone(),
+                    display_name: display.0.clone(),
+                    config_display_id: Some(display.0.clone()),
+                },
+                PanelType::Unknown,
+                3,
+                4,
+                0,
+            ),
+        );
+        let mut cfg = WearConfig {
+            grid_rows: 3,
+            grid_cols: 4,
+            ..WearConfig::default()
+        };
+        cfg.active_sampling.enabled = true;
+        cfg.active_sampling.sampled_display = Some(display.0.clone());
+        let mut brightness_samples = HashMap::new();
+        brightness_samples.insert(
+            display.clone(),
+            Some(PanelState {
+                power: None,
+                brightness: Some(100),
+            }),
+        );
+        let sampled_grid = SampledGrid {
+            grid,
+            captured_at: Tick::now(),
+            phase_at_capture: dormant_core::state_machine::Phase::Active,
+        };
+
+        let _actions = tick(
+            &mut state,
+            &snapshot_with(&display, "active", None),
+            &brightness_samples,
+            &cfg,
+            60,
+            Some(&sampled_grid),
+            None,
+            &HashMap::new(),
+        );
+
+        let ledger = state.ledgers.get(&display).expect("ledger remains loaded");
+        assert_eq!(ledger.cells.len(), 3 * 4);
+        assert_eq!(ledger.sample_count, 1);
+        for (cell, expected_luma) in ledger
+            .cells
+            .iter()
+            .zip([0.0, 0.25, 0.5, 1.0].iter().cycle())
+        {
+            assert!((cell.wear_hours - (expected_luma * 60.0 / 3600.0)).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn sampled_attribution_mode_uses_only_spatial_attribution() {
+        let display = DisplayId("mon".into());
+        let mut state = TrackerState::default();
+        state
+            .ledgers
+            .insert(display.clone(), fresh_ledger(&display, 0));
+        let mut cfg = WearConfig::default();
+        cfg.active_sampling.enabled = true;
+        cfg.active_sampling.sampled_display = Some(display.0.clone());
+        let mut brightness_samples = HashMap::new();
+        brightness_samples.insert(
+            display.clone(),
+            Some(PanelState {
+                power: None,
+                brightness: Some(100),
+            }),
+        );
+        let sampled_grid = SampledGrid {
+            grid: LumaGrid::new(vec![0.5; usize::from(LUMA_GRID_ROWS * LUMA_GRID_COLS)])
+                .expect("16x9 sampled grid"),
+            captured_at: Tick::now(),
+            phase_at_capture: dormant_core::state_machine::Phase::Active,
+        };
+
+        let actions = tick(
+            &mut state,
+            &snapshot_with(&display, "grace", None),
+            &brightness_samples,
+            &cfg,
+            60,
+            Some(&sampled_grid),
+            None,
+            &HashMap::new(),
+        );
+
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            TrackerAction::Attribute {
+                display: attributed,
+                mode: WearAttributionMode::Sampled,
+                ..
+            } if attributed == &display
+        )));
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, TrackerAction::Attribute { .. }))
+                .count(),
+            1
+        );
+        let ledger = state.ledgers.get(&display).expect("ledger remains loaded");
+        assert_eq!(ledger.sample_count, 1);
+        assert!(
+            ledger
+                .cells
+                .iter()
+                .all(|cell| (cell.wear_hours - (0.5 * 60.0 / 3600.0)).abs() < 1e-9)
+        );
+    }
+
+    #[test]
+    fn sampled_stale_or_missing_attribution_mode_uses_only_uniform_attribution() {
+        let display = DisplayId("mon".into());
+        for fallback in [SampleFallbackTag::Stale, SampleFallbackTag::Missing] {
+            let mut state = TrackerState::default();
+            state
+                .ledgers
+                .insert(display.clone(), fresh_ledger(&display, 0));
+            let mut cfg = WearConfig::default();
+            cfg.active_sampling.enabled = true;
+            cfg.active_sampling.sampled_display = Some(display.0.clone());
+            let mut samples = HashMap::new();
+            samples.insert(
+                display.clone(),
+                Some(PanelState {
+                    power: None,
+                    brightness: Some(100),
+                }),
+            );
+
+            let actions = tick(
+                &mut state,
+                &snapshot_with(&display, "active", None),
+                &samples,
+                &cfg,
+                60,
+                None,
+                Some(fallback),
+                &HashMap::new(),
+            );
+
+            assert!(actions.iter().any(|action| matches!(
+                action,
+                TrackerAction::Attribute {
+                    display: attributed,
+                    mode: WearAttributionMode::Uniform,
+                    ..
+                } if attributed == &display
+            )));
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|action| matches!(action, TrackerAction::Attribute { .. }))
+                    .count(),
+                1
+            );
+            let ledger = state.ledgers.get(&display).expect("ledger remains loaded");
+            assert_eq!(ledger.sample_count, 1);
+            assert!(
+                ledger
+                    .cells
+                    .iter()
+                    .all(|cell| (cell.wear_hours - (60.0 / 3600.0)).abs() < 1e-9)
+            );
+        }
+    }
+
+    #[test]
+    fn sampled_grid_on_blanked_tick_emits_no_sampled_selection() {
+        let display = DisplayId("mon".into());
+        let mut state = TrackerState::default();
+        state
+            .ledgers
+            .insert(display.clone(), fresh_ledger(&display, 0));
+        let mut cfg = WearConfig::default();
+        cfg.active_sampling.enabled = true;
+        cfg.active_sampling.sampled_display = Some(display.0.clone());
+        let sampled = SampledGrid {
+            grid: LumaGrid::new(vec![0.5; usize::from(LUMA_GRID_ROWS * LUMA_GRID_COLS)])
+                .expect("16x9 sampled grid"),
+            captured_at: Tick::now(),
+            phase_at_capture: dormant_core::state_machine::Phase::Active,
+        };
+
+        let actions = tick(
+            &mut state,
+            &snapshot_with(&display, "blanked", None),
+            &HashMap::new(),
+            &cfg,
+            60,
+            Some(&sampled),
+            None,
+            &HashMap::new(),
+        );
+
+        assert!(!actions.iter().any(|action| matches!(
+            action,
+            TrackerAction::SampledSelection { display: selected, .. } if selected == &display
+        )));
     }
 
     #[test]

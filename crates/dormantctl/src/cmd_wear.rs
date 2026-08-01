@@ -51,3 +51,24 @@ fn print_status(status: Option<WearSamplingStatus>) -> Result<()> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::print_status;
+    use dormant_core::ipc_proto::WearSamplingStatus;
+
+    #[test]
+    fn terminal_error_status_returns_nonzero_result() {
+        assert!(
+            print_status(Some(WearSamplingStatus::Error(
+                "wear_sampling_wrong_monitor".to_owned(),
+            )))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn granted_status_returns_success() {
+        assert!(print_status(Some(WearSamplingStatus::Granted)).is_ok());
+    }
+}

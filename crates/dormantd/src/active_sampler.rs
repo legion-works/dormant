@@ -460,6 +460,7 @@ async fn handle_command(
     source: &mut dyn CaptureSource,
     consent_path: &std::path::Path,
     command: SamplerCommand,
+    command_rx: &mut mpsc::Receiver<SamplerCommand>,
     status_tx: &watch::Sender<SamplerStatus>,
     cancel: &CancellationToken,
 ) -> bool {
@@ -490,21 +491,56 @@ async fn handle_command(
             );
             // The portal has no config timeout; the five-minute interaction bound
             // prevents an abandoned dialog from retaining a daemon operation forever.
-            let outcome = tokio::select! {
-                () = cancel.cancelled() => None,
-                outcome = tokio::time::timeout(Duration::from_secs(300), source.request_consent(&expected)) => Some(outcome),
+            let mut consent = Box::pin(source.request_consent(&expected));
+            let mut deadline = Box::pin(tokio::time::sleep(Duration::from_secs(300)));
+            let mut pending_disable: Option<(bool, oneshot::Sender<Result<(), SamplerError>>)> =
+                None;
+            let outcome = loop {
+                tokio::select! {
+                    () = cancel.cancelled() => break None,
+                    () = &mut deadline => break Some(Err(CaptureError::Timeout)),
+                    outcome = &mut consent => break Some(outcome),
+                    command = command_rx.recv() => match command {
+                        Some(SamplerCommand::Enable { reply }) => {
+                            let _ = reply.send(ConsentFlowStatus::Error(
+                                SamplerError::FlowAlreadyActive.to_string(),
+                            ));
+                        }
+                        Some(SamplerCommand::Disable { forget, reply }) => {
+                            apply_trigger(runtime, Trigger::Forget, status_tx);
+                            pending_disable = Some((forget, reply));
+                            break Some(Err(CaptureError::Protocol("wear_sampling_cancelled".to_owned())));
+                        }
+                        None => break None,
+                    }
+                }
             };
+            drop(consent);
+            drop(deadline);
+            if let Some((forget, reply)) = pending_disable {
+                source.close().await;
+                if forget {
+                    if let Err(error) = crate::screencast_consent::forget(consent_path) {
+                        let _ = reply.send(Err(SamplerError::Store(error)));
+                    } else {
+                        runtime.record = None;
+                        let _ = reply.send(Ok(()));
+                    }
+                } else {
+                    let _ = reply.send(Ok(()));
+                }
+            }
             match outcome {
                 None => return false,
-                Some(Err(_)) => {
+                Some(Err(CaptureError::Timeout)) => {
                     apply_trigger(runtime, Trigger::ConsentTimedOut, status_tx);
                     let _ = reply.send(ConsentFlowStatus::TimedOut);
                 }
-                Some(Ok(Err(CaptureError::ConsentDenied))) => {
+                Some(Err(CaptureError::ConsentDenied)) => {
                     apply_trigger(runtime, Trigger::ConsentDenied, status_tx);
                     let _ = reply.send(ConsentFlowStatus::Denied);
                 }
-                Some(Ok(Err(error))) => {
+                Some(Err(error)) => {
                     let trigger = if matches!(error, CaptureError::Protocol(ref text) if text == WEAR_SAMPLING_WRONG_MONITOR)
                     {
                         Trigger::WrongMonitor
@@ -522,7 +558,7 @@ async fn handle_command(
                         .unwrap_or(WEAR_SAMPLING_CONSENT_TIMEOUT);
                     let _ = reply.send(ConsentFlowStatus::Error(reason.to_owned()));
                 }
-                Some(Ok(Ok(grant))) => {
+                Some(Ok(grant)) => {
                     let record = crate::screencast_consent::ConsentRecord {
                         token: grant.stream.restore_token,
                         sampled_display: expected.display,
@@ -710,7 +746,7 @@ async fn run(
                     () = deps.cancel.cancelled() => break,
                     command = command_rx.recv() => {
                         if let Some(command) = command
-                            && handle_command(&mut runtime, &mut *deps.source, &deps.consent_path, command, &status_tx, &deps.cancel).await {
+                            && handle_command(&mut runtime, &mut *deps.source, &deps.consent_path, command, &mut command_rx, &status_tx, &deps.cancel).await {
                             capture_now = runtime.state == SamplingState::Streaming;
                         }
                     }
@@ -759,7 +795,7 @@ async fn run(
                             () = deps.cancel.cancelled() => break,
                             () = tokio::time::sleep(delay) => {},
                             update = deps.update_rx.recv() => if let Some(update) = update { let _ = apply_update_with_effects(&mut runtime, &mut *deps.source, update, &status_tx).await; },
-                            command = command_rx.recv() => if let Some(command) = command { let _ = handle_command(&mut runtime, &mut *deps.source, &deps.consent_path, command, &status_tx, &deps.cancel).await; },
+                             command = command_rx.recv() => if let Some(command) = command { let _ = handle_command(&mut runtime, &mut *deps.source, &deps.consent_path, command, &mut command_rx, &status_tx, &deps.cancel).await; },
                         }
                     }
                 }
@@ -778,7 +814,7 @@ async fn run(
                             continue;
                         }
                         command = command_rx.recv() => {
-                            if let Some(command) = command { let _ = handle_command(&mut runtime, &mut *deps.source, &deps.consent_path, command, &status_tx, &deps.cancel).await; }
+                            if let Some(command) = command { let _ = handle_command(&mut runtime, &mut *deps.source, &deps.consent_path, command, &mut command_rx, &status_tx, &deps.cancel).await; }
                             continue;
                         }
                     }
@@ -827,7 +863,7 @@ async fn run(
                         && let Some(transition) = apply_update_with_effects(&mut runtime, &mut *deps.source, update, &status_tx).await {
                         capture_now |= transition.effects.contains(&Effect::Capture);
                     },
-                    command = command_rx.recv() => if let Some(command) = command { let _ = handle_command(&mut runtime, &mut *deps.source, &deps.consent_path, command, &status_tx, &deps.cancel).await; },
+                     command = command_rx.recv() => if let Some(command) = command { let _ = handle_command(&mut runtime, &mut *deps.source, &deps.consent_path, command, &mut command_rx, &status_tx, &deps.cancel).await; },
                 }
             }
             SamplingState::ConsentPending => {
@@ -1279,6 +1315,13 @@ impl ScriptedCaptureSource {
     fn with_pending_capture() -> Self {
         Self {
             frames: VecDeque::from([ScriptedOutcome::Pending]),
+            ..Self::default()
+        }
+    }
+
+    fn with_pending_consent() -> Self {
+        Self {
+            grants: VecDeque::from([ScriptedOutcome::Pending]),
             ..Self::default()
         }
     }
@@ -2034,6 +2077,7 @@ mod tests {
             grants_seen: Arc::new(AtomicUsize::new(0)),
         };
         let (reply_tx, reply_rx) = oneshot::channel();
+        let (_command_tx, mut command_rx) = mpsc::channel(1);
 
         assert!(
             !handle_command(
@@ -2041,6 +2085,7 @@ mod tests {
                 &mut source,
                 &consent_path,
                 SamplerCommand::Enable { reply: reply_tx },
+                &mut command_rx,
                 &status_tx,
                 &CancellationToken::new(),
             )
@@ -2050,6 +2095,90 @@ mod tests {
             reply_rx.await.unwrap(),
             ConsentFlowStatus::Error(SamplerError::FlowAlreadyActive.to_string())
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_sampler_forget_cancels_pending_consent_and_deletes_record() {
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        let config = active_config(Duration::from_secs(10));
+        let (update_tx, update_rx) = mpsc::channel(1);
+        drop(update_tx);
+        let cancel = CancellationToken::new();
+        let (handle, join) = spawn_with_handle(ActiveSamplerDeps {
+            initial_config: config,
+            update_rx,
+            latest_grid: new_latest_grid(),
+            source: Box::new(ScriptedCaptureSource::with_pending_consent()),
+            consent_path: consent_path.clone(),
+            cancel: cancel.clone(),
+        });
+
+        let (enable_tx, enable_rx) = oneshot::channel();
+        handle
+            .send(SamplerCommand::Enable { reply: enable_tx })
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+
+        let (disable_tx, disable_rx) = oneshot::channel();
+        handle
+            .send(SamplerCommand::Disable {
+                forget: true,
+                reply: disable_tx,
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), disable_rx)
+                .await
+                .is_ok()
+        );
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), enable_rx)
+                .await
+                .unwrap()
+                .unwrap(),
+            ConsentFlowStatus::Error(_)
+        ));
+        assert!(!consent_path.exists());
+        cancel.cancel();
+        join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_sampler_wrong_monitor_grant_returns_error_without_record() {
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        let config = active_config(Duration::from_secs(10));
+        let mut runtime = Runtime::new(&config, &consent_path);
+        let (status_tx, _) = watch::channel(initial_status(&config));
+        let mut source = ScriptedCaptureSource {
+            grants: VecDeque::from([ScriptedOutcome::Ready(Err(CaptureError::Protocol(
+                WEAR_SAMPLING_WRONG_MONITOR.to_owned(),
+            )))]),
+            ..ScriptedCaptureSource::default()
+        };
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let (_command_tx, mut command_rx) = mpsc::channel(1);
+
+        handle_command(
+            &mut runtime,
+            &mut source,
+            &consent_path,
+            SamplerCommand::Enable { reply: reply_tx },
+            &mut command_rx,
+            &status_tx,
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(
+            reply_rx.await.unwrap(),
+            ConsentFlowStatus::Error(WEAR_SAMPLING_WRONG_MONITOR.to_owned())
+        );
+        assert!(!consent_path.exists());
     }
 
     struct TransitionCase {

@@ -62,6 +62,7 @@ x86_64-apple-darwin = "macos-15-intel"
 # - libudev-dev: tokio-serial → libudev-sys
 # - libwayland-dev: dormant-render → wayland-sys (wayland-client.pc)
 # - libmpv-dev: dormant-render screensaver → libmpv2
+# - libpipewire-0.3-dev: dormantd active sampling → libspa-sys
 # - pkg-config: build-script probes for the above
 [dist.dependencies.apt]
 libudev-dev = { targets = [
@@ -73,6 +74,10 @@ libwayland-dev = { targets = [
   "aarch64-unknown-linux-gnu",
 ] }
 libmpv-dev = { targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+] }
+libpipewire-0.3-dev = { targets = [
   "x86_64-unknown-linux-gnu",
   "aarch64-unknown-linux-gnu",
 ] }

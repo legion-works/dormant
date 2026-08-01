@@ -2572,6 +2572,7 @@ mod tests {
         assert!(!log.contains("unlogged-rotated-token"), "{log}");
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn active_sampler_fresh_grant_persists_native_dimensions_that_reconcile() {
         let dir = tempdir().unwrap();

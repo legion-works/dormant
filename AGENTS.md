@@ -56,7 +56,8 @@ Local gates mirror the CI workflow at `.github/workflows/ci.yml` exactly. Pre-co
 # Runtime system deps for build (Debian/Ubuntu). The render features additionally need:
 #   libwayland-dev   — Wayland client headers (dormant-render)
 #   libmpv-dev pkg-config — libmpv for the screensaver backend
-sudo apt install libudev-dev pkg-config
+#   libpipewire-0.3-dev — PipeWire client headers (dormantd active sampling)
+sudo apt install libudev-dev libpipewire-0.3-dev pkg-config
 
 # libudev is sometimes undiscovered by pkg-config depending on layout — set this if
 # cargo errors with "udev-sys: failed to run `pkg-config`" during build:

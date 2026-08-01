@@ -23,7 +23,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.131
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev libmpv-dev pkg-config libblas3 liblapack3
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev libmpv-dev libpipewire-0.3-dev pkg-config libblas3 liblapack3
       - name: Run Linux daemon soak filters
         env:
           PKG_CONFIG_PATH: /usr/lib/pkgconfig
@@ -91,7 +91,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.131
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev pkg-config mosquitto-clients
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev libpipewire-0.3-dev pkg-config mosquitto-clients
       - name: Start Mosquitto broker
         run: |
           docker run -d --name mosquitto -p 127.0.0.1::1883 eclipse-mosquitto:2 mosquitto -c /mosquitto-no-auth.conf
@@ -286,7 +286,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.131
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev libmpv-dev pkg-config libblas3 liblapack3
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev libmpv-dev libpipewire-0.3-dev pkg-config libblas3 liblapack3
       - name: Stress concurrent test binaries
         run: bash scripts/ci/run-hermeticity-stress.sh --platform Linux --stress-count 100
       - name: Upload first hermeticity process artifacts

@@ -7,7 +7,7 @@
   macOS-specific install path
 - Rust 1.88+ (MSRV) if installing from source
 - Build dependencies for the full daemon (Linux only — macOS needs nothing
-  beyond Xcode Command Line Tools): `sudo apt install libudev-dev libwayland-dev libmpv-dev pkg-config`
+  beyond Xcode Command Line Tools): `sudo apt install libudev-dev libwayland-dev libmpv-dev libpipewire-0.3-dev pkg-config`
 - If `pkg-config` cannot find `libudev`, set `PKG_CONFIG_PATH=/usr/lib/pkgconfig`
 
 ### Render backend
@@ -47,7 +47,7 @@ yay -S dormant-bin
 ```bash
 git clone https://github.com/legion-works/dormant.git
 cd dormant
-sudo apt install libudev-dev libwayland-dev libmpv-dev pkg-config
+sudo apt install libudev-dev libwayland-dev libmpv-dev libpipewire-0.3-dev pkg-config
 cargo build --release --features web-ui,render
 install -Dm755 target/release/dormantd ~/.local/bin/dormantd
 install -Dm755 target/release/dormantctl ~/.local/bin/dormantctl

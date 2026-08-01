@@ -15,8 +15,8 @@ use time::OffsetDateTime;
 use zbus::zvariant::{OwnedFd as ZbusOwnedFd, OwnedObjectPath, OwnedValue, Value};
 
 use super::{
-    CaptureError, CaptureSource, ConnectedStream, ConsentBinding, DisplayExpectation, Grant,
-    RawFrame, WEAR_SAMPLING_WRONG_MONITOR,
+    CONSENT_INTERACTION_TIMEOUT, CaptureError, CaptureSource, ConnectedStream, ConsentBinding,
+    DisplayExpectation, Grant, RawFrame, WEAR_SAMPLING_WRONG_MONITOR,
 };
 
 const PORTAL_SERVICE: &str = "org.freedesktop.portal.Desktop";
@@ -25,6 +25,8 @@ const SCREENCAST_INTERFACE: &str = "org.freedesktop.portal.ScreenCast";
 const REQUEST_INTERFACE: &str = "org.freedesktop.portal.Request";
 const SESSION_INTERFACE: &str = "org.freedesktop.portal.Session";
 const PORTAL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+const SHM_BUFFER_DATA_TYPES: i32 =
+    (1 << spa::sys::SPA_DATA_MemPtr) | (1 << spa::sys::SPA_DATA_MemFd);
 
 /// Portal session handle retained until its `PipeWire` stream closes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -149,7 +151,11 @@ pub trait PortalTransport: Send + Sync + 'static {
         options: SelectSourcesOptions,
     ) -> Result<(), CaptureError>;
     /// Starts the source and returns stream metadata plus a rotated token.
-    async fn start(&self, session: &PortalSession) -> Result<PortalStartResult, CaptureError>;
+    async fn start(
+        &self,
+        session: &PortalSession,
+        response_timeout: Duration,
+    ) -> Result<PortalStartResult, CaptureError>;
     /// Opens the portal-private `PipeWire` remote for a started session.
     async fn open_pipewire_remote(&self, session: &PortalSession) -> Result<OwnedFd, CaptureError>;
     /// Closes the session without leaking an active portal stream.
@@ -216,6 +222,7 @@ impl<T: PortalTransport> PortalPipeWireSource<T> {
     async fn open(
         &mut self,
         options: SelectSourcesOptions,
+        start_response_timeout: Duration,
     ) -> Result<ConnectedStream, CaptureError> {
         self.close().await;
         let session = self.transport.create_session().await?;
@@ -223,7 +230,7 @@ impl<T: PortalTransport> PortalPipeWireSource<T> {
         let opened = async {
             self.transport.select_sources(&session, options).await?;
             tracing::info!(event = "wear_sampling_stage", stage = "sources_selected");
-            let started = self.transport.start(&session).await;
+            let started = self.transport.start(&session, start_response_timeout).await;
             let start = match started {
                 Ok(start) => {
                     tracing::info!(
@@ -281,7 +288,10 @@ impl<T: PortalTransport> CaptureSource for PortalPipeWireSource<T> {
         binding: &ConsentBinding<'_>,
     ) -> Result<ConnectedStream, CaptureError> {
         let stream = self
-            .open(SelectSourcesOptions::for_reattach(binding.token))
+            .open(
+                SelectSourcesOptions::for_reattach(binding.token),
+                PORTAL_RESPONSE_TIMEOUT,
+            )
             .await?;
         if let Err(error) = reconcile_start_with_binding(&stream, binding) {
             self.close().await;
@@ -306,7 +316,11 @@ impl<T: PortalTransport> CaptureSource for PortalPipeWireSource<T> {
         &mut self,
         _display: &DisplayExpectation,
     ) -> Result<Grant, CaptureError> {
-        self.open(SelectSourcesOptions::for_grant()).await?;
+        self.open(
+            SelectSourcesOptions::for_grant(),
+            CONSENT_INTERACTION_TIMEOUT,
+        )
+        .await?;
         self.capture_one(StreamMode::Warm).await?;
         tracing::info!(
             event = "wear_sampling_stage",
@@ -603,6 +617,10 @@ fn run_warm_stream(
         })
         .register()
         .map_err(|error| CaptureError::Transport(format!("PipeWire stream listener: {error}")))?;
+    let buffers = shm_buffer_param_bytes()?;
+    let mut params = [spa::pod::Pod::from_bytes(&buffers).ok_or_else(|| {
+        CaptureError::Transport("PipeWire serialized shm buffer params are invalid".to_owned())
+    })?];
     stream
         .connect(
             spa::utils::Direction::Input,
@@ -610,7 +628,7 @@ fn run_warm_stream(
             pw::stream::StreamFlags::AUTOCONNECT
                 | pw::stream::StreamFlags::MAP_BUFFERS
                 | pw::stream::StreamFlags::INACTIVE,
-            &mut [],
+            &mut params,
         )
         .map_err(|error| CaptureError::Transport(format!("PipeWire stream connect: {error}")))?;
     let (commands, receiver) = pw::channel::channel();
@@ -700,6 +718,33 @@ struct FrameState {
     reply: std::sync::mpsc::Sender<Result<RawFrame, CaptureError>>,
 }
 
+fn shm_buffer_param_bytes() -> Result<Vec<u8>, CaptureError> {
+    let object = shm_buffer_param_object();
+    spa::pod::serialize::PodSerializer::serialize(
+        std::io::Cursor::new(Vec::new()),
+        &spa::pod::Value::Object(object),
+    )
+    .map(|success| success.0.into_inner())
+    .map_err(|error| CaptureError::Transport(format!("PipeWire shm buffer params: {error}")))
+}
+
+fn shm_buffer_param_object() -> spa::pod::Object {
+    spa::pod::Object {
+        type_: spa::utils::SpaTypes::ObjectParamBuffers.as_raw(),
+        id: spa::param::ParamType::Buffers.as_raw(),
+        properties: vec![spa::pod::Property::new(
+            spa::sys::SPA_PARAM_BUFFERS_dataType,
+            spa::pod::Value::Choice(spa::pod::ChoiceValue::Int(spa::utils::Choice(
+                spa::utils::ChoiceFlags::empty(),
+                spa::utils::ChoiceEnum::Flags {
+                    default: SHM_BUFFER_DATA_TYPES,
+                    flags: vec![SHM_BUFFER_DATA_TYPES],
+                },
+            ))),
+        )],
+    }
+}
+
 fn acquire_one_frame(fd: OwnedFd, node_id: u32) -> Result<RawFrame, CaptureError> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None)
@@ -750,12 +795,16 @@ fn acquire_one_frame(fd: OwnedFd, node_id: u32) -> Result<RawFrame, CaptureError
         })
         .register()
         .map_err(|error| CaptureError::Transport(format!("PipeWire stream listener: {error}")))?;
+    let buffers = shm_buffer_param_bytes()?;
+    let mut params = [spa::pod::Pod::from_bytes(&buffers).ok_or_else(|| {
+        CaptureError::Transport("PipeWire serialized shm buffer params are invalid".to_owned())
+    })?];
     stream
         .connect(
             spa::utils::Direction::Input,
             Some(node_id),
             pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
-            &mut [],
+            &mut params,
         )
         .map_err(|error| CaptureError::Transport(format!("PipeWire stream connect: {error}")))?;
     mainloop.run();
@@ -918,10 +967,11 @@ impl ZbusPortalTransport {
     async fn response(
         &self,
         responses: &mut zbus::proxy::SignalStream<'_>,
+        timeout: Duration,
     ) -> Result<HashMap<String, OwnedValue>, CaptureError> {
         use futures_util::StreamExt;
 
-        let response = tokio::time::timeout(PORTAL_RESPONSE_TIMEOUT, responses.next())
+        let response = tokio::time::timeout(timeout, responses.next())
             .await
             .map_err(|_| CaptureError::Transport("portal Response timed out".to_owned()))?
             .ok_or_else(|| CaptureError::Transport("portal response stream ended".to_owned()))?;
@@ -965,7 +1015,9 @@ impl PortalTransport for ZbusPortalTransport {
                 "portal CreateSession returned an unexpected request path".to_owned(),
             ));
         }
-        let results = self.response(&mut responses).await?;
+        let results = self
+            .response(&mut responses, PORTAL_RESPONSE_TIMEOUT)
+            .await?;
         let session_handle = results
             .get("session_handle")
             .ok_or_else(|| {
@@ -1005,10 +1057,16 @@ impl PortalTransport for ZbusPortalTransport {
                 "portal SelectSources returned an unexpected request path".to_owned(),
             ));
         }
-        self.response(&mut responses).await.map(|_| ())
+        self.response(&mut responses, PORTAL_RESPONSE_TIMEOUT)
+            .await
+            .map(|_| ())
     }
 
-    async fn start(&self, session: &PortalSession) -> Result<PortalStartResult, CaptureError> {
+    async fn start(
+        &self,
+        session: &PortalSession,
+        response_timeout: Duration,
+    ) -> Result<PortalStartResult, CaptureError> {
         let handle_token = self.token("start");
         let expected_path = self.request_path(&handle_token)?;
         let mut options = HashMap::new();
@@ -1024,7 +1082,7 @@ impl PortalTransport for ZbusPortalTransport {
                 "portal Start returned an unexpected request path".to_owned(),
             ));
         }
-        parse_start_result(self.response(&mut responses).await?)
+        parse_start_result(self.response(&mut responses, response_timeout).await?)
     }
 
     async fn open_pipewire_remote(&self, session: &PortalSession) -> Result<OwnedFd, CaptureError> {
@@ -1121,6 +1179,7 @@ mod tests {
         },
         Start {
             handle_token: String,
+            response_timeout: Duration,
         },
         OpenPipeWireRemote,
         Close,
@@ -1134,6 +1193,7 @@ mod tests {
     struct FakeState {
         calls: Vec<PortalCall>,
         start: Result<PortalStartResult, CaptureError>,
+        start_delay: Duration,
     }
 
     #[derive(Clone)]
@@ -1183,6 +1243,17 @@ mod tests {
                 state: Arc::new(Mutex::new(FakeState {
                     calls: Vec::new(),
                     start: Ok(start),
+                    start_delay: Duration::ZERO,
+                })),
+            }
+        }
+
+        fn grant_after(start_delay: Duration, start: PortalStartResult) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(FakeState {
+                    calls: Vec::new(),
+                    start: Ok(start),
+                    start_delay,
                 })),
             }
         }
@@ -1223,12 +1294,21 @@ mod tests {
             Ok(())
         }
 
-        async fn start(&self, _session: &PortalSession) -> Result<PortalStartResult, CaptureError> {
-            let mut state = self.state.lock().expect("fake lock is not poisoned");
-            state.calls.push(PortalCall::Start {
-                handle_token: "dormant_start_3".to_owned(),
-            });
-            state.start.clone()
+        async fn start(
+            &self,
+            _session: &PortalSession,
+            response_timeout: Duration,
+        ) -> Result<PortalStartResult, CaptureError> {
+            let (start_delay, start) = {
+                let mut state = self.state.lock().expect("fake lock is not poisoned");
+                state.calls.push(PortalCall::Start {
+                    handle_token: "dormant_start_3".to_owned(),
+                    response_timeout,
+                });
+                (state.start_delay, state.start.clone())
+            };
+            tokio::time::sleep_until(tokio::time::Instant::now() + start_delay).await;
+            start
         }
 
         async fn open_pipewire_remote(
@@ -1270,7 +1350,11 @@ mod tests {
             Ok(())
         }
 
-        async fn start(&self, _session: &PortalSession) -> Result<PortalStartResult, CaptureError> {
+        async fn start(
+            &self,
+            _session: &PortalSession,
+            _response_timeout: Duration,
+        ) -> Result<PortalStartResult, CaptureError> {
             Ok(PortalStartResult::single(
                 73,
                 3072,
@@ -1288,6 +1372,28 @@ mod tests {
         }
 
         async fn close(&self, _session: PortalSession) {}
+    }
+
+    #[test]
+    fn shm_buffer_params_only_advertise_cpu_mappable_memory() {
+        let object = shm_buffer_param_object();
+        assert_eq!(
+            object.type_,
+            spa::utils::SpaTypes::ObjectParamBuffers.as_raw()
+        );
+        assert_eq!(object.id, spa::param::ParamType::Buffers.as_raw());
+        let property = object.properties.first().expect("one buffer property");
+        assert_eq!(property.key, spa::sys::SPA_PARAM_BUFFERS_dataType);
+        match &property.value {
+            spa::pod::Value::Choice(spa::pod::ChoiceValue::Int(spa::utils::Choice(
+                _,
+                spa::utils::ChoiceEnum::Flags { default, flags },
+            ))) => {
+                assert_eq!(*default, SHM_BUFFER_DATA_TYPES);
+                assert_eq!(flags, &[SHM_BUFFER_DATA_TYPES]);
+            }
+            value => panic!("expected dataType flags, got {value:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1339,10 +1445,42 @@ mod tests {
                 },
                 PortalCall::Start {
                     handle_token: "dormant_start_3".to_owned(),
+                    response_timeout: CONSENT_INTERACTION_TIMEOUT,
                 },
                 PortalCall::OpenPipeWireRemote,
             ]
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_sampling_protocol_allows_start_response_during_consent_window() {
+        let transport = FakePortalTransport::grant_after(
+            Duration::from_secs(200),
+            PortalStartResult::single(73, 3072, 1728, Some("persistent-output"), "rotated-token"),
+        );
+        let mut source = PortalPipeWireSource::from_transport_with_frames(
+            transport.clone(),
+            [Ok(RawFrame {
+                rgba: vec![0; 4],
+                width: 3840,
+                height: 2160,
+                stride: 3840 * 4,
+            })],
+        );
+
+        let grant = source
+            .request_consent(&DisplayExpectation {
+                display: "oled".to_owned(),
+            })
+            .await
+            .expect("a Start response before the consent deadline succeeds");
+
+        assert_eq!(grant.stream.node_id, 73);
+        assert!(transport.calls().iter().any(|call| matches!(
+            call,
+            PortalCall::Start { response_timeout, .. }
+                if *response_timeout == CONSENT_INTERACTION_TIMEOUT
+        )));
     }
 
     #[test]

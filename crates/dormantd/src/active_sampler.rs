@@ -32,6 +32,7 @@ pub const WEAR_SAMPLING_TOKEN_INVALID: &str = "wear_sampling_token_invalid";
 pub const WEAR_SAMPLING_DISPLAY_CHANGED: &str = "wear_sampling_display_changed";
 /// Stable fallback reason when a granted stream does not match its display.
 pub const WEAR_SAMPLING_WRONG_MONITOR: &str = "wear_sampling_wrong_monitor";
+const CONSENT_INTERACTION_TIMEOUT: Duration = Duration::from_secs(300);
 /// Stable fallback reason for a capture failure before the breaker opens.
 pub const WEAR_SAMPLING_CAPTURE_FAILED: &str = "wear_sampling_capture_failed";
 /// Stable fallback reason while the capture circuit breaker is open.
@@ -552,7 +553,7 @@ async fn handle_command(
             // The portal has no config timeout; the five-minute interaction bound
             // prevents an abandoned dialog from retaining a daemon operation forever.
             let mut consent = Box::pin(source.request_consent(&expected));
-            let mut deadline = Box::pin(tokio::time::sleep(Duration::from_secs(300)));
+            let mut deadline = Box::pin(tokio::time::sleep(CONSENT_INTERACTION_TIMEOUT));
             let mut pending_disable: Option<(bool, oneshot::Sender<Result<(), SamplerError>>)> =
                 None;
             let outcome = loop {

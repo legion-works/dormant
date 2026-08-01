@@ -1308,6 +1308,14 @@ fn load_or_create_ledger(
             // The storage key identifies the persisted panel, while the config binding
             // is current runtime metadata. Retaining a v0.1 `None` here makes the web
             // summary report uniform even when this ledger receives sampled grids.
+            if ledger.identity != identity {
+                tracing::debug!(
+                    event = "wear_identity_refreshed",
+                    display = %display_key,
+                    from_config_display_id = ?ledger.identity.config_display_id,
+                    to_config_display_id = ?identity.config_display_id,
+                );
+            }
             ledger.identity = identity;
             // panel_type is config-declared (spec: never auto-detected) —
             // a ledger persisted before the operator set the field carries

@@ -718,6 +718,8 @@ struct TrackerState {
     screensaver_tick_at: Option<Instant>,
     /// True while screensaver attribution is using a tagged uniform fallback.
     screensaver_fallback_active: HashMap<DisplayId, bool>,
+    /// True while sampled attribution is using a tagged uniform fallback.
+    sampled_attribution_fallback_active: HashMap<DisplayId, bool>,
 }
 
 /// One contiguous screensaver exposure interval within a tracker window.
@@ -771,7 +773,8 @@ enum TrackerAction {
 /// Attribution method used for a tracker tick's published observation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WearAttributionMode {
-    /// The ledger received a uniform brightness-weighted attribution.
+    /// The ledger received a uniform brightness-weighted attribution, including
+    /// the staged-screensaver journal path.
     Uniform,
     /// The ledger received a spatially sampled, luma-weighted attribution.
     Sampled,
@@ -874,6 +877,34 @@ fn screensaver_uniform_fallback(
     });
 }
 
+fn sampled_uniform_fallback(
+    latches: &mut HashMap<DisplayId, bool>,
+    display_id: &DisplayId,
+    span: Duration,
+    norm: f64,
+    actions: &mut Vec<TrackerAction>,
+    ledger: &mut WearLedger,
+) {
+    let already_active = latches.get(display_id).copied().unwrap_or(false);
+    if !already_active {
+        tracing::warn!(
+            event = "wear_sampled_luma_fallback",
+            display = %display_id,
+            reason = "ledger_grid_mismatch",
+            ledger_grid_rows = ledger.grid_rows,
+            ledger_grid_cols = ledger.grid_cols,
+        );
+    }
+    latches.insert(display_id.clone(), true);
+    ledger.attribute_uniform(span, norm);
+    actions.push(TrackerAction::Attribute {
+        display: display_id.clone(),
+        span,
+        norm,
+        mode: WearAttributionMode::Uniform,
+    });
+}
+
 /// Pure tracker tick: given the current snapshot/samples/config, mutate
 /// `state`'s ledgers and bookkeeping in place and return the actions the
 /// shell must execute. Zero I/O, zero tokio — see module docs.
@@ -904,6 +935,7 @@ fn tick(
             continue;
         };
         let fallback_latches = &mut state.screensaver_fallback_active;
+        let sampled_fallback_latches = &mut state.sampled_attribution_fallback_active;
 
         // Grid resize on config change.
         if ledger.grid_rows != cfg.grid_rows || ledger.grid_cols != cfg.grid_cols {
@@ -956,7 +988,6 @@ fn tick(
                                 sample: sample.clone(),
                             });
                             sampled_grid = Some(sample.grid.clone());
-                            attribution_mode = WearAttributionMode::Sampled;
                         }
                         AttributionSelection::Uniform(fallback) => {
                             actions.push(TrackerAction::UniformSelection {
@@ -1091,20 +1122,47 @@ fn tick(
                     LUMA_GRID_COLS,
                     ledger.grid_rows,
                     ledger.grid_cols,
-                )
-                .expect("LumaGrid always has the pinned 16x9 dimensions");
-                ledger
-                    .attribute_spatial(span, norm, &cells)
-                    .expect("resampled luma always matches the ledger grid");
+                );
+                if let Some(cells) = cells {
+                    if ledger.attribute_spatial(span, norm, &cells).is_ok() {
+                        sampled_fallback_latches.insert(display_id.clone(), false);
+                        attribution_mode = WearAttributionMode::Sampled;
+                        actions.push(TrackerAction::Attribute {
+                            display: display_id.clone(),
+                            span,
+                            norm,
+                            mode: attribution_mode,
+                        });
+                    } else {
+                        sampled_uniform_fallback(
+                            sampled_fallback_latches,
+                            &display_id,
+                            span,
+                            norm,
+                            &mut actions,
+                            ledger,
+                        );
+                    }
+                } else {
+                    sampled_uniform_fallback(
+                        sampled_fallback_latches,
+                        &display_id,
+                        span,
+                        norm,
+                        &mut actions,
+                        ledger,
+                    );
+                }
             } else {
+                sampled_fallback_latches.insert(display_id.clone(), false);
                 ledger.attribute_uniform(span, norm);
+                actions.push(TrackerAction::Attribute {
+                    display: display_id.clone(),
+                    span,
+                    norm,
+                    mode: attribution_mode,
+                });
             }
-            actions.push(TrackerAction::Attribute {
-                display: display_id.clone(),
-                span,
-                norm,
-                mode: attribution_mode,
-            });
         }
         ledger.last_sample_at_epoch_s = Some(now_epoch_s);
 
@@ -1886,6 +1944,109 @@ mod tests {
                     .all(|cell| (cell.wear_hours - (60.0 / 3600.0)).abs() < 1e-9)
             );
         }
+    }
+
+    #[test]
+    fn sampled_zero_dimension_ledger_degrades_without_double_attribution() {
+        let dir = tempfile::tempdir().expect("temporary ledger directory");
+        let display = DisplayId("mon".into());
+        let identity = WearIdentity {
+            key: display.0.clone(),
+            display_name: display.0.clone(),
+            config_display_id: Some(display.0.clone()),
+        };
+        let persisted = WearLedger::new(identity.clone(), PanelType::Unknown, 0, 0, 0);
+        std::fs::write(
+            dir.path().join("wear-mon.json"),
+            serde_json::to_string(&persisted).expect("serializable zero-dimension ledger"),
+        )
+        .expect("write persisted ledger");
+        let loaded = load_or_create_ledger(
+            dir.path(),
+            "mon",
+            identity,
+            PanelType::Unknown,
+            0,
+            0,
+            60,
+            &ObservationHub::new(1),
+        );
+        assert_eq!((loaded.ledger.grid_rows, loaded.ledger.grid_cols), (0, 0));
+
+        let mut state = TrackerState::default();
+        state.ledgers.insert(display.clone(), loaded.ledger);
+        let mut cfg = WearConfig {
+            grid_rows: 0,
+            grid_cols: 0,
+            ..WearConfig::default()
+        };
+        cfg.active_sampling.enabled = true;
+        cfg.active_sampling.sampled_display = Some(display.0.clone());
+        let mut brightness_samples = HashMap::new();
+        brightness_samples.insert(
+            display.clone(),
+            Some(PanelState {
+                power: None,
+                brightness: Some(100),
+            }),
+        );
+        let sampled_grid = SampledGrid {
+            grid: LumaGrid::new(vec![0.5; 9 * 16]).expect("16x9 sampled grid"),
+            captured_at: Tick::now(),
+            phase_at_capture: dormant_core::state_machine::Phase::Active,
+        };
+
+        let snapshot = snapshot_with(&display, "active", None);
+        let mut actions = Vec::new();
+        let log = capture_tracing(|| {
+            actions = tick(
+                &mut state,
+                &snapshot,
+                &brightness_samples,
+                &cfg,
+                60,
+                Some(&sampled_grid),
+                None,
+                &HashMap::new(),
+            );
+            let _ = tick(
+                &mut state,
+                &snapshot,
+                &brightness_samples,
+                &cfg,
+                120,
+                Some(&sampled_grid),
+                None,
+                &HashMap::new(),
+            );
+        });
+
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            TrackerAction::Attribute {
+                display: attributed,
+                mode: WearAttributionMode::Uniform,
+                ..
+            } if attributed == &display
+        )));
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| matches!(action, TrackerAction::Attribute { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            state
+                .ledgers
+                .get(&display)
+                .expect("ledger remains loaded")
+                .sample_count,
+            2
+        );
+        assert_eq!(log.matches("wear_sampled_luma_fallback").count(), 1);
+        assert!(log.contains("ledger_grid_rows"), "{log}");
+        assert!(log.contains("ledger_grid_cols"), "{log}");
     }
 
     #[test]

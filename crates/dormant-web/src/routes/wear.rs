@@ -18,7 +18,9 @@
 
 use axum::Json;
 use axum::extract::{Path, State};
-use dormant_core::wear::{PanelType, WearLedger, advisory_active, hours_since_effective_dwell};
+use dormant_core::wear::{
+    PanelType, WearAttributionMode, WearLedger, advisory_active, hours_since_effective_dwell,
+};
 
 use crate::WebState;
 use crate::error::WebError;
@@ -63,6 +65,11 @@ pub(crate) struct WearSummary {
     /// long dwell yet (baseline-only — the common first-load case), instead
     /// of rendering "no long standby window in ? days".
     pub(crate) hours_since_long_dwell: u64,
+    /// Attribution method used for the summary's current observation.
+    pub(crate) wear_attribution_mode: WearAttributionMode,
+    /// Consent grant time when this display is content-weighted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) content_weighted_since: Option<i64>,
 }
 
 /// `GET /api/wear` response envelope.
@@ -110,7 +117,13 @@ fn summarize(
     ledger: &WearLedger,
     advisory_after: std::time::Duration,
     now_epoch_s: u64,
+    sampling: Option<&dormant_core::wear::WearSamplingStatus>,
 ) -> WearSummary {
+    let content_weighted_since = sampling.and_then(|status| {
+        (status.bound_display.as_deref() == ledger.identity.config_display_id.as_deref())
+            .then_some(status.granted_at_epoch_s)
+            .flatten()
+    });
     WearSummary {
         display: key.to_string(),
         display_name: ledger.identity.display_name.clone(),
@@ -132,6 +145,12 @@ fn summarize(
             ledger.advisory_baseline_epoch_s,
             now_epoch_s,
         ),
+        wear_attribution_mode: if content_weighted_since.is_some() {
+            WearAttributionMode::Sampled
+        } else {
+            WearAttributionMode::Uniform
+        },
+        content_weighted_since,
     }
 }
 
@@ -144,6 +163,7 @@ fn summarize(
 /// panic into an HTTP 500.
 pub(crate) async fn get_wear(State(state): State<WebState>) -> Json<WearListResponse> {
     let advisory_after = state.inner.config_rx.borrow().wear.advisory_after;
+    let sampling = state.inner.wear_sampling_rx.borrow().clone();
     let now = now_epoch_s();
 
     let Ok(guard) = state.inner.wear.read() else {
@@ -154,7 +174,7 @@ pub(crate) async fn get_wear(State(state): State<WebState>) -> Json<WearListResp
 
     let mut displays: Vec<WearSummary> = guard
         .iter()
-        .map(|(key, ledger)| summarize(key, ledger, advisory_after, now))
+        .map(|(key, ledger)| summarize(key, ledger, advisory_after, now, sampling.as_ref()))
         .collect();
     // Deterministic ordering for a stable UI list / test assertions.
     displays.sort_by(|a, b| a.display.cmp(&b.display));
@@ -183,7 +203,8 @@ pub(crate) async fn get_wear_detail(
         .get(&display)
         .ok_or_else(|| WebError::UnknownDisplay(display.clone()))?;
 
-    let summary = summarize(&display, ledger, advisory_after, now);
+    let sampling = state.inner.wear_sampling_rx.borrow().clone();
+    let summary = summarize(&display, ledger, advisory_after, now, sampling.as_ref());
     let cells: Vec<f64> = ledger.cells.iter().map(|c| c.wear_hours).collect();
     // Compute the max once and reuse it: it's the denominator the
     // heat map was normalized against, AND it's what the legend
@@ -244,6 +265,61 @@ mod tests {
         ledger
     }
 
+    #[test]
+    fn content_weighted_since_requires_matching_bound_display() {
+        let mut ledger = ledger_with("desk", "Desk", PanelType::Woled, 100, None);
+        ledger.identity.config_display_id = Some("desk".to_owned());
+        let matching = dormant_core::wear::WearSamplingStatus {
+            state: dormant_core::wear::WearSamplingState::Streaming,
+            last_capture_age_s: Some(5),
+            uniform_reason: None,
+            bound_display: Some("desk".to_owned()),
+            granted_at_epoch_s: Some(1_700_000_000),
+        };
+        let non_matching = dormant_core::wear::WearSamplingStatus {
+            bound_display: Some("other".to_owned()),
+            ..matching.clone()
+        };
+        let absent_consent = dormant_core::wear::WearSamplingStatus {
+            granted_at_epoch_s: None,
+            ..matching.clone()
+        };
+
+        assert_eq!(
+            summarize(
+                "desk",
+                &ledger,
+                Duration::from_secs(1),
+                200,
+                Some(&matching)
+            )
+            .content_weighted_since,
+            Some(1_700_000_000)
+        );
+        assert!(
+            summarize(
+                "desk",
+                &ledger,
+                Duration::from_secs(1),
+                200,
+                Some(&non_matching)
+            )
+            .content_weighted_since
+            .is_none()
+        );
+        assert!(
+            summarize(
+                "desk",
+                &ledger,
+                Duration::from_secs(1),
+                200,
+                Some(&absent_consent)
+            )
+            .content_weighted_since
+            .is_none()
+        );
+    }
+
     fn test_state_with(
         wear: HashMap<String, WearLedger>,
         wear_cfg: WearConfig,
@@ -295,6 +371,7 @@ mod tests {
                 web_bind: bind,
                 cancel,
                 reload_timeout: Duration::from_secs(10),
+                wear_sampling_rx: tokio::sync::watch::channel(None).1,
             },
         ))
     }

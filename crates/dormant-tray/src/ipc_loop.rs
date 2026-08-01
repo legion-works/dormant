@@ -295,6 +295,7 @@ mod tests {
             pending_reload: None,
             rollback: None,
             kvm: None,
+            wear_sampling_status: None,
         }
     }
 
@@ -439,6 +440,7 @@ mod tests {
                             pending_reload: None,
                             rollback: None,
                             kvm: None,
+                            wear_sampling_status: None,
                         };
                         let json = serde_json::to_string(&IpcResponse::ok(Some(snap))).unwrap();
                         writer.write_all(json.as_bytes()).await.unwrap();
@@ -548,6 +550,7 @@ mod tests {
                 switch_capable_displays: vec![DisplayId("monitor".into())],
                 ..Default::default()
             }),
+            wear_sampling_status: None,
         }
     }
 

@@ -418,7 +418,7 @@ pub enum IdleSource {
 /// Governs the pure [`crate::wear::WearLedger`] sampling/persistence cadence
 /// and the heuristics the tracker in `dormantd` uses to attribute
 /// brightness-weighted on-time to grid cells.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WearConfig {
     /// Enable panel-wear tracking. Enabled by default.
     #[serde(default = "default_wear_enabled")]
@@ -463,6 +463,67 @@ pub struct WearConfig {
     /// surfacing to the operator.
     #[serde(default = "default_wear_advisory_after", with = "humantime_serde")]
     pub advisory_after: Duration,
+
+    /// Active-time spatial sampling configuration.
+    #[serde(default)]
+    pub active_sampling: ActiveSamplingConfig,
+}
+
+/// Active-time spatial wear sampling configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActiveSamplingConfig {
+    /// Enable active sampling.
+    #[serde(default = "default_active_sampling_enabled")]
+    pub enabled: bool,
+
+    /// Configured display whose active surface is sampled.
+    #[serde(default)]
+    pub sampled_display: Option<String>,
+
+    /// `PipeWire` stream lifecycle strategy.
+    #[serde(default = "default_active_sampling_stream_mode")]
+    pub stream_mode: StreamMode,
+
+    /// Maximum time spent capturing one sample.
+    #[serde(
+        default = "default_active_sampling_capture_timeout",
+        with = "humantime_serde"
+    )]
+    pub capture_timeout: Duration,
+
+    /// Consecutive failures before the circuit opens.
+    #[serde(default = "default_active_sampling_failure_threshold")]
+    pub failure_threshold: u32,
+
+    /// Delay before retrying an open circuit.
+    #[serde(
+        default = "default_active_sampling_circuit_reset_after",
+        with = "humantime_serde"
+    )]
+    pub circuit_reset_after: Duration,
+}
+
+impl Default for ActiveSamplingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_active_sampling_enabled(),
+            sampled_display: None,
+            stream_mode: default_active_sampling_stream_mode(),
+            capture_timeout: default_active_sampling_capture_timeout(),
+            failure_threshold: default_active_sampling_failure_threshold(),
+            circuit_reset_after: default_active_sampling_circuit_reset_after(),
+        }
+    }
+}
+
+/// Stream setup strategy for active sampling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StreamMode {
+    /// Keep the capture stream warm between samples.
+    Warm,
+    /// Set up and tear down the stream for each sample.
+    PerTick,
 }
 
 impl Default for WearConfig {
@@ -478,6 +539,7 @@ impl Default for WearConfig {
             screensaver_factor: defaults::WEAR_SCREENSAVER_FACTOR,
             short_cycle_dwell: defaults::WEAR_SHORT_CYCLE_DWELL,
             advisory_after: defaults::WEAR_ADVISORY_AFTER,
+            active_sampling: ActiveSamplingConfig::default(),
         }
     }
 }
@@ -1645,6 +1707,24 @@ fn default_wear_short_cycle_dwell() -> Duration {
 fn default_wear_advisory_after() -> Duration {
     defaults::WEAR_ADVISORY_AFTER
 }
+fn default_active_sampling_enabled() -> bool {
+    defaults::WEAR_ACTIVE_SAMPLING_ENABLED
+}
+fn default_active_sampling_stream_mode() -> StreamMode {
+    match defaults::WEAR_ACTIVE_SAMPLING_STREAM_MODE {
+        "per-tick" => StreamMode::PerTick,
+        _ => StreamMode::Warm,
+    }
+}
+fn default_active_sampling_capture_timeout() -> Duration {
+    defaults::WEAR_ACTIVE_SAMPLING_CAPTURE_TIMEOUT
+}
+fn default_active_sampling_failure_threshold() -> u32 {
+    defaults::WEAR_ACTIVE_SAMPLING_FAILURE_THRESHOLD
+}
+fn default_active_sampling_circuit_reset_after() -> Duration {
+    defaults::WEAR_ACTIVE_SAMPLING_CIRCUIT_RESET_AFTER
+}
 fn default_notify_enabled() -> bool {
     defaults::NOTIFY_ENABLED
 }
@@ -2131,6 +2211,60 @@ advisory_after = "48h"
         assert!((cfg.wear.screensaver_factor - 0.2).abs() < f64::EPSILON);
         assert_eq!(cfg.wear.short_cycle_dwell, Duration::from_secs(300));
         assert_eq!(cfg.wear.advisory_after, Duration::from_secs(48 * 3600));
+    }
+
+    #[test]
+    fn active_sampling_defaults_when_section_absent_or_empty() {
+        for toml_str in [
+            "config_version = 1\n",
+            "config_version = 1\n[wear.active_sampling]\n",
+        ] {
+            let cfg: Config = toml::from_str(toml_str).unwrap();
+            assert!(!cfg.wear.active_sampling.enabled);
+            assert_eq!(cfg.wear.active_sampling.sampled_display, None);
+            assert_eq!(cfg.wear.active_sampling.stream_mode, StreamMode::Warm);
+            assert_eq!(
+                cfg.wear.active_sampling.capture_timeout,
+                Duration::from_secs(2)
+            );
+            assert_eq!(cfg.wear.active_sampling.failure_threshold, 5);
+            assert_eq!(
+                cfg.wear.active_sampling.circuit_reset_after,
+                Duration::from_secs(300)
+            );
+        }
+    }
+
+    #[test]
+    fn active_sampling_explicit_values_and_stream_modes_parse() {
+        for mode in ["warm", "per-tick"] {
+            let toml_str = format!(
+                "config_version = 1\n[wear.active_sampling]\nenabled = true\nsampled_display = \"desk\"\nstream_mode = \"{mode}\"\ncapture_timeout = \"3s\"\nfailure_threshold = 7\ncircuit_reset_after = \"1m\"\n"
+            );
+            let cfg: Config = toml::from_str(&toml_str).unwrap();
+            assert!(cfg.wear.active_sampling.enabled);
+            assert_eq!(
+                cfg.wear.active_sampling.sampled_display.as_deref(),
+                Some("desk")
+            );
+            assert_eq!(
+                cfg.wear.active_sampling.capture_timeout,
+                Duration::from_secs(3)
+            );
+            assert_eq!(cfg.wear.active_sampling.failure_threshold, 7);
+            assert_eq!(
+                cfg.wear.active_sampling.circuit_reset_after,
+                Duration::from_secs(60)
+            );
+            assert_eq!(
+                cfg.wear.active_sampling.stream_mode,
+                if mode == "warm" {
+                    StreamMode::Warm
+                } else {
+                    StreamMode::PerTick
+                }
+            );
+        }
     }
 
     // ── DisplayConfig::panel_type ───────────────────────────────────────────

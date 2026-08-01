@@ -39,6 +39,11 @@ attribution and logs `wear_screensaver_luma_fallback`; scan and journal failures
 also emit `screensaver_luma_scan_failed` and
 `screensaver_item_journal_overflow`. Playback and blanking continue.
 
+The optional [active wear sampling](./active-wear-sampling.md) path applies a
+single compositor-frame approximation to one Linux/KDE Wayland display. It is
+disabled by default; sampled `total_on_hours` is luma-weighted and is not 1:1
+comparable with uniform or pre-M2 ledgers.
+
 The ledger has a `wear.grid_rows` × `wear.grid_cols` grid for future spatial
 attribution. v1 writes the same value to every cell. It does not know which
 region or content was shown.

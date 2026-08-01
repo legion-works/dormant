@@ -13,7 +13,9 @@ dormantctl doctor mqtt      # probe MQTT sensors
 dormantctl doctor ha        # probe HA WebSocket sensors
 dormantctl doctor usb /dev/ttyUSB0  # probe USB LD2410
 dormantctl doctor ddcci     # probe DDC/CI displays (Linux and macOS)
-dormantctl doctor config    # validate configuration
+ dormantctl doctor config    # validate configuration
+ # Live-only active wear sampler check (web Doctor view or daemon IPC)
+ # There is no offline dormantctl doctor wear-sampling arm.
 
 # macOS-only, read-only checks
 dormantctl doctor macos-idle            # two bounded raw idle-clock readings
@@ -22,6 +24,21 @@ dormantctl doctor macos-power           # active power assertions blocking displ
 ```
 
 Each check reports status: OK, WARN, or FAIL. Warnings are non-fatal (e.g., a controller reports its last known state is stale). Failures indicate something needs fixing. The three `macos-*` checks exit 3 ("not yet supported") on Linux — they are read-only probes, never blanking or waking a display.
+
+### Active wear sampling
+
+The `wear-sampling` probe is live-only: use the web Doctor view or the daemon's
+IPC surface. There is no offline `dormantctl doctor wear-sampling` command
+because consent, PipeWire state, and the portal session belong to the running
+daemon; an offline arm would create a second capture lifecycle instead of
+diagnosing the live one.
+
+If sampling is `uniform`, check the sampler status age and journal for capture
+or reattach warnings. Uniform attribution is expected whenever capture is
+unavailable, stale, suspended, denied, timed out, the circuit is open, or the
+monitor binding no longer matches. Re-enable explicitly after granting
+ScreenCast consent; revoke with `dormantctl wear disable-sampling --forget` or
+KDE System Settings → Applications → Screen Sharing permissions.
 
 ### Doctor-assisted issue drafting
 

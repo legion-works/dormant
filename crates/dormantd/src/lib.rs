@@ -4,12 +4,14 @@
 //! display validation, hot config reload, and a user-activity inhibitor. The
 //! `dormantd` binary is a thin wrapper over [`app::App`].
 
+pub mod active_sampler;
 pub mod activity_follow;
 pub mod app;
 mod audio_policy;
 pub mod audio_source;
 pub mod boot;
 pub mod boot_guard;
+pub mod screencast_consent;
 
 mod coordination_poll;
 pub mod direct_switch;

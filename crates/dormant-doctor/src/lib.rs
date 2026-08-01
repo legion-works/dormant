@@ -15,8 +15,8 @@ mod types;
 
 pub use dormant_core::doctor::{Check, CheckStatus, DoctorReport};
 pub use draft::{
-    DisplayInventoryEntry, DraftContext, EnvInfo, SecretSet, build_display_inventory, collect_env,
-    format_date_ymd, render_bug_draft, render_feature_draft,
+    ConsentSecrets, DisplayInventoryEntry, DraftContext, EnvInfo, SecretSet,
+    build_display_inventory, collect_env, format_date_ymd, render_bug_draft, render_feature_draft,
 };
 pub use service::DoctorService;
 pub use types::{ProbeResult, ProbeStatus};

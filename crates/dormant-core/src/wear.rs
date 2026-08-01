@@ -23,6 +23,56 @@ use crate::traits::PanelState;
 /// `dormantd`) branches on this field to decide whether to migrate or reset.
 pub const WEAR_SCHEMA_VERSION: u32 = 1;
 
+/// Attribution method used for a published wear observation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WearAttributionMode {
+    /// Brightness-weighted attribution spread uniformly across the panel.
+    #[default]
+    Uniform,
+    /// Luma-weighted attribution from an active screen sample.
+    Sampled,
+}
+
+/// Lifecycle state of active wear sampling, without consent secrets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WearSamplingState {
+    /// Sampling is disabled by configuration.
+    Disabled,
+    /// Sampling needs an explicit consent grant.
+    NeedsConsent,
+    /// The portal consent flow is open.
+    ConsentPending,
+    /// The sampler is connecting to its capture source.
+    Connecting,
+    /// Sampling is receiving frames.
+    Streaming,
+    /// Sampling is unavailable until its configured display returns.
+    Suspended,
+    /// Sampling is waiting before retrying after capture failures.
+    Cooldown,
+}
+
+/// Redacted active-sampling status that is safe for portable wire consumers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WearSamplingStatus {
+    /// Current sampler lifecycle state.
+    pub state: WearSamplingState,
+    /// Seconds since the latest successfully captured frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_capture_age_s: Option<u64>,
+    /// Stable reason for uniform attribution while sampling is degraded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uniform_reason: Option<String>,
+    /// Configured display to which the current consent grant is bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_display: Option<String>,
+    /// Epoch seconds at which the active consent grant was made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granted_at_epoch_s: Option<i64>,
+}
+
 /// Coarse panel technology classification.
 ///
 /// Used to pick technology-appropriate wear heuristics (e.g. QD-OLED and

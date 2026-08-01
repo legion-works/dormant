@@ -121,6 +121,22 @@ describe("DisplayDetail", () => {
     await waitFor(() => expect(api.postBlank).toHaveBeenCalledWith("main", "hard"));
   });
 
+  it("labels sampled exposure as content-weighted", () => {
+    render(
+      <DisplayDetail
+        id="main"
+        snapshot={snapshot}
+        config={{ controllers: ["ddcci"], blank_mode: "power_off" } as DisplayConfig}
+        rule={undefined}
+        wear={{ ...wear, wear_attribution_mode: "sampled" }}
+        wearError={null}
+        onBack={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("2×2 grid · content-weighted on-hours")).toBeInTheDocument();
+  });
+
   // P1-F: Force wake is non-destructive — un-gated, no confirm dialog.
   // Mirrors Displays.test.tsx's "posts wake/resume immediately with no
   // confirm dialog" coverage at the detail-view level.

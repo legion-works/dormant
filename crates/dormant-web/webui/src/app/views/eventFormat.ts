@@ -27,6 +27,10 @@ export function badgeForEvent(ev: DaemonEvent): EventBadge {
       return { color: "var(--danger)", bg: "color-mix(in oklab, var(--danger) 14%, transparent)", label: "config_reload_rejected" };
     case "wear_snapshot":
       return { color: "var(--purple-400)", bg: "color-mix(in oklab, var(--purple-400) 14%, transparent)", label: "wear_snapshot" };
+    case "wear_sampling_started":
+      return { color: "var(--success)", bg: "color-mix(in oklab, var(--success) 14%, transparent)", label: "wear_sampling_started" };
+    case "wear_sampling_degraded":
+      return { color: "var(--warning)", bg: "color-mix(in oklab, var(--warning) 14%, transparent)", label: "wear_sampling_degraded" };
     case "compensation_advisory":
       return { color: "var(--warning)", bg: "color-mix(in oklab, var(--warning) 14%, transparent)", label: "compensation_advisory" };
     case "blank_failure":
@@ -58,6 +62,10 @@ export function messageForEvent(ev: DaemonEvent): string {
       return `${ev.display}: wake retry attempt ${ev.attempt}`;
     case "wear_snapshot":
       return `${ev.display}: ${ev.total_on_hours.toFixed(1)}h total on-time (${ev.sample_count} samples)`;
+    case "wear_sampling_started":
+      return "wear sampling started";
+    case "wear_sampling_degraded":
+      return `wear sampling degraded: ${ev.reason}`;
     case "compensation_advisory": {
       const days = Math.floor(ev.hours_since_long_dwell / 24);
       return `${ev.display}: no long standby window in ${days} days`;

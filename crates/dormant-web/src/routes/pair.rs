@@ -637,6 +637,7 @@ mod tests {
                 web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
                 cancel: cancel.clone(),
                 reload_timeout: Duration::from_secs(10),
+                wear_sampling_rx: tokio::sync::watch::channel(None).1,
             },
             pair_connect,
             upsert_token,

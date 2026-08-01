@@ -75,6 +75,8 @@ pub(crate) const ACKNOWLEDGED_WEAK_ROUTES: &[&str] = &[
     "/api/doctor",
     "/api/emergency-wake",
     "/api/doctor/exercise/:display",
+    "/api/wear/sampling/enable",
+    "/api/wear/sampling/disable",
 ];
 
 /// Reject any request whose `Host` header is not in the allow-list.
@@ -381,6 +383,7 @@ mod tests {
                 web_bind: bind,
                 cancel: cancel.clone(),
                 reload_timeout: Duration::from_secs(10),
+                wear_sampling_rx: tokio::sync::watch::channel(None).1,
             },
         ));
 
@@ -671,6 +674,12 @@ mod tests {
             "/api/pair/samsung must be pre-classified strict so the route \
              is strict-by-construction the moment it is mounted"
         );
+    }
+
+    #[test]
+    fn wear_sampling_posts_are_acknowledged_weak_routes() {
+        assert!(ACKNOWLEDGED_WEAK_ROUTES.contains(&"/api/wear/sampling/enable"));
+        assert!(ACKNOWLEDGED_WEAK_ROUTES.contains(&"/api/wear/sampling/disable"));
     }
 
     /// M3 Must-2 counterpart for the global emergency-wake route: a direct

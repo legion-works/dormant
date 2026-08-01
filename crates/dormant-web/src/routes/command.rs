@@ -356,6 +356,7 @@ fn command_test_router_at(
         web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
         cancel,
         reload_timeout: Duration::from_secs(10),
+        wear_sampling_rx: tokio::sync::watch::channel(None).1,
     }));
 
     // Keep the reload trigger receiver alive in a spawned task so the
@@ -467,6 +468,7 @@ mod tests {
                 web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
                 cancel,
                 reload_timeout: Duration::from_secs(10),
+                wear_sampling_rx: tokio::sync::watch::channel(None).1,
             },
         ))
     }
@@ -500,6 +502,7 @@ mod tests {
             pending_reload: None,
             rollback: None,
             kvm: None,
+            wear_sampling_status: None,
         }
     }
 
@@ -1040,6 +1043,7 @@ mod tests {
                 web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
                 cancel,
                 reload_timeout: Duration::from_secs(10),
+                wear_sampling_rx: tokio::sync::watch::channel(None).1,
             },
         ));
 

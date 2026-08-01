@@ -118,6 +118,7 @@ fn spawn_fake_engine() -> (
         pending_reload: None,
         rollback: None,
         kvm: None,
+        wear_sampling_status: None,
     };
 
     let event_tx_for_spawn = event_tx.clone();
@@ -290,6 +291,7 @@ async fn setup_server() -> (
         dormant_core::reload::ReloadRequester::new(reload_tx),
         doctor,
         ds,
+        None,
         cancel.clone(),
     )
     .unwrap();
@@ -595,6 +597,7 @@ async fn socket_file_permissions_0600() {
         dormant_core::reload::ReloadRequester::new(reload_tx),
         doctor,
         ds,
+        None,
         cancel.clone(),
     )
     .unwrap();
@@ -634,6 +637,7 @@ async fn stale_socket_replacement() {
         dormant_core::reload::ReloadRequester::new(reload_tx),
         doctor,
         ds,
+        None,
         cancel.clone(),
     );
     assert!(result.is_ok(), "should replace stale socket: {result:?}");
@@ -761,6 +765,7 @@ async fn setup_server_with_display(
         dormant_core::reload::ReloadRequester::new(reload_tx),
         doctor,
         ds,
+        None,
         cancel.clone(),
     )
     .unwrap();

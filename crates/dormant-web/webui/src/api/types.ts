@@ -53,6 +53,8 @@ export const DAEMON_EVENT_TAGS = [
   "wake_retry",
   "config_reload_rejected",
   "wear_snapshot",
+  "wear_sampling_started",
+  "wear_sampling_degraded",
   "compensation_advisory",
   "blank_failure",
   "blank_recovered",
@@ -277,6 +279,8 @@ export type DaemonEvent =
   | ConfigReloadRejectedEvent
   | WakeRetryEvent
   | WearSnapshotEvent
+  | WearSamplingStartedEvent
+  | WearSamplingDegradedEvent
   | CompensationAdvisoryEvent
   | BlankFailureEvent
   | BlankRecoveredEvent
@@ -336,6 +340,16 @@ export interface WearSnapshotEvent {
   display: string;
   total_on_hours: number;
   sample_count: number;
+  wear_attribution_mode?: "uniform" | "sampled";
+}
+
+export interface WearSamplingStartedEvent {
+  event: "wear_sampling_started";
+}
+
+export interface WearSamplingDegradedEvent {
+  event: "wear_sampling_degraded";
+  reason: string;
 }
 
 /**
@@ -458,7 +472,7 @@ export interface ConfigInventory {
   daemon: Record<string, unknown>;
   /** rust: config/schema.rs WearConfig — the `[wear]` TOML section. Optional
    * in fixtures/older payloads; the WearSection form treats absence as `{}`. */
-  wear?: Record<string, unknown>;
+  wear?: WearConfig;
   /** rust: config/schema.rs NotificationsConfig — the `[notifications]`
    * TOML section. Optional in fixtures/older payloads, mirroring `wear`;
    * the NotificationsSection form treats absence as `{}`. */
@@ -491,6 +505,23 @@ export interface ConfigInventory {
   zones: Record<string, ZoneConfig>;
   displays: Record<string, DisplayConfig>;
   rules: Record<string, RuleConfig>;
+}
+
+/** rust: config/schema.rs ActiveSamplingConfig — `[wear.active_sampling]`. */
+export interface ActiveSamplingConfig {
+  enabled: boolean;
+  sampled_display?: string | null;
+  stream_mode: "warm" | "per-tick";
+  capture_timeout: string;
+  failure_threshold: number;
+  circuit_reset_after: string;
+}
+
+/** rust: config/schema.rs WearConfig — the `[wear]` TOML section. */
+export interface WearConfig {
+  enabled?: boolean;
+  active_sampling?: ActiveSamplingConfig;
+  [key: string]: unknown;
 }
 
 /** rust: config/schema.rs CoordinationConfig
@@ -797,6 +828,21 @@ export interface PairStatus {
   detail?: string | null;
 }
 
+/** rust: ipc_proto.rs WearSamplingStatus — token-free sampling flow status. */
+export interface WearSamplingStatus {
+  status: "awaiting_consent" | "granted" | "denied" | "timed_out" | "error";
+  reason?: string;
+}
+
+/** rust: wear.rs WearSamplingStatus — redacted sampler lifecycle state. */
+export interface WearSamplingLifecycleStatus {
+  state: "disabled" | "needs_consent" | "consent_pending" | "connecting" | "streaming" | "suspended" | "cooldown";
+  last_capture_age_s?: number | null;
+  uniform_reason?: string | null;
+  bound_display?: string | null;
+  granted_at_epoch_s?: number | null;
+}
+
 /**
  * rust: config/routes.rs ConfigResponse
  * Full shape of GET /api/config.
@@ -855,6 +901,8 @@ export interface WearSummary {
    * to render a "?" day count.
    */
   hours_since_long_dwell: number;
+  wear_attribution_mode?: "uniform" | "sampled";
+  content_weighted_since?: number | null;
 }
 
 /** rust: routes/wear.rs — `GET /api/wear` response envelope. */

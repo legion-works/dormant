@@ -234,6 +234,7 @@ async fn publisher_publishes_retained_discovery_state_and_graceful_offline() {
                         pending_reload: None,
                         rollback: None,
                         kvm: None,
+                        wear_sampling_status: None,
                     };
                     let _ = tx.send(snap);
                 }

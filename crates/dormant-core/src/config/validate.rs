@@ -135,6 +135,18 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "screensaver_factor",
             "short_cycle_dwell",
             "advisory_after",
+            "active_sampling",
+        ],
+    ),
+    (
+        "wear.active_sampling",
+        &[
+            "enabled",
+            "sampled_display",
+            "stream_mode",
+            "capture_timeout",
+            "failure_threshold",
+            "circuit_reset_after",
         ],
     ),
     // ── notifications ──────────────────────────────────────────────────────
@@ -422,6 +434,21 @@ pub fn collect_macos_power_off_warnings(
         });
     }
     out
+}
+
+/// Warn when active sampling remains enabled while the global wear tracker is off.
+#[must_use]
+pub fn collect_active_sampling_warnings(cfg: &Config) -> Vec<super::schema::Warning> {
+    if cfg.wear.active_sampling.enabled && !cfg.wear.enabled {
+        vec![super::schema::Warning {
+            key_path: "wear.active_sampling".into(),
+            message:
+                "wear.enabled is false; active sampling is suspended until wear tracking is enabled"
+                    .into(),
+        }]
+    } else {
+        Vec::new()
+    }
 }
 
 /// Recursively walk a TOML value, reporting unknown keys.
@@ -1165,6 +1192,76 @@ fn validate_audio(cfg: &Config, errors: &mut Vec<ValidationError>) {
 #[allow(clippy::too_many_lines)] // one flat list of independent range checks; extracting helpers would scatter the logic
 fn validate_wear(cfg: &Config, errors: &mut Vec<ValidationError>) {
     let wear = &cfg.wear;
+    let sampling = &wear.active_sampling;
+
+    if sampling.enabled {
+        if wear.sample_interval < Duration::from_secs(2) {
+            errors.push(ValidationError {
+                what: "E_CONFIG_INVALID".into(),
+                detail: "sample_interval too short for active sampling (needs >= 2s)".into(),
+            });
+        }
+        match sampling.sampled_display.as_deref() {
+            None => errors.push(ValidationError {
+                what: "E_CONFIG_INVALID".into(),
+                detail: "wear.active_sampling.sampled_display is required when enabled".into(),
+            }),
+            Some(display_id) => match cfg.displays.get(display_id) {
+                None => errors.push(ValidationError {
+                    what: "E_CONFIG_INVALID".into(),
+                    detail: format!("wear.active_sampling.sampled_display '{display_id}' is not configured"),
+                }),
+                Some(display) if !display.is_render_eligible() => errors.push(ValidationError {
+                    what: "E_CONFIG_INVALID".into(),
+                    detail: format!("wear.active_sampling.sampled_display '{display_id}' is not wear-tracked eligible"),
+                }),
+                Some(_) => {}
+            },
+        }
+        if sampling.capture_timeout < Duration::from_secs(1) {
+            errors.push(ValidationError {
+                what: "E_CONFIG_INVALID".into(),
+                detail: format!(
+                    "wear.active_sampling.capture_timeout {:?} is below the 1s floor",
+                    sampling.capture_timeout
+                ),
+            });
+        }
+        if sampling.capture_timeout > Duration::from_secs(30) {
+            errors.push(ValidationError {
+                what: "E_CONFIG_INVALID".into(),
+                detail: format!(
+                    "wear.active_sampling.capture_timeout {:?} exceeds the 30s ceiling",
+                    sampling.capture_timeout
+                ),
+            });
+        }
+        if wear.sample_interval >= Duration::from_secs(2)
+            && sampling.capture_timeout > wear.sample_interval / 2
+        {
+            errors.push(ValidationError {
+                what: "E_CONFIG_INVALID".into(),
+                detail:
+                    "wear.active_sampling.capture_timeout must be <= half of wear.sample_interval"
+                        .into(),
+            });
+        }
+        if sampling.failure_threshold == 0 {
+            errors.push(ValidationError {
+                what: "E_CONFIG_INVALID".into(),
+                detail: "wear.active_sampling.failure_threshold must be >= 1".into(),
+            });
+        }
+        if sampling.circuit_reset_after < Duration::from_secs(30) {
+            errors.push(ValidationError {
+                what: "E_CONFIG_INVALID".into(),
+                detail: format!(
+                    "wear.active_sampling.circuit_reset_after {:?} is below the 30s floor",
+                    sampling.circuit_reset_after
+                ),
+            });
+        }
+    }
 
     if wear.sample_interval < Duration::from_secs(5) {
         errors.push(ValidationError {
@@ -6064,6 +6161,107 @@ kind = "power_off"
             crate::config::load_config(&path, Strictness::Strict).is_ok(),
             "all [wear] keys must be in KNOWN_KEYS"
         );
+    }
+
+    #[test]
+    fn active_sampling_unknown_key_rejected_strict() {
+        let dir = std::env::temp_dir().join("dormant-test-active-sampling-unknown-key");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("active_sampling_unknown.toml");
+        std::fs::write(
+            &path,
+            "config_version = 1\n[wear.active_sampling]\nunknown = true\n",
+        )
+        .unwrap();
+        let result = crate::config::load_config(&path, Strictness::Strict);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("wear.active_sampling.unknown")
+        );
+    }
+
+    fn active_sampling_validation_errors(body: &str, displays: &str) -> Vec<ValidationError> {
+        let toml_str = format!(
+            "config_version = 1\n[wear]\nsample_interval = \"10s\"\n[wear.active_sampling]\nenabled = true\n{body}\n{displays}"
+        );
+        let cfg: Config = toml::from_str(&toml_str).unwrap();
+        validate(&cfg, &HashMap::new(), &Credentials::default())
+    }
+
+    #[test]
+    fn active_sampling_enabled_requires_eligible_sampled_display() {
+        for body in ["", "sampled_display = \"missing\"\n"] {
+            let errors = active_sampling_validation_errors(
+                body,
+                "[displays.desk]\ncontrollers = [\"samsung-tizen\"]\nblank_mode = \"brightness_zero\"\n",
+            );
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("sampled_display"))
+            );
+        }
+    }
+
+    #[test]
+    fn active_sampling_bounds_are_hard_errors() {
+        for (field, value) in [
+            ("capture_timeout", "500ms"),
+            ("capture_timeout", "31s"),
+            ("failure_threshold", "0"),
+            ("circuit_reset_after", "29s"),
+        ] {
+            let assignment = if field == "failure_threshold" {
+                format!("sampled_display = \"desk\"\n{field} = {value}\n")
+            } else {
+                format!("sampled_display = \"desk\"\n{field} = \"{value}\"\n")
+            };
+            let errors = active_sampling_validation_errors(
+                &assignment,
+                "[displays.desk]\ncontrollers = [\"ddcci\"]\nblank_mode = \"brightness_zero\"\n",
+            );
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains(field)),
+                "expected {field} error: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn active_sampling_short_interval_has_explicit_error() {
+        let toml_str = "config_version = 1\n[wear]\nsample_interval = \"1500ms\"\n[wear.active_sampling]\nenabled = true\nsampled_display = \"desk\"\n[displays.desk]\ncontrollers = [\"ddcci\"]\nblank_mode = \"brightness_zero\"\n";
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        let errors = validate(&cfg, &HashMap::new(), &Credentials::default());
+        let active_sampling_errors: Vec<_> = errors
+            .iter()
+            .filter(|error| {
+                error.detail.contains("active sampling")
+                    || error.detail.contains("wear.active_sampling")
+            })
+            .collect();
+        assert_eq!(
+            active_sampling_errors.len(),
+            1,
+            "unexpected active sampling errors: {active_sampling_errors:?}"
+        );
+        assert_eq!(
+            active_sampling_errors[0].detail,
+            "sample_interval too short for active sampling (needs >= 2s)"
+        );
+    }
+
+    #[test]
+    fn active_sampling_with_global_wear_disabled_loads_with_one_warning() {
+        let raw = "config_version = 1\n[wear]\nenabled = false\n[wear.active_sampling]\nenabled = true\nsampled_display = \"desk\"\n[displays.desk]\ncontrollers = [\"ddcci\"]\nblank_mode = \"brightness_zero\"\n";
+        let (cfg, warnings) = crate::config::load_config_from_str(raw, Strictness::Strict).unwrap();
+        assert!(!cfg.wear.enabled);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].key_path, "wear.active_sampling");
+        assert!(warnings[0].message.contains("wear.enabled"));
     }
 
     #[test]

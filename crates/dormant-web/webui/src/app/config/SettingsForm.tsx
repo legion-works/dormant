@@ -366,6 +366,7 @@ export function SettingsForm({ config: initialConfig, onNavigationGuard, tab, kv
         <>
           <WearSection
             wear={inv.wear}
+            displays={inv.displays}
             store={store}
             redactedPaths={config.redacted_paths}
             onDirty={onDirty}

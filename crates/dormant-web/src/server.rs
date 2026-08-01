@@ -22,6 +22,7 @@ use crate::assets;
 use crate::error::WebError;
 use crate::routes::{
     command, config, config_apply, daemon, doctor, events, operations, pair, star_nudge, wear,
+    wear_sampling,
 };
 use crate::security::security_guard;
 
@@ -133,6 +134,16 @@ pub(crate) fn build_router(state: WebState) -> Router {
     );
     let api = route_post!(
         api,
+        "/wear/sampling/enable",
+        post(wear_sampling::post_enable)
+    );
+    let api = route_post!(
+        api,
+        "/wear/sampling/disable",
+        post(wear_sampling::post_disable)
+    );
+    let api = route_post!(
+        api,
         "/doctor/exercise/:display",
         post(doctor::post_exercise)
     );
@@ -143,6 +154,7 @@ pub(crate) fn build_router(state: WebState) -> Router {
         .route("/daemon", get(daemon::get_daemon))
         .route("/wear", get(wear::get_wear))
         .route("/wear/:display", get(wear::get_wear_detail))
+        .route("/wear/sampling", get(wear_sampling::get_status))
         .route("/pair/samsung/:id", get(pair::get_pair_samsung))
         // API miss → 404, never the SPA fallback.
         .fallback(api_not_found)
@@ -287,6 +299,7 @@ mod tests {
             web_bind: bind,
             cancel: cancel.clone(),
             reload_timeout: Duration::from_secs(10),
+            wear_sampling_rx: tokio::sync::watch::channel(None).1,
         }));
 
         (state, cancel, ctl_rx)
@@ -664,6 +677,7 @@ mod tests {
                             pending_reload: None,
                             rollback: None,
                             kvm: None,
+                            wear_sampling_status: None,
                         });
                     }
                     ControlMsg::Exercise { display, reply } => {

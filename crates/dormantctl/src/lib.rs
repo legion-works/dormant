@@ -7,3 +7,4 @@
 //! across crates beats drifting copies).
 
 pub mod client;
+pub mod cmd_wear;

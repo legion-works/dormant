@@ -19,9 +19,33 @@ use dormant_core::ipc_proto::IpcRequest;
 use dormant_core::paths;
 use dormant_core::rules::{ExerciseReport, ExerciseStep, ExerciseVerdict};
 use dormant_doctor::{DraftContext, ProbeResult, ProbeStatus};
+use serde::Deserialize;
 
 use dormantctl::client;
 use std::io;
+
+#[derive(Deserialize)]
+struct DraftConsent {
+    token: String,
+    #[serde(default)]
+    portal_persistent_ids: Vec<String>,
+}
+
+impl dormant_doctor::ConsentSecrets for DraftConsent {
+    fn token(&self) -> &str {
+        &self.token
+    }
+
+    fn persistent_ids(&self) -> &[String] {
+        &self.portal_persistent_ids
+    }
+}
+
+fn load_draft_consent() -> Option<DraftConsent> {
+    let path = paths::state_dir().join("screencast-consent.json");
+    let bytes = std::fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
 
 // ── DoctorOutcome ───────────────────────────────────────────────────────────────
 
@@ -321,6 +345,7 @@ async fn run_draft(args: &DoctorArgs) -> Result<DoctorOutcome> {
                 .iter()
                 .filter(|r| r.name == "config")
                 .all(|r| r.status != ProbeStatus::Fail);
+            let consent = load_draft_consent();
             let ctx = DraftContext {
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 env: dormant_doctor::collect_env(),
@@ -328,7 +353,13 @@ async fn run_draft(args: &DoctorArgs) -> Result<DoctorOutcome> {
                 config_ok,
                 displays: dormant_doctor::build_display_inventory(&cfg),
                 probes: results.clone(),
-                secrets: dormant_doctor::SecretSet::collect(&cfg, &creds),
+                secrets: dormant_doctor::SecretSet::collect(
+                    &cfg,
+                    &creds,
+                    consent
+                        .as_ref()
+                        .map(|record| record as &dyn dormant_doctor::ConsentSecrets),
+                ),
             };
             (ctx, results)
         }

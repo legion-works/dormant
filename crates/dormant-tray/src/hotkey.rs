@@ -427,6 +427,7 @@ mod tests {
             pending_reload: None,
             rollback: None,
             kvm: Some(kvm),
+            wear_sampling_status: None,
         }
     }
 

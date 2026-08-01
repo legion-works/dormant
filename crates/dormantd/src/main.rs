@@ -26,6 +26,8 @@ use dormantd::gamma_recovery;
 use dormantd::logging;
 use dormantd::sd_notify::SdNotify;
 use main_sequence::{StartupInputs, run_boot_with_shutdown_restore, run_startup_sequence};
+#[cfg(target_os = "linux")]
+use pipewire as _;
 
 /// dormant daemon — proximity-driven display blanking.
 #[derive(Parser, Debug)]

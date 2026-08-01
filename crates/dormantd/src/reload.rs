@@ -404,6 +404,7 @@ mod dispatch_gate_tests {
             pending_reload: None,
             rollback: None,
             kvm: None,
+            wear_sampling_status: None,
         }
     }
 
@@ -501,6 +502,7 @@ mod dispatch_gate_tests {
             pending_reload: None,
             rollback: None,
             kvm: None,
+            wear_sampling_status: None,
         }
     }
 

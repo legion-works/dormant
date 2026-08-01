@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use dormant_core::ipc_proto::{BlankRequestMode, IpcRequest, IpcResponse};
+use dormant_core::ipc_proto::{BlankRequestMode, IpcRequest, IpcResponse, WearSamplingStatus};
 use dormant_core::observation::ReloadSource;
 use dormant_core::reload::ReloadRequester;
 use dormant_core::rules::{ControlMsg, DaemonEvent, StateSnapshot};
@@ -22,6 +22,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::active_sampler::{ActiveSamplerHandle, SamplerCommand, SamplerError, SamplingState};
 use crate::direct_switch::{DirectSwitchHandle, SwitchReason};
 
 /// Maximum line length for IPC requests/responses (1 MB).
@@ -52,6 +53,7 @@ pub fn spawn(
     reload_requester: ReloadRequester,
     doctor_service: DoctorService,
     direct_switch: Arc<DirectSwitchHandle>,
+    active_sampler: Option<ActiveSamplerHandle>,
     cancel: CancellationToken,
 ) -> Result<JoinHandle<()>> {
     // Stale-socket recovery: connect-test before bind so we never silently
@@ -134,6 +136,7 @@ pub fn spawn(
             reload_requester,
             doctor_service,
             direct_switch,
+            active_sampler,
             cancel,
             &socket_owned,
         )
@@ -154,6 +157,7 @@ async fn run(
     reload_requester: ReloadRequester,
     doctor_service: DoctorService,
     direct_switch: Arc<DirectSwitchHandle>,
+    active_sampler: Option<ActiveSamplerHandle>,
     cancel: CancellationToken,
     socket_path: &std::path::Path,
 ) {
@@ -172,7 +176,8 @@ async fn run(
                         let reload = reload_requester.clone();
                         let doctor = doctor_service.clone();
                         let ds = direct_switch.clone();
-                        tokio::spawn(handle_connection(stream, ctl, reload, doctor, ds));
+                        let sampler = active_sampler.clone();
+                        tokio::spawn(handle_connection(stream, ctl, reload, doctor, ds, sampler));
                         let _ = addr; // Unix socket peer address (debug).
                     }
                     Err(e) => {
@@ -197,6 +202,7 @@ async fn handle_connection(
     reload_requester: ReloadRequester,
     doctor_service: DoctorService,
     direct_switch: Arc<DirectSwitchHandle>,
+    active_sampler: Option<ActiveSamplerHandle>,
 ) {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
@@ -227,7 +233,7 @@ async fn handle_connection(
 
         match request {
             IpcRequest::Status => {
-                let resp = handle_status(&ctl_tx).await;
+                let resp = handle_status(&ctl_tx, active_sampler.as_ref()).await;
                 let _ = write_json(&mut writer, &resp).await;
             }
             IpcRequest::Pause { rule, duration_s } => {
@@ -280,16 +286,122 @@ async fn handle_connection(
                 let resp = handle_switch_peer(&direct_switch, &display).await;
                 let _ = write_json(&mut writer, &resp).await;
             }
+            IpcRequest::WearSamplingEnable => {
+                let resp = handle_wear_enable(active_sampler.as_ref()).await;
+                let _ = write_json(&mut writer, &resp).await;
+            }
+            IpcRequest::WearSamplingStatus => {
+                let resp = handle_wear_status(active_sampler.as_ref());
+                let _ = write_json(&mut writer, &resp).await;
+            }
+            IpcRequest::WearSamplingDisable { forget } => {
+                let resp = handle_wear_disable(active_sampler.as_ref(), forget).await;
+                let _ = write_json(&mut writer, &resp).await;
+            }
         }
+    }
+}
+
+async fn handle_wear_enable(active_sampler: Option<&ActiveSamplerHandle>) -> IpcResponse {
+    let Some(active_sampler) = active_sampler else {
+        return IpcResponse::wear_sampling(WearSamplingStatus::Error(
+            "wear_sampling_unsupported".to_owned(),
+        ));
+    };
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if let Err(error) = active_sampler
+        .send(SamplerCommand::Enable { reply: reply_tx })
+        .await
+    {
+        return IpcResponse::wear_sampling(WearSamplingStatus::Error(sampler_error_reason(&error)));
+    }
+    let status = match reply_rx.await {
+        Ok(status) => status.into_ipc_status(),
+        Err(_) => WearSamplingStatus::Error("wear_sampling_command_closed".to_owned()),
+    };
+    IpcResponse::wear_sampling(status)
+}
+
+fn handle_wear_status(active_sampler: Option<&ActiveSamplerHandle>) -> IpcResponse {
+    let Some(active_sampler) = active_sampler else {
+        return IpcResponse::wear_sampling(WearSamplingStatus::Error(
+            "wear_sampling_unsupported".to_owned(),
+        ));
+    };
+    let status = active_sampler.status().borrow().state;
+    let status = match status {
+        SamplingState::ConsentPending => WearSamplingStatus::AwaitingConsent,
+        SamplingState::NeedsConsent => {
+            WearSamplingStatus::Error("wear_sampling_needs_consent".to_owned())
+        }
+        SamplingState::Connecting | SamplingState::Streaming => WearSamplingStatus::Granted,
+        SamplingState::Disabled | SamplingState::Suspended | SamplingState::Cooldown => {
+            WearSamplingStatus::Error("wear_sampling_not_active".to_owned())
+        }
+    };
+    IpcResponse::wear_sampling(status)
+}
+
+async fn handle_wear_disable(
+    active_sampler: Option<&ActiveSamplerHandle>,
+    forget: bool,
+) -> IpcResponse {
+    let Some(active_sampler) = active_sampler else {
+        return IpcResponse::wear_sampling(WearSamplingStatus::Error(
+            "wear_sampling_unsupported".to_owned(),
+        ));
+    };
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if let Err(error) = active_sampler
+        .send(SamplerCommand::Disable {
+            forget,
+            reply: reply_tx,
+        })
+        .await
+    {
+        return IpcResponse::wear_sampling(WearSamplingStatus::Error(sampler_error_reason(&error)));
+    }
+    match reply_rx.await {
+        Ok(Ok(())) => IpcResponse::wear_sampling(WearSamplingStatus::Granted),
+        Ok(Err(error)) => {
+            IpcResponse::wear_sampling(WearSamplingStatus::Error(sampler_error_reason(&error)))
+        }
+        Err(_) => IpcResponse::wear_sampling(WearSamplingStatus::Error(
+            "wear_sampling_command_closed".to_owned(),
+        )),
+    }
+}
+
+fn sampler_error_reason(error: &SamplerError) -> String {
+    match error {
+        SamplerError::DisabledByConfig => "wear_sampling_disabled".to_owned(),
+        SamplerError::FlowAlreadyActive => "wear_sampling_flow_already_active".to_owned(),
+        SamplerError::NoGraphicalSession => "wear_sampling_no_graphical_session".to_owned(),
+        SamplerError::CommandChannelClosed => "wear_sampling_command_closed".to_owned(),
+        SamplerError::Store(_) => "wear_sampling_store_error".to_owned(),
     }
 }
 
 // ── Request handlers ──────────────────────────────────────────────────────────
 
 /// Fetch a snapshot and return it.
-async fn handle_status(ctl_tx: &mpsc::Sender<ControlMsg>) -> IpcResponse {
+async fn handle_status(
+    ctl_tx: &mpsc::Sender<ControlMsg>,
+    active_sampler: Option<&ActiveSamplerHandle>,
+) -> IpcResponse {
     match request_snapshot(ctl_tx).await {
-        Some(snap) => IpcResponse::ok(Some(snap)),
+        Some(mut snap) => {
+            let status = active_sampler.map(|sampler| {
+                sampler
+                    .status()
+                    .borrow()
+                    .redacted(dormant_core::types::Tick::now())
+            });
+            snap.wear_sampling_status.clone_from(&status);
+            let mut response = IpcResponse::ok(Some(snap));
+            response.wear_sampling_status = status;
+            response
+        }
         None => IpcResponse::error("engine not available"),
     }
 }
@@ -730,6 +842,7 @@ mod tests {
             dormant_core::reload::ReloadRequester::new(reload_tx),
             doctor,
             ds,
+            None,
             cancel,
         );
         assert!(result.is_err(), "group-writable parent should be rejected");
@@ -756,6 +869,7 @@ mod tests {
             dormant_core::reload::ReloadRequester::new(reload_tx),
             doctor,
             ds,
+            None,
             cancel.clone(),
         );
         assert!(
@@ -865,6 +979,7 @@ mod tests {
                 pending_reload: None,
                 rollback: None,
                 kvm: None,
+                wear_sampling_status: None,
             };
             tokio::spawn(async move {
                 while let Some(msg) = ctl_rx.recv().await {

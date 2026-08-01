@@ -54,6 +54,8 @@ vi.mock("../api/client", () => ({
   postReload: vi.fn().mockResolvedValue(undefined),
   getWear: vi.fn().mockResolvedValue({ displays: [] }),
   getWearDetail: vi.fn().mockRejectedValue(new Error("unexpected wear detail request")),
+  getWearSamplingStatus: vi.fn().mockResolvedValue({ status: "granted" }),
+  postWearSamplingEnable: vi.fn(),
   getOperations: vi.fn().mockResolvedValue({
     exercise_in_flight: [],
     emergency_wake_in_flight: false,

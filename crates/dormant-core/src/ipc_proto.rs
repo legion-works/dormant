@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::doctor::DoctorReport;
 use crate::rules::{EmergencyWakeReport, ExerciseReport, StateSnapshot};
+use crate::wear::WearSamplingStatus as WearSamplingLifecycleStatus;
 
 // ── IpcRequest ────────────────────────────────────────────────────────────────
 
@@ -53,7 +54,7 @@ fn blank_mode_is_soft_default_value(m: &BlankRequestMode) -> bool {
 }
 
 /// A request from `dormantctl` to `dormantd`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "req", rename_all = "snake_case")]
 pub enum IpcRequest {
     /// Fetch a full [`StateSnapshot`].
@@ -128,6 +129,31 @@ pub enum IpcRequest {
         /// `scope = "shared"`).
         display: String,
     },
+    /// Start the explicit active-sampling consent flow.
+    WearSamplingEnable,
+    /// Fetch the current active-sampling consent-flow status.
+    WearSamplingStatus,
+    /// Disable active sampling, optionally forgetting its consent record.
+    WearSamplingDisable {
+        /// Delete the stored consent record after closing the session.
+        forget: bool,
+    },
+}
+
+/// Structured status returned by active-sampling IPC requests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "status", content = "reason")]
+pub enum WearSamplingStatus {
+    /// The portal consent dialog is open.
+    AwaitingConsent,
+    /// Consent was granted and the record was stored.
+    Granted,
+    /// The operator denied consent.
+    Denied,
+    /// The consent dialog timed out.
+    TimedOut,
+    /// The flow failed with a stable reason.
+    Error(String),
 }
 
 // ── IpcResponse ───────────────────────────────────────────────────────────────
@@ -156,6 +182,12 @@ pub struct IpcResponse {
     /// exactly the same JSON as before this field was added.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exercise_report: Option<ExerciseReport>,
+    /// Active-sampling status, present only for wear-sampling requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wear_sampling: Option<WearSamplingStatus>,
+    /// Redacted lifecycle status for active wear sampling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wear_sampling_status: Option<WearSamplingLifecycleStatus>,
 }
 
 impl IpcResponse {
@@ -169,6 +201,8 @@ impl IpcResponse {
             doctor_report: None,
             emergency_report: None,
             exercise_report: None,
+            wear_sampling: None,
+            wear_sampling_status: None,
         }
     }
 
@@ -182,6 +216,8 @@ impl IpcResponse {
             doctor_report: None,
             emergency_report: None,
             exercise_report: None,
+            wear_sampling: None,
+            wear_sampling_status: None,
         }
     }
 
@@ -195,6 +231,8 @@ impl IpcResponse {
             doctor_report: Some(report),
             emergency_report: None,
             exercise_report: None,
+            wear_sampling: None,
+            wear_sampling_status: None,
         }
     }
 
@@ -208,6 +246,8 @@ impl IpcResponse {
             doctor_report: None,
             emergency_report: Some(report),
             exercise_report: None,
+            wear_sampling: None,
+            wear_sampling_status: None,
         }
     }
 
@@ -221,6 +261,23 @@ impl IpcResponse {
             doctor_report: None,
             emergency_report: None,
             exercise_report: Some(report),
+            wear_sampling: None,
+            wear_sampling_status: None,
+        }
+    }
+
+    /// Build a response carrying an active-sampling status.
+    #[must_use]
+    pub fn wear_sampling(status: WearSamplingStatus) -> Self {
+        Self {
+            ok: !matches!(status, WearSamplingStatus::Error(_)),
+            error: None,
+            snapshot: None,
+            doctor_report: None,
+            emergency_report: None,
+            exercise_report: None,
+            wear_sampling: Some(status),
+            wear_sampling_status: None,
         }
     }
 }
@@ -528,6 +585,7 @@ mod tests {
             pending_reload: None,
             rollback: None,
             kvm: None,
+            wear_sampling_status: None,
         };
         let resp = IpcResponse::ok(Some(snap));
         let json = serde_json::to_string(&resp).unwrap();
@@ -702,6 +760,57 @@ mod tests {
             .unwrap()
             .contains("exercise_report")
         );
+    }
+
+    #[test]
+    fn wear_sampling_requests_and_status_round_trip() {
+        for request in [
+            IpcRequest::WearSamplingEnable,
+            IpcRequest::WearSamplingStatus,
+            IpcRequest::WearSamplingDisable { forget: false },
+            IpcRequest::WearSamplingDisable { forget: true },
+        ] {
+            let json = serde_json::to_string(&request).unwrap();
+            let back: IpcRequest = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, request);
+        }
+        for status in [
+            WearSamplingStatus::AwaitingConsent,
+            WearSamplingStatus::Granted,
+            WearSamplingStatus::Denied,
+            WearSamplingStatus::TimedOut,
+            WearSamplingStatus::Error("wear_sampling_wrong_monitor".to_owned()),
+        ] {
+            let response = IpcResponse::wear_sampling(status.clone());
+            let back: IpcResponse =
+                serde_json::from_str(&serde_json::to_string(&response).unwrap()).unwrap();
+            assert_eq!(back.wear_sampling, Some(status));
+        }
+    }
+
+    #[test]
+    fn old_response_without_new_wear_sampling_field_deserializes() {
+        let old = r#"{"ok":true,"snapshot":null}"#;
+        let response: IpcResponse = serde_json::from_str(old).unwrap();
+        assert!(response.wear_sampling.is_none());
+        assert!(response.wear_sampling_status.is_none());
+    }
+
+    #[test]
+    fn response_serializes_redacted_sampling_lifecycle_status() {
+        let mut response = IpcResponse::ok(None);
+        response.wear_sampling_status = Some(WearSamplingLifecycleStatus {
+            state: crate::wear::WearSamplingState::Streaming,
+            last_capture_age_s: Some(61),
+            uniform_reason: None,
+            bound_display: Some("desk".to_owned()),
+            granted_at_epoch_s: Some(1_700_000_000),
+        });
+
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["wear_sampling_status"]["state"], "streaming");
+        assert!(json.to_string().contains("desk"));
+        assert!(!json.to_string().contains("token"));
     }
 
     // (dead coordination pair tests removed — the types no longer exist)

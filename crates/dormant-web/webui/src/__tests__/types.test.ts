@@ -56,6 +56,8 @@ describe("enum arrays match Rust serde wire strings", () => {
       "wake_retry",
       "config_reload_rejected",
       "wear_snapshot",
+      "wear_sampling_started",
+      "wear_sampling_degraded",
       "compensation_advisory",
       "blank_failure",
       "blank_recovered",

@@ -430,6 +430,7 @@ mod tests {
             pending_reload: None,
             rollback: None,
             kvm: None,
+            wear_sampling_status: None,
         }
     }
 
@@ -1158,6 +1159,7 @@ mod tests {
             pending_reload: None,
             rollback: None,
             kvm: Some(kvm),
+            wear_sampling_status: None,
         }
     }
 
@@ -1281,6 +1283,7 @@ mod tests {
                 pending_reload: None,
                 rollback: None,
                 kvm: Some(kvm),
+                wear_sampling_status: None,
             }
         };
         let menu = build_menu(Some(&snapshot), false, 8137);

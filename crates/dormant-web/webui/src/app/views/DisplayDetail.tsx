@@ -120,6 +120,9 @@ export default function DisplayDetail({ id, snapshot, config, rule, wear, wearEr
   const navigate = useNavigate();
 
   const grid = normalizeWearGrid(wear);
+  const attributionLabel = wear?.wear_attribution_mode === "sampled"
+    ? "content-weighted"
+    : "brightness-weighted";
   const ruleName = rule?.rule;
   const isShared = snapshot.scope === "shared";
 
@@ -343,7 +346,7 @@ export default function DisplayDetail({ id, snapshot, config, rule, wear, wearEr
                 <div>
                   <div className="display-detail__eyebrow">Panel exposure</div>
                   <div className="display-detail__heat-caption">
-                    {grid.cols}×{grid.rows} grid · brightness-weighted on-hours
+                    {grid.cols}×{grid.rows} grid · {attributionLabel} on-hours
                   </div>
                 </div>
               </div>

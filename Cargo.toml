@@ -43,6 +43,7 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 zbus = "5"
+pipewire = "0.10"
 indexmap = { version = "2", features = ["serde"] }
 tokio-stream = "0.1"
 proptest = "1"

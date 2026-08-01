@@ -34,6 +34,7 @@ serde_json = { workspace = true }
 time = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 evdev = { workspace = true }
+pipewire = { workspace = true }
 wayland-client = { version = "0.31", features = ["system"] }
 wayland-protocols = { version = "0.32", features = [
   "staging",
@@ -44,6 +45,7 @@ rustix = { version = "1", default-features = false, features = [
   "event",
   "std",
 ] }
+futures-util = "0.3"
 
 [features]
 web-ui = ["dep:dormant-web"]

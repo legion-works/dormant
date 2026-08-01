@@ -35,6 +35,7 @@ import type {
   OperationsStatus,
   DaemonIdentity,
   RecentEventsResponse,
+  WearSamplingStatus,
 }  from "./types";
 
 export type { ApplyErrorBody, ConfigApplyErrorDetail, ApplyConflictBody } from "./types";
@@ -201,6 +202,32 @@ export async function postPairSamsung(host: string): Promise<PairAccepted> {
  */
 export function getPairStatus(pairId: string): Promise<PairStatus> {
   return request<PairStatus>(`/pair/samsung/${encodeURIComponent(pairId)}`);
+}
+
+/** POST /api/wear/sampling/enable — begin the explicit portal flow. */
+export function postWearSamplingEnable(): Promise<WearSamplingStatus> {
+  return postWearSampling("/wear/sampling/enable");
+}
+
+/** GET /api/wear/sampling — poll the daemon-owned consent flow. */
+export function getWearSamplingStatus(): Promise<WearSamplingStatus> {
+  return request<WearSamplingStatus>("/wear/sampling");
+}
+
+/** POST /api/wear/sampling/disable — close sampling and optionally forget consent. */
+export function postWearSamplingDisable(forget: boolean): Promise<WearSamplingStatus> {
+  return postWearSampling("/wear/sampling/disable", { forget });
+}
+
+async function postWearSampling(path: string, body?: unknown): Promise<WearSamplingStatus> {
+  const res = await fetch(BASE + path, {
+    method: "POST",
+    headers: JSON_CT,
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const response = await res.json().catch(() => null);
+  if (!res.ok) throw new ApiError(res.status, response);
+  return response as WearSamplingStatus;
 }
 
 /** POST /api/config/apply — apply a set of patches to the live config. */

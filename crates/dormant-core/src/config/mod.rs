@@ -141,6 +141,7 @@ pub fn load_config_from_str(
         &cfg,
         cfg!(target_os = "macos"),
     ));
+    warnings.extend(validate::collect_active_sampling_warnings(&cfg));
 
     // ── Exactly-one-of blank_mode / ladder (R12 symmetric rule) ─────────────
     for (display_id, dc) in &cfg.displays {

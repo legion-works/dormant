@@ -5,12 +5,14 @@
  * W1-5: 230px label column + changed-field markers.
  */
 import FormSection from "./FormSection";
-import { BoolField, DurationField, NumberField, TextField } from "./fields";
+import { BoolField, DurationField, EnumField, NumberField, TextField } from "./fields";
 import type { FieldProps } from "./fields";
 import type { PatchStore } from "./patch";
+import type { DisplayConfig, WearConfig } from "../../api/types";
 
 interface WearSectionProps {
-  wear: Record<string, unknown> | undefined;
+  wear: WearConfig | undefined;
+  displays?: Record<string, DisplayConfig>;
   store: PatchStore;
   redactedPaths: string[][];
   onDirty: () => void;
@@ -51,7 +53,53 @@ const FIELD_PLACEHOLDER: Record<string, string> = {
   advisory_after: "96h",
 };
 
-export default function WearSection({ wear, store, redactedPaths, onDirty, fieldErrors }: WearSectionProps) {
+function isRenderEligible(display: DisplayConfig): boolean {
+  return display.controllers.some((controller) =>
+    controller === "kwin-dpms" || controller === "ddcci" || controller === "command",
+  );
+}
+
+function ActiveSamplingFields({ value, displays, store, redactedPaths, onDirty, fieldErrors }: {
+  value: Record<string, unknown>;
+  displays: Record<string, DisplayConfig>;
+  store: PatchStore;
+  redactedPaths: string[][];
+  onDirty: () => void;
+  fieldErrors: Record<string, string | undefined>;
+}) {
+  const displayOptions = Object.entries(displays)
+    .filter(([, display]) => isRenderEligible(display))
+    .map(([id]) => id);
+  const fields: Array<{ key: string; kind: "bool" | "duration" | "number" | "enum"; options?: readonly string[] }> = [
+    { key: "enabled", kind: "bool" },
+    { key: "sampled_display", kind: "enum", options: displayOptions },
+    { key: "stream_mode", kind: "enum", options: ["warm", "per-tick"] },
+    { key: "capture_timeout", kind: "duration" },
+    { key: "failure_threshold", kind: "number" },
+    { key: "circuit_reset_after", kind: "duration" },
+  ];
+
+  return (
+    <div className="cf-card" data-testid="active-sampling-fields">
+      <h3>Active sampling</h3>
+      {fields.map(({ key, kind, options }) => {
+        const path = ["wear", "active_sampling", key];
+        const locked = store.isLocked(path, redactedPaths);
+        const shared: FieldProps = {
+          path, label: `active_sampling.${key}`, value: value[key], locked,
+          error: fieldErrors[path.join(".")],
+          onEdit: (editPath, next) => { store.trackEdit(editPath, next); onDirty(); },
+        };
+        if (kind === "bool") return <BoolField key={key} {...shared} />;
+        if (kind === "duration") return <DurationField key={key} {...shared} />;
+        if (kind === "number") return <NumberField key={key} {...shared} />;
+        return <EnumField key={key} {...shared} options={options ?? []} />;
+      })}
+    </div>
+  );
+}
+
+export default function WearSection({ wear, displays = {}, store, redactedPaths, onDirty, fieldErrors }: WearSectionProps) {
   const inv = wear ?? {};
   const keys = Object.keys(inv);
   if (keys.length === 0) return null;
@@ -59,7 +107,7 @@ export default function WearSection({ wear, store, redactedPaths, onDirty, field
   return (
     <FormSection id="wear" title="Wear">
       <div className="cf-card">
-        {keys.map((key) => {
+          {keys.filter((key) => key !== "active_sampling").map((key) => {
           const path = ["wear", key];
           const value = inv[key];
           const locked = store.isLocked(path, redactedPaths);
@@ -98,7 +146,17 @@ export default function WearSection({ wear, store, redactedPaths, onDirty, field
             </div>
           );
         })}
-      </div>
-    </FormSection>
+        </div>
+        {typeof inv.active_sampling === "object" && inv.active_sampling !== null && !Array.isArray(inv.active_sampling) && (
+          <ActiveSamplingFields
+            value={inv.active_sampling as unknown as Record<string, unknown>}
+            displays={displays}
+            store={store}
+            redactedPaths={redactedPaths}
+            onDirty={onDirty}
+            fieldErrors={fieldErrors}
+          />
+        )}
+      </FormSection>
   );
 }

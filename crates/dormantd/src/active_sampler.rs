@@ -281,6 +281,7 @@ struct Runtime {
     failures: u32,
     reconnect_backoff: Duration,
     episode_warned: std::collections::HashSet<String>,
+    pending_stream_reset: bool,
 }
 
 impl Runtime {
@@ -319,6 +320,7 @@ impl Runtime {
             failures: 0,
             reconnect_backoff: Duration::from_secs(30),
             episode_warned: std::collections::HashSet::new(),
+            pending_stream_reset: false,
         }
     }
 
@@ -367,7 +369,11 @@ async fn capture_one(
     latest: &LatestGrid,
     cancel: &CancellationToken,
     cadence: &mut tokio::time::Interval,
+    reset_stream: bool,
 ) -> CaptureOutcome {
+    if reset_stream {
+        source.reset_stream().await;
+    }
     let capture = tokio::time::timeout(
         active.capture_timeout,
         source.capture_one(active.stream_mode),
@@ -573,6 +579,12 @@ fn apply_update(
 ) -> Option<Transition> {
     match update {
         SamplerUpdate::Reconfigure(plan) => {
+            if plan.trigger == ConfigDelta::StreamModeChanged {
+                runtime.pending_stream_reset = true;
+            }
+            if plan.trigger == ConfigDelta::SampledDisplayChanged {
+                runtime.record = None;
+            }
             runtime.active = plan.active_sampling;
             runtime.sample_interval = plan.sample_interval;
             Some(apply_trigger(
@@ -582,10 +594,34 @@ fn apply_update(
             ))
         }
         SamplerUpdate::DisplayContext(context) => {
+            let was_present = runtime.display.display.is_some();
+            let is_present = context.display.is_some();
             runtime.display = context;
-            None
+            (was_present != is_present).then(|| {
+                apply_trigger(
+                    runtime,
+                    Trigger::ConfigChanged(ConfigDelta::DisplayPresent(is_present)),
+                    status_tx,
+                )
+            })
         }
     }
+}
+
+async fn apply_update_with_effects(
+    runtime: &mut Runtime,
+    source: &mut dyn CaptureSource,
+    update: SamplerUpdate,
+    status_tx: &watch::Sender<SamplerStatus>,
+) -> Option<Transition> {
+    let transition = apply_update(runtime, update, status_tx);
+    if transition
+        .as_ref()
+        .is_some_and(|transition| transition.effects.contains(&Effect::CloseSession))
+    {
+        source.close().await;
+    }
+    transition
 }
 
 fn transition_to(
@@ -680,7 +716,7 @@ async fn run(
                     }
                     update = deps.update_rx.recv() => {
                         if let Some(update) = update {
-                            apply_update(&mut runtime, update, &status_tx);
+                            let _ = apply_update_with_effects(&mut runtime, &mut *deps.source, update, &status_tx).await;
                             cadence = cadence_for(&runtime);
                         }
                     }
@@ -722,7 +758,7 @@ async fn run(
                         tokio::select! {
                             () = deps.cancel.cancelled() => break,
                             () = tokio::time::sleep(delay) => {},
-                            update = deps.update_rx.recv() => if let Some(update) = update { apply_update(&mut runtime, update, &status_tx); },
+                            update = deps.update_rx.recv() => if let Some(update) = update { let _ = apply_update_with_effects(&mut runtime, &mut *deps.source, update, &status_tx).await; },
                             command = command_rx.recv() => if let Some(command) = command { let _ = handle_command(&mut runtime, &mut *deps.source, &deps.consent_path, command, &status_tx, &deps.cancel).await; },
                         }
                     }
@@ -734,7 +770,11 @@ async fn run(
                         () = deps.cancel.cancelled() => break,
                         _ = cadence.tick() => {},
                         update = deps.update_rx.recv() => {
-                            if let Some(update) = update { apply_update(&mut runtime, update, &status_tx); }
+                            if let Some(update) = update
+                                && let Some(transition) = apply_update_with_effects(&mut runtime, &mut *deps.source, update, &status_tx).await
+                            {
+                                capture_now |= transition.effects.contains(&Effect::Capture);
+                            }
                             continue;
                         }
                         command = command_rx.recv() => {
@@ -751,6 +791,7 @@ async fn run(
                     &deps.latest_grid,
                     &deps.cancel,
                     &mut cadence,
+                    std::mem::take(&mut runtime.pending_stream_reset),
                 )
                 .await;
                 match attempt {
@@ -773,7 +814,7 @@ async fn run(
                     () = tokio::time::sleep(runtime.active.circuit_reset_after) => {
                         let transition = apply_trigger(&mut runtime, Trigger::CooldownElapsed, &status_tx);
                         debug_assert!(transition.effects.contains(&Effect::Capture), "only CooldownElapsed may schedule a cooldown retry");
-                        let attempt = capture_one(&mut *deps.source, &runtime.active, runtime.display.phase.clone(), &deps.latest_grid, &deps.cancel, &mut cadence).await;
+                        let attempt = capture_one(&mut *deps.source, &runtime.active, runtime.display.phase.clone(), &deps.latest_grid, &deps.cancel, &mut cadence, std::mem::take(&mut runtime.pending_stream_reset)).await;
                         match attempt {
                             CaptureOutcome::Cancelled => break,
                             CaptureOutcome::Ok(captured_at) => { runtime.failures = 0; runtime.episode_warned.clear(); apply_trigger(&mut runtime, Trigger::CaptureOk, &status_tx); publish_status(&status_tx, &runtime, None, Some(captured_at)); }
@@ -782,7 +823,10 @@ async fn run(
                             }
                         }
                     }
-                    update = deps.update_rx.recv() => if let Some(update) = update { apply_update(&mut runtime, update, &status_tx); },
+                    update = deps.update_rx.recv() => if let Some(update) = update
+                        && let Some(transition) = apply_update_with_effects(&mut runtime, &mut *deps.source, update, &status_tx).await {
+                        capture_now |= transition.effects.contains(&Effect::Capture);
+                    },
                     command = command_rx.recv() => if let Some(command) = command { let _ = handle_command(&mut runtime, &mut *deps.source, &deps.consent_path, command, &status_tx, &deps.cancel).await; },
                 }
             }
@@ -1032,6 +1076,9 @@ pub trait CaptureSource: Send + Sync + 'static {
 
     /// Capture one frame using the configured stream strategy.
     async fn capture_one(&mut self, mode: StreamMode) -> Result<RawFrame, CaptureError>;
+
+    /// Rebuild capture resources while retaining the portal session and token.
+    async fn reset_stream(&mut self) {}
 
     /// Release any live portal session.
     async fn close(&mut self);
@@ -1310,6 +1357,52 @@ mod tests {
         assert_eq!(sample.grid.cells, vec![0.9; 16 * 9]);
     }
 
+    #[test]
+    fn display_removed_on_generation_swap_suspends_a_reattaching_sampler() {
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        test_record(&consent_path);
+        let config = active_config(Duration::from_secs(10));
+        let mut runtime = Runtime::new(&config, &consent_path);
+        let (status_tx, _) = watch::channel(initial_status(&config));
+
+        let transition = apply_update(
+            &mut runtime,
+            SamplerUpdate::DisplayContext(DisplaySamplingContext {
+                display: None,
+                phase: Phase::Active,
+                stage_active: false,
+            }),
+            &status_tx,
+        );
+
+        assert_eq!(runtime.state, SamplingState::Suspended);
+        assert_eq!(
+            transition
+                .expect("display removal has a lifecycle transition")
+                .effects,
+            vec![
+                Effect::CloseSession,
+                Effect::EnterUniform(WEAR_SAMPLING_SUSPENDED)
+            ]
+        );
+
+        let restored = apply_update(
+            &mut runtime,
+            SamplerUpdate::DisplayContext(DisplaySamplingContext {
+                display: Some(DisplayExpectation {
+                    display: "oled".to_owned(),
+                }),
+                phase: Phase::Active,
+                stage_active: true,
+            }),
+            &status_tx,
+        )
+        .expect("display restoration has a lifecycle transition");
+        assert_eq!(runtime.state, SamplingState::Connecting);
+        assert_eq!(restored.effects, vec![Effect::Connect]);
+    }
+
     #[derive(Clone)]
     enum TestCapture {
         Frame,
@@ -1369,6 +1462,43 @@ mod tests {
         async fn close(&mut self) {
             self.closes_seen.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    struct ReloadSource {
+        connects: Arc<AtomicUsize>,
+        resets: Arc<AtomicUsize>,
+        modes: Arc<Mutex<Vec<StreamMode>>>,
+    }
+
+    #[async_trait]
+    impl CaptureSource for ReloadSource {
+        async fn connect(
+            &mut self,
+            _binding: &ConsentBinding<'_>,
+        ) -> Result<ConnectedStream, CaptureError> {
+            self.connects.fetch_add(1, Ordering::SeqCst);
+            Ok(test_stream())
+        }
+
+        async fn request_consent(
+            &mut self,
+            _display: &DisplayExpectation,
+        ) -> Result<Grant, CaptureError> {
+            Err(CaptureError::Protocol(
+                "unexpected consent request".to_owned(),
+            ))
+        }
+
+        async fn capture_one(&mut self, mode: StreamMode) -> Result<RawFrame, CaptureError> {
+            self.modes.lock().unwrap().push(mode);
+            Ok(test_frame())
+        }
+
+        async fn reset_stream(&mut self) {
+            self.resets.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn close(&mut self) {}
     }
 
     fn test_stream() -> ConnectedStream {
@@ -1491,6 +1621,108 @@ mod tests {
         assert_eq!(captures_seen.load(Ordering::SeqCst), 2);
         assert!(latest.read().unwrap().is_some());
 
+        cancel.cancel();
+        join.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_sampler_stream_mode_reload_resets_only_the_next_capture_without_reconnecting() {
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        test_record(&consent_path);
+        let connects_seen = Arc::new(AtomicUsize::new(0));
+        let resets_seen = Arc::new(AtomicUsize::new(0));
+        let modes_seen = Arc::new(Mutex::new(Vec::new()));
+        let source = ReloadSource {
+            connects: connects_seen.clone(),
+            resets: resets_seen.clone(),
+            modes: modes_seen.clone(),
+        };
+        let cancel = CancellationToken::new();
+        let config = active_config(Duration::from_secs(10));
+        let (updates_tx, updates_rx) = mpsc::channel(2);
+        let deps = ActiveSamplerDeps {
+            initial_config: config.clone(),
+            update_rx: updates_rx,
+            latest_grid: new_latest_grid(),
+            source: Box::new(source),
+            consent_path,
+            cancel: cancel.clone(),
+        };
+        let (_handle, join) = spawn_with_handle(deps);
+
+        tokio::task::yield_now().await;
+        assert_eq!(connects_seen.load(Ordering::SeqCst), 1);
+        assert_eq!(*modes_seen.lock().unwrap(), vec![StreamMode::Warm]);
+
+        let mut reconfigured = (*config).clone();
+        reconfigured.wear.active_sampling.stream_mode = StreamMode::PerTick;
+        updates_tx
+            .send(SamplerUpdate::Reconfigure(ReconfigurePlan {
+                active_sampling: reconfigured.wear.active_sampling,
+                sample_interval: reconfigured.wear.sample_interval,
+                trigger: ConfigDelta::StreamModeChanged,
+            }))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(resets_seen.load(Ordering::SeqCst), 1);
+        assert_eq!(connects_seen.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *modes_seen.lock().unwrap(),
+            vec![StreamMode::Warm, StreamMode::PerTick]
+        );
+
+        updates_tx
+            .send(SamplerUpdate::DisplayContext(DisplaySamplingContext {
+                display: Some(DisplayExpectation {
+                    display: "oled".to_owned(),
+                }),
+                phase: Phase::Active,
+                stage_active: true,
+            }))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(resets_seen.load(Ordering::SeqCst), 1);
+        assert_eq!(connects_seen.load(Ordering::SeqCst), 1);
+        cancel.cancel();
+        join.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_sampler_restart_reattaches_a_retained_consent_record_without_a_grant() {
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        test_record(&consent_path);
+        let connects_seen = Arc::new(AtomicUsize::new(0));
+        let grants_seen = Arc::new(AtomicUsize::new(0));
+        let source = ServiceSource {
+            connects: Mutex::new(VecDeque::from([Ok(test_stream())])),
+            connects_seen: connects_seen.clone(),
+            captures: Mutex::new(VecDeque::from([TestCapture::Frame])),
+            captures_seen: Arc::new(AtomicUsize::new(0)),
+            closes_seen: Arc::new(AtomicUsize::new(0)),
+            grants_seen: grants_seen.clone(),
+        };
+        let cancel = CancellationToken::new();
+        let (deps, _updates, _) = service_deps(
+            active_config(Duration::from_secs(10)),
+            source,
+            consent_path,
+            cancel.clone(),
+        );
+        let (_handle, join) = spawn_with_handle(deps);
+
+        tokio::task::yield_now().await;
+        assert_eq!(connects_seen.load(Ordering::SeqCst), 1);
+        assert_eq!(grants_seen.load(Ordering::SeqCst), 0);
         cancel.cancel();
         join.await.unwrap();
     }

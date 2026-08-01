@@ -89,7 +89,10 @@ use dormant_render::luma::{LumaCache, LumaCatalog, LumaScanJob};
 use dormant_render::{HeatSnapshotHandle, LayerShellRenderSink};
 
 #[cfg(target_os = "linux")]
-use crate::active_sampler::{self, ActiveSamplerDeps, SamplerUpdate};
+use crate::active_sampler::{
+    self, ActiveSamplerDeps, ConfigDelta, DisplayExpectation, DisplaySamplingContext,
+    ReconfigurePlan, SamplerUpdate,
+};
 use crate::boot_guard::{self, PromoteVerdict};
 use crate::coordination_poll::{self, CoordinationPollDeps};
 use crate::direct_switch::DirectSwitchHandle;
@@ -103,6 +106,245 @@ use crate::sd_notify::{self, SdNotify};
 use crate::watchdog_schedule::WatchdogSchedule;
 
 const QUIESCE_OPERATION_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[cfg(target_os = "linux")]
+fn active_sampler_reconfigure_plans(old: &Config, new: &Config) -> Vec<ReconfigurePlan> {
+    let old_active = &old.wear.active_sampling;
+    let new_active = &new.wear.active_sampling;
+    let mut triggers = Vec::new();
+    if new_active.enabled {
+        if old_active.sampled_display != new_active.sampled_display {
+            triggers.push(ConfigDelta::SampledDisplayChanged);
+        }
+        if new.wear.enabled {
+            if old_active.stream_mode != new_active.stream_mode {
+                triggers.push(ConfigDelta::StreamModeChanged);
+            }
+            if old_active.capture_timeout != new_active.capture_timeout
+                || old_active.failure_threshold != new_active.failure_threshold
+                || old_active.circuit_reset_after != new_active.circuit_reset_after
+                || old.wear.sample_interval != new.wear.sample_interval
+            {
+                triggers.push(ConfigDelta::LimitsChanged);
+            }
+            if !old.wear.enabled {
+                triggers.push(ConfigDelta::WearEnabled(true));
+            }
+            if !old_active.enabled {
+                triggers.push(ConfigDelta::Enabled(true));
+            }
+        } else {
+            triggers.push(ConfigDelta::WearEnabled(false));
+        }
+    } else if old_active.enabled {
+        triggers.push(ConfigDelta::Enabled(false));
+    }
+    triggers
+        .into_iter()
+        .map(|trigger| ReconfigurePlan {
+            active_sampling: new_active.clone(),
+            sample_interval: new.wear.sample_interval,
+            trigger,
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn active_sampler_display_context(
+    cfg: &Config,
+    display_exists: bool,
+    phase: Option<&str>,
+) -> DisplaySamplingContext {
+    let phase = match phase {
+        Some("grace") => Phase::Grace { until: Tick::now() },
+        Some("blanking") => Phase::Blanking,
+        Some("blanked") => Phase::Blanked,
+        Some("waking") => Phase::Waking,
+        _ => Phase::Active,
+    };
+    let stage_active = display_exists && matches!(phase, Phase::Active | Phase::Grace { .. });
+    DisplaySamplingContext {
+        display: display_exists
+            .then(|| {
+                cfg.wear
+                    .active_sampling
+                    .sampled_display
+                    .as_ref()
+                    .map(|display| DisplayExpectation {
+                        display: display.clone(),
+                    })
+            })
+            .flatten(),
+        phase,
+        stage_active,
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod active_sampler_reload_tests {
+    use super::*;
+    use dormant_core::config::schema::{
+        AudioConfig, DaemonConfig, NotificationsConfig, WatchdogConfig, WearConfig,
+    };
+    use indexmap::IndexMap;
+
+    fn config() -> Config {
+        Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
+            config_version: 1,
+            daemon: DaemonConfig::default(),
+            sensors: IndexMap::new(),
+            zones: IndexMap::new(),
+            displays: IndexMap::new(),
+            rules: IndexMap::new(),
+            wear: WearConfig::default(),
+            notifications: NotificationsConfig::default(),
+            watchdog: WatchdogConfig::default(),
+            audio: AudioConfig::default(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the reload rows stay together as the specification's auditable table"
+    )]
+    fn active_sampler_reload_table_maps_every_config_row() {
+        let mut old = config();
+        old.wear.enabled = true;
+        old.wear.active_sampling.enabled = true;
+        old.wear.active_sampling.sampled_display = Some("oled-a".to_owned());
+
+        let mut disabled = old.clone();
+        disabled.wear.active_sampling.enabled = false;
+        let cases = vec![
+            (
+                "enabled off",
+                old.clone(),
+                disabled.clone(),
+                vec![ConfigDelta::Enabled(false)],
+            ),
+            (
+                "enabled on",
+                disabled,
+                old.clone(),
+                vec![ConfigDelta::Enabled(true)],
+            ),
+            (
+                "sampled display",
+                old.clone(),
+                {
+                    let mut new = old.clone();
+                    new.wear.active_sampling.sampled_display = Some("oled-b".to_owned());
+                    new
+                },
+                vec![ConfigDelta::SampledDisplayChanged],
+            ),
+            (
+                "stream mode",
+                old.clone(),
+                {
+                    let mut new = old.clone();
+                    new.wear.active_sampling.stream_mode =
+                        dormant_core::config::schema::StreamMode::PerTick;
+                    new
+                },
+                vec![ConfigDelta::StreamModeChanged],
+            ),
+            (
+                "capture limits",
+                old.clone(),
+                {
+                    let mut new = old.clone();
+                    new.wear.active_sampling.capture_timeout = Duration::from_secs(3);
+                    new
+                },
+                vec![ConfigDelta::LimitsChanged],
+            ),
+            (
+                "wear off",
+                old.clone(),
+                {
+                    let mut new = old.clone();
+                    new.wear.enabled = false;
+                    new
+                },
+                vec![ConfigDelta::WearEnabled(false)],
+            ),
+            (
+                "wear on",
+                {
+                    let mut before = old.clone();
+                    before.wear.enabled = false;
+                    before
+                },
+                old.clone(),
+                vec![ConfigDelta::WearEnabled(true)],
+            ),
+            (
+                "unrelated",
+                old.clone(),
+                {
+                    let mut new = old.clone();
+                    new.wear.persist_interval = Duration::from_secs(61);
+                    new
+                },
+                vec![],
+            ),
+        ];
+
+        for (name, previous, new, want) in cases {
+            let plans = active_sampler_reconfigure_plans(&previous, &new);
+            assert_eq!(
+                plans.iter().map(|plan| plan.trigger).collect::<Vec<_>>(),
+                want,
+                "{name}"
+            );
+            for plan in plans {
+                assert_eq!(
+                    plan.active_sampling, new.wear.active_sampling,
+                    "{name} settings"
+                );
+                assert_eq!(
+                    plan.sample_interval, new.wear.sample_interval,
+                    "{name} cadence"
+                );
+            }
+        }
+
+        let mut combined = old.clone();
+        combined.wear.active_sampling.stream_mode =
+            dormant_core::config::schema::StreamMode::PerTick;
+        combined.wear.active_sampling.failure_threshold = 2;
+        assert_eq!(
+            active_sampler_reconfigure_plans(&old, &combined)
+                .iter()
+                .map(|plan| plan.trigger)
+                .collect::<Vec<_>>(),
+            vec![ConfigDelta::StreamModeChanged, ConfigDelta::LimitsChanged]
+        );
+    }
+
+    #[test]
+    fn active_sampler_generation_context_omits_missing_display_and_marks_active_grace_only() {
+        let mut cfg = config();
+        cfg.wear.active_sampling.sampled_display = Some("oled".to_owned());
+
+        let missing = active_sampler_display_context(&cfg, false, Some("active"));
+        assert_eq!(missing.display, None);
+        assert!(!missing.stage_active);
+
+        let restored = active_sampler_display_context(&cfg, true, Some("grace"));
+        assert_eq!(restored.display.unwrap().display, "oled");
+        assert!(restored.stage_active);
+
+        let blanked = active_sampler_display_context(&cfg, true, Some("blanked"));
+        assert!(!blanked.stage_active);
+    }
+}
 
 #[cfg(feature = "render")]
 #[allow(clippy::cast_possible_truncation)]
@@ -1201,6 +1443,26 @@ impl App {
                         consent_path,
                         cancel: root.clone(),
                     });
+                    let display_exists = cfg_clone
+                        .wear
+                        .active_sampling
+                        .sampled_display
+                        .as_ref()
+                        .is_some_and(|display| {
+                            spawn
+                                .generation
+                                .display_executors
+                                .contains_key(&DisplayId(display.clone()))
+                        });
+                    if let Err(error) = update_tx.try_send(SamplerUpdate::DisplayContext(
+                        active_sampler_display_context(&cfg_clone, display_exists, Some("active")),
+                    )) {
+                        tracing::warn!(
+                            event = "wear_sampling_update_dropped",
+                            ?error,
+                            "could not publish initial active-sampler display context"
+                        );
+                    }
                     (Some(handle), Some(update_tx))
                 }
                 Err(error) => {
@@ -1947,6 +2209,44 @@ impl Runner {
         self.events_router.install(spawn.events_tx.clone()).await;
     }
 
+    #[cfg(target_os = "linux")]
+    fn publish_active_sampler_reload(&self, previous_cfg: &Config) {
+        let Some(updates) = &self.active_sampler_updates else {
+            return;
+        };
+        let display_exists = self
+            .generation
+            .cfg
+            .wear
+            .active_sampling
+            .sampled_display
+            .as_ref()
+            .is_some_and(|display| {
+                self.generation
+                    .display_executors
+                    .contains_key(&DisplayId(display.clone()))
+            });
+        if let Err(error) = updates.try_send(SamplerUpdate::DisplayContext(
+            active_sampler_display_context(&self.generation.cfg, display_exists, Some("active")),
+        )) {
+            tracing::warn!(
+                event = "wear_sampling_update_dropped",
+                ?error,
+                "could not publish active-sampler display context"
+            );
+        }
+        for plan in active_sampler_reconfigure_plans(previous_cfg, &self.generation.cfg) {
+            if let Err(error) = updates.try_send(SamplerUpdate::Reconfigure(plan)) {
+                tracing::warn!(
+                    event = "wear_sampling_update_dropped",
+                    ?error,
+                    "could not publish active-sampler reload plan"
+                );
+                break;
+            }
+        }
+    }
+
     /// Build a [`KvmStatus`] from the current generation's config.
     fn build_kvm_status(&self) -> dormant_core::rules::KvmStatus {
         use dormant_core::config::DisplayScope;
@@ -2212,6 +2512,8 @@ impl Runner {
 
         // Capture the new config for watch updates + bind change detection
         // BEFORE new_assembly is consumed by spawn_generation.
+        #[cfg(target_os = "linux")]
+        let previous_active_sampler_cfg = self.generation.cfg.clone();
         let new_cfg = new_assembly.cfg.clone();
         let new_creds = new_assembly.creds.clone();
         self.generation_barrier_ack_timeout = new_cfg.daemon.generation_barrier_ack_timeout;
@@ -2514,6 +2816,8 @@ impl Runner {
                     wake_list.extend(stuck);
                 }
                 self.defensive_wake(wake_list);
+                #[cfg(target_os = "linux")]
+                self.publish_active_sampler_reload(&previous_active_sampler_cfg);
                 self.config_tx.send_replace(Arc::new(new_cfg));
                 self.creds_tx.send_replace(Arc::new(new_creds));
                 tracing::info!(event = "config_reloaded");
@@ -3074,13 +3378,13 @@ async fn run_loop(
                     let _ = reload_requester.notify(ReloadSource::Watcher).await;
                 }
                 Some(first) = reload_requests.recv() => {
-                    execute_reload_batch(
+                    Box::pin(execute_reload_batch(
                         &mut runner,
                         &mut watcher,
                         &reload_requester,
                         &mut reload_requests,
                         first,
-                    ).await;
+                    )).await;
                 }
                 () = tokio::time::sleep_until(watchdog_schedule.deadline()) => {
                     watchdog_schedule.record_tick(tokio::time::Instant::now());

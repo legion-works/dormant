@@ -338,6 +338,12 @@ impl<T: PortalTransport> CaptureSource for PortalPipeWireSource<T> {
         Ok(frame)
     }
 
+    async fn reset_stream(&mut self) {
+        if let Some(mut worker) = self.warm_worker.take() {
+            worker.shutdown().await;
+        }
+    }
+
     async fn close(&mut self) {
         if let Some(mut worker) = self.warm_worker.take() {
             worker.shutdown().await;
@@ -1186,6 +1192,48 @@ mod tests {
                 PortalCall::OpenPipeWireRemote,
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn active_sampling_reload_keeps_the_existing_portal_session_for_unrelated_and_stream_changes()
+     {
+        let transport = FakePortalTransport::grant_with(PortalStartResult::single(
+            73,
+            3072,
+            1728,
+            Some("persistent-output"),
+            "rotated-token",
+        ));
+        let frame = RawFrame {
+            rgba: vec![0; 4],
+            width: 1,
+            height: 1,
+            stride: 4,
+        };
+        let mut source = PortalPipeWireSource::from_transport_with_frames(
+            transport.clone(),
+            [Ok(frame.clone()), Ok(frame.clone()), Ok(frame)],
+        );
+        source
+            .request_consent(&DisplayExpectation {
+                display: "oled".to_owned(),
+            })
+            .await
+            .expect("scripted portal grant succeeds");
+        let session_calls = transport.calls();
+
+        source
+            .capture_one(StreamMode::Warm)
+            .await
+            .expect("unrelated reload leaves the warm stream usable");
+        assert_eq!(transport.calls(), session_calls);
+
+        source.reset_stream().await;
+        source
+            .capture_one(StreamMode::PerTick)
+            .await
+            .expect("stream mode update captures with the retained portal session");
+        assert_eq!(transport.calls(), session_calls);
     }
 
     #[tokio::test]

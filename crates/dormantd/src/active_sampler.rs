@@ -594,6 +594,7 @@ async fn handle_command(
             match outcome {
                 None => return false,
                 Some(Err(CaptureError::Timeout)) => {
+                    tracing::warn!(event = "wear_sampling_consent_failed", reason = "timeout");
                     apply_trigger(runtime, Trigger::ConsentTimedOut, status_tx);
                     let _ = reply.send(ConsentFlowStatus::TimedOut);
                 }
@@ -2441,6 +2442,7 @@ mod tests {
         let (reply_tx, reply_rx) = oneshot::channel();
         let (_command_tx, mut command_rx) = mpsc::channel(1);
         let cancel = CancellationToken::new();
+        let (buffer, _guard) = capture_tracing(tracing::Level::WARN);
         let future = handle_command(
             &mut runtime,
             &mut source,
@@ -2457,6 +2459,9 @@ mod tests {
         future.await;
 
         assert_eq!(reply_rx.await.unwrap(), ConsentFlowStatus::TimedOut);
+        let log = traced_output(&buffer);
+        assert!(log.contains("wear_sampling_consent_failed"), "{log}");
+        assert!(log.contains("reason=\"timeout\""), "{log}");
     }
 
     #[tokio::test]

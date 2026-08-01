@@ -590,11 +590,16 @@ fn run_warm_stream(
     let stream_for_process = stream.clone();
     let _listener = stream
         .add_local_listener_with_user_data(())
-        .param_changed(move |_, (), id, param| {
+        .state_changed(|_, (), _, state| log_stream_state(&state))
+        .param_changed(move |stream, (), id, param| {
             let Some(param) = param else { return };
             if id != pw::spa::param::ParamType::Format.as_raw() {
                 return;
             }
+            tracing::info!(
+                event = "wear_sampling_stage",
+                stage = "pipewire_format_received"
+            );
             let Ok((media_type, media_subtype)) = pw::spa::param::format_utils::parse_format(param)
             else {
                 return;
@@ -603,6 +608,7 @@ fn run_warm_stream(
                 && media_subtype == pw::spa::param::format::MediaSubtype::Raw
             {
                 let _ = state_for_format.borrow_mut().format.parse(param);
+                update_shm_buffer_params(stream);
             }
         })
         .process(move |stream, ()| {
@@ -617,9 +623,9 @@ fn run_warm_stream(
         })
         .register()
         .map_err(|error| CaptureError::Transport(format!("PipeWire stream listener: {error}")))?;
-    let buffers = shm_buffer_param_bytes()?;
-    let mut params = [spa::pod::Pod::from_bytes(&buffers).ok_or_else(|| {
-        CaptureError::Transport("PipeWire serialized shm buffer params are invalid".to_owned())
+    let format = raw_video_format_param_bytes()?;
+    let mut params = [spa::pod::Pod::from_bytes(&format).ok_or_else(|| {
+        CaptureError::Transport("PipeWire serialized raw video params are invalid".to_owned())
     })?];
     stream
         .connect(
@@ -718,14 +724,48 @@ struct FrameState {
     reply: std::sync::mpsc::Sender<Result<RawFrame, CaptureError>>,
 }
 
+fn raw_video_format_param_bytes() -> Result<Vec<u8>, CaptureError> {
+    serialize_param_object(
+        raw_video_format_param_object(),
+        "PipeWire raw video format params",
+    )
+}
+
+fn raw_video_format_param_object() -> spa::pod::Object {
+    spa::pod::Object {
+        type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
+        id: spa::param::ParamType::EnumFormat.as_raw(),
+        properties: vec![
+            spa::pod::Property::new(
+                spa::sys::SPA_FORMAT_mediaType,
+                spa::pod::Value::Id(spa::utils::Id(
+                    spa::param::format::MediaType::Video.as_raw(),
+                )),
+            ),
+            spa::pod::Property::new(
+                spa::sys::SPA_FORMAT_mediaSubtype,
+                spa::pod::Value::Id(spa::utils::Id(
+                    spa::param::format::MediaSubtype::Raw.as_raw(),
+                )),
+            ),
+        ],
+    }
+}
+
 fn shm_buffer_param_bytes() -> Result<Vec<u8>, CaptureError> {
-    let object = shm_buffer_param_object();
+    serialize_param_object(shm_buffer_param_object(), "PipeWire shm buffer params")
+}
+
+fn serialize_param_object(
+    object: spa::pod::Object,
+    context: &'static str,
+) -> Result<Vec<u8>, CaptureError> {
     spa::pod::serialize::PodSerializer::serialize(
         std::io::Cursor::new(Vec::new()),
         &spa::pod::Value::Object(object),
     )
     .map(|success| success.0.into_inner())
-    .map_err(|error| CaptureError::Transport(format!("PipeWire shm buffer params: {error}")))
+    .map_err(|error| CaptureError::Transport(format!("{context}: {error}")))
 }
 
 fn shm_buffer_param_object() -> spa::pod::Object {
@@ -742,6 +782,57 @@ fn shm_buffer_param_object() -> spa::pod::Object {
                 },
             ))),
         )],
+    }
+}
+
+fn update_shm_buffer_params(stream: &pw::stream::Stream) {
+    let Ok(buffers) = shm_buffer_param_bytes() else {
+        tracing::info!(
+            event = "wear_sampling_stage",
+            stage = "pipewire_buffer_params_failed"
+        );
+        return;
+    };
+    let Some(param) = spa::pod::Pod::from_bytes(&buffers) else {
+        tracing::info!(
+            event = "wear_sampling_stage",
+            stage = "pipewire_buffer_params_failed"
+        );
+        return;
+    };
+    if let Err(error) = stream.update_params(&mut [param]) {
+        tracing::info!(
+            event = "wear_sampling_stage",
+            stage = "pipewire_buffer_params_failed",
+            error = %error
+        );
+    }
+}
+
+fn log_stream_state(state: &pw::stream::StreamState) {
+    match state {
+        pw::stream::StreamState::Connecting => tracing::info!(
+            event = "wear_sampling_stage",
+            stage = "pipewire_state_changed",
+            state = "connecting"
+        ),
+        pw::stream::StreamState::Paused => tracing::info!(
+            event = "wear_sampling_stage",
+            stage = "pipewire_state_changed",
+            state = "paused"
+        ),
+        pw::stream::StreamState::Streaming => tracing::info!(
+            event = "wear_sampling_stage",
+            stage = "pipewire_state_changed",
+            state = "streaming"
+        ),
+        pw::stream::StreamState::Error(error) => tracing::info!(
+            event = "wear_sampling_stage",
+            stage = "pipewire_state_changed",
+            state = "error",
+            error = %error
+        ),
+        pw::stream::StreamState::Unconnected => {}
     }
 }
 
@@ -771,13 +862,18 @@ fn acquire_one_frame(fd: OwnedFd, node_id: u32) -> Result<RawFrame, CaptureError
             format: spa::param::video::VideoInfoRaw::default(),
             reply,
         })
-        .param_changed(|_, state, id, param| {
+        .state_changed(|_, _, _, stream_state| log_stream_state(&stream_state))
+        .param_changed(|stream, state, id, param| {
             let Some(param) = param else {
                 return;
             };
             if id != pw::spa::param::ParamType::Format.as_raw() {
                 return;
             }
+            tracing::info!(
+                event = "wear_sampling_stage",
+                stage = "pipewire_format_received"
+            );
             let Ok((media_type, media_subtype)) = pw::spa::param::format_utils::parse_format(param)
             else {
                 return;
@@ -786,6 +882,7 @@ fn acquire_one_frame(fd: OwnedFd, node_id: u32) -> Result<RawFrame, CaptureError
                 && media_subtype == pw::spa::param::format::MediaSubtype::Raw
             {
                 let _ = state.format.parse(param);
+                update_shm_buffer_params(stream);
             }
         })
         .process(move |stream, state| {
@@ -795,9 +892,9 @@ fn acquire_one_frame(fd: OwnedFd, node_id: u32) -> Result<RawFrame, CaptureError
         })
         .register()
         .map_err(|error| CaptureError::Transport(format!("PipeWire stream listener: {error}")))?;
-    let buffers = shm_buffer_param_bytes()?;
-    let mut params = [spa::pod::Pod::from_bytes(&buffers).ok_or_else(|| {
-        CaptureError::Transport("PipeWire serialized shm buffer params are invalid".to_owned())
+    let format = raw_video_format_param_bytes()?;
+    let mut params = [spa::pod::Pod::from_bytes(&format).ok_or_else(|| {
+        CaptureError::Transport("PipeWire serialized raw video params are invalid".to_owned())
     })?];
     stream
         .connect(
@@ -1372,6 +1469,19 @@ mod tests {
         }
 
         async fn close(&self, _session: PortalSession) {}
+    }
+
+    #[test]
+    fn stream_connect_params_only_advertise_raw_video_format() {
+        let object = raw_video_format_param_object();
+        assert_eq!(
+            object.type_,
+            spa::utils::SpaTypes::ObjectParamFormat.as_raw()
+        );
+        assert_eq!(object.id, spa::param::ParamType::EnumFormat.as_raw());
+        assert_eq!(object.properties.len(), 2);
+        assert_eq!(object.properties[0].key, spa::sys::SPA_FORMAT_mediaType);
+        assert_eq!(object.properties[1].key, spa::sys::SPA_FORMAT_mediaSubtype);
     }
 
     #[test]

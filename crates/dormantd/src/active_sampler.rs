@@ -421,47 +421,25 @@ fn apply_capture_failure(
     runtime: &mut Runtime,
     error: CaptureError,
     status_tx: &watch::Sender<SamplerStatus>,
-) {
+) -> Transition {
     match error {
-        CaptureError::Auth | CaptureError::SessionClosed => {
-            transition_to(
-                runtime,
-                SamplingState::NeedsConsent,
-                Some(WEAR_SAMPLING_TOKEN_INVALID),
-                status_tx,
-            );
-        }
+        CaptureError::Auth => apply_trigger(runtime, Trigger::AuthFailed, status_tx),
+        CaptureError::SessionClosed => apply_trigger(runtime, Trigger::SessionClosed, status_tx),
         CaptureError::Protocol(reason) if reason == WEAR_SAMPLING_WRONG_MONITOR => {
-            transition_to(
-                runtime,
-                SamplingState::NeedsConsent,
-                Some(WEAR_SAMPLING_WRONG_MONITOR),
-                status_tx,
-            );
+            apply_trigger(runtime, Trigger::WrongMonitor, status_tx)
         }
-        CaptureError::Transport(_) => {
-            transition_to(
-                runtime,
-                SamplingState::Connecting,
-                Some(WEAR_SAMPLING_PORTAL_UNREACHABLE),
-                status_tx,
-            );
-        }
+        CaptureError::Transport(_) => apply_trigger(runtime, Trigger::TransportFailed, status_tx),
         CaptureError::ConsentDenied | CaptureError::Timeout | CaptureError::Protocol(_) => {
             if runtime.failures >= runtime.active.failure_threshold {
-                transition_to(
-                    runtime,
-                    SamplingState::Cooldown,
-                    Some(WEAR_SAMPLING_COOLDOWN),
-                    status_tx,
-                );
+                apply_trigger(runtime, Trigger::CaptureFailed, status_tx)
             } else {
-                transition_to(
-                    runtime,
-                    SamplingState::Streaming,
-                    Some(WEAR_SAMPLING_CAPTURE_FAILED),
-                    status_tx,
-                );
+                // Below the breaker threshold the lifecycle remains Streaming;
+                // only its uniform fallback changes for this failed tick.
+                publish_status(status_tx, runtime, Some(WEAR_SAMPLING_CAPTURE_FAILED), None);
+                Transition {
+                    next: runtime.state,
+                    effects: vec![Effect::EnterUniform(WEAR_SAMPLING_CAPTURE_FAILED)],
+                }
             }
         }
     }
@@ -489,7 +467,7 @@ async fn handle_command(
             }
             if runtime.state == SamplingState::ConsentPending {
                 let _ = reply.send(ConsentFlowStatus::Error(
-                    "consent flow already active".to_owned(),
+                    SamplerError::FlowAlreadyActive.to_string(),
                 ));
                 return false;
             }
@@ -499,8 +477,11 @@ async fn handle_command(
                 ));
                 return false;
             };
-            runtime.state = SamplingState::ConsentPending;
-            publish_status(status_tx, runtime, None, None);
+            let transition = apply_trigger(runtime, Trigger::GrantStarted, status_tx);
+            debug_assert!(
+                transition.effects.contains(&Effect::OpenConsent),
+                "only GrantStarted may enter ConsentPending"
+            );
             // The portal has no config timeout; the five-minute interaction bound
             // prevents an abandoned dialog from retaining a daemon operation forever.
             let outcome = tokio::select! {
@@ -510,36 +491,29 @@ async fn handle_command(
             match outcome {
                 None => return false,
                 Some(Err(_)) => {
-                    transition_to(
-                        runtime,
-                        SamplingState::NeedsConsent,
-                        Some(WEAR_SAMPLING_CONSENT_TIMEOUT),
-                        status_tx,
-                    );
+                    apply_trigger(runtime, Trigger::ConsentTimedOut, status_tx);
                     let _ = reply.send(ConsentFlowStatus::TimedOut);
                 }
                 Some(Ok(Err(CaptureError::ConsentDenied))) => {
-                    transition_to(
-                        runtime,
-                        SamplingState::NeedsConsent,
-                        Some(WEAR_SAMPLING_CONSENT_TIMEOUT),
-                        status_tx,
-                    );
+                    apply_trigger(runtime, Trigger::ConsentDenied, status_tx);
                     let _ = reply.send(ConsentFlowStatus::Denied);
                 }
                 Some(Ok(Err(error))) => {
-                    let reason = if matches!(error, CaptureError::Protocol(ref text) if text == WEAR_SAMPLING_WRONG_MONITOR)
+                    let trigger = if matches!(error, CaptureError::Protocol(ref text) if text == WEAR_SAMPLING_WRONG_MONITOR)
                     {
-                        WEAR_SAMPLING_WRONG_MONITOR
+                        Trigger::WrongMonitor
                     } else {
-                        WEAR_SAMPLING_CONSENT_TIMEOUT
+                        Trigger::ConsentTimedOut
                     };
-                    transition_to(
-                        runtime,
-                        SamplingState::NeedsConsent,
-                        Some(reason),
-                        status_tx,
-                    );
+                    let transition = apply_trigger(runtime, trigger, status_tx);
+                    let reason = transition
+                        .effects
+                        .iter()
+                        .find_map(|effect| match effect {
+                            Effect::EnterUniform(reason) => Some(*reason),
+                            _ => None,
+                        })
+                        .unwrap_or(WEAR_SAMPLING_CONSENT_TIMEOUT);
                     let _ = reply.send(ConsentFlowStatus::Error(reason.to_owned()));
                 }
                 Some(Ok(Ok(grant))) => {
@@ -558,17 +532,12 @@ async fn handle_command(
                                 &record.sampled_display,
                             )
                             .ok();
-                            transition_to(runtime, SamplingState::Connecting, None, status_tx);
+                            let transition = apply_trigger(runtime, Trigger::Granted, status_tx);
                             let _ = reply.send(ConsentFlowStatus::Granted);
-                            return true;
+                            return transition.effects.contains(&Effect::Connect);
                         }
                         Err(error) => {
-                            transition_to(
-                                runtime,
-                                SamplingState::NeedsConsent,
-                                Some(WEAR_SAMPLING_NEEDS_CONSENT),
-                                status_tx,
-                            );
+                            apply_trigger(runtime, Trigger::ConsentTimedOut, status_tx);
                             let _ = reply.send(ConsentFlowStatus::Error(error.to_string()));
                         }
                     }
@@ -576,7 +545,14 @@ async fn handle_command(
             }
         }
         SamplerCommand::Disable { forget, reply } => {
-            source.close().await;
+            let transition = apply_trigger(
+                runtime,
+                Trigger::ConfigChanged(ConfigDelta::Enabled(false)),
+                status_tx,
+            );
+            if transition.effects.contains(&Effect::CloseSession) {
+                source.close().await;
+            }
             if forget {
                 if let Err(error) = crate::screencast_consent::forget(consent_path) {
                     let _ = reply.send(Err(SamplerError::Store(error)));
@@ -584,7 +560,6 @@ async fn handle_command(
                 }
                 runtime.record = None;
             }
-            transition_to(runtime, SamplingState::Disabled, None, status_tx);
             let _ = reply.send(Ok(()));
         }
     }
@@ -595,30 +570,21 @@ fn apply_update(
     runtime: &mut Runtime,
     update: SamplerUpdate,
     status_tx: &watch::Sender<SamplerStatus>,
-) {
+) -> Option<Transition> {
     match update {
         SamplerUpdate::Reconfigure(plan) => {
             runtime.active = plan.active_sampling;
             runtime.sample_interval = plan.sample_interval;
-            let transition = decide(
-                runtime.state,
-                Trigger::ConfigChanged(plan.trigger),
-                runtime.record.is_some(),
-            );
-            transition_to(
+            Some(apply_trigger(
                 runtime,
-                transition.next,
-                transition.effects.iter().find_map(|effect| {
-                    if let Effect::EnterUniform(reason) = effect {
-                        Some(*reason)
-                    } else {
-                        None
-                    }
-                }),
+                Trigger::ConfigChanged(plan.trigger),
                 status_tx,
-            );
+            ))
         }
-        SamplerUpdate::DisplayContext(context) => runtime.display = context,
+        SamplerUpdate::DisplayContext(context) => {
+            runtime.display = context;
+            None
+        }
     }
 }
 
@@ -635,6 +601,23 @@ fn transition_to(
     {
         tracing::warn!(reason, display = %runtime.display_name(), "active sampling is using uniform attribution");
     }
+}
+
+fn apply_trigger(
+    runtime: &mut Runtime,
+    trigger: Trigger,
+    status_tx: &watch::Sender<SamplerStatus>,
+) -> Transition {
+    let transition = decide(runtime.state, trigger, runtime.record.is_some());
+    let reason = transition.effects.iter().find_map(|effect| {
+        if let Effect::EnterUniform(reason) = effect {
+            Some(*reason)
+        } else {
+            None
+        }
+    });
+    transition_to(runtime, transition.next, reason, status_tx);
+    transition
 }
 
 fn publish_status(
@@ -705,46 +688,34 @@ async fn run(
             }
             SamplingState::Connecting => {
                 let Some(record) = runtime.record.clone() else {
-                    transition_to(
-                        &mut runtime,
-                        SamplingState::NeedsConsent,
-                        Some(WEAR_SAMPLING_NEEDS_CONSENT),
-                        &status_tx,
-                    );
+                    apply_trigger(&mut runtime, Trigger::AuthFailed, &status_tx);
                     continue;
                 };
                 match connect(&mut *deps.source, &record, &deps.cancel).await {
                     ConnectOutcome::Cancelled => break,
                     ConnectOutcome::Connected(stream) => {
-                        if persist_rotated_token(&mut runtime, stream, &deps.consent_path).is_err()
+                        let transition =
+                            apply_trigger(&mut runtime, Trigger::Connected, &status_tx);
+                        if transition.effects.contains(&Effect::SaveRotatedToken)
+                            && persist_rotated_token(&mut runtime, stream, &deps.consent_path)
+                                .is_err()
                         {
-                            transition_to(
-                                &mut runtime,
-                                SamplingState::NeedsConsent,
-                                Some(WEAR_SAMPLING_NEEDS_CONSENT),
-                                &status_tx,
-                            );
+                            apply_trigger(&mut runtime, Trigger::AuthFailed, &status_tx);
                             continue;
                         }
                         runtime.reconnect_backoff = Duration::from_secs(30);
-                        transition_to(&mut runtime, SamplingState::Streaming, None, &status_tx);
-                        capture_now = true;
+                        capture_now = transition.effects.contains(&Effect::Capture);
                     }
                     ConnectOutcome::NeedsConsent(reason) => {
-                        transition_to(
-                            &mut runtime,
-                            SamplingState::NeedsConsent,
-                            Some(reason),
-                            &status_tx,
-                        );
+                        let trigger = if reason == WEAR_SAMPLING_WRONG_MONITOR {
+                            Trigger::WrongMonitor
+                        } else {
+                            Trigger::AuthFailed
+                        };
+                        apply_trigger(&mut runtime, trigger, &status_tx);
                     }
                     ConnectOutcome::Transport => {
-                        transition_to(
-                            &mut runtime,
-                            SamplingState::Connecting,
-                            Some(WEAR_SAMPLING_PORTAL_UNREACHABLE),
-                            &status_tx,
-                        );
+                        apply_trigger(&mut runtime, Trigger::TransportFailed, &status_tx);
                         let delay = runtime.reconnect_backoff;
                         runtime.reconnect_backoff =
                             (runtime.reconnect_backoff * 2).min(Duration::from_secs(300));
@@ -787,7 +758,7 @@ async fn run(
                     CaptureOutcome::Ok(captured_at) => {
                         runtime.failures = 0;
                         runtime.episode_warned.clear();
-                        transition_to(&mut runtime, SamplingState::Streaming, None, &status_tx);
+                        apply_trigger(&mut runtime, Trigger::CaptureOk, &status_tx);
                         publish_status(&status_tx, &runtime, None, Some(captured_at));
                     }
                     CaptureOutcome::Failed(error, overlapping) => {
@@ -800,11 +771,15 @@ async fn run(
                 tokio::select! {
                     () = deps.cancel.cancelled() => break,
                     () = tokio::time::sleep(runtime.active.circuit_reset_after) => {
+                        let transition = apply_trigger(&mut runtime, Trigger::CooldownElapsed, &status_tx);
+                        debug_assert!(transition.effects.contains(&Effect::Capture), "only CooldownElapsed may schedule a cooldown retry");
                         let attempt = capture_one(&mut *deps.source, &runtime.active, runtime.display.phase.clone(), &deps.latest_grid, &deps.cancel, &mut cadence).await;
                         match attempt {
                             CaptureOutcome::Cancelled => break,
-                            CaptureOutcome::Ok(captured_at) => { runtime.failures = 0; runtime.episode_warned.clear(); transition_to(&mut runtime, SamplingState::Streaming, None, &status_tx); publish_status(&status_tx, &runtime, None, Some(captured_at)); }
-                            CaptureOutcome::Failed(error, _) => apply_capture_failure(&mut runtime, error, &status_tx),
+                            CaptureOutcome::Ok(captured_at) => { runtime.failures = 0; runtime.episode_warned.clear(); apply_trigger(&mut runtime, Trigger::CaptureOk, &status_tx); publish_status(&status_tx, &runtime, None, Some(captured_at)); }
+                            CaptureOutcome::Failed(error, _) => {
+                                apply_capture_failure(&mut runtime, error, &status_tx);
+                            }
                         }
                     }
                     update = deps.update_rx.recv() => if let Some(update) = update { apply_update(&mut runtime, update, &status_tx); },
@@ -894,6 +869,8 @@ pub enum Trigger {
     TransportFailed,
     /// The portal closed the active capture session.
     SessionClosed,
+    /// Portal stream metadata or its first frame identifies another monitor.
+    WrongMonitor,
     /// The circuit-breaker timer elapsed.
     CooldownElapsed,
     /// The operator requested removal of the consent record.
@@ -1092,6 +1069,9 @@ pub fn decide(state: SamplingState, trigger: Trigger, has_consent_record: bool) 
                 vec![Effect::EnterUniform(WEAR_SAMPLING_CONSENT_TIMEOUT)],
             )
         }
+        Trigger::WrongMonitor if state == SamplingState::ConsentPending => {
+            needs_consent(state, WEAR_SAMPLING_WRONG_MONITOR)
+        }
         Trigger::Forget if state == SamplingState::ConsentPending => transition(
             SamplingState::NeedsConsent,
             vec![
@@ -1110,6 +1090,9 @@ pub fn decide(state: SamplingState, trigger: Trigger, has_consent_record: bool) 
         Trigger::AuthFailed | Trigger::SessionClosed if state == SamplingState::Connecting => {
             needs_consent(state, WEAR_SAMPLING_TOKEN_INVALID)
         }
+        Trigger::WrongMonitor if state == SamplingState::Connecting => {
+            needs_consent(state, WEAR_SAMPLING_WRONG_MONITOR)
+        }
         Trigger::CaptureOk if state == SamplingState::Streaming => transition(state, vec![]),
         Trigger::CaptureFailed if state == SamplingState::Streaming => transition(
             SamplingState::Cooldown,
@@ -1117,6 +1100,9 @@ pub fn decide(state: SamplingState, trigger: Trigger, has_consent_record: bool) 
         ),
         Trigger::AuthFailed | Trigger::SessionClosed if state == SamplingState::Streaming => {
             needs_consent(state, WEAR_SAMPLING_TOKEN_INVALID)
+        }
+        Trigger::WrongMonitor if state == SamplingState::Streaming => {
+            needs_consent(state, WEAR_SAMPLING_WRONG_MONITOR)
         }
         Trigger::TransportFailed if state == SamplingState::Streaming => transition(
             SamplingState::Connecting,
@@ -1134,6 +1120,9 @@ pub fn decide(state: SamplingState, trigger: Trigger, has_consent_record: bool) 
         ),
         Trigger::AuthFailed | Trigger::SessionClosed if state == SamplingState::Cooldown => {
             needs_consent(state, WEAR_SAMPLING_TOKEN_INVALID)
+        }
+        Trigger::WrongMonitor if state == SamplingState::Cooldown => {
+            needs_consent(state, WEAR_SAMPLING_WRONG_MONITOR)
         }
         Trigger::CaptureFailed if state == SamplingState::Cooldown => transition(
             SamplingState::Cooldown,
@@ -1561,12 +1550,15 @@ mod tests {
             .active_sampling
             .capture_timeout = Duration::from_secs(5);
         let (deps, _updates, _) = service_deps(config, source, consent_path, cancel.clone());
-        let (_handle, join) = spawn_with_handle(deps);
+        let (handle, join) = spawn_with_handle(deps);
 
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(3)).await;
         tokio::task::yield_now().await;
         assert_eq!(captures_seen.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(handle.status().borrow().state, SamplingState::Cooldown);
         cancel.cancel();
         join.await.unwrap();
     }
@@ -1675,6 +1667,89 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn active_sampler_reconnect_backoff_doubles_then_caps_at_five_minutes() {
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        test_record(&consent_path);
+        let connects_seen = Arc::new(AtomicUsize::new(0));
+        let source = ServiceSource {
+            connects: Mutex::new(VecDeque::from([
+                Err(CaptureError::Transport("first".to_owned())),
+                Err(CaptureError::Transport("second".to_owned())),
+                Err(CaptureError::Transport("third".to_owned())),
+                Err(CaptureError::Transport("fourth".to_owned())),
+                Err(CaptureError::Transport("fifth".to_owned())),
+                Ok(test_stream()),
+            ])),
+            connects_seen: connects_seen.clone(),
+            captures: Mutex::new(VecDeque::new()),
+            captures_seen: Arc::new(AtomicUsize::new(0)),
+            closes_seen: Arc::new(AtomicUsize::new(0)),
+            grants_seen: Arc::new(AtomicUsize::new(0)),
+        };
+        let cancel = CancellationToken::new();
+        let (deps, _updates, _) = service_deps(
+            active_config(Duration::from_secs(10)),
+            source,
+            consent_path,
+            cancel.clone(),
+        );
+        let (_handle, join) = spawn_with_handle(deps);
+
+        tokio::task::yield_now().await;
+        for (before_deadline, expected_attempts, final_second) in [
+            (29, 1, 2),
+            (59, 2, 3),
+            (119, 3, 4),
+            (239, 4, 5),
+            (299, 5, 6),
+        ] {
+            tokio::time::advance(Duration::from_secs(before_deadline)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(connects_seen.load(Ordering::SeqCst), expected_attempts);
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(connects_seen.load(Ordering::SeqCst), final_second);
+        }
+        cancel.cancel();
+        join.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_sampler_persists_the_rotated_reattach_token() {
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        test_record(&consent_path);
+        let source = ServiceSource {
+            connects: Mutex::new(VecDeque::from([Ok(test_stream())])),
+            connects_seen: Arc::new(AtomicUsize::new(0)),
+            captures: Mutex::new(VecDeque::new()),
+            captures_seen: Arc::new(AtomicUsize::new(0)),
+            closes_seen: Arc::new(AtomicUsize::new(0)),
+            grants_seen: Arc::new(AtomicUsize::new(0)),
+        };
+        let cancel = CancellationToken::new();
+        let (deps, _updates, _) = service_deps(
+            active_config(Duration::from_secs(10)),
+            source,
+            consent_path.clone(),
+            cancel.clone(),
+        );
+        let (_handle, join) = spawn_with_handle(deps);
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            crate::screencast_consent::load(&consent_path, "oled")
+                .unwrap()
+                .record()
+                .token,
+            "rotated"
+        );
+        cancel.cancel();
+        join.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn active_sampler_opens_consent_only_for_explicit_enable_command() {
         let dir = tempdir().unwrap();
         let consent_path = dir.path().join("consent.json");
@@ -1708,6 +1783,41 @@ mod tests {
         assert!(consent_path.exists());
         cancel.cancel();
         join.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_sampler_rejects_a_second_enable_while_consent_is_pending() {
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        let config = active_config(Duration::from_secs(10));
+        let mut runtime = Runtime::new(&config, &consent_path);
+        let (status_tx, _) = watch::channel(initial_status(&config));
+        apply_trigger(&mut runtime, Trigger::GrantStarted, &status_tx);
+        let mut source = ServiceSource {
+            connects: Mutex::new(VecDeque::new()),
+            connects_seen: Arc::new(AtomicUsize::new(0)),
+            captures: Mutex::new(VecDeque::new()),
+            captures_seen: Arc::new(AtomicUsize::new(0)),
+            closes_seen: Arc::new(AtomicUsize::new(0)),
+            grants_seen: Arc::new(AtomicUsize::new(0)),
+        };
+        let (reply_tx, reply_rx) = oneshot::channel();
+
+        assert!(
+            !handle_command(
+                &mut runtime,
+                &mut source,
+                &consent_path,
+                SamplerCommand::Enable { reply: reply_tx },
+                &status_tx,
+                &CancellationToken::new(),
+            )
+            .await
+        );
+        assert_eq!(
+            reply_rx.await.unwrap(),
+            ConsentFlowStatus::Error(SamplerError::FlowAlreadyActive.to_string())
+        );
     }
 
     struct TransitionCase {
@@ -1808,6 +1918,14 @@ mod tests {
                 effects: vec![Effect::EnterUniform("wear_sampling_token_invalid")],
             },
             TransitionCase {
+                name: "wrong reattached monitor requires fresh consent with its distinct reason",
+                state: SamplingState::Connecting,
+                trigger: Trigger::WrongMonitor,
+                has_consent_record: true,
+                next: SamplingState::NeedsConsent,
+                effects: vec![Effect::EnterUniform("wear_sampling_wrong_monitor")],
+            },
+            TransitionCase {
                 name: "stream capture failure opens the breaker",
                 state: SamplingState::Streaming,
                 trigger: Trigger::CaptureFailed,
@@ -1822,6 +1940,14 @@ mod tests {
                 has_consent_record: true,
                 next: SamplingState::NeedsConsent,
                 effects: vec![Effect::EnterUniform("wear_sampling_token_invalid")],
+            },
+            TransitionCase {
+                name: "wrong streaming monitor requires fresh consent with its distinct reason",
+                state: SamplingState::Streaming,
+                trigger: Trigger::WrongMonitor,
+                has_consent_record: true,
+                next: SamplingState::NeedsConsent,
+                effects: vec![Effect::EnterUniform("wear_sampling_wrong_monitor")],
             },
             TransitionCase {
                 name: "stream transport failure reconnects without discarding consent",

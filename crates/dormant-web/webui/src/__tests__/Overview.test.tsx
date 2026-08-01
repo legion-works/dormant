@@ -73,6 +73,8 @@ vi.mock("../api/client", () => ({
   getOperations: vi.fn().mockResolvedValue({ exercise_in_flight: [], emergency_wake_in_flight: false }),
   getWear: vi.fn().mockResolvedValue({ displays: [] }),
   getWearDetail: vi.fn(),
+  getWearSamplingStatus: vi.fn().mockResolvedValue({ status: "granted" }),
+  postWearSamplingEnable: vi.fn(),
   getRecentEvents: vi.fn().mockResolvedValue({ events: [] }),
   postBlank: vi.fn().mockResolvedValue(undefined),
   postWake: vi.fn().mockResolvedValue(undefined),

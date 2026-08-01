@@ -128,6 +128,9 @@ pub struct WebStateInner {
     /// duration.
     pub(crate) pair_lock: Arc<Mutex<()>>,
 
+    /// Web-scoped single-flight guard for the active-sampling consent flow.
+    pub(crate) wear_sampling_lock: Arc<Mutex<()>>,
+
     /// Injectable seam for the pairing wizard's TV-connect step —
     /// production wiring is [`RealPairConnect`]; pairing tests inject
     /// `dormant_displays::test_support::FakePairConnect` (feature
@@ -305,6 +308,7 @@ impl WebStateInner {
             reload_timeout: params.reload_timeout,
             pairing: Mutex::new(HashMap::new()),
             pair_lock: Arc::new(Mutex::new(())),
+            wear_sampling_lock: Arc::new(Mutex::new(())),
             pair_connect,
             upsert_token,
             emergency_wake_lock: Arc::new(Mutex::new(())),

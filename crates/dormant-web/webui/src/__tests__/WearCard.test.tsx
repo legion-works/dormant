@@ -9,7 +9,7 @@
  * instead of mocking the API client / WS layer.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import WearCard from "../app/components/WearCard";
 import { liveStateFixture } from "./fixtures/live-state";
 import type { WearSummary } from "../api/types";
@@ -17,6 +17,9 @@ import type { WearSummary } from "../api/types";
 const mocks = vi.hoisted(() => ({
   selectDisplay: vi.fn(),
   state: { current: null as unknown },
+  getConfig: vi.fn(),
+  getWearSamplingStatus: vi.fn(),
+  postWearSamplingEnable: vi.fn(),
 }));
 
 vi.mock("../app/hooks/useLiveState", async () => {
@@ -26,10 +29,18 @@ vi.mock("../app/hooks/useLiveState", async () => {
   };
 });
 
+vi.mock("../api/client", () => ({
+  getConfig: mocks.getConfig,
+  getWearSamplingStatus: mocks.getWearSamplingStatus,
+  postWearSamplingEnable: mocks.postWearSamplingEnable,
+}));
+
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
   mocks.state.current = null;
+  mocks.getConfig.mockResolvedValue({ inventory: { wear: { active_sampling: { enabled: false } } } });
+  mocks.getWearSamplingStatus.mockResolvedValue({ status: "granted" });
   window.location.hash = "";
 });
 
@@ -51,6 +62,30 @@ function setState(overrides: Parameters<typeof liveStateFixture>[0]) {
 }
 
 describe("WearCard", () => {
+  it("shows sampling state, age, and the consent action only for enabled needs-consent configuration", async () => {
+    mocks.getConfig.mockResolvedValue({ inventory: { wear: { active_sampling: { enabled: true } } } });
+    mocks.getWearSamplingStatus.mockResolvedValue({ status: "error", reason: "wear_sampling_needs_consent" });
+    mocks.postWearSamplingEnable.mockResolvedValue({ status: "awaiting_consent" });
+    setState({ wear: { displays: [summary({ last_sample_at_epoch_s: Math.floor(Date.now() / 1000) - 90 })] } });
+
+    render(<WearCard />);
+
+    await waitFor(() => expect(screen.getByText("Needs consent")).toBeInTheDocument());
+    expect(screen.getByText("Last sample: 1m ago")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Enable active sampling" }));
+    await waitFor(() => expect(mocks.postWearSamplingEnable).toHaveBeenCalledOnce());
+  });
+
+  it("shows degraded reasons and terminal consent states without an Enable action", async () => {
+    mocks.getConfig.mockResolvedValue({ inventory: { wear: { active_sampling: { enabled: true } } } });
+    mocks.getWearSamplingStatus.mockResolvedValue({ status: "denied" });
+    setState({ wear: { displays: [summary()] } });
+
+    render(<WearCard />);
+
+    await waitFor(() => expect(screen.getByText("Consent denied")).toBeInTheDocument());
+    expect(screen.queryByRole("button", { name: "Enable active sampling" })).not.toBeInTheDocument();
+  });
   it("renders the title, honesty-rule caption (no spatial attribution), and per-display summary", () => {
     setState({ wear: { displays: [summary()] } });
 

@@ -75,6 +75,8 @@ pub(crate) const ACKNOWLEDGED_WEAK_ROUTES: &[&str] = &[
     "/api/doctor",
     "/api/emergency-wake",
     "/api/doctor/exercise/:display",
+    "/api/wear/sampling/enable",
+    "/api/wear/sampling/disable",
 ];
 
 /// Reject any request whose `Host` header is not in the allow-list.

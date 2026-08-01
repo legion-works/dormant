@@ -13,3 +13,4 @@ pub(crate) mod operations;
 pub(crate) mod pair;
 pub(crate) mod star_nudge;
 pub(crate) mod wear;
+pub(crate) mod wear_sampling;

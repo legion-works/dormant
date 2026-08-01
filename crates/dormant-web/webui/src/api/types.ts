@@ -458,7 +458,7 @@ export interface ConfigInventory {
   daemon: Record<string, unknown>;
   /** rust: config/schema.rs WearConfig — the `[wear]` TOML section. Optional
    * in fixtures/older payloads; the WearSection form treats absence as `{}`. */
-  wear?: Record<string, unknown>;
+  wear?: WearConfig;
   /** rust: config/schema.rs NotificationsConfig — the `[notifications]`
    * TOML section. Optional in fixtures/older payloads, mirroring `wear`;
    * the NotificationsSection form treats absence as `{}`. */
@@ -491,6 +491,23 @@ export interface ConfigInventory {
   zones: Record<string, ZoneConfig>;
   displays: Record<string, DisplayConfig>;
   rules: Record<string, RuleConfig>;
+}
+
+/** rust: config/schema.rs ActiveSamplingConfig — `[wear.active_sampling]`. */
+export interface ActiveSamplingConfig {
+  enabled: boolean;
+  sampled_display?: string | null;
+  stream_mode: "warm" | "per-tick";
+  capture_timeout: string;
+  failure_threshold: number;
+  circuit_reset_after: string;
+}
+
+/** rust: config/schema.rs WearConfig — the `[wear]` TOML section. */
+export interface WearConfig {
+  enabled?: boolean;
+  active_sampling?: ActiveSamplingConfig;
+  [key: string]: unknown;
 }
 
 /** rust: config/schema.rs CoordinationConfig
@@ -795,6 +812,12 @@ export interface PairAccepted {
 export interface PairStatus {
   state: "pairing" | "paired" | "timeout" | "error";
   detail?: string | null;
+}
+
+/** rust: ipc_proto.rs WearSamplingStatus — token-free sampling flow status. */
+export interface WearSamplingStatus {
+  status: "awaiting_consent" | "granted" | "denied" | "timed_out" | "error";
+  reason?: string;
 }
 
 /**

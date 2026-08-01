@@ -22,9 +22,11 @@
  *     window in N days".
  *   - otherwise → success border + "compensation window healthy".
  */
+import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "../nav";
 import { useLiveState } from "../hooks/useLiveState";
-import type { WearSummary } from "../../api/types";
+import { getConfig, getWearSamplingStatus, postWearSamplingEnable } from "../../api/client";
+import type { WearSamplingStatus, WearSummary } from "../../api/types";
 import "./WearCard.css";
 
 type Tone = "success" | "warning" | "error";
@@ -64,6 +66,8 @@ function WearRow({ summary, tone, onOpenDetail }: WearRowProps) {
 export default function WearCard() {
   const { wear, wearError, selectDisplay } = useLiveState();
   const navigate = useNavigate();
+  const [sampling, setSampling] = useState<WearSamplingStatus | null>(null);
+  const [samplingEnabled, setSamplingEnabled] = useState(false);
 
   const handleOpenDetail = (displayName: string) => {
     selectDisplay(displayName);
@@ -71,11 +75,58 @@ export default function WearCard() {
   };
 
   const displays = wear?.displays ?? null;
+  const sampledDisplay = useMemo(() => wear?.displays[0] ?? null, [wear]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void Promise.all([getConfig(), getWearSamplingStatus()]).then(([config, status]) => {
+      if (cancelled) return;
+      setSamplingEnabled(config.inventory.wear?.active_sampling?.enabled === true);
+      setSampling(status);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    if (sampling?.status !== "awaiting_consent") return undefined;
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void getWearSamplingStatus().then((status) => {
+        if (!cancelled) setSampling(status);
+      }).catch(() => {});
+    }, 1000);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [sampling]);
+
+  const needsConsent = sampling?.status === "error" && sampling.reason === "wear_sampling_needs_consent";
+  const samplingLabel = needsConsent ? "Needs consent"
+    : sampling?.status === "awaiting_consent" ? "Awaiting consent"
+      : sampling?.status === "granted" ? "Granted"
+        : sampling?.status === "denied" ? "Consent denied"
+          : sampling?.status === "timed_out" ? "Consent timed out"
+            : sampling?.status === "error" ? "Sampling degraded" : "Sampling unavailable";
+  const age = sampledDisplay?.last_sample_at_epoch_s;
+  const ageText = age === undefined || age === null ? "Last sample: unavailable"
+    : `Last sample: ${Math.max(0, Math.floor((Date.now() / 1000 - age) / 60))}m ago`;
+
+  const enableSampling = async () => {
+    setSampling(await postWearSamplingEnable());
+  };
 
   return (
     <div className="wear-card">
       <div className="wear-card__header">Panel exposure</div>
       <div className="wear-card__caption">on-time, sampling, and compensation status</div>
+      <div className="wear-card__sampling">
+        <span className="wear-card__sampling-state">{samplingLabel}</span>
+        <span>{ageText}</span>
+        {sampling?.status === "error" && !needsConsent && sampling.reason && (
+          <span className="wear-card__sampling-reason">{sampling.reason}</span>
+        )}
+        {samplingEnabled && needsConsent && (
+          <button type="button" onClick={() => { void enableSampling(); }}>Enable active sampling</button>
+        )}
+      </div>
 
       {wearError && <div className="wear-card__error">Wear data unavailable: {wearError}</div>}
 

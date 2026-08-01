@@ -1722,6 +1722,79 @@ mod tests {
         )
     }
 
+    #[test]
+    fn streaming_entry_emits_started_once() {
+        let dir = tempdir().unwrap();
+        let config = active_config(Duration::from_secs(10));
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let mut runtime = Runtime::new(&config, &dir.path().join("consent.json"));
+        runtime.event_tx = Some(event_tx);
+        let (status_tx, _) = watch::channel(initial_status(&config));
+
+        transition_to(&mut runtime, SamplingState::Streaming, None, &status_tx);
+        publish_status(&status_tx, &runtime, None, None);
+
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(ControlMsg::PublishDaemonEvent(
+                DaemonEvent::WearSamplingStarted
+            ))
+        ));
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn degradation_events_latch_and_rearm_after_streaming() {
+        let dir = tempdir().unwrap();
+        let config = active_config(Duration::from_secs(10));
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let mut runtime = Runtime::new(&config, &dir.path().join("consent.json"));
+        runtime.event_tx = Some(event_tx);
+        let (status_tx, _) = watch::channel(SamplerStatus {
+            state: SamplingState::Disabled,
+            last_capture: None,
+            uniform_reason: None,
+            bound_display: None,
+            granted_at: None,
+        });
+
+        transition_to(
+            &mut runtime,
+            SamplingState::NeedsConsent,
+            Some(WEAR_SAMPLING_NEEDS_CONSENT),
+            &status_tx,
+        );
+        publish_status(
+            &status_tx,
+            &runtime,
+            Some(WEAR_SAMPLING_NEEDS_CONSENT),
+            None,
+        );
+        transition_to(&mut runtime, SamplingState::Streaming, None, &status_tx);
+        transition_to(
+            &mut runtime,
+            SamplingState::Cooldown,
+            Some(WEAR_SAMPLING_COOLDOWN),
+            &status_tx,
+        );
+
+        let reasons: Vec<String> = std::iter::from_fn(|| event_rx.try_recv().ok())
+            .filter_map(|event| match event {
+                ControlMsg::PublishDaemonEvent(DaemonEvent::WearSamplingDegraded { reason }) => {
+                    Some(reason)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reasons,
+            vec![
+                WEAR_SAMPLING_NEEDS_CONSENT.to_owned(),
+                WEAR_SAMPLING_COOLDOWN.to_owned()
+            ]
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn active_sampler_cadence_runs_once_per_interval_and_replaces_latest() {
         let dir = tempdir().unwrap();

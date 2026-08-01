@@ -237,16 +237,10 @@ async fn run(mut deps: WearTrackerDeps) {
                     boundary,
                     cfg.wear.sample_interval.saturating_mul(2),
                 );
-                let sample_fallback = deps
-                    .sampler_status_rx
-                    .borrow()
-                    .as_ref()
-                    .and_then(|status| {
-                        (status.uniform_reason
-                            == Some(crate::active_sampler::WEAR_SAMPLING_SUSPENDED))
-                        .then_some(SampleFallbackTag::Suspended)
-                    })
-                    .or(sample_fallback);
+                let sample_fallback = sampler_status_fallback(
+                    deps.sampler_status_rx.borrow().as_ref(),
+                )
+                .or(sample_fallback);
 
                 #[cfg(feature = "render")]
                 let exposures = collect_exposure_slices(
@@ -815,6 +809,15 @@ fn filter_sample_for_tick(
     } else {
         (None, Some(SampleFallbackTag::Stale))
     }
+}
+
+fn sampler_status_fallback(
+    status: Option<&crate::active_sampler::SamplerStatus>,
+) -> Option<SampleFallbackTag> {
+    status.and_then(|status| {
+        (status.uniform_reason == Some(crate::active_sampler::WEAR_SAMPLING_SUSPENDED))
+            .then_some(SampleFallbackTag::Suspended)
+    })
 }
 
 /// A captured frame is valid only while the current state still permits it.
@@ -2053,6 +2056,61 @@ mod tests {
         assert_eq!(log.matches("wear_sampled_luma_fallback").count(), 1);
         assert!(log.contains("ledger_grid_rows"), "{log}");
         assert!(log.contains("ledger_grid_cols"), "{log}");
+    }
+
+    #[test]
+    fn suspended_sampler_status_forces_uniform_attribution_with_suspended_tag() {
+        let display = DisplayId("mon".into());
+        let mut state = TrackerState::default();
+        state
+            .ledgers
+            .insert(display.clone(), fresh_ledger(&display, 0));
+        let mut cfg = WearConfig::default();
+        cfg.active_sampling.enabled = true;
+        cfg.active_sampling.sampled_display = Some(display.0.clone());
+        let (status_tx, status_rx) = watch::channel(None);
+        status_tx.send_replace(Some(crate::active_sampler::SamplerStatus {
+            state: crate::active_sampler::SamplingState::Suspended,
+            last_capture: None,
+            uniform_reason: Some(crate::active_sampler::WEAR_SAMPLING_SUSPENDED),
+            bound_display: Some(display.0.clone()),
+            granted_at: None,
+        }));
+        let fallback = sampler_status_fallback(status_rx.borrow().as_ref());
+        let mut samples = HashMap::new();
+        samples.insert(
+            display.clone(),
+            Some(PanelState {
+                power: None,
+                brightness: Some(100),
+            }),
+        );
+
+        let actions = tick(
+            &mut state,
+            &snapshot_with(&display, "active", None),
+            &samples,
+            &cfg,
+            60,
+            None,
+            fallback,
+            &HashMap::new(),
+        );
+
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            TrackerAction::UniformSelection {
+                fallback: Some(SampleFallbackTag::Suspended),
+                ..
+            }
+        )));
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            TrackerAction::Attribute {
+                mode: WearAttributionMode::Uniform,
+                ..
+            }
+        )));
     }
 
     #[test]

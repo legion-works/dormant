@@ -390,14 +390,16 @@ async fn handle_status(
     active_sampler: Option<&ActiveSamplerHandle>,
 ) -> IpcResponse {
     match request_snapshot(ctl_tx).await {
-        Some(snap) => {
-            let mut response = IpcResponse::ok(Some(snap));
-            response.wear_sampling_status = active_sampler.map(|sampler| {
+        Some(mut snap) => {
+            let status = active_sampler.map(|sampler| {
                 sampler
                     .status()
                     .borrow()
                     .redacted(dormant_core::types::Tick::now())
             });
+            snap.wear_sampling_status.clone_from(&status);
+            let mut response = IpcResponse::ok(Some(snap));
+            response.wear_sampling_status = status;
             response
         }
         None => IpcResponse::error("engine not available"),

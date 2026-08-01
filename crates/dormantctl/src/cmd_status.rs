@@ -340,6 +340,20 @@ mod tests {
     }
 
     #[test]
+    fn status_renders_unavailable_sampling_age() {
+        let status = dormant_core::wear::WearSamplingStatus {
+            state: dormant_core::wear::WearSamplingState::Streaming,
+            last_capture_age_s: None,
+            uniform_reason: None,
+            bound_display: Some("desk".to_owned()),
+            granted_at_epoch_s: Some(1_700_000_000),
+        };
+
+        let table = render_table_with_sampling(&canned_snapshot(), Some(&status));
+        assert!(table.contains("sampling: streaming (age: unavailable)"));
+    }
+
+    #[test]
     fn status_renders_degraded_sampling_reason() {
         let status = dormant_core::wear::WearSamplingStatus {
             state: dormant_core::wear::WearSamplingState::Suspended,

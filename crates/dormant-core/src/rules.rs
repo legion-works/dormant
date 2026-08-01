@@ -4845,6 +4845,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn old_wear_snapshot_without_attribution_mode_deserializes_as_uniform() {
+        let old =
+            r#"{"event":"wear_snapshot","display":"desk","total_on_hours":1.5,"sample_count":3}"#;
+        let event: DaemonEvent = serde_json::from_str(old).unwrap();
+        assert!(matches!(
+            event,
+            DaemonEvent::WearSnapshot {
+                wear_attribution_mode: crate::wear::WearAttributionMode::Uniform,
+                ..
+            }
+        ));
+    }
+
     /// The daemon must never construct `DaemonEvent::Unknown` — the ctl
     /// handler debug-asserts this at the publish seam so a bug that tries
     /// fails loudly in debug builds instead of silently shipping a

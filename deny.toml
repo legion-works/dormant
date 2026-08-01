@@ -36,6 +36,7 @@ crate = "libmpv2-sys"
 allow = ["LGPL-2.1"]
 
 [[licenses.exceptions]]
+# Apache-2.0 superset with binary-attribution waiver, no copyleft; pulled in by pipewire→system-deps→cfg-expr.
 crate = "target-lexicon"
 allow = ["Apache-2.0 WITH LLVM-exception"]
 

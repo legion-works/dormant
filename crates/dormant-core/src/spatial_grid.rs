@@ -31,6 +31,10 @@ pub enum GridError {
         /// Requested output columns.
         cols: u16,
     },
+    /// A source frame was too small to populate every output cell.
+    EmptyCell,
+    /// Reduction produced a grid that failed its value invariants.
+    InvalidGrid,
 }
 
 /// Reduce a packed RGBA8 frame to a 16×9 linear-light luma grid.
@@ -87,7 +91,7 @@ pub fn reduce_rgba8_to_luma_grid(
 
     let cell_count = usize::from(rows) * usize::from(cols);
     let mut sums = vec![0.0_f64; cell_count];
-    let mut counts = vec![0.0_f64; cell_count];
+    let mut counts = vec![0_usize; cell_count];
     let width_usize = usize::try_from(width).map_err(|_| GridError::InvalidDimensions)?;
     let height_usize = usize::try_from(height).map_err(|_| GridError::InvalidDimensions)?;
     for y in 0..height_usize {
@@ -112,15 +116,20 @@ pub fn reduce_rgba8_to_luma_grid(
                     + 0.7152 * srgb_to_linear(green)
                     + 0.0722 * srgb_to_linear(blue),
             );
-            counts[cell] += 1.0;
+            counts[cell] += 1;
         }
     }
     let cells = sums
         .into_iter()
         .zip(counts)
-        .map(|(sum, count)| (sum / count) as f32)
-        .collect();
-    LumaGrid::new(cells).ok_or(GridError::InvalidDimensions)
+        .map(|(sum, count)| {
+            if count == 0 {
+                return Err(GridError::EmptyCell);
+            }
+            Ok((sum / count as f64) as f32)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    LumaGrid::new(cells).ok_or(GridError::InvalidGrid)
 }
 
 /// A fixed-size, row-major luma grid.
@@ -322,7 +331,7 @@ mod tests {
                 let offset = row * 68 + col * 4;
                 rgba[offset..offset + 4].copy_from_slice(&[255, 255, 255, 255]);
             }
-            rgba[row * 68 + 64..row * 68 + 68].fill(255);
+            rgba[row * 68 + 64..row * 68 + 68].fill(0);
         }
         let grid = reduce_rgba8_to_luma_grid(&rgba, 16, 9, 68, 9, 16).unwrap();
         assert!(grid.cells.iter().all(|value| (*value - 1.0).abs() < 1e-6));
@@ -339,6 +348,18 @@ mod tests {
         }
         let grid = reduce_rgba8_to_luma_grid(&rgba, 17, 10, 17 * 4, 9, 16).unwrap();
         assert!(grid.cells.iter().all(|value| (*value - 1.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn reduce_rgba8_averages_linear_luma_not_gamma_channels() {
+        let mut rgba = vec![0_u8; 32 * 18 * 4];
+        for channel in rgba.chunks_exact_mut(4) {
+            channel[3] = 255;
+        }
+        rgba[3] = 255;
+        rgba[0..3].fill(255);
+        let grid = reduce_rgba8_to_luma_grid(&rgba, 32, 18, 128, 9, 16).unwrap();
+        assert!((grid.cells[0] - 0.25).abs() < 1e-6);
     }
 
     #[test]

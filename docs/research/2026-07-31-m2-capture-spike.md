@@ -207,12 +207,10 @@ source buffer until KWin changes its output-source size advertisement.
 
 ## Q4 — idle stream cost
 
-**Incomplete / residual-risk.** Closed CPU is measured above; open-idle CPU was deliberately not
-measured to avoid another consent interaction. The token reattach path is proven, so the daemon
-prototype can measure this without a new user consent once it persists the token. No process was
-left running by this spike.
+**Measured.** The daemon-identity gate below covers both closed and warm-paused idle cost over
+30-minute windows.
 
-### 2026-08-01 M2 active-sampling daemon-identity premise gate — **STOP**
+### 2026-08-01 M2 active-sampling daemon-identity premise gate — **PASS**
 
 `dormant.service` was verified as the active graphical-user service before the probe: its unit
 file was `/home/icetea/.config/systemd/user/dormant.service`, its `ExecStart` was
@@ -220,19 +218,34 @@ file was `/home/icetea/.config/systemd/user/dormant.service`, its `ExecStart` wa
 The temporary probe was built into that exact executable, installed at that exact path, and run
 only through `systemctl --user restart dormant.service`.
 
-The initial `CreateSession` failed before any portal consent dialog appeared. The service journal
-recorded the following literal error on every attempted start:
+The first corrected start minted a restore token after one consent dialog. Restarting the same unit
+then logged `token_reattached`, `restore_token_saved`, and `pipewire_remote_opened` without another
+dialog. `identity_reattach = pass` under the real daemon identity.
 
-```
-event="active_sampling_probe_failed" error=org.freedesktop.DBus.Error.NoReply: Remote peer disconnected
-```
+The earlier `NoReply` result was a probe bug, not an identity failure. Its malformed
+`CreateSession` request omitted `session_handle_token`, triggering the xdg-desktop-portal
+`xdp-session.c:296` assertion and three portal coredumps. Supplying unique request and session
+tokens fixed the request. A second probe bug dropped the D-Bus connection after opening the
+PipeWire remote, which destroyed the portal session and produced `no target node available` when
+the stream activated. Retaining that connection for the stream lifetime fixed activation.
 
-Therefore `identity_reattach = fail`: no restore token was minted under the daemon identity, so a
-headless reattach cannot be claimed. The probe was removed, the production binary was rebuilt and
-reinstalled, and `dormant.service` was restarted healthy. Closed-idle CPU, warm-paused CPU,
-per-process deltas, and pause-to-resume p95 were not measured; selecting `warm` or `per-tick` is
-blocked until the daemon's portal identity/lifecycle is re-scoped. The earlier successful token
-probe remains evidence only for its probe-process identity, not this service identity.
+Both CPU windows used the same KDE session and stable process IDs (`kwin_wayland` 10602,
+`pipewire` 1170) with `USER_HZ=100`:
+
+| State | Duration | `kwin_wayland` ticks / CPU | `pipewire` ticks / CPU |
+| --- | ---: | ---: | ---: |
+| Closed | 1806.29 s | 12377→15259 / 1.596% | 1831→2009 / 0.099% |
+| Warm, stream paused | 1801.71 s | 17410→20125 / 1.507% | 2117→2281 / 0.091% |
+| Warm − closed | — | −0.089 percentage points | −0.008 percentage points |
+
+The closed window entered grace several times but never reached `staged` or `blanked`. The warm
+window also had no `staged` or `blanked` transition; `dormantctl status` reported daemon blanking
+paused after the restart. The display and compositor therefore stayed active in both windows,
+which preserves the comparison despite the different daemon pause flag.
+
+Thirty pause→resume→first-frame samples produced p95 **14.377 ms** (minimum 5.627 ms, maximum
+172.557 ms; nearest-rank p95). Neither process exceeded the `> 0.5%` warm-idle delta threshold, so
+the default is **`warm`**. Both stream modes remain available.
 
 ## Q5 — composited output and brightness correlation
 

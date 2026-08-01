@@ -374,6 +374,7 @@ mod tests {
                 web_bind: bind,
                 cancel: cancel.clone(),
                 reload_timeout: Duration::from_secs(10),
+                wear_sampling_rx: tokio::sync::watch::channel(None).1,
             },
         ));
 
@@ -471,6 +472,10 @@ mod tests {
     /// promptly.  After close, the handler's broadcast receiver is dropped,
     /// so `event_tx.receiver_count()` drops within a short timeout.
     #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the route fixture keeps socket setup and cancellation observable together"
+    )]
     async fn idle_client_close_exits_handler() {
         let cancel = CancellationToken::new();
         let (ctl_tx, mut ctl_rx) = mpsc::channel::<ControlMsg>(16);
@@ -524,6 +529,7 @@ mod tests {
                 web_bind: bind,
                 cancel: cancel.clone(),
                 reload_timeout: Duration::from_secs(10),
+                wear_sampling_rx: tokio::sync::watch::channel(None).1,
             },
         ));
 
@@ -593,6 +599,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the route fixture keeps broadcast lag setup and client observation together"
+    )]
     async fn lagged_emits_stream_lagged_frame() {
         let cancel = CancellationToken::new();
         let (ctl_tx, mut ctl_rx) = mpsc::channel::<ControlMsg>(16);
@@ -646,6 +656,7 @@ mod tests {
                 web_bind: bind,
                 cancel: cancel.clone(),
                 reload_timeout: Duration::from_secs(10),
+                wear_sampling_rx: tokio::sync::watch::channel(None).1,
             },
         ));
 
@@ -765,6 +776,7 @@ mod tests {
                 web_bind: bind,
                 cancel: cancel.clone(),
                 reload_timeout: Duration::from_secs(10),
+                wear_sampling_rx: tokio::sync::watch::channel(None).1,
             },
         ));
 
@@ -935,6 +947,7 @@ mod tests {
                 web_bind: bind,
                 cancel: cancel.clone(),
                 reload_timeout: Duration::from_secs(10),
+                wear_sampling_rx: tokio::sync::watch::channel(None).1,
             },
         ));
 
@@ -1111,6 +1124,7 @@ mod tests {
                 web_bind: bind,
                 cancel: cancel.clone(),
                 reload_timeout: Duration::from_secs(10),
+                wear_sampling_rx: tokio::sync::watch::channel(None).1,
             },
         ));
 
@@ -1278,6 +1292,7 @@ mod tests {
                 web_bind: bind,
                 cancel: cancel.clone(),
                 reload_timeout: Duration::from_secs(10),
+                wear_sampling_rx: tokio::sync::watch::channel(None).1,
             },
         ));
 
@@ -1513,6 +1528,7 @@ mod tests {
                 web_bind: bind,
                 cancel: cancel.clone(),
                 reload_timeout: Duration::from_secs(10),
+                wear_sampling_rx: tokio::sync::watch::channel(None).1,
             },
         ));
 

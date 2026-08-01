@@ -65,8 +65,8 @@ use dormant_core::traits::{CommandSink, PanelState};
 use dormant_core::types::ScreensaverItemReport;
 use dormant_core::types::{DisplayId, StageKind, Tick};
 use dormant_core::wear::{
-    PanelType, WEAR_SCHEMA_VERSION, WearHandle, WearIdentity, WearLedger, advisory_active,
-    brightness_norm, hours_since_effective_dwell, sanitize_identity_key,
+    PanelType, WEAR_SCHEMA_VERSION, WearAttributionMode, WearHandle, WearIdentity, WearLedger,
+    advisory_active, brightness_norm, hours_since_effective_dwell, sanitize_identity_key,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
@@ -113,6 +113,8 @@ pub struct WearTrackerDeps {
     pub handle: WearHandle,
     /// Latest privacy-preserving screen sample, owned by the sampler task.
     pub latest_grid: LatestGrid,
+    /// Latest sampler lifecycle state, used to tag uniform fallback episodes.
+    pub sampler_status_rx: watch::Receiver<Option<crate::active_sampler::SamplerStatus>>,
     /// Latest heat snapshots exposed to render sessions, when rendering is enabled.
     #[cfg(feature = "render")]
     pub heat_snapshots: dormant_render::HeatSnapshotHandle,
@@ -235,6 +237,16 @@ async fn run(mut deps: WearTrackerDeps) {
                     boundary,
                     cfg.wear.sample_interval.saturating_mul(2),
                 );
+                let sample_fallback = deps
+                    .sampler_status_rx
+                    .borrow()
+                    .as_ref()
+                    .and_then(|status| {
+                        (status.uniform_reason
+                            == Some(crate::active_sampler::WEAR_SAMPLING_SUSPENDED))
+                        .then_some(SampleFallbackTag::Suspended)
+                    })
+                    .or(sample_fallback);
 
                 #[cfg(feature = "render")]
                 let exposures = collect_exposure_slices(
@@ -480,13 +492,14 @@ async fn apply_actions(
                 display,
                 total_on_hours,
                 sample_count,
-                attribution_mode: _,
+                attribution_mode,
             } => {
                 let _ = ctl_tx
                     .send(ControlMsg::PublishDaemonEvent(DaemonEvent::WearSnapshot {
                         display,
                         total_on_hours,
                         sample_count,
+                        wear_attribution_mode: attribution_mode,
                     }))
                     .await;
             }
@@ -770,16 +783,6 @@ enum TrackerAction {
     Seed { display: DisplayId },
 }
 
-/// Attribution method used for a tracker tick's published observation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WearAttributionMode {
-    /// The ledger received a uniform brightness-weighted attribution, including
-    /// the staged-screensaver journal path.
-    Uniform,
-    /// The ledger received a spatially sampled, luma-weighted attribution.
-    Sampled,
-}
-
 /// Reason a sample was filtered before entering pure tracker logic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SampleFallbackTag {
@@ -787,6 +790,8 @@ pub enum SampleFallbackTag {
     Missing,
     /// The newest published grid exceeds the monotonic freshness bound.
     Stale,
+    /// Sampling is suspended and has tagged uniform attribution explicitly.
+    Suspended,
 }
 
 /// Phase-safe source selection for active and grace windows.
@@ -1514,6 +1519,7 @@ mod tests {
             pending_reload: None,
             rollback: None,
             kvm: None,
+            wear_sampling_status: None,
         }
     }
 
@@ -2289,6 +2295,7 @@ mod tests {
         let executors = fake_executors(&[(&display, None)]);
         let (_executors_tx, executors_rx) = watch::channel(Arc::new(executors));
         let (ctl_tx, mut ctl_rx) = mpsc::channel(8);
+        let (_sampler_status_tx, sampler_status_rx) = watch::channel(None);
         let wear_handle: WearHandle = Arc::new(std::sync::RwLock::new(HashMap::new()));
         let cancel = CancellationToken::new();
 
@@ -2310,6 +2317,7 @@ mod tests {
             executors_rx,
             handle: wear_handle,
             latest_grid: crate::active_sampler::new_latest_grid(),
+            sampler_status_rx,
             #[cfg(feature = "render")]
             heat_snapshots: Arc::new(std::sync::RwLock::new(HashMap::new())),
             cancel: cancel.clone(),

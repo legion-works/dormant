@@ -3,9 +3,11 @@
 use async_trait::async_trait;
 use dormant_core::config::schema::{ActiveSamplingConfig, Config, StreamMode};
 use dormant_core::ipc_proto::WearSamplingStatus;
+use dormant_core::rules::{ControlMsg, DaemonEvent};
 use dormant_core::spatial_grid::LumaGrid;
 use dormant_core::state_machine::Phase;
 use dormant_core::types::Tick;
+use dormant_core::wear::{WearSamplingState, WearSamplingStatus as RedactedWearSamplingStatus};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -64,6 +66,31 @@ pub struct SamplerStatus {
     pub bound_display: Option<String>,
     /// Grant wall-clock timestamp, exposed without any portal identifiers.
     pub granted_at: Option<OffsetDateTime>,
+}
+
+impl SamplerStatus {
+    /// Convert daemon-local monotonic state into the portable redacted wire view.
+    #[must_use]
+    pub fn redacted(&self, now: Tick) -> RedactedWearSamplingStatus {
+        let state = match self.state {
+            SamplingState::Disabled => WearSamplingState::Disabled,
+            SamplingState::NeedsConsent => WearSamplingState::NeedsConsent,
+            SamplingState::ConsentPending => WearSamplingState::ConsentPending,
+            SamplingState::Connecting => WearSamplingState::Connecting,
+            SamplingState::Streaming => WearSamplingState::Streaming,
+            SamplingState::Suspended => WearSamplingState::Suspended,
+            SamplingState::Cooldown => WearSamplingState::Cooldown,
+        };
+        RedactedWearSamplingStatus {
+            state,
+            last_capture_age_s: self
+                .last_capture
+                .map(|capture| now.0.saturating_duration_since(capture.0).as_secs()),
+            uniform_reason: self.uniform_reason.map(str::to_owned),
+            bound_display: self.bound_display.clone(),
+            granted_at_epoch_s: self.granted_at.map(OffsetDateTime::unix_timestamp),
+        }
+    }
 }
 
 /// Sender and status subscription for the daemon's single sampler service.
@@ -168,6 +195,8 @@ pub struct ActiveSamplerDeps {
     pub cancel: CancellationToken,
     /// Environment lookup used to verify that a graphical session exists.
     pub env_reader: fn(&str) -> Option<String>,
+    /// Front control channel used for sampler lifecycle events.
+    pub event_tx: Option<mpsc::Sender<ControlMsg>>,
 }
 
 pub(crate) fn production_env_reader(name: &str) -> Option<String> {
@@ -303,6 +332,7 @@ struct Runtime {
     reconnect_backoff: Duration,
     episode_warned: std::collections::HashSet<String>,
     pending_stream_reset: bool,
+    event_tx: Option<mpsc::Sender<ControlMsg>>,
 }
 
 impl Runtime {
@@ -342,6 +372,7 @@ impl Runtime {
             reconnect_backoff: Duration::from_secs(30),
             episode_warned: std::collections::HashSet::new(),
             pending_stream_reset: false,
+            event_tx: None,
         }
     }
 
@@ -733,6 +764,22 @@ fn publish_status(
     last_capture: Option<Tick>,
 ) {
     let current = status_tx.borrow().clone();
+    if let Some(event_tx) = &runtime.event_tx {
+        if current.state != SamplingState::Streaming && runtime.state == SamplingState::Streaming {
+            let _ = event_tx.try_send(ControlMsg::PublishDaemonEvent(
+                DaemonEvent::WearSamplingStarted,
+            ));
+        }
+        if current.uniform_reason.is_none()
+            && let Some(reason) = reason
+        {
+            let _ = event_tx.try_send(ControlMsg::PublishDaemonEvent(
+                DaemonEvent::WearSamplingDegraded {
+                    reason: reason.to_owned(),
+                },
+            ));
+        }
+    }
     status_tx.send_replace(SamplerStatus {
         state: runtime.state,
         last_capture: last_capture.or(current.last_capture),
@@ -758,6 +805,7 @@ async fn run(
     status_tx: watch::Sender<SamplerStatus>,
 ) {
     let mut runtime = Runtime::new(&deps.initial_config, &deps.consent_path);
+    runtime.event_tx = deps.event_tx.take();
     let initial_reason = match runtime.state {
         SamplingState::NeedsConsent => Some(WEAR_SAMPLING_NEEDS_CONSENT),
         SamplingState::Suspended => Some(WEAR_SAMPLING_SUSPENDED),
@@ -1667,6 +1715,7 @@ mod tests {
                 consent_path,
                 cancel,
                 env_reader: test_env_reader,
+                event_tx: None,
             },
             update_tx,
             latest_grid,
@@ -1736,6 +1785,7 @@ mod tests {
             consent_path,
             cancel: cancel.clone(),
             env_reader: test_env_reader,
+            event_tx: None,
         };
         let (_handle, join) = spawn_with_handle(deps);
 
@@ -2159,6 +2209,7 @@ mod tests {
             consent_path,
             cancel: cancel.clone(),
             env_reader: test_env_reader,
+            event_tx: None,
         });
 
         let (first_tx, _first_rx) = oneshot::channel();
@@ -2353,6 +2404,7 @@ mod tests {
             consent_path: consent_path.clone(),
             cancel: cancel.clone(),
             env_reader: test_env_reader,
+            event_tx: None,
         });
 
         let (enable_tx, enable_rx) = oneshot::channel();

@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::doctor::DoctorReport;
 use crate::rules::{EmergencyWakeReport, ExerciseReport, StateSnapshot};
+use crate::wear::WearSamplingStatus as WearSamplingLifecycleStatus;
 
 // ── IpcRequest ────────────────────────────────────────────────────────────────
 
@@ -184,6 +185,9 @@ pub struct IpcResponse {
     /// Active-sampling status, present only for wear-sampling requests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wear_sampling: Option<WearSamplingStatus>,
+    /// Redacted lifecycle status for active wear sampling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wear_sampling_status: Option<WearSamplingLifecycleStatus>,
 }
 
 impl IpcResponse {
@@ -198,6 +202,7 @@ impl IpcResponse {
             emergency_report: None,
             exercise_report: None,
             wear_sampling: None,
+            wear_sampling_status: None,
         }
     }
 
@@ -212,6 +217,7 @@ impl IpcResponse {
             emergency_report: None,
             exercise_report: None,
             wear_sampling: None,
+            wear_sampling_status: None,
         }
     }
 
@@ -226,6 +232,7 @@ impl IpcResponse {
             emergency_report: None,
             exercise_report: None,
             wear_sampling: None,
+            wear_sampling_status: None,
         }
     }
 
@@ -240,6 +247,7 @@ impl IpcResponse {
             emergency_report: Some(report),
             exercise_report: None,
             wear_sampling: None,
+            wear_sampling_status: None,
         }
     }
 
@@ -254,6 +262,7 @@ impl IpcResponse {
             emergency_report: None,
             exercise_report: Some(report),
             wear_sampling: None,
+            wear_sampling_status: None,
         }
     }
 
@@ -268,6 +277,7 @@ impl IpcResponse {
             emergency_report: None,
             exercise_report: None,
             wear_sampling: Some(status),
+            wear_sampling_status: None,
         }
     }
 }
@@ -575,6 +585,7 @@ mod tests {
             pending_reload: None,
             rollback: None,
             kvm: None,
+            wear_sampling_status: None,
         };
         let resp = IpcResponse::ok(Some(snap));
         let json = serde_json::to_string(&resp).unwrap();
@@ -782,6 +793,24 @@ mod tests {
         let old = r#"{"ok":true,"snapshot":null}"#;
         let response: IpcResponse = serde_json::from_str(old).unwrap();
         assert!(response.wear_sampling.is_none());
+        assert!(response.wear_sampling_status.is_none());
+    }
+
+    #[test]
+    fn response_serializes_redacted_sampling_lifecycle_status() {
+        let mut response = IpcResponse::ok(None);
+        response.wear_sampling_status = Some(WearSamplingLifecycleStatus {
+            state: crate::wear::WearSamplingState::Streaming,
+            last_capture_age_s: Some(61),
+            uniform_reason: None,
+            bound_display: Some("desk".to_owned()),
+            granted_at_epoch_s: Some(1_700_000_000),
+        });
+
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["wear_sampling_status"]["state"], "streaming");
+        assert!(json.to_string().contains("desk"));
+        assert!(!json.to_string().contains("token"));
     }
 
     // (dead coordination pair tests removed — the types no longer exist)

@@ -153,6 +153,7 @@ mod tests {
                 web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
                 cancel,
                 reload_timeout: Duration::from_secs(10),
+                wear_sampling_rx: tokio::sync::watch::channel(None).1,
             },
         ))
     }
@@ -199,6 +200,7 @@ mod tests {
             pending_reload: None,
             rollback: None,
             kvm: None,
+            wear_sampling_status: None,
         }
     }
 
@@ -507,6 +509,7 @@ mod tests {
             pending_reload: None,
             rollback: None,
             kvm: None,
+            wear_sampling_status: None,
         };
         let ctl_tx = spawn_fake_engine(snapshot);
         let state = test_web_state(ctl_tx);

@@ -612,6 +612,16 @@ pub enum DaemonEvent {
         /// Number of wear samples folded into `total_on_hours` so far.
         #[serde(default)]
         sample_count: u64,
+        /// Attribution method used for this observation.
+        #[serde(default)]
+        wear_attribution_mode: crate::wear::WearAttributionMode,
+    },
+    /// Active wear sampling entered its streaming lifecycle state.
+    WearSamplingStarted,
+    /// Active wear sampling entered a degraded uniform-attribution episode.
+    WearSamplingDegraded {
+        /// Stable reason for the degradation episode.
+        reason: String,
     },
     /// Advisory nudge: the display has gone this many hours since its last
     /// long-dwell static-content window (a hint the WebUI/CLI can use to
@@ -862,6 +872,9 @@ pub struct StateSnapshot {
     /// snapshots without the key deserialize cleanly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kvm: Option<KvmStatus>,
+    /// Redacted active wear-sampling lifecycle state, when the platform provides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wear_sampling_status: Option<crate::wear::WearSamplingStatus>,
 }
 
 /// KVM-switch snapshot payload — the tray refetches this on every
@@ -2383,6 +2396,7 @@ impl RulesEngine {
             pending_reload: self.pending_reload.clone(),
             rollback: self.rollback.clone(),
             kvm: self.kvm.clone(),
+            wear_sampling_status: None,
         });
     }
 
@@ -3878,6 +3892,7 @@ mod tests {
             display: DisplayId("m".into()),
             total_on_hours: 1.5,
             sample_count: 3,
+            wear_attribution_mode: crate::wear::WearAttributionMode::Uniform,
         };
         let s = serde_json::to_string(&e).unwrap();
         assert!(s.contains("\"event\":\"wear_snapshot\""));
@@ -3885,6 +3900,15 @@ mod tests {
             serde_json::from_str(&s).unwrap(),
             DaemonEvent::WearSnapshot { .. }
         ));
+    }
+
+    #[test]
+    fn wear_snapshot_preserves_additive_attribution_mode() {
+        let wire = r#"{"event":"wear_snapshot","display":"m","total_on_hours":1.5,"sample_count":3,"wear_attribution_mode":"sampled"}"#;
+        let event: DaemonEvent = serde_json::from_str(wire).unwrap();
+
+        let round_trip = serde_json::to_string(&event).unwrap();
+        assert!(round_trip.contains("\"wear_attribution_mode\":\"sampled\""));
     }
 
     /// `CompensationAdvisory` round-trips through the wire with the expected
@@ -4759,6 +4783,15 @@ mod tests {
     }
 
     #[test]
+    fn state_snapshot_sampling_status_field_is_additive() {
+        let legacy = r#"{"sensors":[],"zones":[],"displays":[],"pending_reload":null}"#;
+        let parsed: StateSnapshot = serde_json::from_str(legacy).unwrap();
+        let json = serde_json::to_value(parsed).unwrap();
+
+        assert!(json.get("wear_sampling_status").is_none());
+    }
+
+    #[test]
     fn rollback_status_parks_in_snapshot_and_clears() {
         let mut engine = minimal_engine();
         let status = RollbackStatus {
@@ -4792,6 +4825,7 @@ mod tests {
             display: DisplayId("m".into()),
             total_on_hours: 1.5,
             sample_count: 3,
+            wear_attribution_mode: crate::wear::WearAttributionMode::Uniform,
         };
         engine.handle_control(ControlMsg::PublishDaemonEvent(ev));
 
@@ -4801,6 +4835,7 @@ mod tests {
                 display,
                 total_on_hours,
                 sample_count,
+                ..
             } => {
                 assert_eq!(display, DisplayId("m".into()));
                 assert!((total_on_hours - 1.5).abs() < f64::EPSILON);

@@ -57,6 +57,11 @@ function WearRow({ summary, tone, onOpenDetail }: WearRowProps) {
         <strong className="wear-row__name">{summary.display_name}</strong>
         <span className="wear-row__stat">{summary.total_on_hours.toFixed(1)}h total on-time</span>
         <span className="wear-row__stat">{summary.sample_count.toLocaleString()} samples</span>
+        {summary.content_weighted_since !== undefined && summary.content_weighted_since !== null && (
+          <span className="wear-row__stat">
+            content-weighted since {new Date(summary.content_weighted_since * 1000).toLocaleDateString()}
+          </span>
+        )}
       </button>
       <div className={`wear-row__tone wear-row__tone--${tone}`}>{toneText}</div>
     </div>

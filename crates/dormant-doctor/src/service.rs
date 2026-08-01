@@ -333,6 +333,7 @@ fn empty_snapshot() -> StateSnapshot {
         pending_reload: None,
         rollback: None,
         kvm: None,
+        wear_sampling_status: None,
     }
 }
 
@@ -491,6 +492,7 @@ mod tests {
             pending_reload: None,
             rollback: None,
             kvm: None,
+            wear_sampling_status: None,
         }
     }
 

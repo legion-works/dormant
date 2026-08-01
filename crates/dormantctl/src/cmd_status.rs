@@ -33,7 +33,10 @@ pub fn run(socket_path: &Path, json_output: bool) -> Result<()> {
     if json_output {
         println!("{}", serde_json::to_string_pretty(snapshot)?);
     } else {
-        print!("{}", render_table(snapshot));
+        print!(
+            "{}",
+            render_table_with_sampling(snapshot, resp.wear_sampling_status.as_ref())
+        );
     }
 
     Ok(())
@@ -44,7 +47,20 @@ pub fn run(socket_path: &Path, json_output: bool) -> Result<()> {
 ///
 /// Pure — performs no I/O. The command path prints the returned value, and
 /// tests can call this directly to assert on the bytes a user would see.
+#[cfg(test)]
 fn render_table(snapshot: &StateSnapshot) -> String {
+    render_table_with_sampling(snapshot, None)
+}
+
+/// Render a [`StateSnapshot`] and its optional active-sampling status.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the status table remains one ordered terminal presentation"
+)]
+fn render_table_with_sampling(
+    snapshot: &StateSnapshot,
+    sampling: Option<&dormant_core::wear::WearSamplingStatus>,
+) -> String {
     let mut out = String::new();
 
     // ── Sensors ────────────────────────────────────────────────────────────
@@ -142,6 +158,22 @@ fn render_table(snapshot: &StateSnapshot) -> String {
         );
     }
 
+    if let Some(sampling) = sampling {
+        let _ = writeln!(out);
+        let _ = write!(
+            out,
+            "sampling: {} (age: {})",
+            sampling_state_name(sampling.state),
+            sampling
+                .last_capture_age_s
+                .map_or_else(|| "unavailable".to_owned(), format_sampling_age)
+        );
+        if let Some(reason) = &sampling.uniform_reason {
+            let _ = write!(out, " (uniform: {reason})");
+        }
+        let _ = writeln!(out);
+    }
+
     // ── Pending reload warning ────────────────────────────────────────────
     if let Some(detail) = &snapshot.pending_reload {
         let _ = writeln!(out);
@@ -149,6 +181,28 @@ fn render_table(snapshot: &StateSnapshot) -> String {
     }
 
     out
+}
+
+fn sampling_state_name(state: dormant_core::wear::WearSamplingState) -> &'static str {
+    match state {
+        dormant_core::wear::WearSamplingState::Disabled => "disabled",
+        dormant_core::wear::WearSamplingState::NeedsConsent => "needs_consent",
+        dormant_core::wear::WearSamplingState::ConsentPending => "consent_pending",
+        dormant_core::wear::WearSamplingState::Connecting => "connecting",
+        dormant_core::wear::WearSamplingState::Streaming => "streaming",
+        dormant_core::wear::WearSamplingState::Suspended => "suspended",
+        dormant_core::wear::WearSamplingState::Cooldown => "cooldown",
+    }
+}
+
+fn format_sampling_age(age_s: u64) -> String {
+    let minutes = age_s / 60;
+    let seconds = age_s % 60;
+    if minutes == 0 {
+        format!("{seconds}s")
+    } else {
+        format!("{minutes}m {seconds}s")
+    }
 }
 
 /// Build the Phase column cell for a [`DisplaySnapshot`].
@@ -260,6 +314,7 @@ mod tests {
             pending_reload: None,
             rollback: None,
             kvm: None,
+            wear_sampling_status: None,
         }
     }
 
@@ -268,6 +323,34 @@ mod tests {
         let snap = canned_snapshot();
         assert!(snap.sensors.iter().any(|s| s.id == "desk"));
         assert!(snap.sensors.iter().any(|s| s.id == "hallway"));
+    }
+
+    #[test]
+    fn status_renders_streaming_sampling_age() {
+        let status = dormant_core::wear::WearSamplingStatus {
+            state: dormant_core::wear::WearSamplingState::Streaming,
+            last_capture_age_s: Some(95),
+            uniform_reason: None,
+            bound_display: Some("desk".to_owned()),
+            granted_at_epoch_s: Some(1_700_000_000),
+        };
+
+        let table = render_table_with_sampling(&canned_snapshot(), Some(&status));
+        assert!(table.contains("sampling: streaming (age: 1m 35s)"));
+    }
+
+    #[test]
+    fn status_renders_degraded_sampling_reason() {
+        let status = dormant_core::wear::WearSamplingStatus {
+            state: dormant_core::wear::WearSamplingState::Suspended,
+            last_capture_age_s: Some(7),
+            uniform_reason: Some("wear_sampling_suspended".to_owned()),
+            bound_display: Some("desk".to_owned()),
+            granted_at_epoch_s: None,
+        };
+
+        let table = render_table_with_sampling(&canned_snapshot(), Some(&status));
+        assert!(table.contains("sampling: suspended (age: 7s) (uniform: wear_sampling_suspended)"));
     }
 
     #[test]
@@ -334,6 +417,7 @@ mod tests {
             pending_reload: None,
             rollback: None,
             kvm: None,
+            wear_sampling_status: None,
         };
 
         let d = &snap.displays[0].1;
@@ -373,6 +457,7 @@ mod tests {
             pending_reload: None,
             rollback: None,
             kvm: None,
+            wear_sampling_status: None,
         };
 
         // Must exercise the production rendering path, not a helper — a
@@ -453,6 +538,7 @@ mod tests {
             pending_reload: None,
             rollback: None,
             kvm: None,
+            wear_sampling_status: None,
         };
         let rendered = render_table(&snap);
         assert!(

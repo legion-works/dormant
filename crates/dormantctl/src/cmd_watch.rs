@@ -69,10 +69,15 @@ fn fmt_event(event: &DaemonEvent) -> String {
             display,
             total_on_hours,
             sample_count,
+            ..
         } => {
             format!(
                 "display {display}: wear snapshot ({total_on_hours:.1}h, {sample_count} samples)"
             )
+        }
+        DaemonEvent::WearSamplingStarted => "wear sampling started".to_string(),
+        DaemonEvent::WearSamplingDegraded { reason } => {
+            format!("wear sampling degraded: {reason}")
         }
         DaemonEvent::CompensationAdvisory {
             display,
@@ -143,6 +148,7 @@ mod tests {
             display: DisplayId("desk".to_string()),
             total_on_hours: 12.34,
             sample_count: 7,
+            wear_attribution_mode: dormant_core::wear::WearAttributionMode::Uniform,
         };
         assert_eq!(
             fmt_event(&event),

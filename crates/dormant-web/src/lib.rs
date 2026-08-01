@@ -256,6 +256,7 @@ mod tests {
             ),
             cancel: cancel.clone(),
             reload_timeout: Duration::from_secs(10),
+            wear_sampling_rx: tokio::sync::watch::channel(None).1,
         }));
 
         (state, cancel)
@@ -273,6 +274,7 @@ mod tests {
             pending_reload: None,
             rollback: None,
             kvm: None,
+            wear_sampling_status: None,
         };
 
         let ctl_tx = spawn_fake_engine(snapshot.clone());
@@ -316,6 +318,7 @@ mod tests {
             pending_reload: None,
             rollback: None,
             kvm: None,
+            wear_sampling_status: None,
         };
 
         let ctl_tx = spawn_fake_engine(snapshot);

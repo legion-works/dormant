@@ -233,7 +233,7 @@ async fn handle_connection(
 
         match request {
             IpcRequest::Status => {
-                let resp = handle_status(&ctl_tx).await;
+                let resp = handle_status(&ctl_tx, active_sampler.as_ref()).await;
                 let _ = write_json(&mut writer, &resp).await;
             }
             IpcRequest::Pause { rule, duration_s } => {
@@ -385,9 +385,21 @@ fn sampler_error_reason(error: &SamplerError) -> String {
 // ── Request handlers ──────────────────────────────────────────────────────────
 
 /// Fetch a snapshot and return it.
-async fn handle_status(ctl_tx: &mpsc::Sender<ControlMsg>) -> IpcResponse {
+async fn handle_status(
+    ctl_tx: &mpsc::Sender<ControlMsg>,
+    active_sampler: Option<&ActiveSamplerHandle>,
+) -> IpcResponse {
     match request_snapshot(ctl_tx).await {
-        Some(snap) => IpcResponse::ok(Some(snap)),
+        Some(snap) => {
+            let mut response = IpcResponse::ok(Some(snap));
+            response.wear_sampling_status = active_sampler.map(|sampler| {
+                sampler
+                    .status()
+                    .borrow()
+                    .redacted(dormant_core::types::Tick::now())
+            });
+            response
+        }
         None => IpcResponse::error("engine not available"),
     }
 }
@@ -965,6 +977,7 @@ mod tests {
                 pending_reload: None,
                 rollback: None,
                 kvm: None,
+                wear_sampling_status: None,
             };
             tokio::spawn(async move {
                 while let Some(msg) = ctl_rx.recv().await {

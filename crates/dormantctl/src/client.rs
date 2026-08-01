@@ -351,6 +351,7 @@ mod tests {
             emergency_report: None,
             exercise_report: None,
             wear_sampling: None,
+            wear_sampling_status: None,
         };
         let result = check_response(&resp);
         assert!(result.is_err(), "non-ok response must produce an error");
@@ -371,6 +372,7 @@ mod tests {
             emergency_report: None,
             exercise_report: None,
             wear_sampling: None,
+            wear_sampling_status: None,
         };
         assert!(check_response(&resp).is_ok());
     }

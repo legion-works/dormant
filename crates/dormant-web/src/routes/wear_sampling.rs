@@ -152,6 +152,7 @@ mod tests {
                 web_bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
                 cancel: tokio_util::sync::CancellationToken::new(),
                 reload_timeout: std::time::Duration::from_secs(1),
+                wear_sampling_rx: tokio::sync::watch::channel(None).1,
             },
             ipc,
         ))

@@ -1496,6 +1496,8 @@ pub fn event_records(cfg: &Config, event: &DaemonEvent, instance: &str) -> Vec<P
         | DaemonEvent::ConfigReloaded
         | DaemonEvent::WakeRetry { .. }
         | DaemonEvent::WearSnapshot { .. }
+        | DaemonEvent::WearSamplingStarted
+        | DaemonEvent::WearSamplingDegraded { .. }
         | DaemonEvent::CompensationAdvisory { .. }
         | DaemonEvent::BlankFailure { .. }
         | DaemonEvent::BlankRecovered { .. }
@@ -1751,6 +1753,7 @@ mod tests {
             pending_reload: None,
             rollback: None,
             kvm: None,
+            wear_sampling_status: None,
         }
     }
 
@@ -2213,6 +2216,7 @@ mod tests {
                 display: DisplayId("main".into()),
                 total_on_hours: 0.0,
                 sample_count: 0,
+                wear_attribution_mode: dormant_core::wear::WearAttributionMode::Uniform,
             },
             DaemonEvent::CompensationAdvisory {
                 display: DisplayId("main".into()),
@@ -2406,6 +2410,7 @@ mod tests {
                 pending_reload: None,
                 rollback: None,
                 kvm: None,
+                wear_sampling_status: None,
             },
             "office-pc",
         );
@@ -4513,6 +4518,7 @@ mod async_tests {
             pending_reload: None,
             rollback: None,
             kvm: None,
+            wear_sampling_status: None,
         }
     }
 }

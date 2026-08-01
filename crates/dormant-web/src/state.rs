@@ -110,6 +110,8 @@ pub struct WebStateInner {
     /// instance the wear tracker writes to (spec §5).  `/api/wear` reads it
     /// directly; no dormantd-local type, so no dependency cycle.
     pub wear: WearHandle,
+    /// Redacted daemon-owned active-sampling lifecycle status.
+    pub wear_sampling_rx: watch::Receiver<Option<dormant_core::wear::WearSamplingStatus>>,
 
     /// The socket address the web server is bound to.  Used by the
     /// security middleware to validate the Host header against the
@@ -223,6 +225,7 @@ pub struct WebStateInnerParams {
     pub creds_path: PathBuf,
     pub doctor: DoctorService,
     pub wear: WearHandle,
+    pub wear_sampling_rx: watch::Receiver<Option<dormant_core::wear::WearSamplingStatus>>,
     pub web_bind: SocketAddr,
     pub cancel: CancellationToken,
     pub reload_timeout: Duration,
@@ -350,6 +353,7 @@ impl WebStateInner {
             apply_lock: Mutex::new(()),
             doctor: params.doctor,
             wear: params.wear,
+            wear_sampling_rx: params.wear_sampling_rx,
             web_bind: params.web_bind,
             cancel: params.cancel,
             reload_timeout: params.reload_timeout,

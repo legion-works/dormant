@@ -53,6 +53,8 @@ export const DAEMON_EVENT_TAGS = [
   "wake_retry",
   "config_reload_rejected",
   "wear_snapshot",
+  "wear_sampling_started",
+  "wear_sampling_degraded",
   "compensation_advisory",
   "blank_failure",
   "blank_recovered",
@@ -277,6 +279,8 @@ export type DaemonEvent =
   | ConfigReloadRejectedEvent
   | WakeRetryEvent
   | WearSnapshotEvent
+  | WearSamplingStartedEvent
+  | WearSamplingDegradedEvent
   | CompensationAdvisoryEvent
   | BlankFailureEvent
   | BlankRecoveredEvent
@@ -336,6 +340,16 @@ export interface WearSnapshotEvent {
   display: string;
   total_on_hours: number;
   sample_count: number;
+  wear_attribution_mode?: "uniform" | "sampled";
+}
+
+export interface WearSamplingStartedEvent {
+  event: "wear_sampling_started";
+}
+
+export interface WearSamplingDegradedEvent {
+  event: "wear_sampling_degraded";
+  reason: string;
 }
 
 /**
@@ -820,6 +834,15 @@ export interface WearSamplingStatus {
   reason?: string;
 }
 
+/** rust: wear.rs WearSamplingStatus — redacted sampler lifecycle state. */
+export interface WearSamplingLifecycleStatus {
+  state: "disabled" | "needs_consent" | "consent_pending" | "connecting" | "streaming" | "suspended" | "cooldown";
+  last_capture_age_s?: number | null;
+  uniform_reason?: string | null;
+  bound_display?: string | null;
+  granted_at_epoch_s?: number | null;
+}
+
 /**
  * rust: config/routes.rs ConfigResponse
  * Full shape of GET /api/config.
@@ -878,6 +901,8 @@ export interface WearSummary {
    * to render a "?" day count.
    */
   hours_since_long_dwell: number;
+  wear_attribution_mode?: "uniform" | "sampled";
+  content_weighted_since?: number | null;
 }
 
 /** rust: routes/wear.rs — `GET /api/wear` response envelope. */

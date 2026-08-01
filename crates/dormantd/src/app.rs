@@ -1410,6 +1410,18 @@ impl App {
         let observations = reload_requester.observations();
 
         let latest_grid = crate::active_sampler::new_latest_grid();
+        #[cfg(target_os = "linux")]
+        let (sampler_tracker_tx, sampler_tracker_rx) =
+            watch::channel::<Option<crate::active_sampler::SamplerStatus>>(None);
+        #[cfg(not(target_os = "linux"))]
+        let (_sampler_tracker_tx, sampler_tracker_rx) =
+            watch::channel::<Option<crate::active_sampler::SamplerStatus>>(None);
+        #[cfg(target_os = "linux")]
+        let (web_sampling_tx, web_sampling_rx) =
+            watch::channel::<Option<dormant_core::wear::WearSamplingStatus>>(None);
+        #[cfg(not(target_os = "linux"))]
+        let (_web_sampling_tx, web_sampling_rx) =
+            watch::channel::<Option<dormant_core::wear::WearSamplingStatus>>(None);
 
         // Wear tracker: daemon-lifetime, reads config via watch, publishes
         // over the front ctl channel (rides the `GenerationRouter`'s
@@ -1422,6 +1434,7 @@ impl App {
                 executors_rx: executors_rx.clone(),
                 handle: wear_handle.clone(),
                 latest_grid: latest_grid.clone(),
+                sampler_status_rx: sampler_tracker_rx,
                 #[cfg(feature = "render")]
                 heat_snapshots: render_context.heat_snapshots.clone(),
                 cancel: root.clone(),
@@ -1445,6 +1458,7 @@ impl App {
                         consent_path,
                         cancel: root.clone(),
                         env_reader: crate::active_sampler::production_env_reader,
+                        event_tx: Some(front_ctl_tx.clone()),
                     });
                     let display_exists = cfg_clone
                         .wear
@@ -1480,6 +1494,31 @@ impl App {
         };
         #[cfg(not(target_os = "linux"))]
         let active_sampler_handle: Option<crate::active_sampler::ActiveSamplerHandle> = None;
+
+        #[cfg(target_os = "linux")]
+        if let Some(active_sampler) = &active_sampler_handle {
+            let mut sampler_status_rx = active_sampler.status();
+            let initial = sampler_status_rx.borrow().clone();
+            let _ = sampler_tracker_tx.send_replace(Some(initial.clone()));
+            let _ = web_sampling_tx.send_replace(Some(initial.redacted(Tick::now())));
+            let cancel = root.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        () = cancel.cancelled() => break,
+                        changed = sampler_status_rx.changed() => {
+                            if changed.is_err() {
+                                break;
+                            }
+                            let _ = sampler_tracker_tx.send_replace(Some(sampler_status_rx.borrow().clone()));
+                            let _ = web_sampling_tx.send_replace(Some(
+                                sampler_status_rx.borrow().redacted(Tick::now()),
+                            ));
+                        }
+                    }
+                }
+            });
+        }
 
         if cfg_clone.daemon.web_allow_nonloopback {
             tracing::warn!(
@@ -1564,6 +1603,7 @@ impl App {
                         creds_path: self.creds_path.clone(),
                         doctor: doctor_service.clone(),
                         wear: wear_handle.clone(),
+                        wear_sampling_rx: web_sampling_rx,
                         web_bind: addr,
                         cancel: root.clone(),
                         reload_timeout: std::time::Duration::from_secs(10),
@@ -5317,6 +5357,7 @@ mod watchdog_tests {
                     pending_reload: None,
                     rollback: None,
                     kvm: None,
+                    wear_sampling_status: None,
                 });
             }
         });
@@ -5384,6 +5425,7 @@ mod watchdog_tests {
             pending_reload: None,
             rollback: None,
             kvm: None,
+            wear_sampling_status: None,
         };
         let sent = ping_if_healthy(&mut sd, Some(&snapshot));
 
@@ -7039,6 +7081,7 @@ mod restore_tests {
             pending_reload: None,
             rollback: None,
             kvm: None,
+            wear_sampling_status: None,
         }
     }
 
@@ -7693,6 +7736,7 @@ mod gamma_reload_tests {
             pending_reload: None,
             rollback: None,
             kvm: None,
+            wear_sampling_status: None,
         }
     }
 

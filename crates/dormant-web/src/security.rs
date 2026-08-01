@@ -383,6 +383,7 @@ mod tests {
                 web_bind: bind,
                 cancel: cancel.clone(),
                 reload_timeout: Duration::from_secs(10),
+                wear_sampling_rx: tokio::sync::watch::channel(None).1,
             },
         ));
 

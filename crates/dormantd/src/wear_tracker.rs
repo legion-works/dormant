@@ -1305,6 +1305,10 @@ fn load_or_create_ledger(
             }
         }
         Ok(mut ledger) => {
+            // The storage key identifies the persisted panel, while the config binding
+            // is current runtime metadata. Retaining a v0.1 `None` here makes the web
+            // summary report uniform even when this ledger receives sampled grids.
+            ledger.identity = identity;
             // panel_type is config-declared (spec: never auto-detected) —
             // a ledger persisted before the operator set the field carries
             // Unknown forever unless we adopt the config value here.
@@ -2334,6 +2338,86 @@ mod tests {
         );
 
         assert_eq!(state.native_max.get(&display).copied(), Some(50));
+    }
+
+    #[test]
+    fn cadence_slot_reaches_tracker_and_migrates_legacy_binding_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let display = DisplayId("mon".into());
+        let legacy = WearLedger::new(
+            WearIdentity {
+                key: "mon".to_owned(),
+                display_name: "mon".to_owned(),
+                config_display_id: None,
+            },
+            PanelType::Unknown,
+            9,
+            16,
+            0,
+        );
+        persist_ledger(dir.path(), "mon", &legacy).expect("legacy ledger persists");
+
+        let mut cfg = minimal_config();
+        cfg.wear.active_sampling.enabled = true;
+        cfg.wear.active_sampling.sampled_display = Some(display.0.clone());
+        let executors = fake_executors(&[(&display, None)]);
+        let mut state = TrackerState::default();
+        ensure_ledgers_loaded(
+            &mut state,
+            &cfg,
+            &executors,
+            dir.path(),
+            60,
+            &ObservationHub::new(1),
+        );
+
+        let latest = crate::active_sampler::new_latest_grid();
+        let captured_at = Tick::now();
+        let sample = SampledGrid {
+            grid: LumaGrid::new(vec![0.5; usize::from(LUMA_GRID_ROWS * LUMA_GRID_COLS)])
+                .expect("16x9 sampled grid"),
+            captured_at,
+            phase_at_capture: dormant_core::state_machine::Phase::Active,
+        };
+        *latest.write().expect("latest-grid lock") = Some(sample.clone());
+        let selected = latest.read().expect("latest-grid lock").clone();
+        let (fresh, fallback) = filter_sample_for_tick(
+            selected.as_ref(),
+            captured_at,
+            cfg.wear.sample_interval.saturating_mul(2),
+        );
+        let actions = tick(
+            &mut state,
+            &snapshot_with(&display, "active", None),
+            &HashMap::new(),
+            &cfg.wear,
+            60,
+            fresh,
+            fallback,
+            &HashMap::new(),
+        );
+
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            TrackerAction::SampledSelection { display: selected_display, sample: selected_sample }
+                if selected_display == &display && selected_sample == &sample
+        )));
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            TrackerAction::Attribute {
+                display: attributed,
+                mode: WearAttributionMode::Sampled,
+                ..
+            } if attributed == &display
+        )));
+        assert_eq!(
+            state.ledgers[&display]
+                .identity
+                .config_display_id
+                .as_deref(),
+            Some("mon"),
+            "the API joins streaming status through the migrated config identity"
+        );
     }
 
     /// The tracker persists through the injected state directory.

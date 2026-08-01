@@ -88,6 +88,8 @@ use dormant_render::luma::{LumaCache, LumaCatalog, LumaScanJob};
 #[cfg(feature = "render")]
 use dormant_render::{HeatSnapshotHandle, LayerShellRenderSink};
 
+#[cfg(target_os = "linux")]
+use crate::active_sampler::{self, ActiveSamplerDeps, SamplerUpdate};
 use crate::boot_guard::{self, PromoteVerdict};
 use crate::coordination_poll::{self, CoordinationPollDeps};
 use crate::direct_switch::DirectSwitchHandle;
@@ -1184,6 +1186,34 @@ impl App {
                 item_journal: render_context.item_journal.clone(),
             });
 
+        #[cfg(target_os = "linux")]
+        let (active_sampler_handle, active_sampler_updates) = {
+            let latest_grid = active_sampler::new_latest_grid();
+            let (update_tx, update_rx) = mpsc::channel::<SamplerUpdate>(16);
+            match active_sampler::linux::PortalPipeWireSource::new().await {
+                Ok(source) => {
+                    let consent_path = self.state_dir.join("screencast-consent.json");
+                    let (handle, _join) = active_sampler::spawn_with_handle(ActiveSamplerDeps {
+                        initial_config: Arc::new(cfg_clone.clone()),
+                        update_rx,
+                        latest_grid,
+                        source: Box::new(source),
+                        consent_path,
+                        cancel: root.clone(),
+                    });
+                    (Some(handle), Some(update_tx))
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        event = "wear_sampling_portal_unreachable",
+                        ?error,
+                        "active sampler unavailable; uniform attribution remains active"
+                    );
+                    (None, None)
+                }
+            }
+        };
+
         if cfg_clone.daemon.web_allow_nonloopback {
             tracing::warn!(
                 event = "web_nonloopback_enabled",
@@ -1367,6 +1397,10 @@ impl App {
             generation_id: GenerationId(0),
             operation_registry,
             wear_tracker_handle,
+            #[cfg(target_os = "linux")]
+            active_sampler_handle,
+            #[cfg(target_os = "linux")]
+            active_sampler_updates,
             started_web_port,
             started_web_bind,
             ctrl_ctx,
@@ -1669,6 +1703,14 @@ struct Runner {
     /// its cancellation-triggered final persist during shutdown, mirroring
     /// [`teardown`]'s bounded-join-then-abort pattern for the engine task.
     wear_tracker_handle: JoinHandle<()>,
+    /// Daemon-lifetime active sampler handle retained for future IPC routing.
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code, reason = "Task 10 wires consent IPC commands")]
+    active_sampler_handle: Option<active_sampler::ActiveSamplerHandle>,
+    /// Sender retained across generation swaps so Task 9 can deliver reload plans.
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code, reason = "Task 9 publishes active-sampler reload plans")]
+    active_sampler_updates: Option<mpsc::Sender<SamplerUpdate>>,
     /// Port the web UI was started with (for reload change-detection).
     started_web_port: Option<u16>,
     /// Bind address the web UI was started with (for reload change-detection).

@@ -1,9 +1,18 @@
 //! Pure lifecycle rules and capture boundary for active wear sampling.
 
 use async_trait::async_trait;
-use dormant_core::config::schema::StreamMode;
+use dormant_core::config::schema::{ActiveSamplingConfig, Config, StreamMode};
+use dormant_core::spatial_grid::LumaGrid;
+use dormant_core::state_machine::Phase;
+use dormant_core::types::Tick;
 use std::fmt;
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use time::OffsetDateTime;
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 #[cfg(target_os = "linux")]
 pub mod linux;
@@ -26,6 +35,803 @@ pub const WEAR_SAMPLING_CAPTURE_FAILED: &str = "wear_sampling_capture_failed";
 pub const WEAR_SAMPLING_COOLDOWN: &str = "wear_sampling_cooldown";
 /// Stable fallback reason while administrative settings suspend sampling.
 pub const WEAR_SAMPLING_SUSPENDED: &str = "wear_sampling_suspended";
+
+/// Privacy-preserving frame sample made available to the wear tracker.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SampledGrid {
+    /// Reduced luma values; the raw portal frame has already been discarded.
+    pub grid: LumaGrid,
+    /// Monotonic instant at which the capture completed.
+    pub captured_at: Tick,
+    /// Display phase observed when the capture was requested.
+    pub phase_at_capture: Phase,
+}
+
+/// Most recent privacy-preserving sample shared with the wear tracker.
+pub type LatestGrid = Arc<RwLock<Option<SampledGrid>>>;
+
+/// Public lifecycle snapshot for future IPC and status consumers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SamplerStatus {
+    /// Current sampling lifecycle state.
+    pub state: SamplingState,
+    /// Monotonic time of the most recent successful sample.
+    pub last_capture: Option<Tick>,
+    /// Stable uniform-attribution reason while not streaming.
+    pub uniform_reason: Option<&'static str>,
+    /// Configured display bound to the current consent record.
+    pub bound_display: Option<String>,
+    /// Grant wall-clock timestamp, exposed without any portal identifiers.
+    pub granted_at: Option<OffsetDateTime>,
+}
+
+/// Sender and status subscription for the daemon's single sampler service.
+#[derive(Clone)]
+pub struct ActiveSamplerHandle {
+    command_tx: mpsc::Sender<SamplerCommand>,
+    status_rx: watch::Receiver<SamplerStatus>,
+}
+
+/// Result reported by an explicit consent command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConsentFlowStatus {
+    /// The portal consent UI is open.
+    AwaitingConsent,
+    /// Consent was granted and its validated record was stored.
+    Granted,
+    /// The operator denied the portal request.
+    Denied,
+    /// The portal request exceeded its deadline.
+    TimedOut,
+    /// The portal flow failed with a stable reason.
+    Error(String),
+}
+
+/// Error returned while routing a sampler command.
+#[derive(Debug)]
+pub enum SamplerError {
+    /// Active sampling is disabled in configuration.
+    DisabledByConfig,
+    /// Another consent request is already active.
+    FlowAlreadyActive,
+    /// The portal source could not be created for this graphical session.
+    NoGraphicalSession,
+    /// The daemon sampler is no longer running.
+    CommandChannelClosed,
+    /// Persistent consent-record I/O failed.
+    Store(crate::screencast_consent::ConsentError),
+}
+
+/// Requests accepted by the daemon-lifetime sampler.
+pub enum SamplerCommand {
+    /// Open the explicit portal consent flow.
+    Enable {
+        /// Receives the resulting flow status.
+        reply: oneshot::Sender<ConsentFlowStatus>,
+    },
+    /// Disable sampling, optionally forgetting the stored record.
+    Disable {
+        /// Remove the consent record as well as closing the session.
+        forget: bool,
+        /// Receives the command outcome.
+        reply: oneshot::Sender<Result<(), SamplerError>>,
+    },
+}
+
+/// Inputs delivered to the service without replacing its daemon lifetime.
+pub enum SamplerUpdate {
+    /// Relevant active-sampling configuration change.
+    Reconfigure(ReconfigurePlan),
+    /// Current sampled-display phase from the active generation.
+    DisplayContext(DisplaySamplingContext),
+}
+
+/// Runtime configuration and its lifecycle trigger, constructed by Task 9.
+#[derive(Debug, Clone)]
+pub struct ReconfigurePlan {
+    /// New active-sampling settings.
+    pub active_sampling: ActiveSamplingConfig,
+    /// Shared cadence with the wear tracker.
+    pub sample_interval: Duration,
+    /// Lifecycle transition implied by the configuration diff.
+    pub trigger: ConfigDelta,
+}
+
+/// Dependencies owned by the active sampler shell.
+pub struct ActiveSamplerDeps {
+    /// Initial daemon configuration used before reload updates arrive.
+    pub initial_config: Arc<Config>,
+    /// Reload and generation-context updates.
+    pub update_rx: mpsc::Receiver<SamplerUpdate>,
+    /// Daemon-lifetime latest-value handoff to the wear tracker.
+    pub latest_grid: LatestGrid,
+    /// Platform capture implementation.
+    pub source: Box<dyn CaptureSource + Send + Sync + 'static>,
+    /// Secure persisted portal-consent record path.
+    pub consent_path: PathBuf,
+    /// Daemon shutdown signal.
+    pub cancel: CancellationToken,
+}
+
+/// Display identity and active phase supplied by generation management.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DisplaySamplingContext {
+    /// Configured sampled display, when present in the generation.
+    pub display: Option<DisplayExpectation>,
+    /// Current display phase.
+    pub phase: Phase,
+    /// Whether a display stage currently permits spatial attribution.
+    pub stage_active: bool,
+}
+
+/// Allocate the daemon-lifetime latest-sample slot.
+#[must_use]
+pub fn new_latest_grid() -> LatestGrid {
+    Arc::new(RwLock::new(None))
+}
+
+fn replace_latest(latest: &LatestGrid, sample: SampledGrid) {
+    if let Ok(mut slot) = latest.write() {
+        *slot = Some(sample);
+    }
+}
+
+impl ActiveSamplerHandle {
+    fn new(
+        status: SamplerStatus,
+    ) -> (
+        Self,
+        mpsc::Receiver<SamplerCommand>,
+        watch::Sender<SamplerStatus>,
+    ) {
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (status_tx, status_rx) = watch::channel(status);
+        (
+            Self {
+                command_tx,
+                status_rx,
+            },
+            command_rx,
+            status_tx,
+        )
+    }
+
+    /// Subscribe to status changes without exposing consent secrets.
+    #[must_use]
+    pub fn status(&self) -> watch::Receiver<SamplerStatus> {
+        self.status_rx.clone()
+    }
+
+    /// Send a command to the daemon sampler.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SamplerError::CommandChannelClosed`] after daemon shutdown.
+    pub async fn send(&self, command: SamplerCommand) -> Result<(), SamplerError> {
+        self.command_tx
+            .send(command)
+            .await
+            .map_err(|_| SamplerError::CommandChannelClosed)
+    }
+}
+
+impl fmt::Display for SamplerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DisabledByConfig => f.write_str("active sampling is disabled by configuration"),
+            Self::FlowAlreadyActive => {
+                f.write_str("an active sampling consent flow is already active")
+            }
+            Self::NoGraphicalSession => f.write_str("no graphical session is available"),
+            Self::CommandChannelClosed => f.write_str("active sampling service is not running"),
+            Self::Store(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for SamplerError {}
+
+/// Spawn the sampler with an internal command channel.
+///
+/// Daemon wiring that needs the command handle should use
+/// [`spawn_with_handle`].
+#[must_use]
+pub fn spawn(deps: ActiveSamplerDeps) -> JoinHandle<()> {
+    let initial = initial_status(&deps.initial_config);
+    let (handle, command_rx, status_tx) = ActiveSamplerHandle::new(initial);
+    tokio::spawn(async move {
+        // Keeping this sender alive prevents a detached sampler from treating its
+        // internal command receiver as a shutdown signal.
+        let _handle = handle;
+        run(deps, command_rx, status_tx).await;
+    })
+}
+
+/// Spawn the sampler and return the command/status handle for daemon routing.
+#[must_use]
+pub fn spawn_with_handle(deps: ActiveSamplerDeps) -> (ActiveSamplerHandle, JoinHandle<()>) {
+    let initial = initial_status(&deps.initial_config);
+    let (handle, command_rx, status_tx) = ActiveSamplerHandle::new(initial);
+    let join = tokio::spawn(run(deps, command_rx, status_tx));
+    (handle, join)
+}
+
+fn initial_status(config: &Config) -> SamplerStatus {
+    let enabled = config.wear.active_sampling.enabled;
+    let state = if enabled {
+        SamplingState::NeedsConsent
+    } else {
+        SamplingState::Disabled
+    };
+    SamplerStatus {
+        state,
+        last_capture: None,
+        uniform_reason: enabled.then_some(WEAR_SAMPLING_NEEDS_CONSENT),
+        bound_display: config.wear.active_sampling.sampled_display.clone(),
+        granted_at: None,
+    }
+}
+
+struct Runtime {
+    state: SamplingState,
+    active: ActiveSamplingConfig,
+    sample_interval: Duration,
+    display: DisplaySamplingContext,
+    record: Option<crate::screencast_consent::BoundConsent>,
+    failures: u32,
+    reconnect_backoff: Duration,
+    episode_warned: std::collections::HashSet<String>,
+}
+
+impl Runtime {
+    fn new(config: &Config, consent_path: &std::path::Path) -> Self {
+        let display = DisplaySamplingContext {
+            display: config
+                .wear
+                .active_sampling
+                .sampled_display
+                .as_ref()
+                .map(|display| DisplayExpectation {
+                    display: display.clone(),
+                }),
+            phase: Phase::Active,
+            stage_active: true,
+        };
+        let active = config.wear.active_sampling.clone();
+        let record = display.display.as_ref().and_then(|expected| {
+            crate::screencast_consent::load(consent_path, &expected.display).ok()
+        });
+        let state = if !active.enabled {
+            SamplingState::Disabled
+        } else if !config.wear.enabled || display.display.is_none() {
+            SamplingState::Suspended
+        } else if record.is_some() {
+            SamplingState::Connecting
+        } else {
+            SamplingState::NeedsConsent
+        };
+        Self {
+            state,
+            active,
+            sample_interval: config.wear.sample_interval,
+            display,
+            record,
+            failures: 0,
+            reconnect_backoff: Duration::from_secs(30),
+            episode_warned: std::collections::HashSet::new(),
+        }
+    }
+
+    fn display_name(&self) -> String {
+        self.display
+            .display
+            .as_ref()
+            .map_or_else(|| "unbound".to_owned(), |display| display.display.clone())
+    }
+}
+
+enum ConnectOutcome {
+    Cancelled,
+    Connected(ConnectedStream),
+    NeedsConsent(&'static str),
+    Transport,
+}
+
+enum CaptureOutcome {
+    Cancelled,
+    Ok(Tick),
+    Failed(CaptureError, u32),
+}
+
+async fn connect(
+    source: &mut dyn CaptureSource,
+    record: &crate::screencast_consent::BoundConsent,
+    cancel: &CancellationToken,
+) -> ConnectOutcome {
+    let binding = record.as_binding();
+    tokio::select! {
+        () = cancel.cancelled() => ConnectOutcome::Cancelled,
+        outcome = source.connect(&binding) => match outcome {
+            Ok(stream) => ConnectOutcome::Connected(stream),
+            Err(CaptureError::Auth | CaptureError::SessionClosed) => ConnectOutcome::NeedsConsent(WEAR_SAMPLING_TOKEN_INVALID),
+            Err(CaptureError::Protocol(reason)) if reason == WEAR_SAMPLING_WRONG_MONITOR => ConnectOutcome::NeedsConsent(WEAR_SAMPLING_WRONG_MONITOR),
+            Err(CaptureError::ConsentDenied | CaptureError::Timeout | CaptureError::Transport(_) | CaptureError::Protocol(_)) => ConnectOutcome::Transport,
+        },
+    }
+}
+
+async fn capture_one(
+    source: &mut dyn CaptureSource,
+    active: &ActiveSamplingConfig,
+    phase: Phase,
+    latest: &LatestGrid,
+    cancel: &CancellationToken,
+    cadence: &mut tokio::time::Interval,
+) -> CaptureOutcome {
+    let capture = tokio::time::timeout(
+        active.capture_timeout,
+        source.capture_one(active.stream_mode),
+    );
+    tokio::pin!(capture);
+    let mut overlapping = 0;
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => return CaptureOutcome::Cancelled,
+            result = &mut capture => match result {
+                Ok(Ok(frame)) => match dormant_core::spatial_grid::reduce_rgba8_to_luma_grid(
+                    &frame.rgba, frame.width, frame.height, frame.stride, 9, 16,
+                ) {
+                    Ok(grid) => {
+                        let captured_at = Tick::now();
+                        replace_latest(latest, SampledGrid {
+                            grid,
+                            captured_at,
+                            phase_at_capture: phase,
+                        });
+                        return CaptureOutcome::Ok(captured_at);
+                    }
+                    Err(_) => return CaptureOutcome::Failed(CaptureError::Protocol("grid reduction failed".to_owned()), overlapping),
+                },
+                Ok(Err(error)) => return CaptureOutcome::Failed(error, overlapping),
+                Err(_) => return CaptureOutcome::Failed(CaptureError::Timeout, overlapping),
+            },
+            _ = cadence.tick() => {
+                overlapping = overlapping.saturating_add(1);
+            }
+        }
+    }
+}
+
+fn persist_rotated_token(
+    runtime: &mut Runtime,
+    stream: ConnectedStream,
+    path: &std::path::Path,
+) -> Result<(), crate::screencast_consent::ConsentError> {
+    let Some(record) = runtime.record.as_ref() else {
+        return Ok(());
+    };
+    let mut rotated = record.record().clone();
+    rotated.token = stream.restore_token;
+    crate::screencast_consent::store_atomic(path, &rotated)?;
+    runtime.record = crate::screencast_consent::load(path, &rotated.sampled_display).ok();
+    Ok(())
+}
+
+fn apply_capture_failure(
+    runtime: &mut Runtime,
+    error: CaptureError,
+    status_tx: &watch::Sender<SamplerStatus>,
+) {
+    match error {
+        CaptureError::Auth | CaptureError::SessionClosed => {
+            transition_to(
+                runtime,
+                SamplingState::NeedsConsent,
+                Some(WEAR_SAMPLING_TOKEN_INVALID),
+                status_tx,
+            );
+        }
+        CaptureError::Protocol(reason) if reason == WEAR_SAMPLING_WRONG_MONITOR => {
+            transition_to(
+                runtime,
+                SamplingState::NeedsConsent,
+                Some(WEAR_SAMPLING_WRONG_MONITOR),
+                status_tx,
+            );
+        }
+        CaptureError::Transport(_) => {
+            transition_to(
+                runtime,
+                SamplingState::Connecting,
+                Some(WEAR_SAMPLING_PORTAL_UNREACHABLE),
+                status_tx,
+            );
+        }
+        CaptureError::ConsentDenied | CaptureError::Timeout | CaptureError::Protocol(_) => {
+            if runtime.failures >= runtime.active.failure_threshold {
+                transition_to(
+                    runtime,
+                    SamplingState::Cooldown,
+                    Some(WEAR_SAMPLING_COOLDOWN),
+                    status_tx,
+                );
+            } else {
+                transition_to(
+                    runtime,
+                    SamplingState::Streaming,
+                    Some(WEAR_SAMPLING_CAPTURE_FAILED),
+                    status_tx,
+                );
+            }
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the command lifecycle keeps each consent result adjacent to its persistent-record outcome"
+)]
+async fn handle_command(
+    runtime: &mut Runtime,
+    source: &mut dyn CaptureSource,
+    consent_path: &std::path::Path,
+    command: SamplerCommand,
+    status_tx: &watch::Sender<SamplerStatus>,
+    cancel: &CancellationToken,
+) -> bool {
+    match command {
+        SamplerCommand::Enable { reply } => {
+            if !runtime.active.enabled {
+                let _ = reply.send(ConsentFlowStatus::Error(
+                    "active sampling is disabled".to_owned(),
+                ));
+                return false;
+            }
+            if runtime.state == SamplingState::ConsentPending {
+                let _ = reply.send(ConsentFlowStatus::Error(
+                    "consent flow already active".to_owned(),
+                ));
+                return false;
+            }
+            let Some(expected) = runtime.display.display.clone() else {
+                let _ = reply.send(ConsentFlowStatus::Error(
+                    "no sampled display is available".to_owned(),
+                ));
+                return false;
+            };
+            runtime.state = SamplingState::ConsentPending;
+            publish_status(status_tx, runtime, None, None);
+            // The portal has no config timeout; the five-minute interaction bound
+            // prevents an abandoned dialog from retaining a daemon operation forever.
+            let outcome = tokio::select! {
+                () = cancel.cancelled() => None,
+                outcome = tokio::time::timeout(Duration::from_secs(300), source.request_consent(&expected)) => Some(outcome),
+            };
+            match outcome {
+                None => return false,
+                Some(Err(_)) => {
+                    transition_to(
+                        runtime,
+                        SamplingState::NeedsConsent,
+                        Some(WEAR_SAMPLING_CONSENT_TIMEOUT),
+                        status_tx,
+                    );
+                    let _ = reply.send(ConsentFlowStatus::TimedOut);
+                }
+                Some(Ok(Err(CaptureError::ConsentDenied))) => {
+                    transition_to(
+                        runtime,
+                        SamplingState::NeedsConsent,
+                        Some(WEAR_SAMPLING_CONSENT_TIMEOUT),
+                        status_tx,
+                    );
+                    let _ = reply.send(ConsentFlowStatus::Denied);
+                }
+                Some(Ok(Err(error))) => {
+                    let reason = if matches!(error, CaptureError::Protocol(ref text) if text == WEAR_SAMPLING_WRONG_MONITOR)
+                    {
+                        WEAR_SAMPLING_WRONG_MONITOR
+                    } else {
+                        WEAR_SAMPLING_CONSENT_TIMEOUT
+                    };
+                    transition_to(
+                        runtime,
+                        SamplingState::NeedsConsent,
+                        Some(reason),
+                        status_tx,
+                    );
+                    let _ = reply.send(ConsentFlowStatus::Error(reason.to_owned()));
+                }
+                Some(Ok(Ok(grant))) => {
+                    let record = crate::screencast_consent::ConsentRecord {
+                        token: grant.stream.restore_token,
+                        sampled_display: expected.display,
+                        granted_at: grant.granted_at,
+                        portal_persistent_ids: grant.stream.persistent_id.into_iter().collect(),
+                        granted_width: grant.stream.width,
+                        granted_height: grant.stream.height,
+                    };
+                    match crate::screencast_consent::store_atomic(consent_path, &record) {
+                        Ok(()) => {
+                            runtime.record = crate::screencast_consent::load(
+                                consent_path,
+                                &record.sampled_display,
+                            )
+                            .ok();
+                            transition_to(runtime, SamplingState::Connecting, None, status_tx);
+                            let _ = reply.send(ConsentFlowStatus::Granted);
+                            return true;
+                        }
+                        Err(error) => {
+                            transition_to(
+                                runtime,
+                                SamplingState::NeedsConsent,
+                                Some(WEAR_SAMPLING_NEEDS_CONSENT),
+                                status_tx,
+                            );
+                            let _ = reply.send(ConsentFlowStatus::Error(error.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        SamplerCommand::Disable { forget, reply } => {
+            source.close().await;
+            if forget {
+                if let Err(error) = crate::screencast_consent::forget(consent_path) {
+                    let _ = reply.send(Err(SamplerError::Store(error)));
+                    return false;
+                }
+                runtime.record = None;
+            }
+            transition_to(runtime, SamplingState::Disabled, None, status_tx);
+            let _ = reply.send(Ok(()));
+        }
+    }
+    false
+}
+
+fn apply_update(
+    runtime: &mut Runtime,
+    update: SamplerUpdate,
+    status_tx: &watch::Sender<SamplerStatus>,
+) {
+    match update {
+        SamplerUpdate::Reconfigure(plan) => {
+            runtime.active = plan.active_sampling;
+            runtime.sample_interval = plan.sample_interval;
+            let transition = decide(
+                runtime.state,
+                Trigger::ConfigChanged(plan.trigger),
+                runtime.record.is_some(),
+            );
+            transition_to(
+                runtime,
+                transition.next,
+                transition.effects.iter().find_map(|effect| {
+                    if let Effect::EnterUniform(reason) = effect {
+                        Some(*reason)
+                    } else {
+                        None
+                    }
+                }),
+                status_tx,
+            );
+        }
+        SamplerUpdate::DisplayContext(context) => runtime.display = context,
+    }
+}
+
+fn transition_to(
+    runtime: &mut Runtime,
+    state: SamplingState,
+    reason: Option<&'static str>,
+    status_tx: &watch::Sender<SamplerStatus>,
+) {
+    runtime.state = state;
+    publish_status(status_tx, runtime, reason, None);
+    if let Some(reason) = reason
+        && runtime.episode_warned.insert(runtime.display_name())
+    {
+        tracing::warn!(reason, display = %runtime.display_name(), "active sampling is using uniform attribution");
+    }
+}
+
+fn publish_status(
+    status_tx: &watch::Sender<SamplerStatus>,
+    runtime: &Runtime,
+    reason: Option<&'static str>,
+    last_capture: Option<Tick>,
+) {
+    let current = status_tx.borrow().clone();
+    status_tx.send_replace(SamplerStatus {
+        state: runtime.state,
+        last_capture: last_capture.or(current.last_capture),
+        uniform_reason: reason,
+        bound_display: runtime
+            .record
+            .as_ref()
+            .map(|record| record.record().sampled_display.clone()),
+        granted_at: runtime
+            .record
+            .as_ref()
+            .map(|record| record.record().granted_at),
+    });
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the daemon-lifetime loop keeps cancellation and every owned timer in one select-driven state machine"
+)]
+async fn run(
+    mut deps: ActiveSamplerDeps,
+    mut command_rx: mpsc::Receiver<SamplerCommand>,
+    status_tx: watch::Sender<SamplerStatus>,
+) {
+    let mut runtime = Runtime::new(&deps.initial_config, &deps.consent_path);
+    let initial_reason = match runtime.state {
+        SamplingState::NeedsConsent => Some(WEAR_SAMPLING_NEEDS_CONSENT),
+        SamplingState::Suspended => Some(WEAR_SAMPLING_SUSPENDED),
+        _ => None,
+    };
+    let initial_state = runtime.state;
+    transition_to(&mut runtime, initial_state, initial_reason, &status_tx);
+    let mut cadence = cadence_for(&runtime);
+    cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut capture_now = runtime.state == SamplingState::Streaming;
+
+    loop {
+        if deps.cancel.is_cancelled() {
+            break;
+        }
+
+        match runtime.state {
+            SamplingState::Disabled | SamplingState::NeedsConsent | SamplingState::Suspended => {
+                tokio::select! {
+                    () = deps.cancel.cancelled() => break,
+                    command = command_rx.recv() => {
+                        if let Some(command) = command
+                            && handle_command(&mut runtime, &mut *deps.source, &deps.consent_path, command, &status_tx, &deps.cancel).await {
+                            capture_now = runtime.state == SamplingState::Streaming;
+                        }
+                    }
+                    update = deps.update_rx.recv() => {
+                        if let Some(update) = update {
+                            apply_update(&mut runtime, update, &status_tx);
+                            cadence = cadence_for(&runtime);
+                        }
+                    }
+                }
+            }
+            SamplingState::Connecting => {
+                let Some(record) = runtime.record.clone() else {
+                    transition_to(
+                        &mut runtime,
+                        SamplingState::NeedsConsent,
+                        Some(WEAR_SAMPLING_NEEDS_CONSENT),
+                        &status_tx,
+                    );
+                    continue;
+                };
+                match connect(&mut *deps.source, &record, &deps.cancel).await {
+                    ConnectOutcome::Cancelled => break,
+                    ConnectOutcome::Connected(stream) => {
+                        if persist_rotated_token(&mut runtime, stream, &deps.consent_path).is_err()
+                        {
+                            transition_to(
+                                &mut runtime,
+                                SamplingState::NeedsConsent,
+                                Some(WEAR_SAMPLING_NEEDS_CONSENT),
+                                &status_tx,
+                            );
+                            continue;
+                        }
+                        runtime.reconnect_backoff = Duration::from_secs(30);
+                        transition_to(&mut runtime, SamplingState::Streaming, None, &status_tx);
+                        capture_now = true;
+                    }
+                    ConnectOutcome::NeedsConsent(reason) => {
+                        transition_to(
+                            &mut runtime,
+                            SamplingState::NeedsConsent,
+                            Some(reason),
+                            &status_tx,
+                        );
+                    }
+                    ConnectOutcome::Transport => {
+                        transition_to(
+                            &mut runtime,
+                            SamplingState::Connecting,
+                            Some(WEAR_SAMPLING_PORTAL_UNREACHABLE),
+                            &status_tx,
+                        );
+                        let delay = runtime.reconnect_backoff;
+                        runtime.reconnect_backoff =
+                            (runtime.reconnect_backoff * 2).min(Duration::from_secs(300));
+                        tokio::select! {
+                            () = deps.cancel.cancelled() => break,
+                            () = tokio::time::sleep(delay) => {},
+                            update = deps.update_rx.recv() => if let Some(update) = update { apply_update(&mut runtime, update, &status_tx); },
+                            command = command_rx.recv() => if let Some(command) = command { let _ = handle_command(&mut runtime, &mut *deps.source, &deps.consent_path, command, &status_tx, &deps.cancel).await; },
+                        }
+                    }
+                }
+            }
+            SamplingState::Streaming => {
+                if !capture_now {
+                    tokio::select! {
+                        () = deps.cancel.cancelled() => break,
+                        _ = cadence.tick() => {},
+                        update = deps.update_rx.recv() => {
+                            if let Some(update) = update { apply_update(&mut runtime, update, &status_tx); }
+                            continue;
+                        }
+                        command = command_rx.recv() => {
+                            if let Some(command) = command { let _ = handle_command(&mut runtime, &mut *deps.source, &deps.consent_path, command, &status_tx, &deps.cancel).await; }
+                            continue;
+                        }
+                    }
+                }
+                capture_now = false;
+                let attempt = capture_one(
+                    &mut *deps.source,
+                    &runtime.active,
+                    runtime.display.phase.clone(),
+                    &deps.latest_grid,
+                    &deps.cancel,
+                    &mut cadence,
+                )
+                .await;
+                match attempt {
+                    CaptureOutcome::Cancelled => break,
+                    CaptureOutcome::Ok(captured_at) => {
+                        runtime.failures = 0;
+                        runtime.episode_warned.clear();
+                        transition_to(&mut runtime, SamplingState::Streaming, None, &status_tx);
+                        publish_status(&status_tx, &runtime, None, Some(captured_at));
+                    }
+                    CaptureOutcome::Failed(error, overlapping) => {
+                        runtime.failures = runtime.failures.saturating_add(1 + overlapping);
+                        apply_capture_failure(&mut runtime, error, &status_tx);
+                    }
+                }
+            }
+            SamplingState::Cooldown => {
+                tokio::select! {
+                    () = deps.cancel.cancelled() => break,
+                    () = tokio::time::sleep(runtime.active.circuit_reset_after) => {
+                        let attempt = capture_one(&mut *deps.source, &runtime.active, runtime.display.phase.clone(), &deps.latest_grid, &deps.cancel, &mut cadence).await;
+                        match attempt {
+                            CaptureOutcome::Cancelled => break,
+                            CaptureOutcome::Ok(captured_at) => { runtime.failures = 0; runtime.episode_warned.clear(); transition_to(&mut runtime, SamplingState::Streaming, None, &status_tx); publish_status(&status_tx, &runtime, None, Some(captured_at)); }
+                            CaptureOutcome::Failed(error, _) => apply_capture_failure(&mut runtime, error, &status_tx),
+                        }
+                    }
+                    update = deps.update_rx.recv() => if let Some(update) = update { apply_update(&mut runtime, update, &status_tx); },
+                    command = command_rx.recv() => if let Some(command) = command { let _ = handle_command(&mut runtime, &mut *deps.source, &deps.consent_path, command, &status_tx, &deps.cancel).await; },
+                }
+            }
+            SamplingState::ConsentPending => {
+                unreachable!("consent flows run to completion in their command branch")
+            }
+        }
+    }
+    deps.source.close().await;
+}
+
+impl Runtime {
+    fn initial_interval(&self) -> Duration {
+        // Cadence intentionally shares the wear tick knob; active sampling has no second interval.
+        self.sample_interval
+    }
+}
+
+fn cadence_for(runtime: &Runtime) -> tokio::time::Interval {
+    let interval = runtime.initial_interval();
+    let mut cadence = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    cadence
+}
 
 /// Lifecycle state of the active sampling service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -487,6 +1293,422 @@ impl CaptureSource for ScriptedCaptureSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tempfile::tempdir;
+
+    #[tokio::test(start_paused = true)]
+    async fn active_sampler_latest_replaces_capture_results() {
+        let latest = new_latest_grid();
+        replace_latest(
+            &latest,
+            SampledGrid {
+                grid: dormant_core::spatial_grid::LumaGrid::new(vec![0.1; 16 * 9]).unwrap(),
+                captured_at: dormant_core::types::Tick::now(),
+                phase_at_capture: dormant_core::state_machine::Phase::Active,
+            },
+        );
+        replace_latest(
+            &latest,
+            SampledGrid {
+                grid: dormant_core::spatial_grid::LumaGrid::new(vec![0.9; 16 * 9]).unwrap(),
+                captured_at: dormant_core::types::Tick::now(),
+                phase_at_capture: dormant_core::state_machine::Phase::Active,
+            },
+        );
+
+        let sample = latest.read().unwrap().clone().unwrap();
+        assert_eq!(sample.grid.cells, vec![0.9; 16 * 9]);
+    }
+
+    #[derive(Clone)]
+    enum TestCapture {
+        Frame,
+        Failure(CaptureError),
+        Pending,
+    }
+
+    struct ServiceSource {
+        connects: Mutex<VecDeque<Result<ConnectedStream, CaptureError>>>,
+        connects_seen: Arc<AtomicUsize>,
+        captures: Mutex<VecDeque<TestCapture>>,
+        captures_seen: Arc<AtomicUsize>,
+        closes_seen: Arc<AtomicUsize>,
+        grants_seen: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl CaptureSource for ServiceSource {
+        async fn connect(
+            &mut self,
+            _binding: &ConsentBinding<'_>,
+        ) -> Result<ConnectedStream, CaptureError> {
+            self.connects_seen.fetch_add(1, Ordering::SeqCst);
+            self.connects
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Ok(test_stream()))
+        }
+
+        async fn request_consent(
+            &mut self,
+            _display: &DisplayExpectation,
+        ) -> Result<Grant, CaptureError> {
+            self.grants_seen.fetch_add(1, Ordering::SeqCst);
+            Ok(Grant {
+                stream: test_stream(),
+                granted_at: OffsetDateTime::UNIX_EPOCH,
+            })
+        }
+
+        async fn capture_one(&mut self, _mode: StreamMode) -> Result<RawFrame, CaptureError> {
+            self.captures_seen.fetch_add(1, Ordering::SeqCst);
+            let outcome = self
+                .captures
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(TestCapture::Frame);
+            match outcome {
+                TestCapture::Frame => Ok(test_frame()),
+                TestCapture::Failure(error) => Err(error),
+                TestCapture::Pending => std::future::pending().await,
+            }
+        }
+
+        async fn close(&mut self) {
+            self.closes_seen.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn test_stream() -> ConnectedStream {
+        ConnectedStream {
+            node_id: 1,
+            restore_token: "rotated".to_owned(),
+            persistent_id: Some("test-panel".to_owned()),
+            width: 16,
+            height: 9,
+            frame_width: 16,
+            frame_height: 9,
+        }
+    }
+
+    fn test_frame() -> RawFrame {
+        RawFrame {
+            rgba: vec![128; 16 * 9 * 4],
+            width: 16,
+            height: 9,
+            stride: 16 * 4,
+        }
+    }
+
+    fn active_config(interval: Duration) -> Arc<Config> {
+        let mut config = Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
+            config_version: 1,
+            daemon: dormant_core::config::schema::DaemonConfig::default(),
+            sensors: indexmap::IndexMap::new(),
+            zones: indexmap::IndexMap::new(),
+            displays: indexmap::IndexMap::new(),
+            rules: indexmap::IndexMap::new(),
+            wear: dormant_core::config::schema::WearConfig::default(),
+            notifications: dormant_core::config::schema::NotificationsConfig::default(),
+            watchdog: dormant_core::config::schema::WatchdogConfig::default(),
+            audio: dormant_core::config::schema::AudioConfig::default(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
+        };
+        config.wear.enabled = true;
+        config.wear.sample_interval = interval;
+        config.wear.active_sampling.enabled = true;
+        config.wear.active_sampling.sampled_display = Some("oled".to_owned());
+        config.wear.active_sampling.capture_timeout = Duration::from_secs(2);
+        config.wear.active_sampling.failure_threshold = 1;
+        config.wear.active_sampling.circuit_reset_after = Duration::from_secs(5);
+        Arc::new(config)
+    }
+
+    fn test_record(path: &std::path::Path) {
+        crate::screencast_consent::store_atomic(
+            path,
+            &crate::screencast_consent::ConsentRecord {
+                token: "saved".to_owned(),
+                sampled_display: "oled".to_owned(),
+                granted_at: OffsetDateTime::UNIX_EPOCH,
+                portal_persistent_ids: vec!["test-panel".to_owned()],
+                granted_width: 16,
+                granted_height: 9,
+            },
+        )
+        .unwrap();
+    }
+
+    fn service_deps(
+        config: Arc<Config>,
+        source: ServiceSource,
+        consent_path: PathBuf,
+        cancel: CancellationToken,
+    ) -> (ActiveSamplerDeps, mpsc::Sender<SamplerUpdate>, LatestGrid) {
+        let latest_grid = new_latest_grid();
+        let (update_tx, update_rx) = mpsc::channel(2);
+        (
+            ActiveSamplerDeps {
+                initial_config: config,
+                update_rx,
+                latest_grid: latest_grid.clone(),
+                source: Box::new(source),
+                consent_path,
+                cancel,
+            },
+            update_tx,
+            latest_grid,
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_sampler_cadence_runs_once_per_interval_and_replaces_latest() {
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        test_record(&consent_path);
+        let captures_seen = Arc::new(AtomicUsize::new(0));
+        let closes_seen = Arc::new(AtomicUsize::new(0));
+        let grants_seen = Arc::new(AtomicUsize::new(0));
+        let source = ServiceSource {
+            connects: Mutex::new(VecDeque::new()),
+            connects_seen: Arc::new(AtomicUsize::new(0)),
+            captures: Mutex::new(VecDeque::from([TestCapture::Frame, TestCapture::Frame])),
+            captures_seen: captures_seen.clone(),
+            closes_seen,
+            grants_seen,
+        };
+        let cancel = CancellationToken::new();
+        let (deps, _updates, latest) = service_deps(
+            active_config(Duration::from_secs(10)),
+            source,
+            consent_path,
+            cancel.clone(),
+        );
+        let (_handle, join) = spawn_with_handle(deps);
+
+        tokio::task::yield_now().await;
+        assert_eq!(captures_seen.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_secs(9)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(captures_seen.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(captures_seen.load(Ordering::SeqCst), 2);
+        assert!(latest.read().unwrap().is_some());
+
+        cancel.cancel();
+        join.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_sampler_timeout_enters_cooldown_and_cancellation_closes_source() {
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        test_record(&consent_path);
+        let captures_seen = Arc::new(AtomicUsize::new(0));
+        let closes_seen = Arc::new(AtomicUsize::new(0));
+        let source = ServiceSource {
+            connects: Mutex::new(VecDeque::new()),
+            connects_seen: Arc::new(AtomicUsize::new(0)),
+            captures: Mutex::new(VecDeque::from([TestCapture::Pending])),
+            captures_seen,
+            closes_seen: closes_seen.clone(),
+            grants_seen: Arc::new(AtomicUsize::new(0)),
+        };
+        let cancel = CancellationToken::new();
+        let (deps, _updates, _) = service_deps(
+            active_config(Duration::from_secs(10)),
+            source,
+            consent_path,
+            cancel.clone(),
+        );
+        let (handle, join) = spawn_with_handle(deps);
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(handle.status().borrow().state, SamplingState::Cooldown);
+        cancel.cancel();
+        join.await.unwrap();
+        assert_eq!(closes_seen.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_sampler_skips_overlapping_cadence_without_second_capture() {
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        test_record(&consent_path);
+        let captures_seen = Arc::new(AtomicUsize::new(0));
+        let source = ServiceSource {
+            connects: Mutex::new(VecDeque::new()),
+            connects_seen: Arc::new(AtomicUsize::new(0)),
+            captures: Mutex::new(VecDeque::from([TestCapture::Pending])),
+            captures_seen: captures_seen.clone(),
+            closes_seen: Arc::new(AtomicUsize::new(0)),
+            grants_seen: Arc::new(AtomicUsize::new(0)),
+        };
+        let cancel = CancellationToken::new();
+        let mut config = active_config(Duration::from_secs(1));
+        Arc::get_mut(&mut config)
+            .unwrap()
+            .wear
+            .active_sampling
+            .capture_timeout = Duration::from_secs(5);
+        let (deps, _updates, _) = service_deps(config, source, consent_path, cancel.clone());
+        let (_handle, join) = spawn_with_handle(deps);
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(3)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(captures_seen.load(Ordering::SeqCst), 1);
+        cancel.cancel();
+        join.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_sampler_sigterm_cancels_pending_capture_without_waiting_for_timeout() {
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        test_record(&consent_path);
+        let closes_seen = Arc::new(AtomicUsize::new(0));
+        let source = ServiceSource {
+            connects: Mutex::new(VecDeque::new()),
+            connects_seen: Arc::new(AtomicUsize::new(0)),
+            captures: Mutex::new(VecDeque::from([TestCapture::Pending])),
+            captures_seen: Arc::new(AtomicUsize::new(0)),
+            closes_seen: closes_seen.clone(),
+            grants_seen: Arc::new(AtomicUsize::new(0)),
+        };
+        let cancel = CancellationToken::new();
+        let (deps, _updates, _) = service_deps(
+            active_config(Duration::from_secs(10)),
+            source,
+            consent_path,
+            cancel.clone(),
+        );
+        let (_handle, join) = spawn_with_handle(deps);
+
+        tokio::task::yield_now().await;
+        cancel.cancel();
+        join.await.unwrap();
+        assert_eq!(closes_seen.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_sampler_cooldown_retries_and_recovers_automatically() {
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        test_record(&consent_path);
+        let source = ServiceSource {
+            connects: Mutex::new(VecDeque::new()),
+            connects_seen: Arc::new(AtomicUsize::new(0)),
+            captures: Mutex::new(VecDeque::from([
+                TestCapture::Failure(CaptureError::Timeout),
+                TestCapture::Frame,
+            ])),
+            captures_seen: Arc::new(AtomicUsize::new(0)),
+            closes_seen: Arc::new(AtomicUsize::new(0)),
+            grants_seen: Arc::new(AtomicUsize::new(0)),
+        };
+        let cancel = CancellationToken::new();
+        let (deps, _updates, _) = service_deps(
+            active_config(Duration::from_secs(10)),
+            source,
+            consent_path,
+            cancel.clone(),
+        );
+        let (handle, join) = spawn_with_handle(deps);
+
+        tokio::task::yield_now().await;
+        assert_eq!(handle.status().borrow().state, SamplingState::Cooldown);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(handle.status().borrow().state, SamplingState::Streaming);
+        cancel.cancel();
+        join.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_sampler_reconnects_after_exponential_backoff() {
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        test_record(&consent_path);
+        let connects_seen = Arc::new(AtomicUsize::new(0));
+        let source = ServiceSource {
+            connects: Mutex::new(VecDeque::from([
+                Err(CaptureError::Transport("portal unavailable".to_owned())),
+                Ok(test_stream()),
+            ])),
+            connects_seen: connects_seen.clone(),
+            captures: Mutex::new(VecDeque::new()),
+            captures_seen: Arc::new(AtomicUsize::new(0)),
+            closes_seen: Arc::new(AtomicUsize::new(0)),
+            grants_seen: Arc::new(AtomicUsize::new(0)),
+        };
+        let cancel = CancellationToken::new();
+        let (deps, _updates, _) = service_deps(
+            active_config(Duration::from_secs(10)),
+            source,
+            consent_path,
+            cancel.clone(),
+        );
+        let (handle, join) = spawn_with_handle(deps);
+
+        tokio::task::yield_now().await;
+        assert_eq!(connects_seen.load(Ordering::SeqCst), 1);
+        assert_eq!(handle.status().borrow().state, SamplingState::Connecting);
+        tokio::time::advance(Duration::from_secs(29)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(connects_seen.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(connects_seen.load(Ordering::SeqCst), 2);
+        assert_eq!(handle.status().borrow().state, SamplingState::Streaming);
+        cancel.cancel();
+        join.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_sampler_opens_consent_only_for_explicit_enable_command() {
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        let grants_seen = Arc::new(AtomicUsize::new(0));
+        let source = ServiceSource {
+            connects: Mutex::new(VecDeque::new()),
+            connects_seen: Arc::new(AtomicUsize::new(0)),
+            captures: Mutex::new(VecDeque::new()),
+            captures_seen: Arc::new(AtomicUsize::new(0)),
+            closes_seen: Arc::new(AtomicUsize::new(0)),
+            grants_seen: grants_seen.clone(),
+        };
+        let cancel = CancellationToken::new();
+        let (deps, _updates, _) = service_deps(
+            active_config(Duration::from_secs(10)),
+            source,
+            consent_path.clone(),
+            cancel.clone(),
+        );
+        let (handle, join) = spawn_with_handle(deps);
+
+        tokio::task::yield_now().await;
+        assert_eq!(grants_seen.load(Ordering::SeqCst), 0);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handle
+            .send(SamplerCommand::Enable { reply: reply_tx })
+            .await
+            .unwrap();
+        assert_eq!(reply_rx.await.unwrap(), ConsentFlowStatus::Granted);
+        assert_eq!(grants_seen.load(Ordering::SeqCst), 1);
+        assert!(consent_path.exists());
+        cancel.cancel();
+        join.await.unwrap();
+    }
 
     struct TransitionCase {
         name: &'static str,

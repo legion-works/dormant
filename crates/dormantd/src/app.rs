@@ -1442,6 +1442,7 @@ impl App {
                         source: Box::new(source),
                         consent_path,
                         cancel: root.clone(),
+                        env_reader: crate::active_sampler::production_env_reader,
                     });
                     let display_exists = cfg_clone
                         .wear

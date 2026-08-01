@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use dormant_core::config::schema::{ActiveSamplingConfig, Config, StreamMode};
+use dormant_core::ipc_proto::WearSamplingStatus;
 use dormant_core::spatial_grid::LumaGrid;
 use dormant_core::state_machine::Phase;
 use dormant_core::types::Tick;
@@ -87,6 +88,20 @@ pub enum ConsentFlowStatus {
     Error(String),
 }
 
+impl ConsentFlowStatus {
+    pub(crate) fn into_ipc_status(self) -> WearSamplingStatus {
+        match self {
+            Self::AwaitingConsent => {
+                unreachable!("consent flow replies only after terminal status")
+            }
+            Self::Granted => WearSamplingStatus::Granted,
+            Self::Denied => WearSamplingStatus::Denied,
+            Self::TimedOut => WearSamplingStatus::TimedOut,
+            Self::Error(reason) => WearSamplingStatus::Error(reason),
+        }
+    }
+}
+
 /// Error returned while routing a sampler command.
 #[derive(Debug)]
 pub enum SamplerError {
@@ -151,6 +166,12 @@ pub struct ActiveSamplerDeps {
     pub consent_path: PathBuf,
     /// Daemon shutdown signal.
     pub cancel: CancellationToken,
+    /// Environment lookup used to verify that a graphical session exists.
+    pub env_reader: fn(&str) -> Option<String>,
+}
+
+pub(crate) fn production_env_reader(name: &str) -> Option<String> {
+    std::env::var(name).ok()
 }
 
 /// Display identity and active phase supplied by generation management.
@@ -453,6 +474,7 @@ fn apply_capture_failure(
 
 #[allow(
     clippy::too_many_lines,
+    clippy::too_many_arguments,
     reason = "the command lifecycle keeps each consent result adjacent to its persistent-record outcome"
 )]
 async fn handle_command(
@@ -463,6 +485,7 @@ async fn handle_command(
     command_rx: &mut mpsc::Receiver<SamplerCommand>,
     status_tx: &watch::Sender<SamplerStatus>,
     cancel: &CancellationToken,
+    env_reader: fn(&str) -> Option<String>,
 ) -> bool {
     match command {
         SamplerCommand::Enable { reply } => {
@@ -484,6 +507,12 @@ async fn handle_command(
                 ));
                 return false;
             };
+            if env_reader("WAYLAND_DISPLAY").is_none() && env_reader("DISPLAY").is_none() {
+                let _ = reply.send(ConsentFlowStatus::Error(
+                    SamplerError::NoGraphicalSession.to_string(),
+                ));
+                return false;
+            }
             let transition = apply_trigger(runtime, Trigger::GrantStarted, status_tx);
             debug_assert!(
                 transition.effects.contains(&Effect::OpenConsent),
@@ -541,6 +570,11 @@ async fn handle_command(
                     let _ = reply.send(ConsentFlowStatus::Denied);
                 }
                 Some(Err(error)) => {
+                    if matches!(error, CaptureError::Protocol(ref text) if text == "wear_sampling_cancelled")
+                    {
+                        let _ = reply.send(ConsentFlowStatus::Error("cancelled".to_owned()));
+                        return false;
+                    }
                     let trigger = if matches!(error, CaptureError::Protocol(ref text) if text == WEAR_SAMPLING_WRONG_MONITOR)
                     {
                         Trigger::WrongMonitor
@@ -746,7 +780,7 @@ async fn run(
                     () = deps.cancel.cancelled() => break,
                     command = command_rx.recv() => {
                         if let Some(command) = command
-                            && handle_command(&mut runtime, &mut *deps.source, &deps.consent_path, command, &mut command_rx, &status_tx, &deps.cancel).await {
+                            && handle_command(&mut runtime, &mut *deps.source, &deps.consent_path, command, &mut command_rx, &status_tx, &deps.cancel, deps.env_reader).await {
                             capture_now = runtime.state == SamplingState::Streaming;
                         }
                     }
@@ -795,7 +829,7 @@ async fn run(
                             () = deps.cancel.cancelled() => break,
                             () = tokio::time::sleep(delay) => {},
                             update = deps.update_rx.recv() => if let Some(update) = update { let _ = apply_update_with_effects(&mut runtime, &mut *deps.source, update, &status_tx).await; },
-                             command = command_rx.recv() => if let Some(command) = command { let _ = handle_command(&mut runtime, &mut *deps.source, &deps.consent_path, command, &mut command_rx, &status_tx, &deps.cancel).await; },
+                             command = command_rx.recv() => if let Some(command) = command { let _ = handle_command(&mut runtime, &mut *deps.source, &deps.consent_path, command, &mut command_rx, &status_tx, &deps.cancel, deps.env_reader).await; },
                         }
                     }
                 }
@@ -814,7 +848,7 @@ async fn run(
                             continue;
                         }
                         command = command_rx.recv() => {
-                            if let Some(command) = command { let _ = handle_command(&mut runtime, &mut *deps.source, &deps.consent_path, command, &mut command_rx, &status_tx, &deps.cancel).await; }
+                            if let Some(command) = command { let _ = handle_command(&mut runtime, &mut *deps.source, &deps.consent_path, command, &mut command_rx, &status_tx, &deps.cancel, deps.env_reader).await; }
                             continue;
                         }
                     }
@@ -863,7 +897,7 @@ async fn run(
                         && let Some(transition) = apply_update_with_effects(&mut runtime, &mut *deps.source, update, &status_tx).await {
                         capture_now |= transition.effects.contains(&Effect::Capture);
                     },
-                     command = command_rx.recv() => if let Some(command) = command { let _ = handle_command(&mut runtime, &mut *deps.source, &deps.consent_path, command, &mut command_rx, &status_tx, &deps.cancel).await; },
+                     command = command_rx.recv() => if let Some(command) = command { let _ = handle_command(&mut runtime, &mut *deps.source, &deps.consent_path, command, &mut command_rx, &status_tx, &deps.cancel, deps.env_reader).await; },
                 }
             }
             SamplingState::ConsentPending => {
@@ -1376,6 +1410,15 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
 
+    #[allow(clippy::unnecessary_wraps)]
+    fn test_env_reader(_name: &str) -> Option<String> {
+        Some("test-session".to_owned())
+    }
+
+    fn headless_env_reader(_name: &str) -> Option<String> {
+        None
+    }
+
     #[tokio::test(start_paused = true)]
     async fn active_sampler_latest_replaces_capture_results() {
         let latest = new_latest_grid();
@@ -1623,6 +1666,7 @@ mod tests {
                 source: Box::new(source),
                 consent_path,
                 cancel,
+                env_reader: test_env_reader,
             },
             update_tx,
             latest_grid,
@@ -1691,6 +1735,7 @@ mod tests {
             source: Box::new(source),
             consent_path,
             cancel: cancel.clone(),
+            env_reader: test_env_reader,
         };
         let (_handle, join) = spawn_with_handle(deps);
 
@@ -2088,6 +2133,7 @@ mod tests {
                 &mut command_rx,
                 &status_tx,
                 &CancellationToken::new(),
+                test_env_reader,
             )
             .await
         );
@@ -2095,6 +2141,161 @@ mod tests {
             reply_rx.await.unwrap(),
             ConsentFlowStatus::Error(SamplerError::FlowAlreadyActive.to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn active_sampler_rejects_enable_without_graphical_session() {
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        let config = active_config(Duration::from_secs(10));
+        let mut runtime = Runtime::new(&config, &consent_path);
+        let initial_state = runtime.state;
+        let (status_tx, _) = watch::channel(initial_status(&config));
+        let mut source = ScriptedCaptureSource::with_pending_consent();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let (_command_tx, mut command_rx) = mpsc::channel(1);
+
+        handle_command(
+            &mut runtime,
+            &mut source,
+            &consent_path,
+            SamplerCommand::Enable { reply: reply_tx },
+            &mut command_rx,
+            &status_tx,
+            &CancellationToken::new(),
+            headless_env_reader,
+        )
+        .await;
+
+        assert_eq!(
+            reply_rx.await.unwrap(),
+            ConsentFlowStatus::Error(SamplerError::NoGraphicalSession.to_string())
+        );
+        assert_eq!(runtime.state, initial_state);
+        assert_eq!(source.close_calls(), 0);
+        assert!(!consent_path.exists());
+    }
+
+    #[tokio::test]
+    async fn active_sampler_config_disabled_replies_without_opening_consent() {
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        let mut config = (*active_config(Duration::from_secs(10))).clone();
+        config.wear.active_sampling.enabled = false;
+        let mut runtime = Runtime::new(&config, &consent_path);
+        let (status_tx, _) = watch::channel(initial_status(&config));
+        let mut source = ScriptedCaptureSource::default();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let (_command_tx, mut command_rx) = mpsc::channel(1);
+
+        handle_command(
+            &mut runtime,
+            &mut source,
+            &consent_path,
+            SamplerCommand::Enable { reply: reply_tx },
+            &mut command_rx,
+            &status_tx,
+            &CancellationToken::new(),
+            test_env_reader,
+        )
+        .await;
+
+        assert_eq!(
+            reply_rx.await.unwrap(),
+            ConsentFlowStatus::Error("active sampling is disabled".to_owned())
+        );
+        assert!(!consent_path.exists());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_sampler_consent_timeout_replies_timed_out() {
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        let config = active_config(Duration::from_secs(10));
+        let mut runtime = Runtime::new(&config, &consent_path);
+        let (status_tx, _) = watch::channel(initial_status(&config));
+        let mut source = ScriptedCaptureSource::with_pending_consent();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let (_command_tx, mut command_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let future = handle_command(
+            &mut runtime,
+            &mut source,
+            &consent_path,
+            SamplerCommand::Enable { reply: reply_tx },
+            &mut command_rx,
+            &status_tx,
+            &cancel,
+            test_env_reader,
+        );
+        tokio::pin!(future);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(300)).await;
+        future.await;
+
+        assert_eq!(reply_rx.await.unwrap(), ConsentFlowStatus::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn active_sampler_denial_replies_denied() {
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        let config = active_config(Duration::from_secs(10));
+        let mut runtime = Runtime::new(&config, &consent_path);
+        let (status_tx, _) = watch::channel(initial_status(&config));
+        let mut source = ScriptedCaptureSource {
+            grants: VecDeque::from([ScriptedOutcome::Ready(Err(CaptureError::ConsentDenied))]),
+            ..ScriptedCaptureSource::default()
+        };
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let (_command_tx, mut command_rx) = mpsc::channel(1);
+
+        handle_command(
+            &mut runtime,
+            &mut source,
+            &consent_path,
+            SamplerCommand::Enable { reply: reply_tx },
+            &mut command_rx,
+            &status_tx,
+            &CancellationToken::new(),
+            test_env_reader,
+        )
+        .await;
+
+        assert_eq!(reply_rx.await.unwrap(), ConsentFlowStatus::Denied);
+        assert!(!consent_path.exists());
+    }
+
+    #[tokio::test]
+    async fn active_sampler_disable_without_forget_retains_record() {
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        test_record(&consent_path);
+        let config = active_config(Duration::from_secs(10));
+        let mut runtime = Runtime::new(&config, &consent_path);
+        let (status_tx, _) = watch::channel(initial_status(&config));
+        let mut source = ScriptedCaptureSource::default();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let (_command_tx, mut command_rx) = mpsc::channel(1);
+
+        handle_command(
+            &mut runtime,
+            &mut source,
+            &consent_path,
+            SamplerCommand::Disable {
+                forget: false,
+                reply: reply_tx,
+            },
+            &mut command_rx,
+            &status_tx,
+            &CancellationToken::new(),
+            test_env_reader,
+        )
+        .await;
+
+        assert!(matches!(reply_rx.await.unwrap(), Ok(())));
+        assert!(crate::screencast_consent::load(&consent_path, "oled").is_ok());
+        assert_eq!(source.close_calls(), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2112,6 +2313,7 @@ mod tests {
             source: Box::new(ScriptedCaptureSource::with_pending_consent()),
             consent_path: consent_path.clone(),
             cancel: cancel.clone(),
+            env_reader: test_env_reader,
         });
 
         let (enable_tx, enable_rx) = oneshot::channel();
@@ -2135,13 +2337,13 @@ mod tests {
                 .await
                 .is_ok()
         );
-        assert!(matches!(
+        assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), enable_rx)
                 .await
                 .unwrap()
                 .unwrap(),
-            ConsentFlowStatus::Error(_)
-        ));
+            ConsentFlowStatus::Error("cancelled".to_owned())
+        );
         assert!(!consent_path.exists());
         cancel.cancel();
         join.await.unwrap();
@@ -2171,6 +2373,7 @@ mod tests {
             &mut command_rx,
             &status_tx,
             &CancellationToken::new(),
+            test_env_reader,
         )
         .await;
 

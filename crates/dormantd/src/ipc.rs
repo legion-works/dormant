@@ -316,15 +316,7 @@ async fn handle_wear_enable(active_sampler: Option<&ActiveSamplerHandle>) -> Ipc
         return IpcResponse::wear_sampling(WearSamplingStatus::Error(sampler_error_reason(&error)));
     }
     let status = match reply_rx.await {
-        Ok(crate::active_sampler::ConsentFlowStatus::AwaitingConsent) => {
-            WearSamplingStatus::AwaitingConsent
-        }
-        Ok(crate::active_sampler::ConsentFlowStatus::Granted) => WearSamplingStatus::Granted,
-        Ok(crate::active_sampler::ConsentFlowStatus::Denied) => WearSamplingStatus::Denied,
-        Ok(crate::active_sampler::ConsentFlowStatus::TimedOut) => WearSamplingStatus::TimedOut,
-        Ok(crate::active_sampler::ConsentFlowStatus::Error(reason)) => {
-            WearSamplingStatus::Error(reason)
-        }
+        Ok(status) => status.into_ipc_status(),
         Err(_) => WearSamplingStatus::Error("wear_sampling_command_closed".to_owned()),
     };
     IpcResponse::wear_sampling(status)
@@ -338,8 +330,9 @@ fn handle_wear_status(active_sampler: Option<&ActiveSamplerHandle>) -> IpcRespon
     };
     let status = active_sampler.status().borrow().state;
     let status = match status {
-        SamplingState::ConsentPending | SamplingState::NeedsConsent => {
-            WearSamplingStatus::AwaitingConsent
+        SamplingState::ConsentPending => WearSamplingStatus::AwaitingConsent,
+        SamplingState::NeedsConsent => {
+            WearSamplingStatus::Error("wear_sampling_needs_consent".to_owned())
         }
         SamplingState::Connecting | SamplingState::Streaming => WearSamplingStatus::Granted,
         SamplingState::Disabled | SamplingState::Suspended | SamplingState::Cooldown => {

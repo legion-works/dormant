@@ -1,6 +1,8 @@
 //! Active-sampling consent commands.
 
 use std::path::Path;
+use std::sync::mpsc;
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use dormant_core::ipc_proto::{IpcRequest, WearSamplingStatus};
@@ -11,7 +13,7 @@ use dormant_core::ipc_proto::{IpcRequest, WearSamplingStatus};
 ///
 /// Returns an error when IPC fails or the daemon reports a non-success status.
 pub fn run_enable(socket: &Path) -> Result<()> {
-    let response = crate::client::send_request(socket, &IpcRequest::WearSamplingEnable)?;
+    let response = send_request_timeout(socket, IpcRequest::WearSamplingEnable)?;
     print_status(response.wear_sampling)
 }
 
@@ -21,9 +23,24 @@ pub fn run_enable(socket: &Path) -> Result<()> {
 ///
 /// Returns an error when IPC fails or the daemon reports a non-success status.
 pub fn run_disable(socket: &Path, forget: bool) -> Result<()> {
-    let response =
-        crate::client::send_request(socket, &IpcRequest::WearSamplingDisable { forget })?;
+    let response = send_request_timeout(socket, IpcRequest::WearSamplingDisable { forget })?;
     print_status(response.wear_sampling)
+}
+
+fn send_request_timeout(
+    socket: &Path,
+    request: IpcRequest,
+) -> Result<dormant_core::ipc_proto::IpcResponse> {
+    let socket = socket.to_owned();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(crate::client::send_request(&socket, &request));
+    });
+    match rx.recv_timeout(Duration::from_secs(30)) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(anyhow!("wear sampling request timed out")),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(anyhow!("wear sampling request failed")),
+    }
 }
 
 fn print_status(status: Option<WearSamplingStatus>) -> Result<()> {

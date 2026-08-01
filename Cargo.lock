@@ -1246,6 +1246,7 @@ dependencies = [
  "dormantctl",
  "dormantd",
  "evdev",
+ "futures-util",
  "indexmap",
  "libc",
  "notify",

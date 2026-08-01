@@ -5,6 +5,124 @@ pub const LUMA_GRID_ROWS: u16 = 9;
 /// Number of columns in the fixed luma ordering grid.
 pub const LUMA_GRID_COLS: u16 = 16;
 
+/// Errors encountered while reducing a raw RGBA frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GridError {
+    /// The frame dimensions cannot describe a valid RGBA buffer.
+    InvalidDimensions,
+    /// The row stride is shorter than one packed RGBA row.
+    InvalidStride {
+        /// Minimum packed RGBA row length.
+        minimum: usize,
+        /// Supplied row length.
+        actual: usize,
+    },
+    /// The buffer length does not match its dimensions and stride.
+    InvalidLength {
+        /// Buffer length required by the dimensions and stride.
+        expected: usize,
+        /// Supplied buffer length.
+        actual: usize,
+    },
+    /// The requested output dimensions do not match [`LumaGrid`].
+    InvalidOutputDimensions {
+        /// Requested output rows.
+        rows: u16,
+        /// Requested output columns.
+        cols: u16,
+    },
+}
+
+/// Reduce a packed RGBA8 frame to a 16×9 linear-light luma grid.
+///
+/// The transfer-function constants and Rec. 709 weights intentionally mirror
+/// `dormant-render::luma`; they should move to a shared pure module if another
+/// consumer needs the same conversion.
+///
+/// # Errors
+///
+/// Returns [`GridError`] when the input buffer, stride, source dimensions, or
+/// requested output dimensions are malformed.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "pixel coordinates are bounded by the supplied u32 dimensions"
+)]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "the validated normalized luma result is intentionally f32"
+)]
+pub fn reduce_rgba8_to_luma_grid(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    stride: usize,
+    rows: u16,
+    cols: u16,
+) -> Result<LumaGrid, GridError> {
+    if width == 0 || height == 0 || rows == 0 || cols == 0 {
+        return Err(GridError::InvalidDimensions);
+    }
+    if rows != LUMA_GRID_ROWS || cols != LUMA_GRID_COLS {
+        return Err(GridError::InvalidOutputDimensions { rows, cols });
+    }
+    let minimum_stride = usize::try_from(width)
+        .ok()
+        .and_then(|width| width.checked_mul(4))
+        .ok_or(GridError::InvalidDimensions)?;
+    if stride < minimum_stride {
+        return Err(GridError::InvalidStride {
+            minimum: minimum_stride,
+            actual: stride,
+        });
+    }
+    let expected_length = stride
+        .checked_mul(usize::try_from(height).map_err(|_| GridError::InvalidDimensions)?)
+        .ok_or(GridError::InvalidDimensions)?;
+    if rgba.len() != expected_length {
+        return Err(GridError::InvalidLength {
+            expected: expected_length,
+            actual: rgba.len(),
+        });
+    }
+
+    let cell_count = usize::from(rows) * usize::from(cols);
+    let mut sums = vec![0.0_f64; cell_count];
+    let mut counts = vec![0.0_f64; cell_count];
+    let width_usize = usize::try_from(width).map_err(|_| GridError::InvalidDimensions)?;
+    let height_usize = usize::try_from(height).map_err(|_| GridError::InvalidDimensions)?;
+    for y in 0..height_usize {
+        for x in 0..width_usize {
+            let cell_row = (y as u64 * u64::from(rows) / u64::from(height)) as usize;
+            let cell_col = (x as u64 * u64::from(cols) / u64::from(width)) as usize;
+            let cell = cell_row * usize::from(cols) + cell_col;
+            let offset = y * stride + x * 4;
+            let alpha = f32::from(rgba[offset + 3]) / 255.0;
+            let red = f32::from(rgba[offset]) / 255.0 * alpha;
+            let green = f32::from(rgba[offset + 1]) / 255.0 * alpha;
+            let blue = f32::from(rgba[offset + 2]) / 255.0 * alpha;
+            let srgb_to_linear = |channel: f32| {
+                if channel <= 0.04045 {
+                    channel / 12.92
+                } else {
+                    ((channel + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            sums[cell] += f64::from(
+                0.2126 * srgb_to_linear(red)
+                    + 0.7152 * srgb_to_linear(green)
+                    + 0.0722 * srgb_to_linear(blue),
+            );
+            counts[cell] += 1.0;
+        }
+    }
+    let cells = sums
+        .into_iter()
+        .zip(counts)
+        .map(|(sum, count)| (sum / count) as f32)
+        .collect();
+    LumaGrid::new(cells).ok_or(GridError::InvalidDimensions)
+}
+
 /// A fixed-size, row-major luma grid.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LumaGrid {
@@ -157,6 +275,113 @@ mod tests {
         let mut nan = valid;
         nan[0] = f32::NAN;
         assert!(LumaGrid::new(nan).is_none());
+    }
+
+    #[test]
+    fn reduce_rgba8_maps_black_white_and_primary_colors() {
+        let cases = [
+            ([0, 0, 0, 255], 0.0),
+            ([255, 255, 255, 255], 1.0),
+            ([255, 0, 0, 255], 0.2126),
+            ([0, 255, 0, 255], 0.7152),
+            ([0, 0, 255, 255], 0.0722),
+        ];
+        for (pixel, expected) in cases {
+            let rgba = pixel.repeat(16 * 9);
+            let grid = reduce_rgba8_to_luma_grid(&rgba, 16, 9, 16 * 4, 9, 16).unwrap();
+            assert!(
+                grid.cells
+                    .iter()
+                    .all(|value| (*value - expected).abs() < 1e-6)
+            );
+        }
+    }
+
+    #[test]
+    fn reduce_rgba8_matches_srgb_branch_boundary() {
+        let low = [10_u8, 10, 10, 255];
+        let high = [11_u8, 11, 11, 255];
+        for pixel in [low, high] {
+            let rgba = pixel.repeat(16 * 9);
+            let grid = reduce_rgba8_to_luma_grid(&rgba, 16, 9, 64, 9, 16).unwrap();
+            let channel = f32::from(rgba[0]) / 255.0;
+            let expected = if channel <= 0.04045 {
+                channel / 12.92
+            } else {
+                ((channel + 0.055) / 1.055).powf(2.4)
+            };
+            assert!((grid.cells[0] - expected).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn reduce_rgba8_ignores_padded_stride_bytes() {
+        let mut rgba = vec![0_u8; 68 * 9];
+        for row in 0..9 {
+            for col in 0..16 {
+                let offset = row * 68 + col * 4;
+                rgba[offset..offset + 4].copy_from_slice(&[255, 255, 255, 255]);
+            }
+            rgba[row * 68 + 64..row * 68 + 68].fill(255);
+        }
+        let grid = reduce_rgba8_to_luma_grid(&rgba, 16, 9, 68, 9, 16).unwrap();
+        assert!(grid.cells.iter().all(|value| (*value - 1.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn reduce_rgba8_covers_non_divisible_source_dimensions() {
+        let mut rgba = vec![0_u8; 17 * 10 * 4];
+        for row in 0..10 {
+            for col in 0..17 {
+                let offset = (row * 17 + col) * 4;
+                rgba[offset..offset + 4].copy_from_slice(&[255, 255, 255, 255]);
+            }
+        }
+        let grid = reduce_rgba8_to_luma_grid(&rgba, 17, 10, 17 * 4, 9, 16).unwrap();
+        assert!(grid.cells.iter().all(|value| (*value - 1.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn reduce_rgba8_composites_alpha_over_black_before_transfer() {
+        let pixel = [255, 0, 0, 128];
+        let rgba = pixel.repeat(16 * 9);
+        let grid = reduce_rgba8_to_luma_grid(&rgba, 16, 9, 64, 9, 16).unwrap();
+        let alpha = 128.0 / 255.0;
+        let expected = 0.2126 * (alpha + 0.055_f32).powf(2.4) / 1.055_f32.powf(2.4);
+        assert!((grid.cells[0] - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn reduce_rgba8_rejects_malformed_length_and_stride() {
+        let rgba = vec![0_u8; 16 * 9 * 4];
+        assert!(reduce_rgba8_to_luma_grid(&rgba[..rgba.len() - 1], 16, 9, 64, 9, 16).is_err());
+        assert!(reduce_rgba8_to_luma_grid(&rgba, 16, 9, 63, 9, 16).is_err());
+        assert!(reduce_rgba8_to_luma_grid(&rgba, 16, 9, 64, 0, 16).is_err());
+    }
+
+    #[test]
+    fn reduce_rgba8_produces_deterministic_16_by_9_output() {
+        let mut rgba = vec![0_u8; 16 * 9 * 4];
+        for row in 0..9 {
+            for col in 0..16 {
+                let offset = (row * 16 + col) * 4;
+                rgba[offset..offset + 4].copy_from_slice(&[
+                    u8::try_from(col * 16).unwrap(),
+                    u8::try_from(row * 16).unwrap(),
+                    0,
+                    255,
+                ]);
+            }
+        }
+        let grid = reduce_rgba8_to_luma_grid(&rgba, 16, 9, 64, 9, 16).unwrap();
+        assert_eq!(grid.cells.len(), 144);
+        assert_eq!(
+            grid.cells,
+            reduce_rgba8_to_luma_grid(&rgba, 16, 9, 64, 9, 16)
+                .unwrap()
+                .cells
+        );
+        assert!(grid.cells[0] < grid.cells[143]);
     }
 
     proptest! {

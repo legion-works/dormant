@@ -68,6 +68,8 @@ export default function WearCard() {
   const navigate = useNavigate();
   const [sampling, setSampling] = useState<WearSamplingStatus | null>(null);
   const [samplingEnabled, setSamplingEnabled] = useState(false);
+  const [sampledDisplayId, setSampledDisplayId] = useState<string | null>(null);
+  const [samplingError, setSamplingError] = useState<string | null>(null);
 
   const handleOpenDetail = (displayName: string) => {
     selectDisplay(displayName);
@@ -75,13 +77,19 @@ export default function WearCard() {
   };
 
   const displays = wear?.displays ?? null;
-  const sampledDisplay = useMemo(() => wear?.displays[0] ?? null, [wear]);
+  const sampledDisplay = useMemo(() => {
+    const configured = wear?.displays.find((display) =>
+      display.config_display_id === sampledDisplayId || display.display_name === sampledDisplayId,
+    );
+    return configured ?? wear?.displays[0] ?? null;
+  }, [wear, sampledDisplayId]);
 
   useEffect(() => {
     let cancelled = false;
     void Promise.all([getConfig(), getWearSamplingStatus()]).then(([config, status]) => {
       if (cancelled) return;
       setSamplingEnabled(config.inventory.wear?.active_sampling?.enabled === true);
+      setSampledDisplayId(config.inventory.wear?.active_sampling?.sampled_display ?? null);
       setSampling(status);
     }).catch(() => {});
     return () => { cancelled = true; };
@@ -110,7 +118,12 @@ export default function WearCard() {
     : `Last sample: ${Math.max(0, Math.floor((Date.now() / 1000 - age) / 60))}m ago`;
 
   const enableSampling = async () => {
-    setSampling(await postWearSamplingEnable());
+    try {
+      setSamplingError(null);
+      setSampling(await postWearSamplingEnable());
+    } catch (error) {
+      setSamplingError(error instanceof Error ? error.message : "Unable to start active sampling");
+    }
   };
 
   return (
@@ -123,6 +136,7 @@ export default function WearCard() {
         {sampling?.status === "error" && !needsConsent && sampling.reason && (
           <span className="wear-card__sampling-reason">{sampling.reason}</span>
         )}
+        {samplingError && <span className="wear-card__sampling-reason">{samplingError}</span>}
         {samplingEnabled && needsConsent && (
           <button type="button" onClick={() => { void enableSampling(); }}>Enable active sampling</button>
         )}

@@ -675,6 +675,12 @@ mod tests {
         );
     }
 
+    #[test]
+    fn wear_sampling_posts_are_acknowledged_weak_routes() {
+        assert!(ACKNOWLEDGED_WEAK_ROUTES.contains(&"/api/wear/sampling/enable"));
+        assert!(ACKNOWLEDGED_WEAK_ROUTES.contains(&"/api/wear/sampling/disable"));
+    }
+
     /// M3 Must-2 counterpart for the global emergency-wake route: a direct
     /// membership assertion pinning it to the weak (same-origin) set, not
     /// merely coverage by the `⊆ STRICT ∪ WEAK` union check in `server.rs`.

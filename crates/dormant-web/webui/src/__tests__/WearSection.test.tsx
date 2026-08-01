@@ -69,4 +69,11 @@ describe("WearSection active sampling", () => {
       { op: "set", path: ["wear", "active_sampling", "circuit_reset_after"], value: "30s" },
     ]));
   });
+
+  it("renders server validation detail for an active-sampling field", () => {
+    const store = createPatchStore();
+    render(<WearSection wear={wear} displays={displays} store={store} redactedPaths={[]} onDirty={() => {}}
+      fieldErrors={{ "wear.active_sampling.capture_timeout": "must be no more than half the sample interval" }} />);
+    expect(screen.getByText("must be no more than half the sample interval")).toBeInTheDocument();
+  });
 });

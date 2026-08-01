@@ -219,10 +219,38 @@ impl<T: PortalTransport> PortalPipeWireSource<T> {
     ) -> Result<ConnectedStream, CaptureError> {
         self.close().await;
         let session = self.transport.create_session().await?;
+        tracing::info!(event = "wear_sampling_stage", stage = "session_created");
         let opened = async {
             self.transport.select_sources(&session, options).await?;
-            let stream = connected_stream(self.transport.start(&session).await?)?;
-            let pipewire_fd = self.transport.open_pipewire_remote(&session).await?;
+            tracing::info!(event = "wear_sampling_stage", stage = "sources_selected");
+            let started = self.transport.start(&session).await;
+            let start = match started {
+                Ok(start) => {
+                    tracing::info!(
+                        event = "wear_sampling_stage",
+                        stage = "start_response_received",
+                        granted = true
+                    );
+                    start
+                }
+                Err(CaptureError::ConsentDenied) => {
+                    tracing::info!(
+                        event = "wear_sampling_stage",
+                        stage = "start_response_received",
+                        granted = false
+                    );
+                    return Err(CaptureError::ConsentDenied);
+                }
+                Err(error) => return Err(error),
+            };
+            let stream = connected_stream(start)?;
+            let pipewire_fd = tokio::time::timeout(
+                PORTAL_RESPONSE_TIMEOUT,
+                self.transport.open_pipewire_remote(&session),
+            )
+            .await
+            .map_err(|_| CaptureError::Transport("open_pipewire_remote_timeout".to_owned()))??;
+            tracing::info!(event = "wear_sampling_stage", stage = "pipewire_fd_opened");
             Ok::<_, CaptureError>((stream, pipewire_fd))
         }
         .await;
@@ -231,6 +259,11 @@ impl<T: PortalTransport> PortalPipeWireSource<T> {
                 self.session = Some(session);
                 self.stream = Some(stream.clone());
                 self.pipewire_fd = Some(pipewire_fd);
+                tracing::info!(
+                    event = "wear_sampling_stage",
+                    stage = "stream_connected",
+                    node_id = stream.node_id
+                );
                 Ok(stream)
             }
             Err(error) => {
@@ -271,6 +304,10 @@ impl<T: PortalTransport> CaptureSource for PortalPipeWireSource<T> {
     ) -> Result<Grant, CaptureError> {
         self.open(SelectSourcesOptions::for_grant()).await?;
         self.capture_one(StreamMode::Warm).await?;
+        tracing::info!(
+            event = "wear_sampling_stage",
+            stage = "first_frame_received"
+        );
         Ok(Grant {
             stream: self
                 .stream
@@ -315,7 +352,7 @@ impl<T: PortalTransport> CaptureSource for PortalPipeWireSource<T> {
             }
             StreamMode::Warm => {
                 if self.warm_worker.is_none() {
-                    self.warm_worker = Some(WarmWorker::spawn(fd, node_id)?);
+                    self.warm_worker = Some(WarmWorker::spawn(fd, node_id).await?);
                 }
                 let result = self
                     .warm_worker
@@ -369,7 +406,19 @@ struct WarmWorker {
 }
 
 impl WarmWorker {
-    fn spawn(fd: OwnedFd, node_id: u32) -> Result<Self, CaptureError> {
+    async fn spawn(fd: OwnedFd, node_id: u32) -> Result<Self, CaptureError> {
+        tokio::time::timeout(
+            PORTAL_RESPONSE_TIMEOUT,
+            tokio::task::spawn_blocking(move || Self::spawn_blocking(fd, node_id)),
+        )
+        .await
+        .map_err(|_| {
+            CaptureError::Transport("pipewire_warm_worker_initialization_timeout".to_owned())
+        })?
+        .map_err(|error| CaptureError::Transport(format!("PipeWire warm worker join: {error}")))?
+    }
+
+    fn spawn_blocking(fd: OwnedFd, node_id: u32) -> Result<Self, CaptureError> {
         let (frames_tx, frames) = tokio::sync::mpsc::channel(1);
         let (initialized_tx, initialized_rx) = std::sync::mpsc::sync_channel(1);
         let join = std::thread::Builder::new()
@@ -1032,6 +1081,7 @@ fn parse_start_result(
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
     use std::sync::{Arc, Mutex};
 
     use super::*;
@@ -1060,6 +1110,47 @@ mod tests {
     struct FakeState {
         calls: Vec<PortalCall>,
         start: Result<PortalStartResult, CaptureError>,
+    }
+
+    #[derive(Clone)]
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("trace buffer lock is not poisoned")
+                .write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn capture_tracing<F: FnOnce()>(f: F) -> String {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(CaptureWriter(buffer.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8(
+            buffer
+                .lock()
+                .expect("trace buffer lock is not poisoned")
+                .clone(),
+        )
+        .expect("tracing output is UTF-8")
     }
 
     impl FakePortalTransport {
@@ -1139,6 +1230,42 @@ mod tests {
         }
     }
 
+    struct StallingOpenPipeWireRemoteTransport;
+
+    #[async_trait]
+    impl PortalTransport for StallingOpenPipeWireRemoteTransport {
+        async fn create_session(&self) -> Result<PortalSession, CaptureError> {
+            Ok(PortalSession::fake())
+        }
+
+        async fn select_sources(
+            &self,
+            _session: &PortalSession,
+            _options: SelectSourcesOptions,
+        ) -> Result<(), CaptureError> {
+            Ok(())
+        }
+
+        async fn start(&self, _session: &PortalSession) -> Result<PortalStartResult, CaptureError> {
+            Ok(PortalStartResult::single(
+                73,
+                3072,
+                1728,
+                Some("persistent-output"),
+                "rotated-token",
+            ))
+        }
+
+        async fn open_pipewire_remote(
+            &self,
+            _session: &PortalSession,
+        ) -> Result<OwnedFd, CaptureError> {
+            std::future::pending().await
+        }
+
+        async fn close(&self, _session: PortalSession) {}
+    }
+
     #[tokio::test]
     async fn active_sampling_protocol_grant_uses_exact_portal_options_and_rotates_token() {
         let transport = FakePortalTransport::grant_with(PortalStartResult::single(
@@ -1191,6 +1318,73 @@ mod tests {
                 },
                 PortalCall::OpenPipeWireRemote,
             ]
+        );
+    }
+
+    #[test]
+    fn active_sampling_protocol_logs_completed_consent_stages() {
+        let log = capture_tracing(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread runtime builds");
+            runtime.block_on(async {
+                let transport = FakePortalTransport::grant_with(PortalStartResult::single(
+                    73,
+                    3072,
+                    1728,
+                    Some("persistent-output"),
+                    "rotated-token",
+                ));
+                let mut source = PortalPipeWireSource::from_transport_with_frames(
+                    transport,
+                    [Ok(RawFrame {
+                        rgba: vec![0; 4],
+                        width: 3840,
+                        height: 2160,
+                        stride: 3840 * 4,
+                    })],
+                );
+
+                source
+                    .request_consent(&DisplayExpectation {
+                        display: "oled".to_owned(),
+                    })
+                    .await
+                    .expect("scripted portal grant succeeds");
+            });
+        });
+
+        for stage in [
+            "session_created",
+            "sources_selected",
+            "start_response_received",
+            "pipewire_fd_opened",
+            "stream_connected",
+            "first_frame_received",
+        ] {
+            assert!(log.contains(stage), "missing {stage} stage: {log}");
+        }
+        assert!(log.contains("granted=true"), "missing grant result: {log}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_sampling_protocol_bounds_a_stalled_open_pipewire_remote_call() {
+        let mut source = PortalPipeWireSource::from_transport(StallingOpenPipeWireRemoteTransport);
+
+        let result = tokio::time::timeout(
+            PORTAL_RESPONSE_TIMEOUT + Duration::from_secs(1),
+            source.request_consent(&DisplayExpectation {
+                display: "oled".to_owned(),
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Ok(Err(CaptureError::Transport(
+                "open_pipewire_remote_timeout".to_owned()
+            )))
         );
     }
 

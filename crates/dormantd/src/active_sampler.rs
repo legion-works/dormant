@@ -639,6 +639,10 @@ async fn handle_command(
                                 &record.sampled_display,
                             )
                             .ok();
+                            tracing::info!(
+                                event = "wear_sampling_stage",
+                                stage = "token_persisted"
+                            );
                             let transition = apply_trigger(runtime, Trigger::Granted, status_tx);
                             let _ = reply.send(ConsentFlowStatus::Granted);
                             return transition.effects.contains(&Effect::Connect);

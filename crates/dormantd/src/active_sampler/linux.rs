@@ -3,9 +3,11 @@
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use async_trait::async_trait;
-use dormant_core::config::schema::StreamMode;
+use dormant_core::config::schema::{ActiveSamplingConfig, StreamMode};
 use pipewire as pw;
 use pw::properties::properties;
 use pw::spa;
@@ -159,6 +161,8 @@ pub struct PortalPipeWireSource<T = ZbusPortalTransport> {
     session: Option<PortalSession>,
     stream: Option<ConnectedStream>,
     pipewire_fd: Option<OwnedFd>,
+    warm_worker: Option<WarmWorker>,
+    capture_timeout: Duration,
     #[cfg(test)]
     scripted_frames: std::collections::VecDeque<Result<RawFrame, CaptureError>>,
 }
@@ -182,9 +186,18 @@ impl<T> PortalPipeWireSource<T> {
             session: None,
             stream: None,
             pipewire_fd: None,
+            warm_worker: None,
+            capture_timeout: ActiveSamplingConfig::default().capture_timeout,
             #[cfg(test)]
             scripted_frames: std::collections::VecDeque::new(),
         }
+    }
+
+    /// Uses the configured deadline for warm-worker frame delivery.
+    #[must_use]
+    pub fn with_capture_timeout(mut self, capture_timeout: Duration) -> Self {
+        self.capture_timeout = capture_timeout;
+        self
     }
 
     #[cfg(test)]
@@ -266,7 +279,7 @@ impl<T: PortalTransport> CaptureSource for PortalPipeWireSource<T> {
         })
     }
 
-    async fn capture_one(&mut self, _mode: StreamMode) -> Result<RawFrame, CaptureError> {
+    async fn capture_one(&mut self, mode: StreamMode) -> Result<RawFrame, CaptureError> {
         #[cfg(test)]
         if let Some(frame) = self.scripted_frames.pop_front() {
             let frame = frame?;
@@ -288,9 +301,35 @@ impl<T: PortalTransport> CaptureSource for PortalPipeWireSource<T> {
                 CaptureError::Transport(format!("clone portal PipeWire fd: {error}"))
             })?;
         let node_id = stream.node_id;
-        let frame = tokio::task::spawn_blocking(move || acquire_one_frame(fd, node_id))
-            .await
-            .map_err(|error| CaptureError::Transport(format!("PipeWire worker join: {error}")))??;
+        let frame = match mode {
+            StreamMode::PerTick => {
+                if let Some(mut worker) = self.warm_worker.take() {
+                    worker.shutdown().await;
+                }
+                tokio::task::spawn_blocking(move || acquire_one_frame(fd, node_id))
+                    .await
+                    .map_err(|error| {
+                        CaptureError::Transport(format!("PipeWire worker join: {error}"))
+                    })??
+            }
+            StreamMode::Warm => {
+                if self.warm_worker.is_none() {
+                    self.warm_worker = Some(WarmWorker::spawn(fd, node_id)?);
+                }
+                let result = self
+                    .warm_worker
+                    .as_mut()
+                    .expect("warm worker was initialized")
+                    .capture(self.capture_timeout)
+                    .await;
+                if result == Err(CaptureError::Timeout)
+                    && let Some(mut worker) = self.warm_worker.take()
+                {
+                    worker.shutdown().await;
+                }
+                result?
+            }
+        };
         if let Some(stream) = self.stream.as_mut() {
             stream.frame_width = frame.width;
             stream.frame_height = frame.height;
@@ -299,12 +338,225 @@ impl<T: PortalTransport> CaptureSource for PortalPipeWireSource<T> {
     }
 
     async fn close(&mut self) {
+        if let Some(mut worker) = self.warm_worker.take() {
+            worker.shutdown().await;
+        }
         self.pipewire_fd = None;
         self.stream = None;
         if let Some(session) = self.session.take() {
             self.transport.close(session).await;
         }
     }
+}
+
+#[derive(Debug)]
+enum WarmCommand {
+    Capture,
+    Shutdown,
+}
+
+struct WarmWorker {
+    commands: pw::channel::Sender<WarmCommand>,
+    frames: tokio::sync::mpsc::UnboundedReceiver<Result<RawFrame, CaptureError>>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl WarmWorker {
+    fn spawn(fd: OwnedFd, node_id: u32) -> Result<Self, CaptureError> {
+        let (frames_tx, frames) = tokio::sync::mpsc::unbounded_channel();
+        let (initialized_tx, initialized_rx) = std::sync::mpsc::sync_channel(1);
+        let join = std::thread::Builder::new()
+            .name("dormant-pipewire-warm".to_owned())
+            .spawn(move || {
+                if let Err(error) = run_warm_stream(fd, node_id, frames_tx, &initialized_tx) {
+                    let _ = initialized_tx.send(Err(error));
+                }
+            })
+            .map_err(|error| {
+                CaptureError::Transport(format!("spawn PipeWire warm worker: {error}"))
+            })?;
+        let commands = initialized_rx.recv().map_err(|error| {
+            CaptureError::Transport(format!("PipeWire warm worker initialization: {error}"))
+        })??;
+        Ok(Self {
+            commands,
+            frames,
+            join: Some(join),
+        })
+    }
+
+    async fn capture(&mut self, timeout: Duration) -> Result<RawFrame, CaptureError> {
+        self.commands.send(WarmCommand::Capture).map_err(|_| {
+            CaptureError::Transport("PipeWire warm worker is unavailable".to_owned())
+        })?;
+        tokio::time::timeout(timeout, self.frames.recv())
+            .await
+            .map_err(|_| CaptureError::Timeout)?
+            .ok_or_else(|| {
+                CaptureError::Transport(
+                    "PipeWire warm worker ended before delivering a frame".to_owned(),
+                )
+            })?
+    }
+
+    async fn shutdown(&mut self) {
+        let _ = self.commands.send(WarmCommand::Shutdown);
+        if let Some(join) = self.join.take() {
+            let _ = tokio::task::spawn_blocking(move || join.join()).await;
+        }
+    }
+
+    #[cfg(test)]
+    fn spawn_fake(frames: impl IntoIterator<Item = Option<RawFrame>> + Send + 'static) -> Self {
+        let (frames_tx, frames_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (initialized_tx, initialized_rx) = std::sync::mpsc::sync_channel(1);
+        let join = std::thread::spawn(move || {
+            pw::init();
+            let mainloop = pw::main_loop::MainLoopRc::new(None).expect("fake main loop");
+            let (commands, receiver) = pw::channel::channel();
+            let scripted = std::rc::Rc::new(std::cell::RefCell::new(
+                frames
+                    .into_iter()
+                    .collect::<std::collections::VecDeque<_>>(),
+            ));
+            let loop_for_commands = mainloop.clone();
+            let scripted_for_commands = scripted.clone();
+            let _attached = receiver.attach(mainloop.loop_(), move |command| match command {
+                WarmCommand::Capture => {
+                    if let Some(Some(frame)) = scripted_for_commands.borrow_mut().pop_front() {
+                        let _ = frames_tx.send(Ok(frame));
+                    }
+                }
+                WarmCommand::Shutdown => loop_for_commands.quit(),
+            });
+            initialized_tx.send(commands).expect("publish fake sender");
+            mainloop.run();
+        });
+        Self {
+            commands: initialized_rx.recv().expect("fake worker initialized"),
+            frames: frames_rx,
+            join: Some(join),
+        }
+    }
+}
+
+impl Drop for WarmWorker {
+    fn drop(&mut self) {
+        let _ = self.commands.send(WarmCommand::Shutdown);
+        if let Some(join) = self.join.take() {
+            // A reaper preserves non-blocking Drop while retaining ownership of the worker handle.
+            let _ = std::thread::Builder::new()
+                .name("dormant-pipewire-reaper".to_owned())
+                .spawn(move || {
+                    let _ = join.join();
+                });
+        }
+    }
+}
+
+struct WarmFrameState {
+    format: spa::param::video::VideoInfoRaw,
+    capturing: bool,
+    frames: tokio::sync::mpsc::UnboundedSender<Result<RawFrame, CaptureError>>,
+}
+
+fn run_warm_stream(
+    fd: OwnedFd,
+    node_id: u32,
+    frames: tokio::sync::mpsc::UnboundedSender<Result<RawFrame, CaptureError>>,
+    initialized: &std::sync::mpsc::SyncSender<
+        Result<pw::channel::Sender<WarmCommand>, CaptureError>,
+    >,
+) -> Result<(), CaptureError> {
+    pw::init();
+    let mainloop = pw::main_loop::MainLoopRc::new(None)
+        .map_err(|error| CaptureError::Transport(format!("PipeWire main loop: {error}")))?;
+    let context = pw::context::ContextRc::new(&mainloop, None)
+        .map_err(|error| CaptureError::Transport(format!("PipeWire context: {error}")))?;
+    let core = context
+        .connect_fd_rc(fd, None)
+        .map_err(|error| CaptureError::Transport(format!("PipeWire portal remote: {error}")))?;
+    let stream = pw::stream::StreamRc::new(
+        core,
+        "dormant-active-sampling-warm",
+        properties! {
+            *pw::keys::MEDIA_TYPE => "Video",
+            *pw::keys::MEDIA_CATEGORY => "Capture",
+            *pw::keys::MEDIA_ROLE => "Screen",
+        },
+    )
+    .map_err(|error| CaptureError::Transport(format!("PipeWire stream: {error}")))?;
+    let state = std::rc::Rc::new(std::cell::RefCell::new(WarmFrameState {
+        format: spa::param::video::VideoInfoRaw::default(),
+        capturing: false,
+        frames,
+    }));
+    let state_for_format = state.clone();
+    let state_for_process = state.clone();
+    let stream_for_process = stream.clone();
+    let _listener = stream
+        .add_local_listener_with_user_data(())
+        .param_changed(move |_, (), id, param| {
+            let Some(param) = param else { return };
+            if id != pw::spa::param::ParamType::Format.as_raw() {
+                return;
+            }
+            let Ok((media_type, media_subtype)) = pw::spa::param::format_utils::parse_format(param)
+            else {
+                return;
+            };
+            if media_type == pw::spa::param::format::MediaType::Video
+                && media_subtype == pw::spa::param::format::MediaSubtype::Raw
+            {
+                let _ = state_for_format.borrow_mut().format.parse(param);
+            }
+        })
+        .process(move |stream, ()| {
+            let mut state = state_for_process.borrow_mut();
+            if !state.capturing {
+                return;
+            }
+            let result = capture_buffer(stream, &state.format);
+            state.capturing = false;
+            let _ = stream_for_process.set_active(false);
+            let _ = state.frames.send(result);
+        })
+        .register()
+        .map_err(|error| CaptureError::Transport(format!("PipeWire stream listener: {error}")))?;
+    stream
+        .connect(
+            spa::utils::Direction::Input,
+            Some(node_id),
+            pw::stream::StreamFlags::AUTOCONNECT
+                | pw::stream::StreamFlags::MAP_BUFFERS
+                | pw::stream::StreamFlags::INACTIVE,
+            &mut [],
+        )
+        .map_err(|error| CaptureError::Transport(format!("PipeWire stream connect: {error}")))?;
+    let (commands, receiver) = pw::channel::channel();
+    let loop_for_commands = mainloop.clone();
+    let stream_for_commands = stream.clone();
+    let state_for_commands = state.clone();
+    let _attached = receiver.attach(mainloop.loop_(), move |command| match command {
+        WarmCommand::Capture => {
+            let mut state = state_for_commands.borrow_mut();
+            state.capturing = true;
+            if let Err(error) = stream_for_commands.set_active(true) {
+                state.capturing = false;
+                let _ = state.frames.send(Err(CaptureError::Transport(format!(
+                    "activate PipeWire warm stream: {error}"
+                ))));
+            }
+        }
+        WarmCommand::Shutdown => {
+            let _ = stream_for_commands.set_active(false);
+            loop_for_commands.quit();
+        }
+    });
+    if initialized.send(Ok(commands)).is_ok() {
+        mainloop.run();
+    }
+    Ok(())
 }
 
 fn connected_stream(start: PortalStartResult) -> Result<ConnectedStream, CaptureError> {
@@ -972,5 +1224,52 @@ mod tests {
         };
 
         assert_eq!(reconcile_start_with_binding(&stream, &binding), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn warm_worker_shutdown_wakes_loop_and_joins() {
+        let mut worker = WarmWorker::spawn_fake([]);
+
+        worker.shutdown().await;
+
+        assert!(worker.join.is_none());
+    }
+
+    #[tokio::test]
+    async fn warm_worker_serializes_consecutive_captures() {
+        let first = RawFrame {
+            rgba: vec![1, 2, 3, 4],
+            width: 1,
+            height: 1,
+            stride: 4,
+        };
+        let second = RawFrame {
+            rgba: vec![5, 6, 7, 8],
+            width: 1,
+            height: 1,
+            stride: 4,
+        };
+        let mut worker = WarmWorker::spawn_fake([Some(first.clone()), Some(second.clone())]);
+
+        assert_eq!(
+            worker.capture(std::time::Duration::from_secs(1)).await,
+            Ok(first)
+        );
+        assert_eq!(
+            worker.capture(std::time::Duration::from_secs(1)).await,
+            Ok(second)
+        );
+        worker.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn warm_worker_maps_missing_frame_to_timeout() {
+        let mut worker = WarmWorker::spawn_fake([None]);
+
+        assert_eq!(
+            worker.capture(std::time::Duration::from_millis(10)).await,
+            Err(CaptureError::Timeout)
+        );
+        worker.shutdown().await;
     }
 }

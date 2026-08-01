@@ -785,6 +785,48 @@ mod tests {
         assert_eq!(WEAR_SAMPLING_SUSPENDED, "wear_sampling_suspended");
     }
 
+    #[test]
+    fn decide_keeps_spec_silent_triggers_inert() {
+        let cases = [
+            (
+                "suspended grant start never enters the consent flow",
+                SamplingState::Suspended,
+                Trigger::GrantStarted,
+                true,
+            ),
+            (
+                "suspended grant completion never enters the consent flow",
+                SamplingState::Suspended,
+                Trigger::Granted,
+                true,
+            ),
+            (
+                "disabled capture success is inert",
+                SamplingState::Disabled,
+                Trigger::CaptureOk,
+                false,
+            ),
+            (
+                "needs consent cooldown expiry is inert",
+                SamplingState::NeedsConsent,
+                Trigger::CooldownElapsed,
+                false,
+            ),
+            (
+                "streaming grant start is inert",
+                SamplingState::Streaming,
+                Trigger::GrantStarted,
+                true,
+            ),
+        ];
+
+        for (name, state, trigger, has_consent_record) in cases {
+            let transition = decide(state, trigger, has_consent_record);
+            assert_eq!(transition.next, state, "{name} next state");
+            assert_eq!(transition.effects, Vec::<Effect>::new(), "{name} effects");
+        }
+    }
+
     #[tokio::test]
     async fn scripted_capture_outcomes_are_consumed_in_order() {
         let mut source = ScriptedCaptureSource::with_frames([

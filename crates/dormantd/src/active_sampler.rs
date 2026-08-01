@@ -2143,6 +2143,45 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn active_sampler_rejects_inline_second_enable_while_first_flow_waits() {
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        let config = active_config(Duration::from_secs(10));
+        let (update_tx, update_rx) = mpsc::channel(1);
+        drop(update_tx);
+        let cancel = CancellationToken::new();
+        let (handle, join) = spawn_with_handle(ActiveSamplerDeps {
+            initial_config: config,
+            update_rx,
+            latest_grid: new_latest_grid(),
+            source: Box::new(ScriptedCaptureSource::with_pending_consent()),
+            consent_path,
+            cancel: cancel.clone(),
+            env_reader: test_env_reader,
+        });
+
+        let (first_tx, _first_rx) = oneshot::channel();
+        handle
+            .send(SamplerCommand::Enable { reply: first_tx })
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+
+        let (second_tx, second_rx) = oneshot::channel();
+        handle
+            .send(SamplerCommand::Enable { reply: second_tx })
+            .await
+            .unwrap();
+        assert_eq!(
+            second_rx.await.unwrap(),
+            ConsentFlowStatus::Error(SamplerError::FlowAlreadyActive.to_string())
+        );
+
+        cancel.cancel();
+        join.await.unwrap();
+    }
+
     #[tokio::test]
     async fn active_sampler_rejects_enable_without_graphical_session() {
         let dir = tempdir().unwrap();

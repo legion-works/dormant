@@ -35,6 +35,10 @@ allow = ["LGPL-2.1"]
 crate = "libmpv2-sys"
 allow = ["LGPL-2.1"]
 
+[[licenses.exceptions]]
+crate = "target-lexicon"
+allow = ["Apache-2.0 WITH LLVM-exception"]
+
 [bans]
 # "wildcards" are semver-minimum specs like "2" (≥2.0.0) — standard Cargo practice
 wildcards = "allow"

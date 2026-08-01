@@ -1971,7 +1971,6 @@ struct Runner {
     active_sampler_handle: Option<active_sampler::ActiveSamplerHandle>,
     /// Sender retained across generation swaps so Task 9 can deliver reload plans.
     #[cfg(target_os = "linux")]
-    #[allow(dead_code, reason = "Task 9 publishes active-sampler reload plans")]
     active_sampler_updates: Option<mpsc::Sender<SamplerUpdate>>,
     /// Port the web UI was started with (for reload change-detection).
     started_web_port: Option<u16>,
@@ -2210,24 +2209,23 @@ impl Runner {
     }
 
     #[cfg(target_os = "linux")]
-    fn publish_active_sampler_reload(&self, previous_cfg: &Config) {
+    fn publish_active_sampler_reload(&self, previous_cfg: &Config, new_generation: &Generation) {
         let Some(updates) = &self.active_sampler_updates else {
             return;
         };
-        let display_exists = self
-            .generation
+        let display_exists = new_generation
             .cfg
             .wear
             .active_sampling
             .sampled_display
             .as_ref()
             .is_some_and(|display| {
-                self.generation
+                new_generation
                     .display_executors
                     .contains_key(&DisplayId(display.clone()))
             });
         if let Err(error) = updates.try_send(SamplerUpdate::DisplayContext(
-            active_sampler_display_context(&self.generation.cfg, display_exists, Some("active")),
+            active_sampler_display_context(&new_generation.cfg, display_exists, Some("active")),
         )) {
             tracing::warn!(
                 event = "wear_sampling_update_dropped",
@@ -2235,7 +2233,7 @@ impl Runner {
                 "could not publish active-sampler display context"
             );
         }
-        for plan in active_sampler_reconfigure_plans(previous_cfg, &self.generation.cfg) {
+        for plan in active_sampler_reconfigure_plans(previous_cfg, &new_generation.cfg) {
             if let Err(error) = updates.try_send(SamplerUpdate::Reconfigure(plan)) {
                 tracing::warn!(
                     event = "wear_sampling_update_dropped",
@@ -2817,7 +2815,7 @@ impl Runner {
                 }
                 self.defensive_wake(wake_list);
                 #[cfg(target_os = "linux")]
-                self.publish_active_sampler_reload(&previous_active_sampler_cfg);
+                self.publish_active_sampler_reload(&previous_active_sampler_cfg, &self.generation);
                 self.config_tx.send_replace(Arc::new(new_cfg));
                 self.creds_tx.send_replace(Arc::new(new_creds));
                 tracing::info!(event = "config_reloaded");

@@ -1482,6 +1482,16 @@ mod tests {
         assert_eq!(object.properties.len(), 2);
         assert_eq!(object.properties[0].key, spa::sys::SPA_FORMAT_mediaType);
         assert_eq!(object.properties[1].key, spa::sys::SPA_FORMAT_mediaSubtype);
+        // Non-circular value pins: the advertised format must be video/raw —
+        // a drifted subtype (e.g. Dsp) would stall KWin's negotiation silently.
+        assert_eq!(
+            object.properties[0].value,
+            spa::pod::Value::Id(spa::utils::Id(spa::sys::SPA_MEDIA_TYPE_video))
+        );
+        assert_eq!(
+            object.properties[1].value,
+            spa::pod::Value::Id(spa::utils::Id(spa::sys::SPA_MEDIA_SUBTYPE_raw))
+        );
     }
 
     #[test]

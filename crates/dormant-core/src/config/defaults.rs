@@ -226,6 +226,21 @@ pub const WEAR_SHORT_CYCLE_DWELL: Duration = Duration::from_secs(10 * 60);
 /// surfacing to the operator.
 pub const WEAR_ADVISORY_AFTER: Duration = Duration::from_secs(96 * 60 * 60);
 
+/// Whether active display sampling is enabled by default.
+pub const WEAR_ACTIVE_SAMPLING_ENABLED: bool = false;
+
+/// Default active-sampling stream mode.
+pub const WEAR_ACTIVE_SAMPLING_STREAM_MODE: &str = "warm";
+
+/// Timeout for an active-sampling capture.
+pub const WEAR_ACTIVE_SAMPLING_CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Consecutive capture failures before opening the circuit.
+pub const WEAR_ACTIVE_SAMPLING_FAILURE_THRESHOLD: u32 = 5;
+
+/// Time before an open active-sampling circuit is retried.
+pub const WEAR_ACTIVE_SAMPLING_CIRCUIT_RESET_AFTER: Duration = Duration::from_secs(5 * 60);
+
 // ── [notifications] section defaults ────────────────────────────────────────
 
 /// Whether wake-failure notifications are enabled by default.

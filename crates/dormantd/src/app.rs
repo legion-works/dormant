@@ -1409,6 +1409,8 @@ impl App {
             ReloadRequester::new_with_observations(reload_request_tx, self.observations.clone());
         let observations = reload_requester.observations();
 
+        let latest_grid = crate::active_sampler::new_latest_grid();
+
         // Wear tracker: daemon-lifetime, reads config via watch, publishes
         // over the front ctl channel (rides the `GenerationRouter`'s
         // pause/queue/release across generation swaps), sees the current
@@ -1419,6 +1421,7 @@ impl App {
                 ctl_tx: front_ctl_tx.clone(),
                 executors_rx: executors_rx.clone(),
                 handle: wear_handle.clone(),
+                latest_grid: latest_grid.clone(),
                 #[cfg(feature = "render")]
                 heat_snapshots: render_context.heat_snapshots.clone(),
                 cancel: root.clone(),
@@ -1430,7 +1433,6 @@ impl App {
 
         #[cfg(target_os = "linux")]
         let (active_sampler_handle, active_sampler_updates) = {
-            let latest_grid = active_sampler::new_latest_grid();
             let (update_tx, update_rx) = mpsc::channel::<SamplerUpdate>(16);
             match active_sampler::linux::PortalPipeWireSource::new().await {
                 Ok(source) => {
@@ -1438,7 +1440,7 @@ impl App {
                     let (handle, _join) = active_sampler::spawn_with_handle(ActiveSamplerDeps {
                         initial_config: Arc::new(cfg_clone.clone()),
                         update_rx,
-                        latest_grid,
+                        latest_grid: latest_grid.clone(),
                         source: Box::new(source),
                         consent_path,
                         cancel: root.clone(),

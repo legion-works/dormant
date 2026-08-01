@@ -61,15 +61,17 @@ use dormant_core::observation::{DaemonObservation, ObservationHub};
 use dormant_core::rules::{ControlMsg, DaemonEvent, StageInfo, StateSnapshot};
 use dormant_core::spatial_grid::{LUMA_GRID_COLS, LUMA_GRID_ROWS, LumaGrid, resample_area};
 use dormant_core::traits::{CommandSink, PanelState};
-use dormant_core::types::{DisplayId, StageKind};
 #[cfg(feature = "render")]
-use dormant_core::types::{ScreensaverItemReport, Tick};
+use dormant_core::types::ScreensaverItemReport;
+use dormant_core::types::{DisplayId, StageKind, Tick};
 use dormant_core::wear::{
     PanelType, WEAR_SCHEMA_VERSION, WearHandle, WearIdentity, WearLedger, advisory_active,
     brightness_norm, hours_since_effective_dwell, sanitize_identity_key,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
+
+use crate::active_sampler::{LatestGrid, SampledGrid};
 
 /// DDC/CI-shaped native brightness top-of-scale — the default for every
 /// display whose controller list does not include `samsung-tizen` (see
@@ -109,6 +111,8 @@ pub struct WearTrackerDeps {
     pub executors_rx: watch::Receiver<Arc<HashMap<DisplayId, Arc<dyn CommandSink>>>>,
     /// Shared ledger map for concurrent readers (IPC/WebUI).
     pub handle: WearHandle,
+    /// Latest privacy-preserving screen sample, owned by the sampler task.
+    pub latest_grid: LatestGrid,
     /// Latest heat snapshots exposed to render sessions, when rendering is enabled.
     #[cfg(feature = "render")]
     pub heat_snapshots: dormant_render::HeatSnapshotHandle,
@@ -191,6 +195,7 @@ async fn run(mut deps: WearTrackerDeps) {
                 interval = new_interval(period);
             }
             _ = interval.tick() => {
+                let boundary = Tick::now();
                 let cfg = deps.config_rx.borrow().clone();
 
                 if !cfg.wear.enabled {
@@ -220,6 +225,16 @@ async fn run(mut deps: WearTrackerDeps) {
                 ensure_ledgers_loaded(&mut state, &cfg, &executors, &dir, now, &deps.observations);
 
                 let samples = collect_samples(&snapshot, &executors, &cfg.wear).await;
+                let latest_grid = deps
+                    .latest_grid
+                    .read()
+                    .ok()
+                    .and_then(|slot| slot.clone());
+                let (injected_grid, sample_fallback) = filter_sample_for_tick(
+                    latest_grid.as_ref(),
+                    boundary,
+                    cfg.wear.sample_interval.saturating_mul(2),
+                );
 
                 #[cfg(feature = "render")]
                 let exposures = collect_exposure_slices(
@@ -231,7 +246,16 @@ async fn run(mut deps: WearTrackerDeps) {
                 #[cfg(not(feature = "render"))]
                 let exposures = HashMap::new();
 
-                let actions = tick(&mut state, &snapshot, &samples, &cfg.wear, now, &exposures);
+                let actions = tick(
+                    &mut state,
+                    &snapshot,
+                    &samples,
+                    &cfg.wear,
+                    now,
+                    injected_grid,
+                    sample_fallback,
+                    &exposures,
+                );
                 apply_actions(&mut state, actions, &executors, &deps.ctl_tx, &dir).await;
                 sync_handle(&state, &deps.handle);
                 #[cfg(feature = "render")]
@@ -417,6 +441,14 @@ async fn apply_actions(
 ) {
     for action in actions {
         match action {
+            TrackerAction::SampledSelection { display, sample } => {
+                // Selection is intentionally I/O-free; Task 13 consumes its grid.
+                drop((display, sample));
+            }
+            TrackerAction::UniformSelection { display, fallback } => {
+                // Selection is intentionally I/O-free; Task 13 consumes its tag.
+                drop((display, fallback));
+            }
             TrackerAction::Attribute { .. } => {
                 // Already applied to the ledger inside `tick`; nothing left
                 // for the shell to do beyond the `sync_handle` pass below.
@@ -697,6 +729,17 @@ struct ScreensaverExposureSlice {
 /// One action the pure [`tick`] wants the async shell to perform.
 #[derive(Debug, Clone, PartialEq)]
 enum TrackerAction {
+    /// A fresh active-time grid survived shell filtering and phase re-check.
+    /// Task 13 turns this selection into spatial ledger attribution.
+    SampledSelection {
+        display: DisplayId,
+        sample: SampledGrid,
+    },
+    /// No fresh grid is available for an active-time attribution window.
+    UniformSelection {
+        display: DisplayId,
+        fallback: Option<SampleFallbackTag>,
+    },
     /// Attribution was applied to `display`'s ledger (informational — the
     /// mutation already happened inside `tick`; shell/tests use this to
     /// observe what happened).
@@ -720,6 +763,55 @@ enum TrackerAction {
     },
     /// Seed `display`'s freshly created ledger with `read_usage_hours()`.
     Seed { display: DisplayId },
+}
+
+/// Reason a sample was filtered before entering pure tracker logic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleFallbackTag {
+    /// The sampler has not published a grid for this tick.
+    Missing,
+    /// The newest published grid exceeds the monotonic freshness bound.
+    Stale,
+}
+
+/// Phase-safe source selection for active and grace windows.
+enum AttributionSelection<'a> {
+    Sampled(&'a SampledGrid),
+    Uniform(Option<SampleFallbackTag>),
+}
+
+/// Keep capture-age arithmetic at the shell boundary with its monotonic tick.
+fn filter_sample_for_tick(
+    sample: Option<&SampledGrid>,
+    boundary: Tick,
+    max_age: Duration,
+) -> (Option<&SampledGrid>, Option<SampleFallbackTag>) {
+    let Some(sample) = sample else {
+        return (None, Some(SampleFallbackTag::Missing));
+    };
+    let age = boundary.0.saturating_duration_since(sample.captured_at.0);
+    if age <= max_age {
+        (Some(sample), None)
+    } else {
+        (None, Some(SampleFallbackTag::Stale))
+    }
+}
+
+/// A captured frame is valid only while the current state still permits it.
+fn select_sample_for_attribution<'a>(
+    phase: &str,
+    stage: Option<&StageInfo>,
+    sampled: Option<&'a SampledGrid>,
+    fallback: Option<SampleFallbackTag>,
+) -> AttributionSelection<'a> {
+    if stage.is_none() && matches!(phase, "active" | "grace") {
+        sampled.map_or(
+            AttributionSelection::Uniform(fallback),
+            AttributionSelection::Sampled,
+        )
+    } else {
+        AttributionSelection::Uniform(None)
+    }
 }
 
 /// Classify a display's effective wear-attribution stage from its
@@ -772,13 +864,15 @@ fn screensaver_uniform_fallback(
 /// Pure tracker tick: given the current snapshot/samples/config, mutate
 /// `state`'s ledgers and bookkeeping in place and return the actions the
 /// shell must execute. Zero I/O, zero tokio — see module docs.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn tick(
     state: &mut TrackerState,
     snapshot: &StateSnapshot,
     samples: &HashMap<DisplayId, Option<PanelState>>,
     cfg: &WearConfig,
     now_epoch_s: u64,
+    injected_grid: Option<&SampledGrid>,
+    fallback: Option<SampleFallbackTag>,
     exposures: &HashMap<DisplayId, Vec<ScreensaverExposureSlice>>,
 ) -> Vec<TrackerAction> {
     let mut actions = Vec::new();
@@ -831,6 +925,30 @@ fn tick(
             "render_screensaver" => cfg.screensaver_factor.clamp(0.0, 1.0),
             "render_black" | "blanked" => 0.0,
             "active" => {
+                if cfg.active_sampling.enabled
+                    && cfg.active_sampling.sampled_display.as_deref() == Some(display_id.0.as_str())
+                {
+                    let selection = select_sample_for_attribution(
+                        &dsnap.phase,
+                        dsnap.stage.as_ref(),
+                        injected_grid,
+                        fallback,
+                    );
+                    match selection {
+                        AttributionSelection::Sampled(sample) => {
+                            actions.push(TrackerAction::SampledSelection {
+                                display: display_id.clone(),
+                                sample: sample.clone(),
+                            });
+                        }
+                        AttributionSelection::Uniform(fallback) => {
+                            actions.push(TrackerAction::UniformSelection {
+                                display: display_id.clone(),
+                                fallback,
+                            });
+                        }
+                    }
+                }
                 let sample = samples.get(&display_id).cloned().flatten();
                 // T7 review S2: log `wear_sample_fallback` once per
                 // fallback EPISODE (spec §4.3.3's rate-limit note), not
@@ -1492,10 +1610,152 @@ mod tests {
             &samples,
             &cfg,
             1_000_060,
+            None,
+            None,
             &HashMap::new(),
         );
         let (_, norm) = find_attribute(&actions, &display).expect("Attribute action");
         assert!((norm - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sampled_active_and_grace_select_sampled_over_uniform() {
+        let boundary = Tick::now();
+        let sample = SampledGrid {
+            grid: LumaGrid::new(vec![0.5; 9 * 16]).unwrap(),
+            captured_at: boundary,
+            phase_at_capture: dormant_core::state_machine::Phase::Active,
+        };
+
+        let (fresh, fallback) =
+            filter_sample_for_tick(Some(&sample), boundary, Duration::from_secs(120));
+
+        assert!(fallback.is_none());
+        for phase in ["active", "grace"] {
+            let display = DisplayId(phase.into());
+            let mut state = TrackerState::default();
+            state
+                .ledgers
+                .insert(display.clone(), fresh_ledger(&display, 0));
+            let mut cfg = WearConfig::default();
+            cfg.active_sampling.enabled = true;
+            cfg.active_sampling.sampled_display = Some(display.0.clone());
+            let actions = tick(
+                &mut state,
+                &snapshot_with(&display, phase, None),
+                &HashMap::new(),
+                &cfg,
+                u64::MAX,
+                fresh,
+                fallback,
+                &HashMap::new(),
+            );
+            assert!(actions.iter().any(|action| matches!(
+                action,
+                TrackerAction::SampledSelection { display: selected, sample: selected_sample }
+                    if selected == &display && selected_sample == &sample
+            )));
+        }
+    }
+
+    #[test]
+    fn filter_sample_for_tick_keeps_exactly_two_intervals_old_sample() {
+        let boundary = Tick::now();
+        let max_age = Duration::from_secs(120);
+        let sample = SampledGrid {
+            grid: LumaGrid::new(vec![0.5; 9 * 16]).unwrap(),
+            captured_at: Tick(boundary.0.checked_sub(max_age).unwrap()),
+            phase_at_capture: dormant_core::state_machine::Phase::Active,
+        };
+
+        let (fresh, fallback) = filter_sample_for_tick(Some(&sample), boundary, max_age);
+
+        assert!(fresh.is_some());
+        assert!(fallback.is_none());
+    }
+
+    #[test]
+    fn filter_sample_for_tick_marks_older_than_two_intervals_stale() {
+        let boundary = Tick::now();
+        let max_age = Duration::from_secs(120);
+        let sample = SampledGrid {
+            grid: LumaGrid::new(vec![0.5; 9 * 16]).unwrap(),
+            captured_at: Tick(
+                boundary
+                    .0
+                    .checked_sub(max_age + Duration::from_nanos(1))
+                    .unwrap(),
+            ),
+            phase_at_capture: dormant_core::state_machine::Phase::Active,
+        };
+
+        let (fresh, fallback) = filter_sample_for_tick(Some(&sample), boundary, max_age);
+
+        assert!(fresh.is_none());
+        assert_eq!(fallback, Some(SampleFallbackTag::Stale));
+    }
+
+    #[test]
+    fn phase_recheck_discards_active_capture_outside_active_or_grace_without_stage() {
+        let boundary = Tick::now();
+        let sample = SampledGrid {
+            grid: LumaGrid::new(vec![0.5; 9 * 16]).unwrap(),
+            captured_at: boundary,
+            phase_at_capture: dormant_core::state_machine::Phase::Active,
+        };
+
+        for phase in ["blanked", "staged", "waking"] {
+            assert!(matches!(
+                select_sample_for_attribution(phase, None, Some(&sample), None),
+                AttributionSelection::Uniform(_)
+            ));
+        }
+        assert!(matches!(
+            select_sample_for_attribution(
+                "active",
+                Some(&StageInfo {
+                    idx: 0,
+                    kind: StageKind::RenderScreensaver,
+                }),
+                Some(&sample),
+                None,
+            ),
+            AttributionSelection::Uniform(_)
+        ));
+    }
+
+    #[test]
+    fn sampled_missing_suspended_state_routes_uniform_with_sampler_literal() {
+        let display = DisplayId("mon".into());
+        let mut state = TrackerState::default();
+        state
+            .ledgers
+            .insert(display.clone(), fresh_ledger(&display, 0));
+        let mut cfg = WearConfig::default();
+        cfg.active_sampling.enabled = true;
+        cfg.active_sampling.sampled_display = Some(display.0.clone());
+        let actions = tick(
+            &mut state,
+            &snapshot_with(&display, "active", None),
+            &HashMap::new(),
+            &cfg,
+            60,
+            None,
+            Some(SampleFallbackTag::Missing),
+            &HashMap::new(),
+        );
+
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            TrackerAction::UniformSelection {
+                display: selected,
+                fallback: Some(SampleFallbackTag::Missing),
+            } if selected == &display
+        )));
+        assert_eq!(
+            crate::active_sampler::WEAR_SAMPLING_SUSPENDED,
+            "wear_sampling_suspended"
+        );
     }
 
     // ── T7 fix M2: per-display native brightness scale ───────────────────────
@@ -1548,6 +1808,8 @@ mod tests {
             &samples,
             &cfg,
             1_000_060,
+            None,
+            None,
             &HashMap::new(),
         );
         let (_, norm) = find_attribute(&actions, &display).expect("Attribute action");
@@ -1622,6 +1884,7 @@ mod tests {
             ctl_tx,
             executors_rx,
             handle: wear_handle,
+            latest_grid: crate::active_sampler::new_latest_grid(),
             #[cfg(feature = "render")]
             heat_snapshots: Arc::new(std::sync::RwLock::new(HashMap::new())),
             cancel: cancel.clone(),
@@ -1814,7 +2077,9 @@ mod tests {
                 luma: Some(luma),
             }],
         )]);
-        let actions = tick(&mut state, &snapshot, &samples, &cfg, 1_000_060, &exposures);
+        let actions = tick(
+            &mut state, &snapshot, &samples, &cfg, 1_000_060, None, None, &exposures,
+        );
         let (span, norm) = find_attribute(&actions, &display).expect("Attribute action");
         assert_eq!(span, Duration::from_secs(60));
         assert!((norm - cfg.screensaver_factor).abs() < 1e-9);
@@ -1858,6 +2123,8 @@ mod tests {
             &HashMap::new(),
             &cfg,
             1_000_120,
+            None,
+            None,
             &exposures,
         );
         assert!(
@@ -1911,6 +2178,8 @@ mod tests {
             &HashMap::new(),
             &cfg,
             1_000_060,
+            None,
+            None,
             &exposures,
         );
         let expected = cfg.screensaver_factor * (10.0 + 10.0 + 7.5) / 3600.0;
@@ -1958,6 +2227,8 @@ mod tests {
             &HashMap::new(),
             &cfg,
             1_000_060,
+            None,
+            None,
             &exposures,
         );
         let expected = dormant_core::spatial_grid::resample_area(&source, 9, 16, 2, 2).unwrap();
@@ -1998,6 +2269,8 @@ mod tests {
                 &HashMap::new(),
                 &cfg,
                 1_000_060,
+                None,
+                None,
                 &exposures,
             );
             let _ = tick(
@@ -2006,6 +2279,8 @@ mod tests {
                 &HashMap::new(),
                 &cfg,
                 1_000_120,
+                None,
+                None,
                 &exposures,
             );
         });
@@ -2055,6 +2330,8 @@ mod tests {
                 &HashMap::new(),
                 &cfg,
                 1_000_060,
+                None,
+                None,
                 &missing,
             );
             let _ = tick(
@@ -2063,6 +2340,8 @@ mod tests {
                 &HashMap::new(),
                 &cfg,
                 1_000_120,
+                None,
+                None,
                 &ready,
             );
             let _ = tick(
@@ -2071,6 +2350,8 @@ mod tests {
                 &HashMap::new(),
                 &cfg,
                 1_000_180,
+                None,
+                None,
                 &missing,
             );
         });
@@ -2177,7 +2458,16 @@ mod tests {
             }),
         );
         let cfg = WearConfig::default();
-        let _ = tick(&mut state, &snapshot, &HashMap::new(), &cfg, 60, &exposures);
+        let _ = tick(
+            &mut state,
+            &snapshot,
+            &HashMap::new(),
+            &cfg,
+            60,
+            None,
+            None,
+            &exposures,
+        );
         assert!(
             state.ledgers[&display]
                 .cells
@@ -2217,6 +2507,8 @@ mod tests {
             &HashMap::new(),
             &cfg,
             1_000_060,
+            None,
+            None,
             &exposures,
         );
         let (_, norm) = find_attribute(&actions, &display).expect("Attribute action");
@@ -2234,6 +2526,8 @@ mod tests {
             &HashMap::new(),
             &cfg,
             1_000_060,
+            None,
+            None,
             &HashMap::new(),
         );
         let (_, norm2) = find_attribute(&actions2, &display2).expect("Attribute action");
@@ -2268,6 +2562,8 @@ mod tests {
             &HashMap::new(),
             &WearConfig::default(),
             1_000_060,
+            None,
+            None,
             &exposures,
         );
         assert_eq!(state.ledgers[&display].schema_version, WEAR_SCHEMA_VERSION);
@@ -2300,6 +2596,8 @@ mod tests {
                 &HashMap::new(),
                 &cfg,
                 1_000_060,
+                None,
+                None,
                 &HashMap::new(),
             );
             let _ = tick(
@@ -2308,6 +2606,8 @@ mod tests {
                 &HashMap::new(),
                 &cfg,
                 1_000_120,
+                None,
+                None,
                 &HashMap::new(),
             );
         });
@@ -2333,6 +2633,8 @@ mod tests {
                 &samples,
                 &cfg,
                 1_000_180,
+                None,
+                None,
                 &HashMap::new(),
             );
             // ...so a LATER fallback episode logs again.
@@ -2342,6 +2644,8 @@ mod tests {
                 &HashMap::new(),
                 &cfg,
                 1_000_240,
+                None,
+                None,
                 &HashMap::new(),
             );
         });
@@ -2374,6 +2678,8 @@ mod tests {
             &HashMap::new(),
             &cfg,
             1_000_060,
+            None,
+            None,
             &HashMap::new(),
         );
         let (_, norm) = find_attribute(&actions, &display).expect("Attribute action");
@@ -2411,6 +2717,8 @@ mod tests {
             &samples,
             &cfg,
             1_000_060,
+            None,
+            None,
             &HashMap::new(),
         );
         let (_, norm) = find_attribute(&actions, &display).expect("Attribute action");
@@ -2438,7 +2746,16 @@ mod tests {
                 brightness: Some(100),
             }),
         );
-        let actions = tick(&mut state, &snapshot, &samples, &cfg, now, &HashMap::new());
+        let actions = tick(
+            &mut state,
+            &snapshot,
+            &samples,
+            &cfg,
+            now,
+            None,
+            None,
+            &HashMap::new(),
+        );
         let (span, _) = find_attribute(&actions, &display).expect("Attribute action");
         assert_eq!(span, Duration::from_secs(cfg.sample_interval.as_secs() * 2));
     }
@@ -2463,7 +2780,16 @@ mod tests {
                 brightness: Some(100),
             }),
         );
-        let _ = tick(&mut state, &snapshot, &samples, &cfg, now, &HashMap::new());
+        let _ = tick(
+            &mut state,
+            &snapshot,
+            &samples,
+            &cfg,
+            now,
+            None,
+            None,
+            &HashMap::new(),
+        );
         let ledger = state.ledgers.get(&display).unwrap();
         assert_eq!(ledger.last_long_dwell_epoch_s, Some(now));
         assert_eq!(state.advisory_active.get(&display).copied(), Some(false));
@@ -2488,7 +2814,16 @@ mod tests {
                 brightness: Some(100),
             }),
         );
-        let _ = tick(&mut state, &snapshot, &samples, &cfg, now, &HashMap::new());
+        let _ = tick(
+            &mut state,
+            &snapshot,
+            &samples,
+            &cfg,
+            now,
+            None,
+            None,
+            &HashMap::new(),
+        );
         let ledger = state.ledgers.get(&display).unwrap();
         assert_eq!(ledger.last_long_dwell_epoch_s, None);
     }
@@ -2512,7 +2847,16 @@ mod tests {
             }),
         );
 
-        let actions1 = tick(&mut state, &snapshot, &samples, &cfg, now, &HashMap::new());
+        let actions1 = tick(
+            &mut state,
+            &snapshot,
+            &samples,
+            &cfg,
+            now,
+            None,
+            None,
+            &HashMap::new(),
+        );
         let count1 = actions1
             .iter()
             .filter(|a| matches!(a, TrackerAction::EmitAdvisory { .. }))
@@ -2525,6 +2869,8 @@ mod tests {
             &samples,
             &cfg,
             now + 1,
+            None,
+            None,
             &HashMap::new(),
         );
         let count2 = actions2
@@ -2552,6 +2898,8 @@ mod tests {
             &HashMap::new(),
             &cfg,
             1000,
+            None,
+            None,
             &HashMap::new(),
         );
         assert!(actions.is_empty());
@@ -2584,6 +2932,8 @@ mod tests {
             &samples,
             &cfg,
             1_000_060,
+            None,
+            None,
             &HashMap::new(),
         );
         let ledger = state.ledgers.get(&display).unwrap();

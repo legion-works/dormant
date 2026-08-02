@@ -41,6 +41,7 @@ fn print_event(event: &DaemonEvent) {
 /// Render a [`DaemonEvent`] as the human-readable line `print_event` prints
 /// — split out as a pure `-> String` seam so the formatting (including the
 /// `Unknown` arm, W2 review fix) is unit-testable without capturing stdout.
+#[allow(clippy::too_many_lines)]
 fn fmt_event(event: &DaemonEvent) -> String {
     match event {
         DaemonEvent::SensorChanged { sensor, state } => {
@@ -122,6 +123,33 @@ fn fmt_event(event: &DaemonEvent) -> String {
             )
         }
         DaemonEvent::Subscribed => "event stream subscribed".to_string(),
+        DaemonEvent::OperationsChanged {
+            exercise_in_flight,
+            emergency_wake_in_flight,
+        } => {
+            // Human-terminal noise — the web UI drives its own operations display.
+            // cmd_watch users see a one-liner summary.
+            let ex_line = if exercise_in_flight.is_empty() {
+                String::new()
+            } else {
+                format!("  exercises in flight: {}", exercise_in_flight.join(", "))
+            };
+            let ew_display = if *emergency_wake_in_flight {
+                "  [EMERGENCY WAKE IN FLIGHT]".to_string()
+            } else {
+                String::new()
+            };
+            format!(
+                "operations:{}{}{}",
+                if exercise_in_flight.is_empty() && !*emergency_wake_in_flight {
+                    " idle"
+                } else {
+                    ""
+                },
+                ex_line,
+                ew_display
+            )
+        }
         DaemonEvent::Unknown => "unknown daemon event".to_string(),
     }
 }

@@ -18,7 +18,7 @@ use dormant_core::config::schema::{Config, Credentials};
 use dormant_core::error::DormantError;
 use dormant_core::reload::ReloadOutcome;
 use dormant_core::reload::ReloadRequester;
-use dormant_core::rules::ControlMsg;
+use dormant_core::rules::{ControlMsg, DaemonEvent};
 use dormant_core::types::DisplayId;
 use dormant_core::wear::WearHandle;
 use dormant_displays::samsung_tizen::{PairConnect, RealPairConnect};
@@ -248,6 +248,38 @@ impl WebStateInner {
             Arc::new(crate::SocketDaemonIpc),
             true,
         )
+    }
+
+    /// Snapshot the current web single-flight guards and publish an
+    /// authoritative [`DaemonEvent::OperationsChanged`] to the engine event
+    /// bus. Called from every guard mutation site (insert, remove — including
+    /// the detached completion monitor that outlives an HTTP timeout). The
+    /// wire `exercise_in_flight` is sorted ascending so a consumer can diff
+    /// successive frames without re-sorting.
+    ///
+    /// The publish goes through the same `ControlMsg::PublishDaemonEvent`
+    /// path the wear tracker and other daemon-lifetime components use, so
+    /// it joins the existing broadcast (`Subscribed`-gated) and the
+    /// `event_ring` feeder without an extra wiring seam.
+    pub(crate) async fn publish_operations_changed(&self) {
+        let mut exercise_in_flight: Vec<String> = self
+            .exercise_in_flight
+            .lock()
+            .await
+            .iter()
+            .map(|display| display.0.clone())
+            .collect();
+        exercise_in_flight.sort();
+        let emergency_wake_in_flight = self.emergency_wake_lock.try_lock().is_err();
+        let _ = self
+            .ctl_tx
+            .send(ControlMsg::PublishDaemonEvent(
+                DaemonEvent::OperationsChanged {
+                    exercise_in_flight,
+                    emergency_wake_in_flight,
+                },
+            ))
+            .await;
     }
 
     /// Test constructor for call sites that never reach the pairing

@@ -1524,6 +1524,7 @@ pub fn event_records(cfg: &Config, event: &DaemonEvent, instance: &str) -> Vec<P
         // already have their own diagnostic surfaces.
         DaemonEvent::Subscribed
         | DaemonEvent::ConfigReloaded
+        | DaemonEvent::OperationsChanged { .. }
         | DaemonEvent::WakeRetry { .. }
         | DaemonEvent::WearSnapshot { .. }
         | DaemonEvent::WearSamplingStarted

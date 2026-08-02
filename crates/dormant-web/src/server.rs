@@ -522,8 +522,14 @@ mod tests {
         let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
         let (state, _cancel, mut ctl_rx) = test_web_state_with_bind(bind);
         tokio::spawn(async move {
-            let Some(ControlMsg::EmergencyWake { reply }) = ctl_rx.recv().await else {
-                panic!("expected EmergencyWake");
+            // Drain PublishDaemonEvent frames (#184) before reaching the
+            // EmergencyWake control message.
+            let reply = loop {
+                match ctl_rx.recv().await.unwrap() {
+                    ControlMsg::EmergencyWake { reply } => break reply,
+                    ControlMsg::PublishDaemonEvent(_) => {}
+                    other => panic!("expected EmergencyWake, got {other:?}"),
+                }
             };
             let _ = reply.send(EmergencyWakeReport {
                 operation_id: None,
@@ -691,6 +697,9 @@ mod tests {
                         });
                         break;
                     }
+                    // Issue #184: routes publish a guard snapshot on insert;
+                    // this test only exercises the exercise control flow.
+                    ControlMsg::PublishDaemonEvent(_) => {}
                     other => panic!("unexpected route message: {other:?}"),
                 }
             }

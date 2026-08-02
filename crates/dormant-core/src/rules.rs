@@ -706,6 +706,21 @@ pub enum DaemonEvent {
     /// registered, so events emitted after this line will be delivered.
     /// Consumers may ignore it.
     Subscribed,
+    /// Web-scoped single-flight guard state changed — published by the
+    /// `dormant-web` HTTP layer after every `exercise_in_flight` /
+    /// `emergency_wake_lock` mutation (insert AND remove, including the
+    /// detached completion monitor that outlives an HTTP timeout). Lets the
+    /// webui replace a 1 Hz paired poll with event-driven UI, while still
+    /// hitting `GET /api/operations` on initial load and on reconnect/refocus.
+    /// `exercise_in_flight` is sorted ascending on the wire (grep-stable).
+    OperationsChanged {
+        /// Configured display ids with a web exercise currently awaiting
+        /// engine completion.
+        exercise_in_flight: Vec<String>,
+        /// Whether a global web emergency wake is currently awaiting engine
+        /// completion.
+        emergency_wake_in_flight: bool,
+    },
     /// Wire-tolerance catch-all: any event tag this build does not
     /// recognize deserializes to this variant instead of failing the whole
     /// stream.  The daemon never constructs this — see
@@ -3917,6 +3932,42 @@ mod tests {
             serde_json::from_str(&s).unwrap(),
             DaemonEvent::WearSnapshot { .. }
         ));
+    }
+
+    /// `OperationsChanged` (issue #184) round-trips through the wire with
+    /// the expected tag and fields, and the `Unknown` catch-all still
+    /// traps unrecognized tags so older clients keep working.
+    #[test]
+    fn operations_changed_event_round_trips() {
+        let ev = DaemonEvent::OperationsChanged {
+            exercise_in_flight: vec!["studio".to_string(), "main".to_string()],
+            emergency_wake_in_flight: true,
+        };
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "event": "operations_changed",
+                "exercise_in_flight": ["studio", "main"],
+                "emergency_wake_in_flight": true,
+            })
+        );
+        let parsed: DaemonEvent = serde_json::from_value(json).unwrap();
+        match parsed {
+            DaemonEvent::OperationsChanged {
+                exercise_in_flight,
+                emergency_wake_in_flight,
+            } => {
+                assert_eq!(exercise_in_flight, vec!["studio", "main"]);
+                assert!(emergency_wake_in_flight);
+            }
+            other => panic!("expected OperationsChanged verbatim, got {other:?}"),
+        }
+        // The catch-all still routes unknown tags to Unknown — this is the
+        // forward-compat path a rolling daemon-upgrade relies on.
+        let unknown: DaemonEvent =
+            serde_json::from_str(r#"{"event":"from_the_future","x":1}"#).unwrap();
+        assert!(matches!(unknown, DaemonEvent::Unknown));
     }
 
     #[test]

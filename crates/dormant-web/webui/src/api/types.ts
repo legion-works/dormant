@@ -60,6 +60,7 @@ export const DAEMON_EVENT_TAGS = [
   "blank_recovered",
   "wake_recovered",
   "ownership",
+  "operations_changed",
 ] as const;
 export type DaemonEventTag = (typeof DAEMON_EVENT_TAGS)[number];
 
@@ -285,7 +286,8 @@ export type DaemonEvent =
   | BlankFailureEvent
   | BlankRecoveredEvent
   | WakeRecoveredEvent
-  | OwnershipEvent;
+  | OwnershipEvent
+  | OperationsChangedEvent;
 
 export interface SensorChangedEvent {
   event: "sensor_changed";
@@ -411,6 +413,20 @@ export interface OwnershipEvent {
   verified?: boolean | null;
   /** Set when the write path degraded (peer READ alias absent). */
   degraded?: boolean;
+}
+
+/**
+ * rust: rules.rs DaemonEvent::OperationsChanged (issue #184).
+ * Pushed by the HTTP layer after every exercise / emergency-wake guard mutation
+ * (insert AND remove, including the detached completion monitor). Lets the
+ * webui replace the 1 Hz paired poll with event-driven UI.
+ */
+export interface OperationsChangedEvent {
+  event: "operations_changed";
+  /** Display ids with a web exercise currently awaiting engine completion. */
+  exercise_in_flight: string[];
+  /** Whether a global web emergency wake is currently awaiting engine completion. */
+  emergency_wake_in_flight: boolean;
 }
 
 /**

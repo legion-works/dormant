@@ -63,6 +63,7 @@ describe("enum arrays match Rust serde wire strings", () => {
       "blank_recovered",
       "wake_recovered",
       "ownership",
+      "operations_changed",
     ]);
   });
 

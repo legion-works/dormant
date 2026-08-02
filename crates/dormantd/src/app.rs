@@ -893,6 +893,7 @@ impl App {
             reload_lifecycle_capture: None,
             #[cfg(any(test, feature = "test-util"))]
             activity_follow_pull_recorder: None,
+            #[cfg(any(test, feature = "test-util"))]
             activity_follow_terminated_sink: None,
         })
     }
@@ -1414,14 +1415,24 @@ impl App {
                 .collect();
             if !shared.is_empty() {
                 let gen_cancel = root.child_token();
+                #[cfg(any(test, feature = "test-util"))]
+                let pull_recorder = self.activity_follow_pull_recorder.clone();
+                #[cfg(any(test, feature = "test-util"))]
+                let on_terminated = self.activity_follow_terminated_sink.clone();
+                #[cfg(not(any(test, feature = "test-util")))]
+                let pull_recorder: Option<
+                    tokio::sync::mpsc::UnboundedSender<dormant_core::types::DisplayId>,
+                > = None;
+                #[cfg(not(any(test, feature = "test-util")))]
+                let on_terminated: Option<tokio::sync::mpsc::UnboundedSender<()>> = None;
                 let deps = crate::activity_follow::ActivityFollowDeps {
                     idle_rx,
                     direct_switch: Some(direct_switch.clone()),
                     display_ids: shared.into(),
                     arm_after: cfg_clone.coordination.arm_after,
                     cancel: gen_cancel.clone(),
-                    pull_recorder: self.activity_follow_pull_recorder.clone(),
-                    on_terminated: self.activity_follow_terminated_sink.clone(),
+                    pull_recorder,
+                    on_terminated,
                     clock: crate::activity_follow::production_clock,
                 };
                 activity_follow_slot = Some(ActivityFollowSlot {
@@ -2513,14 +2524,24 @@ impl Runner {
 
             if !shared.is_empty() {
                 let gen_cancel = self.root.child_token();
+                #[cfg(any(test, feature = "test-util"))]
+                let pull_recorder = self.activity_follow_pull_recorder.clone();
+                #[cfg(any(test, feature = "test-util"))]
+                let on_terminated = self.activity_follow_terminated_sink.clone();
+                #[cfg(not(any(test, feature = "test-util")))]
+                let pull_recorder: Option<
+                    tokio::sync::mpsc::UnboundedSender<dormant_core::types::DisplayId>,
+                > = None;
+                #[cfg(not(any(test, feature = "test-util")))]
+                let on_terminated: Option<tokio::sync::mpsc::UnboundedSender<()>> = None;
                 let deps = crate::activity_follow::ActivityFollowDeps {
                     idle_rx,
                     direct_switch: Some(self.direct_switch.clone()),
                     display_ids: shared.into(),
                     arm_after: self.generation.cfg.coordination.arm_after,
                     cancel: gen_cancel.clone(),
-                    pull_recorder: self.activity_follow_pull_recorder.clone(),
-                    on_terminated: self.activity_follow_terminated_sink.clone(),
+                    pull_recorder,
+                    on_terminated,
                     clock: crate::activity_follow::production_clock,
                 };
                 self.activity_follow_slot = Some(ActivityFollowSlot {

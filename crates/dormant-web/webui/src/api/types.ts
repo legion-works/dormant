@@ -241,6 +241,21 @@ export interface DaemonIdentity {
    *  "Star the repo" nudge has been dismissed (flag file in config dir).
    *  Omitted by old daemons so the API client defaults it to false. */
   star_nudge_dismissed?: boolean;
+  /** rust: DaemonIdentity::wear_sampling_supported — whether the daemon's
+   *  active wear-sampling pipeline is **platform-capable** on this host.
+   *  Derived from `wear_sampling_rx.borrow().is_some()`: non-Linux builds
+   *  never spawn the active sampler (the module is
+   *  `#[cfg(target_os = "linux")]`), so the watch stays `None` and this
+   *  is `false`. Critically, this is independent of the user's
+   *  `wear.active_sampling.enabled` config flag — that is the user's
+   *  *intent*, this is the system's *capability*. The wear-card
+   *  onboarding nudge (issue #186) MUST read this field, not the config
+   *  flag, to decide whether to show the portal action. */
+  wear_sampling_supported?: boolean;
+  /** rust: DaemonIdentity::wear_sampling_nudge_dismissed — whether the
+   *  wear-card onboarding nudge has been dismissed (flag file in config
+   *  dir). Omitted by old daemons so the API client defaults it to false. */
+  wear_sampling_nudge_dismissed?: boolean;
 }
 
 /**

@@ -77,6 +77,7 @@ pub(crate) const ACKNOWLEDGED_WEAK_ROUTES: &[&str] = &[
     "/api/doctor/exercise/:display",
     "/api/wear/sampling/enable",
     "/api/wear/sampling/disable",
+    "/api/wear/sampling/nudge/dismiss",
 ];
 
 /// Reject any request whose `Host` header is not in the allow-list.
@@ -680,6 +681,20 @@ mod tests {
     fn wear_sampling_posts_are_acknowledged_weak_routes() {
         assert!(ACKNOWLEDGED_WEAK_ROUTES.contains(&"/api/wear/sampling/enable"));
         assert!(ACKNOWLEDGED_WEAK_ROUTES.contains(&"/api/wear/sampling/disable"));
+    }
+
+    /// #186 counterpart: the onboarding-nudge dismiss endpoint is a
+    /// write that does not need the strict exact-port origin check — it
+    /// only mutates a local flag file with the same persistence shape as
+    /// `star-nudge/dismiss`. Pre-classifying it `WEAK` keeps the
+    /// preserved-by-construction invariant that every `route_post!`-mounted
+    /// path is in `STRICT ∪ WEAK` (see the inverted meta-test in
+    /// `server.rs`); the moment T19 mounts the route, it is already
+    /// classified.
+    #[test]
+    fn wear_sampling_nudge_dismiss_is_acknowledged_weak() {
+        assert!(ACKNOWLEDGED_WEAK_ROUTES.contains(&"/api/wear/sampling/nudge/dismiss"));
+        assert!(!STRICT_ORIGIN_PATHS.contains(&"/api/wear/sampling/nudge/dismiss"));
     }
 
     /// M3 Must-2 counterpart for the global emergency-wake route: a direct

@@ -296,6 +296,16 @@ export function postStarNudgeDismiss(): Promise<void> {
   });
 }
 
+/** POST /api/wear/sampling/nudge/dismiss — dismiss the wear-card active-sampling
+ *  onboarding nudge permanently (issue #186). The flag file lives in the
+ *  config directory beside the star-nudge flag; persistence is symmetric. */
+export function postWearSamplingNudgeDismiss(): Promise<void> {
+  return request<void>("/wear/sampling/nudge/dismiss", {
+    method: "POST",
+    headers: JSON_CT,
+  });
+}
+
 /** GET /api/daemon — daemon process identity (pid, uptime, version, socket). */
 export function getDaemon(): Promise<DaemonIdentity> {
   return request<DaemonIdentity>("/daemon");

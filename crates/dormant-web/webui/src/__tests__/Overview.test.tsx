@@ -75,6 +75,19 @@ vi.mock("../api/client", () => ({
   getWearDetail: vi.fn(),
   getWearSamplingStatus: vi.fn().mockResolvedValue({ status: "granted" }),
   postWearSamplingEnable: vi.fn(),
+  // #186: WearCard now also fetches `getDaemon` (platform-capability
+  // gate) and exposes `postWearSamplingNudgeDismiss` (nudge persistence).
+  // The Overview view imports WearCard, so this mock must provide
+  // both functions for the Overview tests to render without throwing.
+  getDaemon: vi.fn().mockResolvedValue({
+    pid: 1,
+    started_epoch_s: 0,
+    version: "test",
+    socket: "/tmp/dormant.sock",
+    wear_sampling_supported: false,
+    wear_sampling_nudge_dismissed: false,
+  }),
+  postWearSamplingNudgeDismiss: vi.fn().mockResolvedValue(undefined),
   getRecentEvents: vi.fn().mockResolvedValue({ events: [] }),
   postBlank: vi.fn().mockResolvedValue(undefined),
   postWake: vi.fn().mockResolvedValue(undefined),

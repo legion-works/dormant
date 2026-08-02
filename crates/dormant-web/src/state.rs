@@ -196,6 +196,15 @@ pub struct WebStateInner {
     /// `POST /api/star-nudge/dismiss`.
     pub(crate) star_nudge_path: PathBuf,
 
+    /// Path to the `wear-sampling-nudge-dismissed` flag file in the config
+    /// directory. Existence of this file means the user has dismissed the
+    /// active-sampling onboarding nudge (#186) on the wear card. Read by
+    /// `GET /api/daemon`; written atomically by
+    /// `POST /api/wear/sampling/nudge/dismiss`. Mirrors [`star_nudge_path`]
+    /// — same persistence discipline (tempfile + rename, `create_new(true)`,
+    /// symlink-safe), same config-dir placement.
+    pub(crate) wear_sampling_nudge_path: PathBuf,
+
     /// Test-only seam: explicit path to the `gh` binary for
     /// `POST /api/star-nudge/star`.  When `None` (production), the handler
     /// does a PATH lookup on a fixed, hardened PATH.  Tests inject a
@@ -373,6 +382,10 @@ impl WebStateInner {
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| std::path::Path::new("."));
         let star_nudge_path = config_dir.join("star-nudge-dismissed");
+        // #186: companion flag for the active-sampling onboarding nudge.
+        // Same config-dir layout as the star nudge so the operator sees
+        // one cluster of UI-state files together.
+        let wear_sampling_nudge_path = config_dir.join("wear-sampling-nudge-dismissed");
 
         Self {
             ctl_tx: params.ctl_tx,
@@ -400,6 +413,7 @@ impl WebStateInner {
             started_epoch_s: now_epoch_s(),
             event_history,
             star_nudge_path,
+            wear_sampling_nudge_path,
             star_gh_path: None,
             star_test_path: None,
         }

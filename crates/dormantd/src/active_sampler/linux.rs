@@ -1,9 +1,11 @@
 //! Linux XDG `ScreenCast` portal and `PipeWire` capture implementation.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
+use std::thread_local;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -838,23 +840,66 @@ fn update_shm_buffer_params(stream: &pw::stream::Stream) {
     }
 }
 
+// Thread-local: tracks whether we have established a PipeWire streaming session.
+// The first `streaming` after initial connection is INFO (diagnostic signal).
+// All subsequent steady-state cadence transitions are DEBUG to eliminate the
+// ~3k lines/day noise from 60s sampling cycles.
+thread_local! {
+    static ESTABLISHED_STREAMING: RefCell<bool> = const { RefCell::new(false) };
+}
+
 fn log_stream_state(state: &pw::stream::StreamState) {
     match state {
-        pw::stream::StreamState::Connecting => tracing::info!(
-            event = "wear_sampling_stage",
-            stage = "pipewire_state_changed",
-            state = "connecting"
-        ),
-        pw::stream::StreamState::Paused => tracing::info!(
-            event = "wear_sampling_stage",
-            stage = "pipewire_state_changed",
-            state = "paused"
-        ),
-        pw::stream::StreamState::Streaming => tracing::info!(
-            event = "wear_sampling_stage",
-            stage = "pipewire_state_changed",
-            state = "streaming"
-        ),
+        pw::stream::StreamState::Connecting => {
+            // Reset the established-stream tracker so the next streaming transition
+            // is logged at INFO again (the diagnostic signal after any reconnect).
+            // This is topology-independent: Warm workers are dedicated threads so
+            // the thread-local is naturally fresh per session; PerTick mode uses
+            // a reused spawn_blocking thread, so we must explicitly reset.
+            ESTABLISHED_STREAMING.with(|flag| *flag.borrow_mut() = false);
+            tracing::info!(
+                event = "wear_sampling_stage",
+                stage = "pipewire_state_changed",
+                state = "connecting"
+            );
+        }
+        pw::stream::StreamState::Paused => {
+            // `paused` is part of the steady-state cadence; after the first
+            // `streaming` is established it is demoted to DEBUG.
+            let established = ESTABLISHED_STREAMING.with(|flag| *flag.borrow());
+            if established {
+                tracing::debug!(
+                    event = "wear_sampling_stage",
+                    stage = "pipewire_state_changed",
+                    state = "paused"
+                );
+            } else {
+                tracing::info!(
+                    event = "wear_sampling_stage",
+                    stage = "pipewire_state_changed",
+                    state = "paused"
+                );
+            }
+        }
+        pw::stream::StreamState::Streaming => {
+            let established = ESTABLISHED_STREAMING.with(|flag| *flag.borrow());
+            if established {
+                // Subsequent steady-state streaming transitions are DEBUG noise.
+                tracing::debug!(
+                    event = "wear_sampling_stage",
+                    stage = "pipewire_state_changed",
+                    state = "streaming"
+                );
+            } else {
+                // First streaming after (re)connect is the diagnostic signal.
+                ESTABLISHED_STREAMING.with(|flag| *flag.borrow_mut() = true);
+                tracing::info!(
+                    event = "wear_sampling_stage",
+                    stage = "pipewire_state_changed",
+                    state = "streaming"
+                );
+            }
+        }
         pw::stream::StreamState::Error(error) => tracing::info!(
             event = "wear_sampling_stage",
             stage = "pipewire_state_changed",
@@ -1695,6 +1740,37 @@ mod tests {
             assert!(log.contains(stage), "missing {stage} stage: {log}");
         }
         assert!(log.contains("granted=true"), "missing grant result: {log}");
+    }
+
+    /// RED test: after a reconnect (Connecting), the next streaming must be INFO again.
+    /// Intra-session cadence repeats (paused→streaming→paused→…) stay DEBUG.
+    ///
+    /// Sequence: session1: Connecting→Streaming→Paused→Streaming (2nd, DEBUG)
+    ///           session2: Connecting→Streaming (INFO again — reconnect resets)
+    #[test]
+    fn active_sampling_cadence_repeated_streaming_logged_at_info() {
+        let log = capture_tracing(|| {
+            // Session 1
+            log_stream_state(&pw::stream::StreamState::Connecting);
+            log_stream_state(&pw::stream::StreamState::Streaming); // 1st, INFO
+            // First cadence cycle
+            log_stream_state(&pw::stream::StreamState::Paused);
+            log_stream_state(&pw::stream::StreamState::Streaming); // 2nd, DEBUG
+            // Session 2 (reconnect resets so this streaming is INFO again)
+            log_stream_state(&pw::stream::StreamState::Connecting); // reconnect
+            log_stream_state(&pw::stream::StreamState::Streaming); // 3rd, INFO (first of session 2)
+        });
+
+        let streaming_at_info: usize = log
+            .lines()
+            .filter(|line| line.contains("pipewire_state_changed") && line.contains("streaming"))
+            .count();
+
+        // Two sessions → two first-streaming transitions are INFO; intra-session repeats are DEBUG.
+        assert_eq!(
+            streaming_at_info, 2,
+            "expected 2 INFO streaming (one per session), got {streaming_at_info}: {log}"
+        );
     }
 
     #[test]

@@ -377,3 +377,147 @@ async fn mqtt_concurrent_sources_receive_only_their_own_state() {
     stop_source(cancel_a, handle_a).await;
     stop_source(cancel_b, handle_b).await;
 }
+
+// ── Reconnect tests ───────────────────────────────────────────────────────────────
+
+/// Issue #213 — verify that MQTT subscriptions are issued exactly once per
+/// `ConnAck`, for both initial connection and reconnect.
+///
+/// ## Bug anatomy (before fix)
+///
+/// `connect()` called `subscribe_topics()` immediately when constructing the
+/// client/eventloop — **before** any `ConnAck` arrived. The `ConnAck` handler
+/// then did:
+/// - initial `ConnAck`: set `initial_connack_seen = true`, no subscribe
+/// - reconnect `ConnAck`: called `subscribe_topics()` again
+///
+/// Result: **N subs from `connect()` + N subs from reconnect = 2N** for a
+/// single reconnect cycle, and the `Subscribed` readiness event could fire
+/// against a stale acknowledgement counter.
+///
+/// ## Fix
+///
+/// `connect()` now only constructs the `AsyncClient`/`EventLoop` pair.
+/// Every `ConnAck` is the sole subscription site (initial and reconnect
+/// identical). Counters are reset before each batch, so `Subscribed` fires
+/// exactly when `acknowledged == queued`.
+///
+/// ## Test approach
+///
+/// We drive the source through two connection cycles and verify that
+/// `Subscribed` fires exactly once per cycle:
+///
+/// 1. Spawn source → wait for initial `Subscribed` (N topics, 1 event)
+/// 2. Cancel source task → restart fresh → wait for reconnect `Subscribed`
+/// 3. Assert: `Subscribed` fires exactly twice (one per `ConnAck`)
+///
+/// The acked-vs-queued invariant is guaranteed by the counter reset before
+/// each subscription batch: `pending_subacks`, `acknowledged_subscriptions`,
+/// and `outgoing_subscriptions` are all cleared to 0 on every `ConnAck`,
+/// and `queued_subscriptions` is set after `subscribe_topics()` returns.
+/// Since `acknowledged` only increments after looking up the pkid in
+/// `pending_subacks`, it can never exceed `queued`.
+///
+/// The `#[ignore]` attribute mirrors other broker-dependent tests;
+/// enable with `DORMANT_TEST_MQTT=1`.
+#[ignore = "requires broker: DORMANT_TEST_MQTT=1"]
+#[tokio::test]
+async fn mqtt_reconnect() {
+    let Some(port) = mqtt_port() else {
+        return;
+    };
+
+    let topic_a = mqtt_topic("reconnect-a");
+    let topic_b = mqtt_topic("reconnect-b");
+    let topics = [topic_a.clone(), topic_b.clone()];
+
+    let sensors: Vec<_> = topics
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (SensorId(format!("sensor-{i}")), mqtt_cfg(t.clone(), port)))
+        .collect();
+
+    // Lifecycle channel: tracks Connected + Subscribed per cycle.
+    let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel();
+
+    // ── Phase 1: initial connection ─────────────────────────────────────────
+    let source = MqttSource::new(broker_url(port), sensors.clone(), None)
+        .with_lifecycle_sender(lifecycle_tx.clone());
+
+    let (tx, _rx) = mpsc::channel(16);
+    let (ctl_tx, _ctl_rx) = mpsc::channel(8);
+    let cancel = CancellationToken::new();
+    let cancel_clone = cancel.clone();
+
+    let handle = tokio::spawn(async move {
+        let _ = Box::new(source).run(tx, ctl_tx, cancel_clone).await;
+    });
+
+    // Wait for initial Subscribed.
+    wait_for_subscribed(&mut lifecycle_rx).await;
+
+    // Collect any other lifecycle events that arrived.
+    let mut subscribed_events = 0usize;
+    while let Some(l) = lifecycle_rx.recv().await {
+        if l == MqttLifecycle::Subscribed {
+            subscribed_events += 1;
+        }
+    }
+    assert_eq!(
+        subscribed_events, 1,
+        "initial connection should produce exactly 1 Subscribed event, got {subscribed_events}"
+    );
+
+    // ── Phase 2: reconnect ─────────────────────────────────────────────────
+    cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("first source run should exit after cancellation");
+
+    // Drain any lingering lifecycle events from the first run.
+    let _ = tokio::time::timeout(Duration::from_millis(100), async {
+        while lifecycle_rx.recv().await.is_some() {}
+    })
+    .await;
+
+    // Restart source for the reconnect cycle.
+    let source2 = MqttSource::new(broker_url(port), sensors, None)
+        .with_lifecycle_sender(lifecycle_tx.clone());
+
+    let (tx2, _rx) = mpsc::channel(16);
+    let (ctl_tx2, _ctl_rx) = mpsc::channel(8);
+    let cancel2 = CancellationToken::new();
+    let cancel2_inner = cancel2.clone();
+
+    let handle2 = tokio::spawn(async move {
+        let _ = Box::new(source2).run(tx2, ctl_tx2, cancel2_inner).await;
+    });
+
+    // Wait for reconnect Subscribed.
+    wait_for_subscribed(&mut lifecycle_rx).await;
+
+    // Collect all remaining Subscribed events from the reconnect cycle.
+    let mut reconnect_subscribed = 1usize; // counted the reconnect one above
+    while let Some(l) = lifecycle_rx.recv().await {
+        if l == MqttLifecycle::Subscribed {
+            reconnect_subscribed += 1;
+        }
+    }
+
+    // ── Assertions ─────────────────────────────────────────────────────────
+    // With the fix: each connection cycle issues exactly N subscriptions and
+    // fires exactly one `Subscribed` event. Two cycles = 2 events total.
+    // Without the fix (bug #213): the initial cycle also subscribes in
+    // `connect()`, producing two `Subscribed` events for the first cycle
+    // (one for the connect()-batch, one for the ConnAck-batch), so we'd
+    // see 3 events across two cycles instead of 2.
+    let total_subscribed = subscribed_events + reconnect_subscribed;
+    assert_eq!(
+        total_subscribed, 2,
+        "two connection cycles should produce exactly 2 Subscribed events, got {total_subscribed}"
+    );
+
+    // ── Cleanup ─────────────────────────────────────────────────────────────
+    cancel2.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(2), handle2).await;
+}

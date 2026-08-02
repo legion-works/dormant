@@ -527,7 +527,10 @@ async fn handle_command(
                 ));
                 return false;
             }
-            if runtime.state == SamplingState::ConsentPending {
+            if runtime.state != SamplingState::NeedsConsent {
+                // Reject before reaching the capture source: in Streaming / Connecting
+                // a subsequent cancellation of the new consent flow would call
+                // source.close() on a live portal session and tear it down.
                 let _ = reply.send(ConsentFlowStatus::Error(
                     SamplerError::FlowAlreadyActive.to_string(),
                 ));
@@ -548,7 +551,7 @@ async fn handle_command(
             let transition = apply_trigger(runtime, Trigger::GrantStarted, status_tx);
             debug_assert!(
                 transition.effects.contains(&Effect::OpenConsent),
-                "only GrantStarted may enter ConsentPending"
+                "Enable from NeedsConsent must request a portal consent flow"
             );
             // The portal has no config timeout; the five-minute interaction bound
             // prevents an abandoned dialog from retaining a daemon operation forever.
@@ -2325,6 +2328,85 @@ mod tests {
             reply_rx.await.unwrap(),
             ConsentFlowStatus::Error(SamplerError::FlowAlreadyActive.to_string())
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_sampler_rejects_enable_while_active() {
+        let cases: &[(&str, &[Trigger])] = &[
+            ("connecting", &[Trigger::GrantStarted, Trigger::Granted]),
+            (
+                "streaming",
+                &[Trigger::GrantStarted, Trigger::Granted, Trigger::Connected],
+            ),
+            (
+                "cooldown",
+                &[
+                    Trigger::GrantStarted,
+                    Trigger::Granted,
+                    Trigger::Connected,
+                    Trigger::CaptureFailed,
+                ],
+            ),
+            (
+                "suspended",
+                &[Trigger::ConfigChanged(ConfigDelta::WearEnabled(false))],
+            ),
+        ];
+        for (label, setup) in cases {
+            let dir = tempdir().unwrap();
+            let consent_path = dir.path().join("consent.json");
+            let config = active_config(Duration::from_secs(10));
+            let mut runtime = Runtime::new(&config, &consent_path);
+            let (status_tx, _) = watch::channel(initial_status(&config));
+            for trigger in *setup {
+                apply_trigger(&mut runtime, *trigger, &status_tx);
+            }
+            let expected_state = runtime.state;
+            let mut source = ServiceSource {
+                connects: Mutex::new(VecDeque::new()),
+                connects_seen: Arc::new(AtomicUsize::new(0)),
+                captures: Mutex::new(VecDeque::new()),
+                captures_seen: Arc::new(AtomicUsize::new(0)),
+                closes_seen: Arc::new(AtomicUsize::new(0)),
+                grants_seen: Arc::new(AtomicUsize::new(0)),
+            };
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let (_command_tx, mut command_rx) = mpsc::channel(1);
+
+            assert!(
+                !handle_command(
+                    &mut runtime,
+                    &mut source,
+                    &consent_path,
+                    SamplerCommand::Enable { reply: reply_tx },
+                    &mut command_rx,
+                    &status_tx,
+                    &CancellationToken::new(),
+                    test_env_reader,
+                )
+                .await,
+                "{label}: handle_command returned true (signalled connect)"
+            );
+            assert_eq!(
+                reply_rx.await.unwrap(),
+                ConsentFlowStatus::Error(SamplerError::FlowAlreadyActive.to_string()),
+                "{label}: reply mismatch"
+            );
+            assert_eq!(
+                runtime.state, expected_state,
+                "{label}: state mutated by rejected Enable"
+            );
+            assert_eq!(
+                source.grants_seen.load(Ordering::SeqCst),
+                0,
+                "{label}: request_consent was called"
+            );
+            assert_eq!(
+                source.closes_seen.load(Ordering::SeqCst),
+                0,
+                "{label}: close was called"
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]

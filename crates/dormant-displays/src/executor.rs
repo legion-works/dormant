@@ -508,6 +508,13 @@ impl CommandSink for DisplayExecutor {
                         error: format!("{E_WAKE_FAILED}: superseded by blank"),
                     });
                 }
+                // The owner's wake succeeded: clear it.  A non-owner fallback
+                // success (above, implicitly — `is_owner_attempt` is false there)
+                // leaves the owner in place, per invariant.
+                if is_owner_attempt {
+                    self.blank_owners
+                        .clear_if_owner(&self.display, &self.chain_fingerprint, i);
+                }
                 return Ok(());
             }
         }
@@ -684,6 +691,13 @@ impl CommandSink for DisplayExecutor {
                         controller: "superseded".to_string(),
                         error: format!("{E_WAKE_FAILED}: superseded by blank"),
                     });
+                }
+                // The owner's wake succeeded: clear it.  A non-owner fallback
+                // success (above, implicitly — `is_owner_attempt` is false there)
+                // leaves the owner in place, per invariant.
+                if is_owner_attempt {
+                    self.blank_owners
+                        .clear_if_owner(&self.display, &self.chain_fingerprint, i);
                 }
                 return Ok(());
             }
@@ -2026,6 +2040,144 @@ mod tests {
         assert!(err.error.contains("superseded by blank"));
         assert_eq!(exec.blank_owner_for_test(), Some(1));
         assert_eq!(b.count_op("wake"), 0);
+    }
+
+    // ── Task 3 fix-round Must 1: owner cleared after reprobe-heal wake ───────
+
+    #[tokio::test]
+    async fn wake_reprobe_heal_clears_owner_when_owner_succeeds() {
+        // A (index 0) is owner (A blank succeeds; B blank fails).
+        // A.wake() fails in the main round; B.wake() fails.
+        // Reprobe heals A (set_probe_result Ok); A.wake() succeeds.
+        // Owner (A) must be cleared after this.
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let b = FakeController::new("B", vec![BlankMode::PowerOff]);
+        // B fails blank → owner stays A (index 0).
+        b.push_blank_result(Err(err("B")));
+        let (exec, _) = executor_with(vec![a.clone(), b.clone()], default_retry());
+
+        exec.blank(BlankMode::PowerOff).await.unwrap();
+        assert_eq!(
+            exec.blank_owner_for_test(),
+            Some(0),
+            "A (index 0) is owner after A succeeds blank"
+        );
+
+        // Main round: A fails wake, B fails wake.
+        a.push_wake_result(Err(err("A")));
+        b.push_wake_result(Err(err("B")));
+        // Reprobe: A heals (probe_result Ok); A.wake() succeeds.
+        a.set_probe_result(Ok(()));
+        a.push_wake_result(Ok(()));
+
+        exec.wake().await.unwrap();
+
+        assert_eq!(
+            exec.blank_owner_for_test(),
+            None,
+            "owner cleared after owner's wake succeeds in reprobe-heal"
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_once_reprobe_heal_clears_owner_when_owner_succeeds() {
+        // Same scenario through wake_once().
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let b = FakeController::new("B", vec![BlankMode::PowerOff]);
+        b.push_blank_result(Err(err("B")));
+        let (exec, _) = executor_with(vec![a.clone(), b.clone()], default_retry());
+
+        exec.blank(BlankMode::PowerOff).await.unwrap();
+        assert_eq!(exec.blank_owner_for_test(), Some(0));
+
+        a.push_wake_result(Err(err("A")));
+        b.push_wake_result(Err(err("B")));
+        a.set_probe_result(Ok(()));
+        a.push_wake_result(Ok(()));
+
+        exec.wake_once().await.unwrap();
+
+        assert_eq!(
+            exec.blank_owner_for_test(),
+            None,
+            "owner cleared after owner's wake_once succeeds in reprobe-heal"
+        );
+    }
+
+    // ── Task 3 fix-round Must 1 (negative): non-owner success INSIDE the
+    // reprobe-heal loop must not clear ownership. The main-loop equivalent is
+    // covered by `wake_retains_owner_when_owner_wake_fails_and_fallback_succeeds`;
+    // these two drive execution into the reprobe loop itself (every controller
+    // fails the main round) before the non-owner succeeds.
+
+    #[tokio::test]
+    async fn wake_reprobe_heal_keeps_owner_when_non_owner_succeeds() {
+        // A blanks successfully → owner = A (index 0). Wake: A (owner) fails
+        // the main round AND the reprobe attempt; B fails the main round,
+        // then succeeds inside the reprobe-heal loop (scripted Err consumed,
+        // default Ok). Owner must stay A.
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let b = FakeController::new("B", vec![BlankMode::PowerOff]);
+        let (exec, _) = executor_with(vec![a.clone(), b.clone()], default_retry());
+
+        exec.blank(BlankMode::PowerOff).await.unwrap();
+        assert_eq!(
+            exec.blank_owner_for_test(),
+            Some(0),
+            "A (index 0) is owner after A succeeds blank"
+        );
+
+        // default_retry has wake_retries: 0 → one main round. Script both
+        // controllers to fail it so the burst exhausts and the reprobe loop
+        // runs; A fails again there, B's queue is empty → default Ok.
+        a.push_wake_result(Err(err("A")));
+        a.push_wake_result(Err(err("A")));
+        b.push_wake_result(Err(err("B")));
+
+        exec.wake().await.unwrap();
+
+        assert_eq!(a.count_op("wake"), 2, "A tried in main round and reprobe");
+        assert_eq!(
+            b.count_op("wake"),
+            2,
+            "B failed the main round, succeeded in the reprobe loop"
+        );
+        assert_eq!(
+            exec.blank_owner_for_test(),
+            Some(0),
+            "non-owner success in the reprobe-heal loop must NOT clear ownership"
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_once_reprobe_heal_keeps_owner_when_non_owner_succeeds() {
+        // Same reprobe-path negative scenario through wake_once(): single
+        // main pass fails for both controllers, reprobe loop runs, A fails
+        // again, B succeeds there. Owner must stay A.
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let b = FakeController::new("B", vec![BlankMode::PowerOff]);
+        let (exec, _) = executor_with(vec![a.clone(), b.clone()], default_retry());
+
+        exec.blank(BlankMode::PowerOff).await.unwrap();
+        assert_eq!(exec.blank_owner_for_test(), Some(0));
+
+        a.push_wake_result(Err(err("A")));
+        a.push_wake_result(Err(err("A")));
+        b.push_wake_result(Err(err("B")));
+
+        exec.wake_once().await.unwrap();
+
+        assert_eq!(a.count_op("wake"), 2, "A tried in single pass and reprobe");
+        assert_eq!(
+            b.count_op("wake"),
+            2,
+            "B failed the single pass, succeeded in the reprobe loop"
+        );
+        assert_eq!(
+            exec.blank_owner_for_test(),
+            Some(0),
+            "non-owner success in the reprobe-heal loop must NOT clear ownership"
+        );
     }
 
     #[tokio::test]

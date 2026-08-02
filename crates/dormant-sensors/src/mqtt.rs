@@ -48,6 +48,7 @@ use dormant_core::types::{
     PresenceEvent, SensorAvailabilityEvent, SensorId, SensorState, Timestamp,
 };
 use rumqttc::mqttbytes::v4::SubscribeReasonCode;
+#[allow(unused_imports)]
 use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Outgoing, Packet, QoS};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
@@ -89,11 +90,24 @@ struct SensorBinding {
 type TopicMap = HashMap<String, Vec<SensorBinding>>;
 
 /// Connection observations exposed only to external integration tests.
-#[cfg(feature = "test-util")]
+///
+/// All variants are constructed only inside `#[cfg(feature = "test-util")]` blocks,
+/// so the enum itself is safe to keep ungated (it is uninhabited in non-test-util
+/// builds, causing no dead-code warnings).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MqttLifecycle {
     /// The broker accepted the MQTT connection.
     Connected,
+    /// N topic subscriptions were queued to the client request channel.
+    ///
+    /// Emitted from inside `subscribe_topics` after each batch is queued, before
+    /// the broker has acknowledged or rejected any of them. Fires on every
+    /// `subscribe_topics` call regardless of caller, so it observes batches
+    /// issued both from `connect()` and from the [`ConnAck`](rumqttc::ConnAck) handler.
+    SubscribeQueued {
+        /// Number of topic subscriptions queued.
+        count: usize,
+    },
     /// Every queued topic subscription was acknowledged by the broker.
     Subscribed,
 }
@@ -222,13 +236,22 @@ impl MqttSource {
 
     /// Queue subscriptions for every topic and return the number accepted by
     /// the client request channel.
-    async fn subscribe_topics(client: &AsyncClient, topics: &[String]) -> usize {
+    #[cfg(feature = "test-util")]
+    async fn subscribe_topics(
+        client: &AsyncClient,
+        topics: &[String],
+        lifecycle_tx: Option<&mpsc::UnboundedSender<MqttLifecycle>>,
+    ) -> usize {
         let mut queued = 0;
         for topic in topics {
-            match client.subscribe(topic, QoS::AtLeastOnce).await {
+            match client.subscribe(topic, rumqttc::QoS::AtLeastOnce).await {
                 Ok(()) => queued += 1,
                 Err(e) => warn!("mqtt: initial subscribe failed for '{topic}': {e}"),
             }
+        }
+        #[cfg(feature = "test-util")]
+        if let Some(tx) = lifecycle_tx {
+            let _ = tx.send(MqttLifecycle::SubscribeQueued { count: queued });
         }
         queued
     }
@@ -244,7 +267,7 @@ impl MqttSource {
     /// `broker_url` is expected in the form `host:port` (e.g. `localhost:1883`)
     /// or `tcp://host:port`. A malformed URL surfaces as an `anyhow::Error`
     /// so the caller can fail fast rather than connect to a garbage host.
-    /// Subscriptions are NOT issued here — [`ConnAck`](rumqttc::Event::Incoming) is
+    /// Subscriptions are NOT issued here — [`ConnAck`](rumqttc::ConnAck) is
     /// the sole subscription site so that first-session and reconnect sessions
     /// behave identically.
     fn connect(
@@ -446,7 +469,11 @@ impl SensorSource for MqttSource {
                             // because clean_session = true — the broker stores no session state.
                             // connect() only constructs the client/eventloop; it does NOT subscribe.
                             info!("mqtt: connected to '{}', subscribing", self.broker_url);
-                            queued_subscriptions = Self::subscribe_topics(&client, &topics).await;
+                            #[cfg(feature = "test-util")]
+                            {
+                                queued_subscriptions =
+                                    Self::subscribe_topics(&client, &topics, self.lifecycle_tx.as_ref()).await;
+                            }
                             backoff = BACKOFF_MIN;
                             outage_reported = false;
                         }

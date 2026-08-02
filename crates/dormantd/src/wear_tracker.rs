@@ -52,9 +52,7 @@ use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
-#[cfg(feature = "render")]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use dormant_core::config::schema::{Config, WearConfig};
 use dormant_core::observation::{DaemonObservation, ObservationHub};
@@ -226,6 +224,21 @@ async fn run(mut deps: WearTrackerDeps) {
                 let now = now_epoch_s();
                 ensure_ledgers_loaded(&mut state, &cfg, &executors, &dir, now, &deps.observations);
 
+                // Compute the wall-clock-INDEPENDENT elapsed span since the
+                // previous attribution tick (issue #210 / sweep-2 Task 15).
+                // First call after a fresh `TrackerState` falls back to the
+                // configured sample interval; subsequent calls saturate the
+                // raw `Instant` delta at 2× sample interval so a
+                // suspend-resume cannot attribute hours of phantom on-time.
+                // The shell owns this because `tick` must stay pure.
+                let max_span = cfg.wear.sample_interval.saturating_mul(2);
+                let monotonic_span = state
+                    .last_tick_at
+                    .map_or(cfg.wear.sample_interval, |prev| {
+                        boundary.0.saturating_duration_since(prev).min(max_span)
+                    });
+                state.last_tick_at = Some(boundary.0);
+
                 let samples = collect_samples(&snapshot, &executors, &cfg.wear).await;
                 let latest_grid = deps
                     .latest_grid
@@ -258,6 +271,7 @@ async fn run(mut deps: WearTrackerDeps) {
                     &samples,
                     &cfg.wear,
                     now,
+                    monotonic_span,
                     injected_grid,
                     sample_fallback,
                     &exposures,
@@ -700,6 +714,12 @@ struct TrackerState {
     dwell_start: HashMap<DisplayId, Option<u64>>,
     /// Epoch-seconds of the last successful persist, per display.
     last_persist_epoch_s: HashMap<DisplayId, u64>,
+    /// Monotonic boundary of the previous attribution tick. Drives the
+    /// non-screensaver wear span so a backward wall-clock step (NTP
+    /// correction, suspend-resume) cannot zero or corrupt attributed
+    /// wear — `last_sample_at_epoch_s` is kept only for storage/persist
+    /// and advisory math, never as a span source.
+    last_tick_at: Option<Instant>,
     /// Resolved on-disk storage key per display (T7 review M1):
     /// `CommandSink::panel_identity()` when available, else the sanitized
     /// config key. Used consistently for the ledger filename,
@@ -916,6 +936,14 @@ fn sampled_uniform_fallback(
 /// Pure tracker tick: given the current snapshot/samples/config, mutate
 /// `state`'s ledgers and bookkeeping in place and return the actions the
 /// shell must execute. Zero I/O, zero tokio — see module docs.
+///
+/// `monotonic_span` is the wall-clock-INDEPENDENT elapsed time since the
+/// previous tick — the shell computes it from `state.last_tick_at` against
+/// a monotonic `Instant` (issue #210 / sweep-2 Task 15). Non-screensaver
+/// attribution rows use it as their span source; the screensaver path
+/// keeps its own per-item exposure slices which are already in the
+/// monotonic domain. `now_epoch_s` is retained solely for the persisted
+/// `last_sample_at_epoch_s` field, dwell tracking, and the advisory math.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn tick(
     state: &mut TrackerState,
@@ -923,6 +951,7 @@ fn tick(
     samples: &HashMap<DisplayId, Option<PanelState>>,
     cfg: &WearConfig,
     now_epoch_s: u64,
+    monotonic_span: Duration,
     injected_grid: Option<&SampledGrid>,
     fallback: Option<SampleFallbackTag>,
     exposures: &HashMap<DisplayId, Vec<ScreensaverExposureSlice>>,
@@ -932,8 +961,12 @@ fn tick(
         return actions;
     }
 
-    let sample_interval_s = cfg.sample_interval.as_secs().max(1);
-    let max_span_s = sample_interval_s.saturating_mul(2);
+    let max_span = cfg.sample_interval.saturating_mul(2);
+    // Defensive clamp — the shell already bounds `monotonic_span` against
+    // 2× sample interval, but a stray caller (test, future scheduler
+    // change) must never be able to attribute hours of phantom on-time
+    // after a suspend-resume.
+    let monotonic_span = monotonic_span.min(max_span);
     let persist_interval_s = cfg.persist_interval.as_secs().max(1);
     let short_cycle_s = cfg.short_cycle_dwell.as_secs();
 
@@ -963,17 +996,17 @@ fn tick(
         let mut attribution_mode = WearAttributionMode::Uniform;
 
         // ── Attribution ──────────────────────────────────────────────────
-        let elapsed_s = ledger
-            .last_sample_at_epoch_s
-            .map_or(sample_interval_s, |last| now_epoch_s.saturating_sub(last));
-        let span_s = elapsed_s.min(max_span_s);
-        let wall_span = Duration::from_secs(span_s);
+        // The screensaver path already lives in the monotonic domain
+        // (per-item `ScreensaverExposureSlice.span` sums). Every OTHER
+        // stage — active, grace, blanked, render_black — uses the
+        // shell-supplied `monotonic_span`, so a backward wall-clock step
+        // cannot zero or corrupt attributed wear (issue #210).
         let span = if stage_kind == "render_screensaver" {
-            exposures.get(&display_id).map_or(wall_span, |slices| {
+            exposures.get(&display_id).map_or(monotonic_span, |slices| {
                 slices.iter().map(|slice| slice.span).sum()
             })
         } else {
-            wall_span
+            monotonic_span
         };
 
         let norm = match stage_kind {
@@ -1724,6 +1757,7 @@ mod tests {
             &samples,
             &cfg,
             1_000_060,
+            Duration::from_secs(60),
             None,
             None,
             &HashMap::new(),
@@ -1760,6 +1794,7 @@ mod tests {
                 &HashMap::new(),
                 &cfg,
                 u64::MAX,
+                Duration::from_secs(60),
                 fresh,
                 fallback,
                 &HashMap::new(),
@@ -1832,6 +1867,7 @@ mod tests {
             &brightness_samples,
             &cfg,
             60,
+            Duration::from_secs(60),
             Some(&sampled_grid),
             None,
             &HashMap::new(),
@@ -1880,6 +1916,7 @@ mod tests {
             &brightness_samples,
             &cfg,
             60,
+            Duration::from_secs(60),
             Some(&sampled_grid),
             None,
             &HashMap::new(),
@@ -1936,6 +1973,7 @@ mod tests {
                 &samples,
                 &cfg,
                 60,
+                Duration::from_secs(60),
                 None,
                 Some(fallback),
                 &HashMap::new(),
@@ -2026,6 +2064,7 @@ mod tests {
                 &brightness_samples,
                 &cfg,
                 60,
+                Duration::from_secs(60),
                 Some(&sampled_grid),
                 None,
                 &HashMap::new(),
@@ -2036,6 +2075,7 @@ mod tests {
                 &brightness_samples,
                 &cfg,
                 120,
+                Duration::from_secs(60),
                 Some(&sampled_grid),
                 None,
                 &HashMap::new(),
@@ -2104,6 +2144,7 @@ mod tests {
             &samples,
             &cfg,
             60,
+            Duration::from_secs(60),
             None,
             fallback,
             &HashMap::new(),
@@ -2148,6 +2189,7 @@ mod tests {
             &HashMap::new(),
             &cfg,
             60,
+            Duration::from_secs(60),
             Some(&sampled),
             None,
             &HashMap::new(),
@@ -2241,6 +2283,7 @@ mod tests {
             &HashMap::new(),
             &cfg,
             60,
+            Duration::from_secs(60),
             None,
             Some(SampleFallbackTag::Missing),
             &HashMap::new(),
@@ -2309,6 +2352,7 @@ mod tests {
             &samples,
             &cfg,
             1_000_060,
+            Duration::from_secs(60),
             None,
             None,
             &HashMap::new(),
@@ -2400,6 +2444,7 @@ mod tests {
             &HashMap::new(),
             &cfg.wear,
             60,
+            Duration::from_secs(60),
             fresh,
             fallback,
             &HashMap::new(),
@@ -2661,7 +2706,15 @@ mod tests {
             }],
         )]);
         let actions = tick(
-            &mut state, &snapshot, &samples, &cfg, 1_000_060, None, None, &exposures,
+            &mut state,
+            &snapshot,
+            &samples,
+            &cfg,
+            1_000_060,
+            Duration::from_secs(60),
+            None,
+            None,
+            &exposures,
         );
         let (span, norm) = find_attribute(&actions, &display).expect("Attribute action");
         assert_eq!(span, Duration::from_secs(60));
@@ -2706,6 +2759,7 @@ mod tests {
             &HashMap::new(),
             &cfg,
             1_000_120,
+            Duration::from_secs(60),
             None,
             None,
             &exposures,
@@ -2761,6 +2815,7 @@ mod tests {
             &HashMap::new(),
             &cfg,
             1_000_060,
+            Duration::from_secs(60),
             None,
             None,
             &exposures,
@@ -2810,6 +2865,7 @@ mod tests {
             &HashMap::new(),
             &cfg,
             1_000_060,
+            Duration::from_secs(60),
             None,
             None,
             &exposures,
@@ -2852,6 +2908,7 @@ mod tests {
                 &HashMap::new(),
                 &cfg,
                 1_000_060,
+                Duration::from_secs(60),
                 None,
                 None,
                 &exposures,
@@ -2862,6 +2919,7 @@ mod tests {
                 &HashMap::new(),
                 &cfg,
                 1_000_120,
+                Duration::from_secs(60),
                 None,
                 None,
                 &exposures,
@@ -2913,6 +2971,7 @@ mod tests {
                 &HashMap::new(),
                 &cfg,
                 1_000_060,
+                Duration::from_secs(60),
                 None,
                 None,
                 &missing,
@@ -2923,6 +2982,7 @@ mod tests {
                 &HashMap::new(),
                 &cfg,
                 1_000_120,
+                Duration::from_secs(60),
                 None,
                 None,
                 &ready,
@@ -2933,6 +2993,7 @@ mod tests {
                 &HashMap::new(),
                 &cfg,
                 1_000_180,
+                Duration::from_secs(60),
                 None,
                 None,
                 &missing,
@@ -3047,6 +3108,7 @@ mod tests {
             &HashMap::new(),
             &cfg,
             60,
+            Duration::from_secs(60),
             None,
             None,
             &exposures,
@@ -3090,6 +3152,7 @@ mod tests {
             &HashMap::new(),
             &cfg,
             1_000_060,
+            Duration::from_secs(60),
             None,
             None,
             &exposures,
@@ -3109,6 +3172,7 @@ mod tests {
             &HashMap::new(),
             &cfg,
             1_000_060,
+            Duration::from_secs(60),
             None,
             None,
             &HashMap::new(),
@@ -3145,6 +3209,7 @@ mod tests {
             &HashMap::new(),
             &WearConfig::default(),
             1_000_060,
+            Duration::from_secs(60),
             None,
             None,
             &exposures,
@@ -3179,6 +3244,7 @@ mod tests {
                 &HashMap::new(),
                 &cfg,
                 1_000_060,
+                Duration::from_secs(60),
                 None,
                 None,
                 &HashMap::new(),
@@ -3189,6 +3255,7 @@ mod tests {
                 &HashMap::new(),
                 &cfg,
                 1_000_120,
+                Duration::from_secs(60),
                 None,
                 None,
                 &HashMap::new(),
@@ -3216,6 +3283,7 @@ mod tests {
                 &samples,
                 &cfg,
                 1_000_180,
+                Duration::from_secs(60),
                 None,
                 None,
                 &HashMap::new(),
@@ -3227,6 +3295,7 @@ mod tests {
                 &HashMap::new(),
                 &cfg,
                 1_000_240,
+                Duration::from_secs(60),
                 None,
                 None,
                 &HashMap::new(),
@@ -3261,6 +3330,7 @@ mod tests {
             &HashMap::new(),
             &cfg,
             1_000_060,
+            Duration::from_secs(60),
             None,
             None,
             &HashMap::new(),
@@ -3300,6 +3370,7 @@ mod tests {
             &samples,
             &cfg,
             1_000_060,
+            Duration::from_secs(60),
             None,
             None,
             &HashMap::new(),
@@ -3335,6 +3406,7 @@ mod tests {
             &samples,
             &cfg,
             now,
+            cfg.sample_interval.saturating_mul(10),
             None,
             None,
             &HashMap::new(),
@@ -3369,6 +3441,7 @@ mod tests {
             &samples,
             &cfg,
             now,
+            Duration::from_secs(60),
             None,
             None,
             &HashMap::new(),
@@ -3403,6 +3476,7 @@ mod tests {
             &samples,
             &cfg,
             now,
+            Duration::from_secs(60),
             None,
             None,
             &HashMap::new(),
@@ -3436,6 +3510,7 @@ mod tests {
             &samples,
             &cfg,
             now,
+            Duration::from_secs(60),
             None,
             None,
             &HashMap::new(),
@@ -3452,6 +3527,7 @@ mod tests {
             &samples,
             &cfg,
             now + 1,
+            Duration::from_secs(60),
             None,
             None,
             &HashMap::new(),
@@ -3481,6 +3557,7 @@ mod tests {
             &HashMap::new(),
             &cfg,
             1000,
+            Duration::from_secs(60),
             None,
             None,
             &HashMap::new(),
@@ -3515,6 +3592,7 @@ mod tests {
             &samples,
             &cfg,
             1_000_060,
+            Duration::from_secs(60),
             None,
             None,
             &HashMap::new(),
@@ -3941,5 +4019,65 @@ mod tests {
             &ObservationHub::new(1),
         );
         assert!(!again.needs_seed);
+    }
+
+    /// Issue #210 (sweep-2 Task 15): non-screensaver wear attribution must
+    /// source its span from a monotonic Instant, not the wall-clock epoch.
+    /// A backward wall-clock step (NTP correction, suspend-resume) must
+    /// never zero or corrupt the attributed span — the monotonic timer
+    /// advances regardless of what the OS clock does.
+    ///
+    /// RED: feed tick boundaries 60 MONOTONIC seconds apart while the wall
+    /// epoch moves BACKWARD 300s; assert 60s attribution AND that the
+    /// non-increasing wall timestamp does not erase wear.
+    #[test]
+    fn wear_tracker_backward_clock() {
+        let display = DisplayId("mon".into());
+        let cfg = WearConfig::default();
+        let mut ledger = fresh_ledger(&display, 1000);
+        // The wall-clock last-sample anchor is set to epoch 1000.
+        ledger.last_sample_at_epoch_s = Some(1000);
+        let mut state = TrackerState::default();
+        state.ledgers.insert(display.clone(), ledger);
+
+        // 60s of monotonic time has elapsed since the previous tick...
+        state.last_tick_at = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(60))
+                .expect("Instant::now() must be at least 60s past epoch"),
+        );
+        // ...while the wall epoch moved BACKWARD 300s (NTP step or
+        // suspend-resume) — `now_epoch_s = 700` is *before* the stored
+        // `last_sample_at_epoch_s = 1000`.
+        let now_epoch_s = 700_u64;
+
+        let snapshot = snapshot_with(&display, "active", None);
+        let mut samples = HashMap::new();
+        samples.insert(
+            display.clone(),
+            Some(PanelState {
+                power: None,
+                brightness: Some(100),
+            }),
+        );
+
+        let actions = tick(
+            &mut state,
+            &snapshot,
+            &samples,
+            &cfg,
+            now_epoch_s,
+            Duration::from_secs(60),
+            None,
+            None,
+            &HashMap::new(),
+        );
+        let (span, _) = find_attribute(&actions, &display).expect("Attribute action");
+        assert_eq!(
+            span,
+            Duration::from_secs(60),
+            "backward wall clock must not erase the monotonic wear span \
+             (issue #210: span was {span:?}, expected 60s)",
+        );
     }
 }

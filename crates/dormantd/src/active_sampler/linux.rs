@@ -370,7 +370,8 @@ impl<T: PortalTransport> CaptureSource for PortalPipeWireSource<T> {
             }
             StreamMode::Warm => {
                 if self.warm_worker.is_none() {
-                    self.warm_worker = Some(WarmWorker::spawn(fd, node_id).await?);
+                    self.warm_worker =
+                        Some(WarmWorker::spawn(fd, node_id, self.capture_timeout).await?);
                 }
                 let result = self
                     .warm_worker
@@ -409,6 +410,22 @@ impl<T: PortalTransport> CaptureSource for PortalPipeWireSource<T> {
             self.transport.close(session).await;
         }
     }
+
+    fn set_capture_timeout(&mut self, capture_timeout: Duration) {
+        self.capture_timeout = capture_timeout;
+    }
+
+    async fn invalidate_pending_capture(&mut self) {
+        // Drop any retained warm worker so a frame buffered in the cap-1
+        // channel by a cancelled capture cannot be served on the next
+        // attempt as if it were fresh. `Worker::Drop` sends the shutdown
+        // command and reaps the thread; the channel's `Sender` going away
+        // also forces any pending `try_send` from the process callback to
+        // become a no-op.
+        if let Some(mut worker) = self.warm_worker.take() {
+            worker.shutdown().await;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -424,15 +441,23 @@ struct WarmWorker {
 }
 
 impl WarmWorker {
-    async fn spawn(fd: OwnedFd, node_id: u32) -> Result<Self, CaptureError> {
-        tokio::task::spawn_blocking(move || Self::spawn_blocking(fd, node_id))
+    async fn spawn(
+        fd: OwnedFd,
+        node_id: u32,
+        init_timeout: Duration,
+    ) -> Result<Self, CaptureError> {
+        tokio::task::spawn_blocking(move || Self::spawn_blocking(fd, node_id, init_timeout))
             .await
             .map_err(|error| {
                 CaptureError::Transport(format!("PipeWire warm worker join: {error}"))
             })?
     }
 
-    fn spawn_blocking(fd: OwnedFd, node_id: u32) -> Result<Self, CaptureError> {
+    fn spawn_blocking(
+        fd: OwnedFd,
+        node_id: u32,
+        init_timeout: Duration,
+    ) -> Result<Self, CaptureError> {
         let (frames_tx, frames) = tokio::sync::mpsc::channel(1);
         let (initialized_tx, initialized_rx) = std::sync::mpsc::sync_channel(1);
         let join = std::thread::Builder::new()
@@ -445,7 +470,7 @@ impl WarmWorker {
             .map_err(|error| {
                 CaptureError::Transport(format!("spawn PipeWire warm worker: {error}"))
             })?;
-        match receive_warm_worker_initialization(initialized_rx, PORTAL_RESPONSE_TIMEOUT) {
+        match receive_warm_worker_initialization(initialized_rx, init_timeout) {
             Ok(commands) => Ok(Self {
                 commands,
                 frames,
@@ -1977,5 +2002,79 @@ mod tests {
             Err(CaptureError::Timeout)
         );
         worker.shutdown().await;
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #211 — timeout ownership (defects B and C).
+    // ---------------------------------------------------------------------
+
+    /// Defect C: `WarmWorker::spawn`'s initialization must be bounded by the
+    /// caller-supplied timeout, not the hardcoded `PORTAL_RESPONSE_TIMEOUT`.
+    /// With a slow (non-signalling) init and a caller timeout of 50ms, the
+    /// spawn must return `Err` (specifically the
+    /// `pipewire_warm_worker_initialization_timeout` transport error) rather
+    /// than block for the full 30s.
+    #[tokio::test(start_paused = true)]
+    async fn warm_worker_spawn_initialization_is_bounded_by_caller_timeout() {
+        // We do not call `WarmWorker::spawn` directly because that path would
+        // exercise the real PipeWire init; instead we exercise the same
+        // bounded-receive primitive that `spawn_blocking` delegates to.
+        let (initialized_tx, initialized_rx) = std::sync::mpsc::sync_channel(1);
+        // Never send; init never completes.
+        let _hold_tx = initialized_tx;
+
+        let start = tokio::time::Instant::now();
+        let result = receive_warm_worker_initialization::<pw::channel::Sender<WarmCommand>>(
+            initialized_rx,
+            Duration::from_millis(50),
+        );
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(
+                &result,
+                Err(CaptureError::Transport(message))
+                    if message == "pipewire_warm_worker_initialization_timeout"
+            ),
+            "expected init timeout"
+        );
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "init should be bounded by the caller timeout, took {elapsed:?}"
+        );
+    }
+
+    /// Defect B (warm-worker side): the source's `invalidate_pending_capture`
+    /// must drop the warm worker so a stale frame buffered in the cap-1
+    /// channel cannot be served on the next capture.
+    #[tokio::test]
+    async fn portal_source_invalidate_pending_capture_drops_warm_worker() {
+        let transport = FakePortalTransport::grant_with(PortalStartResult::single(
+            73,
+            16,
+            9,
+            None,
+            "rotated-token",
+        ));
+        let mut source = PortalPipeWireSource::from_transport(transport);
+
+        // Inject a fake warm worker. The test module has access to the
+        // private field; the public constructor would require a real PipeWire
+        // fd.
+        let frame = RawFrame {
+            rgba: vec![1, 2, 3, 4],
+            width: 1,
+            height: 1,
+            stride: 4,
+        };
+        source.warm_worker = Some(WarmWorker::spawn_fake([Some(frame.clone())]));
+        assert!(source.warm_worker.is_some());
+
+        source.invalidate_pending_capture().await;
+
+        assert!(
+            source.warm_worker.is_none(),
+            "invalidate_pending_capture must drop the warm worker"
+        );
     }
 }

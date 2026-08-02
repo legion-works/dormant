@@ -1449,6 +1449,15 @@ impl App {
             let (update_tx, update_rx) = mpsc::channel::<SamplerUpdate>(16);
             match active_sampler::linux::PortalPipeWireSource::new().await {
                 Ok(source) => {
+                    // Propagate the configured per-capture deadline into the
+                    // source so the inner warm-mode bound stays in sync with
+                    // the outer daemon bound. Without this, raising
+                    // `wear.active_sampling.capture_timeout` only widens the
+                    // outer timeout while the source still aborts at the 2s
+                    // default, accumulating `Timeout` and tripping the breaker
+                    // (issue #211 defect A).
+                    let source =
+                        source.with_capture_timeout(cfg_clone.wear.active_sampling.capture_timeout);
                     let consent_path = self.state_dir.join("screencast-consent.json");
                     let (handle, _join) = active_sampler::spawn_with_handle(ActiveSamplerDeps {
                         initial_config: Arc::new(cfg_clone.clone()),

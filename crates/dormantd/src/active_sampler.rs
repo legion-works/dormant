@@ -444,38 +444,54 @@ async fn capture_one(
     if reset_stream {
         source.reset_stream().await;
     }
-    let capture = tokio::time::timeout(
-        active.capture_timeout,
-        source.capture_one(active.stream_mode),
-    );
-    tokio::pin!(capture);
-    let mut overlapping = 0;
-    loop {
-        tokio::select! {
-            () = cancel.cancelled() => return CaptureOutcome::Cancelled,
-            result = &mut capture => match result {
-                Ok(Ok(frame)) => match dormant_core::spatial_grid::reduce_rgba8_to_luma_grid(
-                    &frame.rgba, frame.width, frame.height, frame.stride, 9, 16,
-                ) {
-                    Ok(grid) => {
-                        let captured_at = Tick::now();
-                        replace_latest(latest, SampledGrid {
-                            grid,
-                            captured_at,
-                            phase_at_capture: phase,
-                        });
-                        return CaptureOutcome::Ok(captured_at);
-                    }
-                    Err(_) => return CaptureOutcome::Failed(CaptureError::Protocol("grid reduction failed".to_owned()), overlapping),
+    let capture_outcome = {
+        let capture = tokio::time::timeout(
+            active.capture_timeout,
+            source.capture_one(active.stream_mode),
+        );
+        tokio::pin!(capture);
+        let mut overlapping = 0;
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => break CaptureOutcome::Cancelled,
+                result = &mut capture => match result {
+                    Ok(Ok(frame)) => match dormant_core::spatial_grid::reduce_rgba8_to_luma_grid(
+                        &frame.rgba, frame.width, frame.height, frame.stride, 9, 16,
+                    ) {
+                        Ok(grid) => {
+                            let captured_at = Tick::now();
+                            replace_latest(latest, SampledGrid {
+                                grid,
+                                captured_at,
+                                phase_at_capture: phase,
+                            });
+                            break CaptureOutcome::Ok(captured_at);
+                        }
+                        Err(_) => break CaptureOutcome::Failed(
+                            CaptureError::Protocol("grid reduction failed".to_owned()),
+                            overlapping,
+                        ),
+                    },
+                    Ok(Err(error)) => break CaptureOutcome::Failed(error, overlapping),
+                    Err(_) => break CaptureOutcome::Failed(
+                        CaptureError::Timeout,
+                        overlapping,
+                    ),
                 },
-                Ok(Err(error)) => return CaptureOutcome::Failed(error, overlapping),
-                Err(_) => return CaptureOutcome::Failed(CaptureError::Timeout, overlapping),
-            },
-            _ = cadence.tick() => {
-                overlapping = overlapping.saturating_add(1);
+                _ = cadence.tick() => {
+                    overlapping = overlapping.saturating_add(1);
+                }
             }
         }
+    };
+    // After the capture future is fully dropped, reclaim the borrow on
+    // `source` so the outer-timeout path can invalidate any warm-worker
+    // state that would otherwise be served stale on the next capture
+    // (issue #211 defect B).
+    if let CaptureOutcome::Failed(CaptureError::Timeout, _) = &capture_outcome {
+        source.invalidate_pending_capture().await;
     }
+    capture_outcome
 }
 
 fn persist_rotated_token(
@@ -774,6 +790,10 @@ async fn apply_update_with_effects(
     status_tx: &watch::Sender<SamplerStatus>,
 ) -> Option<Transition> {
     let transition = apply_update(runtime, update, status_tx);
+    // Keep the platform source's inner per-capture bound in sync with the
+    // daemon's outer bound so a raised `capture_timeout` actually takes
+    // effect in warm mode (issue #211 defect A).
+    source.set_capture_timeout(runtime.active.capture_timeout);
     if transition
         .as_ref()
         .is_some_and(|transition| transition.effects.contains(&Effect::CloseSession))
@@ -884,6 +904,11 @@ async fn run(
 ) {
     let mut runtime = Runtime::new(&deps.initial_config, &deps.consent_path);
     runtime.event_tx = deps.event_tx.take();
+    // Push the configured per-capture deadline into the platform source at
+    // startup so the inner warm-mode bound is in lockstep with the daemon
+    // bound from the first tick (issue #211 defect A).
+    deps.source
+        .set_capture_timeout(runtime.active.capture_timeout);
     let initial_reason = match runtime.state {
         SamplingState::NeedsConsent => Some(WEAR_SAMPLING_NEEDS_CONSENT),
         SamplingState::Suspended => Some(WEAR_SAMPLING_SUSPENDED),
@@ -1312,6 +1337,17 @@ pub trait CaptureSource: Send + Sync + 'static {
 
     /// Release any live portal session.
     async fn close(&mut self);
+
+    /// Apply a new per-capture deadline. Sources with an inner timeout that
+    /// bounds a single frame must mirror the new value; sources without one
+    /// may accept and ignore the call.
+    fn set_capture_timeout(&mut self, _timeout: Duration) {}
+
+    /// Drop any state retained from a capture whose owning future was
+    /// cancelled. Called by the lifecycle when the outer capture timeout
+    /// fires before the inner bound, so a buffered frame cannot be served
+    /// on the next capture as if it were fresh.
+    async fn invalidate_pending_capture(&mut self) {}
 }
 
 /// Decide the next lifecycle state without performing portal I/O.
@@ -1805,6 +1841,62 @@ mod tests {
         }
 
         async fn close(&mut self) {}
+    }
+
+    /// Capture source that records every `set_capture_timeout` and
+    /// `invalidate_pending_capture` call so reload-seam tests can assert the
+    /// lifecycle actually pushed configuration down to the platform boundary.
+    struct RecordingSource {
+        connects: Arc<AtomicUsize>,
+        capture_timeouts: Arc<Mutex<Vec<Duration>>>,
+        invalidations: Arc<AtomicUsize>,
+        captures: Mutex<VecDeque<TestCapture>>,
+        captures_seen: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl CaptureSource for RecordingSource {
+        async fn connect(
+            &mut self,
+            _binding: &ConsentBinding<'_>,
+        ) -> Result<ConnectedStream, CaptureError> {
+            self.connects.fetch_add(1, Ordering::SeqCst);
+            Ok(test_stream())
+        }
+
+        async fn request_consent(
+            &mut self,
+            _display: &DisplayExpectation,
+        ) -> Result<Grant, CaptureError> {
+            Err(CaptureError::Protocol(
+                "unexpected consent request".to_owned(),
+            ))
+        }
+
+        async fn capture_one(&mut self, _mode: StreamMode) -> Result<RawFrame, CaptureError> {
+            self.captures_seen.fetch_add(1, Ordering::SeqCst);
+            let outcome = self
+                .captures
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(TestCapture::Frame);
+            match outcome {
+                TestCapture::Frame => Ok(test_frame()),
+                TestCapture::Failure(error) => Err(error),
+                TestCapture::Pending => std::future::pending().await,
+            }
+        }
+
+        async fn close(&mut self) {}
+
+        fn set_capture_timeout(&mut self, timeout: Duration) {
+            self.capture_timeouts.lock().unwrap().push(timeout);
+        }
+
+        async fn invalidate_pending_capture(&mut self) {
+            self.invalidations.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     fn test_stream() -> ConnectedStream {
@@ -3685,5 +3777,131 @@ mod tests {
 
         source.close().await;
         assert_eq!(source.close_calls(), 1);
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #211 — timeout ownership (defects A and B).
+    // ---------------------------------------------------------------------
+
+    /// Defect A: a `LimitsChanged` reconfigure must push the new
+    /// `capture_timeout` to the platform source so its inner warm-mode bound
+    /// stays in sync with the outer daemon bound.
+    #[tokio::test(start_paused = true)]
+    async fn active_sampler_limits_changed_reconfigure_pushes_capture_timeout_to_source() {
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        test_record(&consent_path);
+        let connects_seen = Arc::new(AtomicUsize::new(0));
+        let capture_timeouts = Arc::new(Mutex::new(Vec::<Duration>::new()));
+        let invalidations = Arc::new(AtomicUsize::new(0));
+        let captures_seen = Arc::new(AtomicUsize::new(0));
+        let source = RecordingSource {
+            connects: connects_seen.clone(),
+            capture_timeouts: capture_timeouts.clone(),
+            invalidations: invalidations.clone(),
+            captures: Mutex::new(VecDeque::new()),
+            captures_seen: captures_seen.clone(),
+        };
+        let cancel = CancellationToken::new();
+        let config = active_config(Duration::from_secs(10));
+        let (updates_tx, updates_rx) = mpsc::channel(2);
+        let deps = ActiveSamplerDeps {
+            initial_config: config.clone(),
+            update_rx: updates_rx,
+            latest_grid: new_latest_grid(),
+            source: Box::new(source),
+            consent_path,
+            cancel: cancel.clone(),
+            env_reader: test_env_reader,
+            event_tx: None,
+        };
+        let (_handle, join) = spawn_with_handle(deps);
+
+        tokio::task::yield_now().await;
+        let recorded = capture_timeouts.lock().unwrap().clone();
+        assert!(
+            recorded
+                .iter()
+                .any(|timeout| *timeout == Duration::from_secs(2)),
+            "initial capture_timeout must reach the source (got {recorded:?})"
+        );
+
+        let mut reconfigured = (*config).clone();
+        reconfigured.wear.active_sampling.capture_timeout = Duration::from_secs(7);
+        updates_tx
+            .send(SamplerUpdate::Reconfigure(ReconfigurePlan {
+                active_sampling: reconfigured.wear.active_sampling,
+                sample_interval: reconfigured.wear.sample_interval,
+                trigger: ConfigDelta::LimitsChanged,
+            }))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        let recorded = capture_timeouts.lock().unwrap().clone();
+        assert!(
+            recorded
+                .iter()
+                .any(|timeout| *timeout == Duration::from_secs(7)),
+            "LimitsChanged reconfigure must push the new capture_timeout to the source (got {recorded:?})"
+        );
+        let _ = invalidations.load(Ordering::SeqCst);
+        let _ = captures_seen.load(Ordering::SeqCst);
+
+        cancel.cancel();
+        join.await.unwrap();
+    }
+
+    /// Defect B: when the outer `tokio::time::timeout` elapses before the
+    /// inner bound, the lifecycle must call `invalidate_pending_capture` on
+    /// the source so a buffered frame cannot be served on the next capture.
+    #[tokio::test(start_paused = true)]
+    async fn active_sampler_outer_timeout_invalidates_pending_capture() {
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        test_record(&consent_path);
+        let invalidations = Arc::new(AtomicUsize::new(0));
+        let source: Box<dyn CaptureSource + Send + Sync + 'static> = Box::new(RecordingSource {
+            connects: Arc::new(AtomicUsize::new(0)),
+            capture_timeouts: Arc::new(Mutex::new(Vec::new())),
+            invalidations: invalidations.clone(),
+            captures: Mutex::new(VecDeque::from([TestCapture::Pending, TestCapture::Pending])),
+            captures_seen: Arc::new(AtomicUsize::new(0)),
+        });
+        let cancel = CancellationToken::new();
+        let mut config = active_config(Duration::from_secs(10));
+        Arc::get_mut(&mut config)
+            .unwrap()
+            .wear
+            .active_sampling
+            .capture_timeout = Duration::from_millis(50);
+        let latest_grid = new_latest_grid();
+        let (update_tx, update_rx) = mpsc::channel(2);
+        let deps = ActiveSamplerDeps {
+            initial_config: config,
+            update_rx,
+            latest_grid: latest_grid.clone(),
+            source,
+            consent_path,
+            cancel: cancel.clone(),
+            env_reader: test_env_reader,
+            event_tx: None,
+        };
+        let (handle, join) = spawn_with_handle(deps);
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(60)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            invalidations.load(Ordering::SeqCst),
+            1,
+            "outer capture timeout must invalidate the source's pending state"
+        );
+        let _ = handle.status();
+        cancel.cancel();
+        join.await.unwrap();
+        let _ = update_tx;
     }
 }

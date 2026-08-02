@@ -228,4 +228,28 @@ describe("WearCard", () => {
     expect(mocks.selectDisplay).toHaveBeenCalledWith("Office Monitor");
     expect(window.location.hash).toBe("#/displays");
   });
+
+  it("#201 clicking a row with config_display_id selects by stable config id, not display_name", () => {
+    // When config_display_id differs from display_name, selection must use the
+    // stable config id so the detail panel opens the correct display.
+    setState({
+      wear: {
+        displays: [
+          summary({
+            display: "panel-office",
+            display_name: "Office Monitor",
+            config_display_id: "panel-office",
+          }),
+        ],
+      },
+    });
+
+    render(<WearCard />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Open Office Monitor panel detail" }));
+
+    // Must select by config_display_id ("panel-office"), not display_name ("Office Monitor").
+    expect(mocks.selectDisplay).toHaveBeenCalledWith("panel-office");
+    expect(window.location.hash).toBe("#/displays");
+  });
 });

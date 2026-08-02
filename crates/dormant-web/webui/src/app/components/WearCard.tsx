@@ -52,7 +52,7 @@ function WearRow({ summary, tone, onOpenDetail }: WearRowProps) {
         type="button"
         className="wear-row__summary"
         aria-label={`Open ${summary.display_name} panel detail`}
-        onClick={() => onOpenDetail(summary.display_name)}
+        onClick={() => onOpenDetail(summary.config_display_id ?? summary.display_name)}
       >
         <strong className="wear-row__name">{summary.display_name}</strong>
         <span className="wear-row__stat">{summary.total_on_hours.toFixed(1)}h total on-time</span>

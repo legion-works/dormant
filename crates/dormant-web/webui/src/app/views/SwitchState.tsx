@@ -89,7 +89,16 @@ export default function SwitchState({
   const [pushState, setPushState] = useState<PushState>({ kind: "idle" });
   const pullTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const { events } = useEventLog();
+  // Call useLiveState() BEFORE useRef so snapshotRef captures the real value
+  // (not undefined from the uninitialized variable).
   const { snapshot } = useLiveState();
+  // #212: snapshotRef keeps the timeout callback synchronized with the latest
+  // snapshot — the closure over `snapshot` in handlePull would otherwise go stale
+  // when an ownership change arrives between the pull POST and the timer expiry.
+  const snapshotRef = useRef(snapshot);
+  useEffect(() => {
+    snapshotRef.current = snapshot;
+  }, [snapshot]);
 
   // ── BG-1 Ownership event reconciliation (pull + push) ──────────────────
   useEffect(() => {
@@ -142,7 +151,7 @@ export default function SwitchState({
       ? parseFloat(coordination.poll_interval) * 1000
       : 2000;
     pullTimerRef.current = setTimeout(() => {
-      const snap = snapshot;
+      const snap = snapshotRef.current;
       const displaySnap = snap?.displays?.find(([id]) => id === displayId)?.[1];
       if (displaySnap?.owned === true) {
         // Snapshot confirms ownership — transition to verified.
@@ -162,7 +171,7 @@ export default function SwitchState({
       }
       setPullState({ kind: "failed", error: classifyError(err) });
     }
-  }, [displayId, localWriteCode, coordination?.poll_interval, snapshot]);
+  }, [displayId, localWriteCode, coordination?.poll_interval]);
 
   // ── Push handler ────────────────────────────────────────────────────────
   const handlePush = useCallback(async () => {

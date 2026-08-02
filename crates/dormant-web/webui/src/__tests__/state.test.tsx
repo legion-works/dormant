@@ -657,3 +657,96 @@ describe("LiveStateProvider wake/blank failure events", () => {
     expect(screen.getByTestId("failure-d1")).toHaveTextContent("undef:undef");
   });
 });
+
+describe("LiveStateProvider ownership events", () => {
+  function ObservedInputConsumer() {
+    const { snapshot } = useLiveState();
+    if (!snapshot) return <span>loading</span>;
+    const code = snapshot.displays.find(([id]) => id === "d1")?.[1].observed_input_code;
+    return <span data-testid="observed-input">{String(code ?? "null")}</span>;
+  }
+
+  it("#200 explicit null observed_input_code clears the stored value (does not retain prior)", async () => {
+    const priorState: StateSnapshot = {
+      ...fixtures.state,
+      displays: [["d1", {
+        phase: "active",
+        inhibited: false,
+        paused: false,
+        cmd_gen: 1,
+        controllers: [],
+        owned: true,
+        observed_input_code: 0x10 as number | null,
+      }]] as StateSnapshot["displays"],
+    };
+    const { getState } = await import("../api/client");
+    vi.mocked(getState).mockResolvedValue(priorState);
+
+    render(
+      <LiveStateProvider>
+        <ObservedInputConsumer />
+      </LiveStateProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("observed-input")).toHaveTextContent("16");
+    });
+
+    // Send an ownership event where observed_input_code is explicitly null
+    // (input became unreadable) — the stored value MUST become null, NOT 0x10.
+    act(() => {
+      mocks.onMessage?.({
+        event: "ownership",
+        display: "d1",
+        owned: true,
+        observed_input_code: null,
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("observed-input")).toHaveTextContent("null");
+    });
+  });
+
+  it("#200 observed_input_code: undefined in event also clears (cannot occur on real wire — null is the wire unreadable value; this tests the defensive path)", async () => {
+    const priorState = {
+      ...fixtures.state,
+      displays: [["d1", {
+        phase: "active",
+        inhibited: false,
+        paused: false,
+        cmd_gen: 1,
+        controllers: [],
+        owned: true,
+        observed_input_code: 0x10 as number | null,
+      }]] as StateSnapshot["displays"],
+    };
+    const { getState } = await import("../api/client");
+    vi.mocked(getState).mockResolvedValue(priorState);
+
+    render(
+      <LiveStateProvider>
+        <ObservedInputConsumer />
+      </LiveStateProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("observed-input")).toHaveTextContent("16");
+    });
+
+    // Send observed_input_code: undefined (key IS present, value is undefined).
+    // This is distinct from absent (key not present) — the in check handles each correctly.
+    act(() => {
+      mocks.onMessage?.({
+        event: "ownership",
+        display: "d1",
+        owned: true,
+        observed_input_code: undefined,
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("observed-input")).toHaveTextContent("null");
+    });
+  });
+});

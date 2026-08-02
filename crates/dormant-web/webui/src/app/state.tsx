@@ -409,7 +409,13 @@ export function LiveStateProvider({ children }: { children: ReactNode }) {
                       {
                         ...d,
                         owned: oe.owned,
-                        observed_input_code: oe.observed_input_code ?? d.observed_input_code,
+                        // GOTCHA: undefined and explicit null BOTH mean "unreadable" on
+                        // the current wire; neither licenses retaining the prior owner's code.
+                        // Use the `in` operator to distinguish absent (keep existing) from
+                        // present-but-null (clear to null).
+                        observed_input_code: "observed_input_code" in oe
+                          ? oe.observed_input_code
+                          : d.observed_input_code,
                       },
                     ]
                   : [id, d],

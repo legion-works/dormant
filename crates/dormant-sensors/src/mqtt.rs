@@ -48,7 +48,6 @@ use dormant_core::types::{
     PresenceEvent, SensorAvailabilityEvent, SensorId, SensorState, Timestamp,
 };
 use rumqttc::mqttbytes::v4::SubscribeReasonCode;
-#[allow(unused_imports)]
 use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Outgoing, Packet, QoS};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
@@ -236,15 +235,14 @@ impl MqttSource {
 
     /// Queue subscriptions for every topic and return the number accepted by
     /// the client request channel.
-    #[cfg(feature = "test-util")]
     async fn subscribe_topics(
         client: &AsyncClient,
         topics: &[String],
-        lifecycle_tx: Option<&mpsc::UnboundedSender<MqttLifecycle>>,
+        #[allow(unused_variables)] lifecycle_tx: Option<&mpsc::UnboundedSender<MqttLifecycle>>,
     ) -> usize {
         let mut queued = 0;
         for topic in topics {
-            match client.subscribe(topic, rumqttc::QoS::AtLeastOnce).await {
+            match client.subscribe(topic, QoS::AtLeastOnce).await {
                 Ok(()) => queued += 1,
                 Err(e) => warn!("mqtt: initial subscribe failed for '{topic}': {e}"),
             }
@@ -470,10 +468,11 @@ impl SensorSource for MqttSource {
                             // connect() only constructs the client/eventloop; it does NOT subscribe.
                             info!("mqtt: connected to '{}', subscribing", self.broker_url);
                             #[cfg(feature = "test-util")]
-                            {
-                                queued_subscriptions =
-                                    Self::subscribe_topics(&client, &topics, self.lifecycle_tx.as_ref()).await;
-                            }
+                            let lifecycle = self.lifecycle_tx.as_ref();
+                            #[cfg(not(feature = "test-util"))]
+                            let lifecycle: Option<&mpsc::UnboundedSender<MqttLifecycle>> = None;
+                            queued_subscriptions =
+                                Self::subscribe_topics(&client, &topics, lifecycle).await;
                             backoff = BACKOFF_MIN;
                             outage_reported = false;
                         }

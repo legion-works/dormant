@@ -63,6 +63,89 @@ pub fn send_request(socket_path: &Path, request: &IpcRequest) -> Result<IpcRespo
     }
 }
 
+/// The outcome of a typed IPC round-trip — distinguishes a connect-time
+/// failure (the daemon socket is not listening) from a post-connect
+/// error (the daemon accepted then dropped / garbled the response).
+///
+/// Issue #202 makes the distinction load-bearing: the cold offline
+/// `probe_all_offline` is only safe to run on a connect failure
+/// (daemon is not up — the serial port is not held by anyone). A
+/// post-connect failure means the daemon IS up and likely owns the
+/// port; reopening it for the cold probe set re-introduces the
+/// frame-steal the fix targets.
+#[derive(Debug)]
+pub enum IpcSendOutcome {
+    /// `connect(2)` failed — the daemon is not running on this socket.
+    /// The only case the plan permits the cold offline probe set to
+    /// run in.
+    ConnectFailed(anyhow::Error),
+    /// The connect succeeded but the round-trip did not (write failed,
+    /// read EOF, malformed JSON, non-Unix platform). The daemon is
+    /// reachable; its state is authoritative. Do NOT fall back to
+    /// offline — respect the daemon's reachability.
+    PostConnectError(anyhow::Error),
+    /// The round-trip succeeded; the daemon's response is the third
+    /// variant's payload. Boxed to keep the enum small (`IpcResponse`
+    /// is hundreds of bytes once every optional report is in scope).
+    Ok(Box<IpcResponse>),
+}
+
+/// `send_request` with the connect error classified separately. Lets
+/// callers branch on `ConnectFailed` vs `PostConnectError` without
+/// re-implementing the connect/serialize/send/recv/parse protocol.
+///
+/// # Panics
+///
+/// Panics if `serde_json::to_string(request)` itself fails — that
+/// can only happen for a `serde_json::ser::Error` (recursion limit,
+/// non-string map keys, etc.). `IpcRequest` is a flat enum of
+/// trivially-serializable variants so this is unreachable in practice;
+/// the `expect` is a belt-and-braces guard, not a normal failure mode.
+#[must_use = "the typed outcome must be inspected; an Ok variant means a successful round-trip, a PostConnectError must be surfaced to the operator, only ConnectFailed is safe to fall back from"]
+pub fn send_request_typed(socket_path: &Path, request: &IpcRequest) -> IpcSendOutcome {
+    #[cfg(unix)]
+    {
+        use std::io::{BufRead, BufReader, Write};
+
+        let mut stream = match connect(socket_path) {
+            Ok(s) => s,
+            Err(e) => return IpcSendOutcome::ConnectFailed(e),
+        };
+        if let Err(e) = (|| -> std::io::Result<()> {
+            let line = serde_json::to_string(request).expect("IpcRequest is always serializable");
+            writeln!(stream, "{line}")?;
+            stream.flush()?;
+            Ok(())
+        })() {
+            return IpcSendOutcome::PostConnectError(
+                anyhow::Error::from(e).context("write doctor request to daemon"),
+            );
+        }
+
+        let mut reader = BufReader::new(&stream);
+        let mut response_line = String::new();
+        if let Err(e) = reader.read_line(&mut response_line) {
+            return IpcSendOutcome::PostConnectError(
+                anyhow::Error::from(e).context("read response from daemon"),
+            );
+        }
+        match serde_json::from_str::<IpcResponse>(response_line.trim()) {
+            Ok(resp) => IpcSendOutcome::Ok(Box::new(resp)),
+            Err(e) => IpcSendOutcome::PostConnectError(
+                anyhow::Error::from(e).context("parse daemon response"),
+            ),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (socket_path, request);
+        IpcSendOutcome::PostConnectError(anyhow::anyhow!(
+            "{}: IPC is only supported on Unix platforms in this release",
+            dormant_core::error::E_IPC
+        ))
+    }
+}
+
 /// Connect to the daemon's event stream: send an `Events` request and
 /// return an iterator over [`DaemonEvent`] JSON lines plus a shutdown
 /// handle.

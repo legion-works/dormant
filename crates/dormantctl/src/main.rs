@@ -326,6 +326,39 @@ fn main() -> ExitCode {
                 };
             }
 
+            // Bare doctor (no subcommand, no draft flag) routes through
+            // the live daemon first to avoid reopening the port the
+            // daemon already owns (issue #202). Explicit subcommands
+            // and the issue/feature draft flags keep their current
+            // paths via `cmd_doctor::run` below.
+            if subcommand.is_none() && report_issue.is_none() && draft_feature.is_none() {
+                let args = cmd_doctor::DoctorArgs {
+                    config,
+                    credentials,
+                    report_issue,
+                    draft_feature,
+                    subcommand: None,
+                };
+                return match cmd_doctor::run_bare_with_socket(&args, &socket_path) {
+                    Ok(cmd_doctor::DoctorOutcome::AllOk) => ExitCode::SUCCESS,
+                    Ok(cmd_doctor::DoctorOutcome::SomeFailed) => {
+                        eprintln!("some probes failed");
+                        ExitCode::FAILURE
+                    }
+                    Ok(cmd_doctor::DoctorOutcome::NotSupported(controller)) => {
+                        eprintln!(
+                            "not yet supported: requires the {controller} controller \
+                             (pending hardware verification milestone)"
+                        );
+                        ExitCode::from(3)
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e:#}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
+
             let args = cmd_doctor::DoctorArgs {
                 config,
                 credentials,

@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+humantime.workspace = true
 humantime-serde.workspace = true
 indexmap.workspace = true
 serde.workspace = true

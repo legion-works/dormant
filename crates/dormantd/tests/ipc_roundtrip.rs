@@ -293,6 +293,7 @@ async fn setup_server() -> (
         ds,
         None,
         cancel.clone(),
+        std::sync::Arc::new(Vec::new),
     )
     .unwrap();
 
@@ -599,6 +600,7 @@ async fn socket_file_permissions_0600() {
         ds,
         None,
         cancel.clone(),
+        std::sync::Arc::new(Vec::new),
     )
     .unwrap();
 
@@ -639,6 +641,7 @@ async fn stale_socket_replacement() {
         ds,
         None,
         cancel.clone(),
+        std::sync::Arc::new(Vec::new),
     );
     assert!(result.is_ok(), "should replace stale socket: {result:?}");
 
@@ -767,6 +770,7 @@ async fn setup_server_with_display(
         ds,
         None,
         cancel.clone(),
+        std::sync::Arc::new(Vec::new),
     )
     .unwrap();
 

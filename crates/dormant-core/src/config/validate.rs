@@ -143,6 +143,7 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
         &[
             "enabled",
             "sampled_display",
+            "sampled_displays",
             "stream_mode",
             "capture_timeout",
             "failure_threshold",
@@ -1210,22 +1211,29 @@ fn validate_wear(cfg: &Config, errors: &mut Vec<ValidationError>) {
                 detail: "sample_interval too short for active sampling (needs >= 2s)".into(),
             });
         }
-        match sampling.sampled_display.as_deref() {
-            None => errors.push(ValidationError {
+        let selected = sampling.selected_displays();
+        if selected.is_empty() {
+            errors.push(ValidationError {
                 what: "E_CONFIG_INVALID".into(),
                 detail: "wear.active_sampling.sampled_display is required when enabled".into(),
-            }),
-            Some(display_id) => match cfg.displays.get(display_id) {
+            });
+        }
+        for display_id in &selected {
+            match cfg.displays.get(display_id) {
                 None => errors.push(ValidationError {
                     what: "E_CONFIG_INVALID".into(),
-                    detail: format!("wear.active_sampling.sampled_display '{display_id}' is not configured"),
+                    detail: format!(
+                        "wear.active_sampling.sampled_display '{display_id}' is not configured"
+                    ),
                 }),
                 Some(display) if !display.is_render_eligible() => errors.push(ValidationError {
                     what: "E_CONFIG_INVALID".into(),
-                    detail: format!("wear.active_sampling.sampled_display '{display_id}' is not wear-tracked eligible"),
+                    detail: format!(
+                        "wear.active_sampling.sampled_display '{display_id}' is not wear-tracked eligible"
+                    ),
                 }),
                 Some(_) => {}
-            },
+            }
         }
         if sampling.capture_timeout < Duration::from_secs(1) {
             errors.push(ValidationError {

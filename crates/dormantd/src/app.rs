@@ -102,6 +102,7 @@ use crate::inhibit_audio::{self, AudioRule};
 use crate::macos_idle;
 use crate::notifier::{self, NotifierDeps, NotifySink, NotifyState};
 use crate::reload;
+use crate::screencast_consent;
 use crate::sd_notify::{self, SdNotify};
 use crate::watchdog_schedule::WatchdogSchedule;
 
@@ -1522,7 +1523,7 @@ impl App {
                     // (issue #211 defect A).
                     let source =
                         source.with_capture_timeout(cfg_clone.wear.active_sampling.capture_timeout);
-                    let consent_path = self.state_dir.join("screencast-consent.json");
+                    let consent_path = screencast_consent::legacy_consent_path(&self.state_dir);
                     let (handle, _join) = active_sampler::spawn_with_handle(ActiveSamplerDeps {
                         initial_config: Arc::new(cfg_clone.clone()),
                         update_rx,
@@ -1536,13 +1537,12 @@ impl App {
                     let display_exists = cfg_clone
                         .wear
                         .active_sampling
-                        .sampled_display
-                        .as_ref()
+                        .first_sampled_display()
                         .is_some_and(|display| {
                             spawn
                                 .generation
                                 .display_executors
-                                .contains_key(&DisplayId(display.clone()))
+                                .contains_key(&DisplayId(display.to_owned()))
                         });
                     if let Err(error) = update_tx.try_send(SamplerUpdate::DisplayContext(
                         active_sampler_display_context(&cfg_clone, display_exists, Some("active")),
@@ -1645,6 +1645,18 @@ impl App {
         let ipc_handle = if self.disable_ipc {
             None
         } else {
+            // The IPC alias strategy: the unit wear-sampling variants
+            // resolve to the single configured display and error when
+            // >1 is selected, so the handler needs the current selection
+            // at request time. The config_rx is already kept up-to-date
+            // by reload; cloning a watch::Receiver and reading through
+            // the closure gives the IPC server a cheap snapshot view.
+            let selected_displays_closure = {
+                let config_rx = config_rx.clone();
+                std::sync::Arc::new(move || {
+                    config_rx.borrow().wear.active_sampling.selected_displays()
+                }) as std::sync::Arc<dyn Fn() -> Vec<String> + Send + Sync>
+            };
             Some(
                 crate::ipc::spawn(
                     &socket_path,
@@ -1654,6 +1666,7 @@ impl App {
                     direct_switch.clone(),
                     active_sampler_handle.clone(),
                     root.clone(),
+                    selected_displays_closure,
                 )
                 .context("spawn IPC server")?,
             )

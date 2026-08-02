@@ -77,3 +77,59 @@ describe("WearSection active sampling", () => {
     expect(screen.getByText("must be no more than half the sample interval")).toBeInTheDocument();
   });
 });
+
+describe("WearSection active sampling plural form", () => {
+  const pluralWear: WearConfig = {
+    enabled: true,
+    active_sampling: {
+      enabled: true,
+      sampled_displays: ["desk", "tv"],
+      stream_mode: "warm",
+      capture_timeout: "2s",
+      failure_threshold: 5,
+      circuit_reset_after: "5m",
+    },
+  };
+
+  const displays = {
+    desk: { controllers: ["kwin-dpms"] },
+    tv: { controllers: ["kwin-dpms"] },
+  };
+
+  it("renders the multi-select when sampled_displays is the canonical field", () => {
+    const store = createPatchStore();
+    render(
+      <WearSection
+        wear={pluralWear}
+        displays={displays}
+        store={store}
+        redactedPaths={[]}
+        onDirty={() => {}}
+        fieldErrors={{}}
+      />,
+    );
+    expect(screen.getByLabelText("active_sampling.sampled_displays: desk")).toBeChecked();
+    expect(screen.getByLabelText("active_sampling.sampled_displays: tv")).toBeChecked();
+    // Legacy singular row stays hidden in the plural form to keep the
+    // operator from mixing keys (server rejects both at once).
+    expect(screen.queryByLabelText("active_sampling.sampled_display")).not.toBeInTheDocument();
+  });
+
+  it("patches a sampled_displays toggle at its exact path", () => {
+    const store = createPatchStore();
+    render(
+      <WearSection
+        wear={pluralWear}
+        displays={displays}
+        store={store}
+        redactedPaths={[]}
+        onDirty={() => {}}
+        fieldErrors={{}}
+      />,
+    );
+    fireEvent.click(screen.getByLabelText("active_sampling.sampled_displays: tv"));
+    expect(store.buildPatches()).toEqual(expect.arrayContaining([
+      { op: "set", path: ["wear", "active_sampling", "sampled_displays"], value: ["desk"] },
+    ]));
+  });
+});

@@ -47,6 +47,10 @@ const MAX_LINE_BYTES: usize = 1_048_576;
 /// - Bind failure (address in use by a live daemon, permission denied, …).
 /// - Permission set failure.
 /// - Parent directory is group/world-writable or not owned by us.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "IPC server dependencies are explicit at the daemon lifecycle boundary; grouping them into a context type would obscure ownership and is not worth the indirection for this single-call surface."
+)]
 pub fn spawn(
     socket_path: &Path,
     ctl_tx: mpsc::Sender<ControlMsg>,
@@ -55,6 +59,7 @@ pub fn spawn(
     direct_switch: Arc<DirectSwitchHandle>,
     active_sampler: Option<ActiveSamplerHandle>,
     cancel: CancellationToken,
+    selected_displays: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
 ) -> Result<JoinHandle<()>> {
     // Stale-socket recovery: connect-test before bind so we never silently
     // replace a live daemon's socket.
@@ -139,6 +144,7 @@ pub fn spawn(
             active_sampler,
             cancel,
             &socket_owned,
+            selected_displays,
         )
         .await;
     });
@@ -160,6 +166,7 @@ async fn run(
     active_sampler: Option<ActiveSamplerHandle>,
     cancel: CancellationToken,
     socket_path: &std::path::Path,
+    selected_displays: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
 ) {
     loop {
         tokio::select! {
@@ -177,7 +184,8 @@ async fn run(
                         let doctor = doctor_service.clone();
                         let ds = direct_switch.clone();
                         let sampler = active_sampler.clone();
-                        tokio::spawn(handle_connection(stream, ctl, reload, doctor, ds, sampler));
+                        let selected = selected_displays.clone();
+                        tokio::spawn(handle_connection(stream, ctl, reload, doctor, ds, sampler, selected));
                         let _ = addr; // Unix socket peer address (debug).
                     }
                     Err(e) => {
@@ -203,6 +211,7 @@ async fn handle_connection(
     doctor_service: DoctorService,
     direct_switch: Arc<DirectSwitchHandle>,
     active_sampler: Option<ActiveSamplerHandle>,
+    selected_displays: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
 ) {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
@@ -287,22 +296,59 @@ async fn handle_connection(
                 let _ = write_json(&mut writer, &resp).await;
             }
             IpcRequest::WearSamplingEnable => {
-                let resp = handle_wear_enable(active_sampler.as_ref()).await;
+                let resp =
+                    handle_wear_enable_unit(active_sampler.as_ref(), &selected_displays).await;
                 let _ = write_json(&mut writer, &resp).await;
             }
             IpcRequest::WearSamplingStatus => {
-                let resp = handle_wear_status(active_sampler.as_ref());
+                let resp = handle_wear_status_unit(active_sampler.as_ref(), &selected_displays);
                 let _ = write_json(&mut writer, &resp).await;
             }
             IpcRequest::WearSamplingDisable { forget } => {
-                let resp = handle_wear_disable(active_sampler.as_ref(), forget).await;
+                let resp =
+                    handle_wear_disable_unit(active_sampler.as_ref(), forget, &selected_displays)
+                        .await;
+                let _ = write_json(&mut writer, &resp).await;
+            }
+            IpcRequest::WearSamplingEnableFor { display } => {
+                let resp =
+                    handle_wear_enable_for(active_sampler.as_ref(), &display, &selected_displays)
+                        .await;
+                let _ = write_json(&mut writer, &resp).await;
+            }
+            IpcRequest::WearSamplingStatusFor { display } => {
+                let resp =
+                    handle_wear_status_for(active_sampler.as_ref(), &display, &selected_displays);
+                let _ = write_json(&mut writer, &resp).await;
+            }
+            IpcRequest::WearSamplingDisableFor { display, forget } => {
+                let resp = handle_wear_disable_for(
+                    active_sampler.as_ref(),
+                    &display,
+                    forget,
+                    &selected_displays,
+                )
+                .await;
                 let _ = write_json(&mut writer, &resp).await;
             }
         }
     }
 }
 
-async fn handle_wear_enable(active_sampler: Option<&ActiveSamplerHandle>) -> IpcResponse {
+async fn handle_wear_enable_unit(
+    active_sampler: Option<&ActiveSamplerHandle>,
+    selected_displays: &Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+) -> IpcResponse {
+    // IPC alias strategy: the unit variant resolves to the single
+    // configured display. >1 selected is an operator-visible error
+    // because the unit form is ambiguous once sampling spans multiple
+    // displays.
+    let selected = selected_displays();
+    if selected.len() > 1 {
+        return IpcResponse::error(
+            "E_CONFIG_INVALID: multiple displays configured — use the per-display request",
+        );
+    }
     let Some(active_sampler) = active_sampler else {
         return IpcResponse::wear_sampling(WearSamplingStatus::Error(
             "wear_sampling_unsupported".to_owned(),
@@ -322,7 +368,16 @@ async fn handle_wear_enable(active_sampler: Option<&ActiveSamplerHandle>) -> Ipc
     IpcResponse::wear_sampling(status)
 }
 
-fn handle_wear_status(active_sampler: Option<&ActiveSamplerHandle>) -> IpcResponse {
+fn handle_wear_status_unit(
+    active_sampler: Option<&ActiveSamplerHandle>,
+    selected_displays: &Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+) -> IpcResponse {
+    let selected = selected_displays();
+    if selected.len() > 1 {
+        return IpcResponse::error(
+            "E_CONFIG_INVALID: multiple displays configured — use the per-display request",
+        );
+    }
     let Some(active_sampler) = active_sampler else {
         return IpcResponse::wear_sampling(WearSamplingStatus::Error(
             "wear_sampling_unsupported".to_owned(),
@@ -342,10 +397,112 @@ fn handle_wear_status(active_sampler: Option<&ActiveSamplerHandle>) -> IpcRespon
     IpcResponse::wear_sampling(status)
 }
 
-async fn handle_wear_disable(
+async fn handle_wear_disable_unit(
     active_sampler: Option<&ActiveSamplerHandle>,
     forget: bool,
+    selected_displays: &Arc<dyn Fn() -> Vec<String> + Send + Sync>,
 ) -> IpcResponse {
+    let selected = selected_displays();
+    if selected.len() > 1 {
+        return IpcResponse::error(
+            "E_CONFIG_INVALID: multiple displays configured — use the per-display request",
+        );
+    }
+    let Some(active_sampler) = active_sampler else {
+        return IpcResponse::wear_sampling(WearSamplingStatus::Error(
+            "wear_sampling_unsupported".to_owned(),
+        ));
+    };
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if let Err(error) = active_sampler
+        .send(SamplerCommand::Disable {
+            forget,
+            reply: reply_tx,
+        })
+        .await
+    {
+        return IpcResponse::wear_sampling(WearSamplingStatus::Error(sampler_error_reason(&error)));
+    }
+    match reply_rx.await {
+        Ok(Ok(())) => IpcResponse::wear_sampling(WearSamplingStatus::Granted),
+        Ok(Err(error)) => {
+            IpcResponse::wear_sampling(WearSamplingStatus::Error(sampler_error_reason(&error)))
+        }
+        Err(_) => IpcResponse::wear_sampling(WearSamplingStatus::Error(
+            "wear_sampling_command_closed".to_owned(),
+        )),
+    }
+}
+
+async fn handle_wear_enable_for(
+    active_sampler: Option<&ActiveSamplerHandle>,
+    display: &str,
+    selected_displays: &Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+) -> IpcResponse {
+    if !selected_displays().iter().any(|d| d == display) {
+        return IpcResponse::error(format!(
+            "E_CONFIG_INVALID: display '{display}' is not a selected wear-sampling display",
+        ));
+    }
+    let Some(active_sampler) = active_sampler else {
+        return IpcResponse::wear_sampling(WearSamplingStatus::Error(
+            "wear_sampling_unsupported".to_owned(),
+        ));
+    };
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if let Err(error) = active_sampler
+        .send(SamplerCommand::Enable { reply: reply_tx })
+        .await
+    {
+        return IpcResponse::wear_sampling(WearSamplingStatus::Error(sampler_error_reason(&error)));
+    }
+    let status = match reply_rx.await {
+        Ok(status) => status.into_ipc_status(),
+        Err(_) => WearSamplingStatus::Error("wear_sampling_command_closed".to_owned()),
+    };
+    IpcResponse::wear_sampling(status)
+}
+
+fn handle_wear_status_for(
+    active_sampler: Option<&ActiveSamplerHandle>,
+    display: &str,
+    selected_displays: &Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+) -> IpcResponse {
+    if !selected_displays().iter().any(|d| d == display) {
+        return IpcResponse::error(format!(
+            "E_CONFIG_INVALID: display '{display}' is not a selected wear-sampling display",
+        ));
+    }
+    let Some(active_sampler) = active_sampler else {
+        return IpcResponse::wear_sampling(WearSamplingStatus::Error(
+            "wear_sampling_unsupported".to_owned(),
+        ));
+    };
+    let status = active_sampler.status().borrow().state;
+    let status = match status {
+        SamplingState::ConsentPending => WearSamplingStatus::AwaitingConsent,
+        SamplingState::NeedsConsent => {
+            WearSamplingStatus::Error("wear_sampling_needs_consent".to_owned())
+        }
+        SamplingState::Connecting | SamplingState::Streaming => WearSamplingStatus::Granted,
+        SamplingState::Disabled | SamplingState::Suspended | SamplingState::Cooldown => {
+            WearSamplingStatus::Error("wear_sampling_not_active".to_owned())
+        }
+    };
+    IpcResponse::wear_sampling(status)
+}
+
+async fn handle_wear_disable_for(
+    active_sampler: Option<&ActiveSamplerHandle>,
+    display: &str,
+    forget: bool,
+    selected_displays: &Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+) -> IpcResponse {
+    if !selected_displays().iter().any(|d| d == display) {
+        return IpcResponse::error(format!(
+            "E_CONFIG_INVALID: display '{display}' is not a selected wear-sampling display",
+        ));
+    }
     let Some(active_sampler) = active_sampler else {
         return IpcResponse::wear_sampling(WearSamplingStatus::Error(
             "wear_sampling_unsupported".to_owned(),
@@ -847,6 +1004,7 @@ mod tests {
             ds,
             None,
             cancel,
+            std::sync::Arc::new(Vec::new),
         );
         assert!(result.is_err(), "group-writable parent should be rejected");
         let err = format!("{}", result.unwrap_err());
@@ -874,6 +1032,7 @@ mod tests {
             ds,
             None,
             cancel.clone(),
+            std::sync::Arc::new(Vec::new),
         );
         assert!(
             result.is_ok(),

@@ -1,14 +1,16 @@
 # Active wear sampling
 
 **What this gives you.** Optional content-weighted OLED wear tracking for one
-display, using a compositor frame captured from the KDE Wayland session. The
-frame becomes a luma grid for the existing wear ledger; raw pixels are not
-stored.
+or more configured displays, using a compositor frame captured from the KDE
+Wayland session. Each frame becomes a luma grid for the existing wear ledger;
+raw pixels are not stored.
 
 **Scope.** This feature is Linux/KDE Wayland only. It uses the xdg-desktop-
-portal ScreenCast flow and supports exactly one `sampled_display`. macOS and
-Windows remain on uniform attribution; this feature does not provide capture
-support for those platforms, GNOME, X11, TVs, or multiple displays.
+portal ScreenCast flow and supports the per-display `sampled_displays` list
+introduced in M6 (Task 23); the legacy `sampled_display` singular form
+remains accepted for backward compatibility. macOS and Windows remain on
+uniform attribution; this feature does not provide capture support for those
+platforms, GNOME, X11, or TVs.
 
 ## What sampling means
 
@@ -35,7 +37,9 @@ never overrides a blank, wake, grace, or render-stage decision.
 ## Defaults and configuration
 
 Active sampling is opt-in and disabled by default. The complete configuration
-is under `[wear.active_sampling]`:
+is under `[wear.active_sampling]`. `config_version = 1` accepts the legacy
+singular `sampled_display` OR the canonical plural `sampled_displays`; supply
+both and the daemon rejects the config at parse time:
 
 ```toml
 [wear]
@@ -43,7 +47,7 @@ sample_interval = "60s" # also drives active-frame cadence
 
 [wear.active_sampling]
 enabled = false
-sampled_display = "monitor"
+sampled_displays = ["monitor", "sidecar"]  # canonical plural form
 stream_mode = "warm"
 capture_timeout = "2s"
 failure_threshold = 5
@@ -53,7 +57,8 @@ circuit_reset_after = "5m"
 | Key | Default | Meaning |
 |---|---|---|
 | `wear.active_sampling.enabled` | `false` | Opt in to compositor sampling |
-| `wear.active_sampling.sampled_display` | unset | One configured, wear-tracked display; required when enabled |
+| `wear.active_sampling.sampled_display` | unset | Legacy singular form: one configured, wear-tracked display; required when enabled and the plural list is absent |
+| `wear.active_sampling.sampled_displays` | unset | Canonical plural form: one or more configured, wear-tracked displays; required when enabled and the singular form is absent |
 | `wear.active_sampling.stream_mode` | `"warm"` | Keep the paused stream attached, or use `"per-tick"` |
 | `wear.active_sampling.capture_timeout` | `"2s"` | Maximum time for one capture; valid range is `1s`–`30s` |
 | `wear.active_sampling.failure_threshold` | `5` | Consecutive failures before the circuit opens |
@@ -75,13 +80,15 @@ capture and recreates it on the next tick, without requiring consent again.
 
 Enabling grants the daemon's graphical session persistent screen-capture access
 through **xdg-desktop-portal ScreenCast** with `persist_mode=2`. The daemon
-stores the consent record at
-`$XDG_STATE_HOME/dormant/screencast-consent.json` (or the platform state-dir
-fallback). The parent directory is mode `0700`; the file is mode `0600`; the
-record is written with fsync and atomic rename. It contains the restore token,
-the selected display, grant time, and portal persistent IDs. The token rotates
-on every reattach. Tokens and IDs are redacted from logs, status, events, IPC,
-HTTP, and doctor drafts.
+stores one consent record per selected display at
+`$XDG_STATE_HOME/dormant/screencast-consent-<sanitized-display>.json` (or the
+platform state-dir fallback). The legacy un-suffixed
+`screencast-consent.json` is preserved as a one-time source for the
+legacy-selected display only. The parent directory is mode `0700`; each
+consent file is mode `0600`; every record is written with fsync and atomic
+rename. The record contains the restore token, the selected display, grant
+time, and portal persistent IDs. The token rotates on every reattach. Tokens
+and IDs are redacted from logs, status, events, IPC, HTTP, and doctor drafts.
 
 Disable in the configuration to close the session while retaining the record:
 

@@ -349,10 +349,9 @@ impl Runtime {
             display: config
                 .wear
                 .active_sampling
-                .sampled_display
-                .as_ref()
+                .first_sampled_display()
                 .map(|display| DisplayExpectation {
-                    display: display.clone(),
+                    display: display.to_owned(),
                 }),
             phase: Phase::Active,
             stage_active: true,

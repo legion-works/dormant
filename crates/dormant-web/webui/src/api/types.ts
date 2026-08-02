@@ -538,10 +538,21 @@ export interface ConfigInventory {
   rules: Record<string, RuleConfig>;
 }
 
-/** rust: config/schema.rs ActiveSamplingConfig — `[wear.active_sampling]`. */
+/** rust: config/schema.rs ActiveSamplingConfig — `[wear.active_sampling]`.
+ *
+ * `sampled_displays` is the canonical multi-display field. The legacy
+ * singular `sampled_display` is still accepted for backward
+ * compatibility inside `config_version = 1`; the editor surfaces
+ * `sampled_displays` and the server validates that exactly one of the
+ * two keys is present. When `sampled_displays` is omitted (legacy
+ * configs), the form keeps rendering the single `sampled_display`
+ * row. */
 export interface ActiveSamplingConfig {
   enabled: boolean;
+  /** Legacy singular form. Mutually exclusive with `sampled_displays`. */
   sampled_display?: string | null;
+  /** Canonical plural form. */
+  sampled_displays?: string[];
   stream_mode: "warm" | "per-tick";
   capture_timeout: string;
   failure_threshold: number;

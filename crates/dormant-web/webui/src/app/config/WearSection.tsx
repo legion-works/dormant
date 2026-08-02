@@ -5,7 +5,7 @@
  * W1-5: 230px label column + changed-field markers.
  */
 import FormSection from "./FormSection";
-import { BoolField, DurationField, EnumField, NumberField, TextField } from "./fields";
+import { BoolField, DurationField, EnumField, MultiSelectField, NumberField, TextField } from "./fields";
 import type { FieldProps } from "./fields";
 import type { PatchStore } from "./patch";
 import type { DisplayConfig, WearConfig } from "../../api/types";
@@ -70,9 +70,15 @@ function ActiveSamplingFields({ value, displays, store, redactedPaths, onDirty, 
   const displayOptions = Object.entries(displays)
     .filter(([, display]) => isRenderEligible(display))
     .map(([id]) => id);
-  const fields: Array<{ key: string; kind: "bool" | "duration" | "number" | "enum"; options?: readonly string[] }> = [
+  // Canonical multi-display field renders the plural selector when the
+  // config carries a list; the legacy singular row is hidden so the
+  // operator cannot mix keys (the server rejects both keys present).
+  const plural = Array.isArray(value["sampled_displays"]);
+  const fields: Array<{ key: string; kind: "bool" | "duration" | "number" | "enum" | "multiselect"; options?: readonly string[] }> = [
     { key: "enabled", kind: "bool" },
-    { key: "sampled_display", kind: "enum", options: displayOptions },
+    ...(plural
+      ? [{ key: "sampled_displays", kind: "multiselect" as const, options: displayOptions }]
+      : [{ key: "sampled_display", kind: "enum" as const, options: displayOptions }]),
     { key: "stream_mode", kind: "enum", options: ["warm", "per-tick"] },
     { key: "capture_timeout", kind: "duration" },
     { key: "failure_threshold", kind: "number" },
@@ -93,6 +99,7 @@ function ActiveSamplingFields({ value, displays, store, redactedPaths, onDirty, 
         if (kind === "bool") return <BoolField key={key} {...shared} />;
         if (kind === "duration") return <DurationField key={key} {...shared} />;
         if (kind === "number") return <NumberField key={key} {...shared} />;
+        if (kind === "multiselect") return <MultiSelectField key={key} {...shared} options={options ?? []} />;
         return <EnumField key={key} {...shared} options={options ?? []} />;
       })}
     </div>

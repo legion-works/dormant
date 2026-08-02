@@ -4,6 +4,7 @@
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::{Path, PathBuf};
     use tempfile::tempdir;
     use time::OffsetDateTime;
 
@@ -131,16 +132,148 @@ mod tests {
         assert!(path.is_dir());
         assert!(!path.join("token-rotated-secret").exists());
     }
+
+    #[test]
+    fn consent_path_derives_per_display_filename() {
+        // Per-display records are named after the sanitized display id
+        // so two configured displays get two separate on-disk files.
+        // Unsanitized input (mixed case, punctuation) is exercised here
+        // so the test only holds when the sanitizer is wired.
+        assert_eq!(
+            consent_path(Path::new("/var/lib/state"), "Desk"),
+            PathBuf::from("/var/lib/state/screencast-consent-desk.json"),
+        );
+        assert_eq!(
+            consent_path(Path::new("/var/lib/state"), "tv/1"),
+            PathBuf::from("/var/lib/state/screencast-consent-tv-1.json"),
+        );
+    }
+
+    #[test]
+    fn consent_path_sanitizes_unsafe_characters() {
+        // Any character outside [a-z0-9._-] must collapse to '-', and the
+        // id is bounded to 64 chars to keep filesystem paths bounded.
+        let long = "x".repeat(120);
+        let sanitized = consent_path(Path::new("/state"), &long);
+        let name = sanitized.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.len() <= "screencast-consent-".len() + 64 + ".json".len(),
+            "filename must stay bounded, got: {name}"
+        );
+        let ugly = consent_path(Path::new("/state"), "Desk/Layout!");
+        assert_eq!(
+            ugly,
+            PathBuf::from("/state/screencast-consent-desk-layout-.json"),
+        );
+    }
+
+    #[test]
+    fn two_consent_records_store_and_load_without_overwrite_or_cross_binding() {
+        // Two consent records at per-display paths must remain
+        // independent: storing one does not overwrite the other, and
+        // loading each against its own display id binds cleanly while
+        // loading each against the OTHER id fails DisplayChanged. Use
+        // distinct display ids that don't sanitize to the same key
+        // (collision is rejected at config parse; here we exercise the
+        // store/load path with names that differ after sanitization).
+        let dir = tempdir().unwrap();
+        let path_desk = consent_path(dir.path(), "desk");
+        let path_tv = consent_path(dir.path(), "tv");
+
+        let mut desk_record = record();
+        desk_record.sampled_display = "desk".into();
+        desk_record.token = "desk-token".into();
+        store_atomic(&path_desk, &desk_record).unwrap();
+
+        let mut tv_record = record();
+        tv_record.sampled_display = "tv".into();
+        tv_record.token = "tv-token".into();
+        store_atomic(&path_tv, &tv_record).unwrap();
+
+        let loaded_desk = load(&path_desk, "desk").unwrap();
+        assert_eq!(loaded_desk.record().token, "desk-token");
+        let loaded_tv = load(&path_tv, "tv").unwrap();
+        assert_eq!(loaded_tv.record().token, "tv-token");
+
+        // Cross-binding fails: loading the desk record bound to "tv" must
+        // surface DisplayChanged, never silently succeed.
+        assert!(matches!(
+            load(&path_desk, "tv"),
+            Err(ConsentError::DisplayChanged)
+        ));
+        assert!(matches!(
+            load(&path_tv, "desk"),
+            Err(ConsentError::DisplayChanged)
+        ));
+        // The two on-disk files have distinct names after sanitization,
+        // so a store-then-store sequence leaves both readable.
+        assert!(path_desk.exists());
+        assert!(path_tv.exists());
+        assert_ne!(path_desk, path_tv);
+    }
+
+    #[test]
+    fn legacy_consent_path_is_a_one_time_source_for_legacy_display() {
+        // The pre-multi-display record at screencast-consent.json stays
+        // readable for the legacy-selected display; it must never
+        // re-bind to a different display id.
+        let dir = tempdir().unwrap();
+        let legacy_path = dir.path().join("screencast-consent.json");
+        store_atomic(&legacy_path, &record()).unwrap();
+        assert_eq!(
+            legacy_consent_path(dir.path()),
+            legacy_path,
+            "legacy path must be the un-suffixed screencast-consent.json",
+        );
+        let loaded = load(&legacy_path, "oled-main").unwrap();
+        assert_eq!(loaded.record().sampled_display, "oled-main");
+        assert!(matches!(
+            load(&legacy_path, "other-display"),
+            Err(ConsentError::DisplayChanged)
+        ));
+    }
 }
 use std::fmt;
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Filename prefix for per-display consent records.
+const CONSENT_FILENAME_PREFIX: &str = "screencast-consent-";
+/// Filename suffix for all consent records.
+const CONSENT_FILENAME_SUFFIX: &str = ".json";
+/// Legacy un-suffixed filename retained as the one-time source for the
+/// legacy-selected display after a multi-display migration.
+const LEGACY_CONSENT_FILENAME: &str = "screencast-consent.json";
+
+/// Build the on-disk path for one display's consent record.
+///
+/// The id is sanitized to a stable filesystem-safe key (see
+/// [`dormant_core::wear::sanitize_identity_key`]) so two display ids
+/// that differ only in punctuation collapse to the same path — that
+/// collision is rejected at config parse rather than discovered at
+/// sampler spawn. The legacy `screencast-consent.json` is preserved
+/// by [`legacy_consent_path`] for the legacy-selected display only.
+#[must_use]
+pub fn consent_path(state_dir: &Path, display_id: &str) -> PathBuf {
+    let sanitized = dormant_core::wear::sanitize_identity_key(display_id);
+    state_dir.join(format!(
+        "{CONSENT_FILENAME_PREFIX}{sanitized}{CONSENT_FILENAME_SUFFIX}"
+    ))
+}
+
+/// The legacy un-suffixed consent path, retained as a one-time source
+/// for the legacy-selected display when migrating to the per-display
+/// layout.
+#[must_use]
+pub fn legacy_consent_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(LEGACY_CONSENT_FILENAME)
+}
 
 /// The persisted grant needed to reattach a portal capture stream.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]

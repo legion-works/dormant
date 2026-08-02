@@ -5459,6 +5459,142 @@ async fn watchdog_ping_before_rebuild_old_on_spawn_generation_failure() {
     );
 }
 
+/// Issue #197: the `assemble_loaded` call inside `execute_reload_batch` runs
+/// controller probes (the slow part of the reload path) and must be bracketed
+/// by `before_assemble`/`after_assemble` watchdog pings. A slow probe would
+/// otherwise starve the watchdog and let systemd kill a healthy daemon.
+///
+/// The `source_builder` is the assembly seam — blocking it stalls the probe
+/// phase for an unbounded duration. The test holds the release gate,
+/// asserts `before_assemble` has already fired in the captured log (it
+/// must fire BEFORE `assemble_loaded` is called), then releases and
+/// asserts `after_assemble` fires once the probe unblocks and assembly
+/// completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_count_lock() serializes every reload-driving test in this binary against \
+              this exact-count reader (see the lock's doc comment) and is always released \
+              promptly at test end"
+)]
+async fn watchdog_ping_brackets_reload_assembly_boundary() {
+    let _guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    install_capture_subscriber();
+
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &one_display_config(&marker, "0s"),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+    let (_listener, sd) = fake_systemd_socket(dir.path());
+
+    // Gate the source_builder so the assembly probe phase parks on a
+    // `Condvar` until the test releases it. The first call (initial
+    // generation) must return immediately, so we pre-notify. `Mutex` +
+    // `Condvar` are both `Sync` and the source_builder closure requires
+    // `Send + Sync`.
+    let gate_pair: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)> =
+        std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    {
+        let (lock, cvar) = &*gate_pair;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+    }
+    let gate_pair_for_factory = gate_pair.clone();
+    let script = vec![(Duration::from_millis(100), ev("desk", SensorState::Absent))];
+    let template = dormant_core::fakes::FakeSensorSource {
+        id: "desk".to_string(),
+        script,
+    };
+    let app = App::build_with_sources(
+        cfg_path.clone(),
+        creds_path,
+        Strictness::Strict,
+        move |_cfg: &Config, _creds: &Credentials| -> anyhow::Result<Vec<Box<dyn SensorSource>>> {
+            // The source_builder is a sync `Fn` called from an async
+            // context. `block_in_place` moves the worker thread out of
+            // the runtime's worker pool, so the blocking `cvar.wait()`
+            // below does not starve other tasks — the `before_assemble`
+            // ping in `execute_reload_batch` fires BEFORE this closure
+            // is entered, so it's already in the capture by the time we
+            // park here.
+            tokio::task::block_in_place(|| {
+                let (lock, cvar) = &*gate_pair_for_factory;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = cvar.wait(released).unwrap();
+                }
+                // Consume the release so the next call blocks again.
+                *released = false;
+            });
+            Ok(vec![Box::new(template.clone()) as Box<dyn SensorSource>])
+        },
+    )
+    .expect("build app")
+    .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
+    .disable_ipc()
+    .with_sd_notify(sd)
+    .with_watchdog_interval(Duration::from_secs(120));
+    let (handle, join) = app.start().await.expect("start app");
+    let mut reloads = handle.subscribe_reload();
+
+    assert!(
+        wait_for(|| count(&marker, 'B') >= 1, Duration::from_secs(3)).await,
+        "display should blank before reload (initial generation assembly uses the same factory)"
+    );
+
+    drain_capture(); // discard startup noise (initial assembly pings, etc.)
+
+    // Trigger a reload via the file watcher. The reload's assembly phase
+    // will enter the factory and park on the condvar (the pre-armed
+    // release was consumed by the initial call).
+    fs::write(&cfg_path, one_display_config(&marker, "50ms")).unwrap();
+
+    // Wait for the reload to start AND for the assembly probe to be in
+    // flight (the factory is parked on the condvar). The `before_assemble`
+    // ping is emitted in `execute_reload_batch` BEFORE `assemble_loaded`
+    // is called, so it must already be in the capture by the time the
+    // assembly is parked.
+    let parked = wait_for(
+        || capture_contains("before_assemble"),
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        parked,
+        "before_assemble must fire before the assembly probe phase begins: \
+         current capture = {:?}",
+        drain_capture()
+    );
+
+    // Release the gate so assembly completes and `after_assemble` fires.
+    {
+        let (lock, cvar) = &*gate_pair;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+    }
+
+    let outcome = tokio::time::timeout(Duration::from_secs(5), reloads.recv())
+        .await
+        .expect("reload outcome in time")
+        .expect("reload bus open");
+    assert_eq!(outcome, ReloadOutcome::Reloaded);
+
+    let output = drain_capture();
+    shutdown(handle, join).await;
+
+    assert!(
+        output.contains("after_assemble"),
+        "after_assemble must fire once assembly completes: {output}"
+    );
+}
+
 /// A failed accepted-config spawn leaves both front-door routers paused while
 /// `rebuild_old` attempts to restore service. If that second spawn fails too,
 /// the daemon must exit rather than remain alive without an engine that can

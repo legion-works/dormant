@@ -2598,13 +2598,14 @@ impl Runner {
             coordination.reconcile_shared(new_shared);
         }
 
-        // Step-boundary ping 1/7 (spec §6.3): after `load_and_assemble`
-        // returns (probes done). The spec names this as a boundary DISTINCT
-        // from "after the quiesce loop" below — the serial controller
-        // probes inside `load_and_assemble` and the quiesce loop that
-        // follows are two independently-unbounded stretches of work, so
-        // each needs its own ping to keep either gap alone bounded.
-        self.ping("after_assemble");
+        // NOTE (issue #197): the `after_assemble` watchdog ping now lives
+        // in `execute_reload_batch`, bracketing the `assemble_loaded` call
+        // (probes) directly. The previous location here fired AFTER
+        // `request_snapshot` + validation + shared-displays check, which
+        // left the probe phase itself without a ping — a slow probe could
+        // starve the watchdog and let systemd kill a healthy daemon.
+        // The `after_quiesce` and `before_teardown` pings below remain
+        // in their spec §6.3 positions.
 
         // Build the set of rule-driven displays from the NEW config.
         // Rule-less (manual-only) displays are those in [displays] but NOT
@@ -3795,10 +3796,20 @@ async fn execute_reload_batch(
             true,
         )
     } else {
+        // Issue #197: bracket the assembly probe phase with watchdog pings.
+        // The probe phase inside `assemble_loaded` is the slowest part of
+        // the reload path and can run for an unbounded duration; a gap in
+        // pings here would let systemd kill a healthy daemon mid-reload.
+        // The `after_assemble` ping that used to live inside `Runner::reload`
+        // fired after `request_snapshot` + validation + shared-displays
+        // check, NOT right after the probes — moving the boundary to
+        // `execute_reload_batch` closes the gap.
+        runner.ping("before_assemble");
         let assembly = match loaded {
             Ok((cfg, creds)) => runner.assemble_loaded(cfg, creds).await,
             Err(detail) => Err(detail),
         };
+        runner.ping("after_assemble");
         runner
             .reload(
                 assembly,
@@ -4026,22 +4037,39 @@ impl GenerationRouter<ControlMsg> {
         state.paused = false;
     }
 
-    async fn route_control(&self, mut message: ControlMsg, root: &CancellationToken) -> bool {
-        let mut state = self.state.lock().await;
-        if state.paused {
-            state.queued.push_back(message);
-            return true;
-        }
-        if let (Some(registry), Some(generation)) = (&state.operation_registry, state.generation_id)
-        {
-            message = stamp_control_operation(message, registry, generation);
-        }
-        let Some(target) = state.target.clone() else {
-            return false;
+    async fn route_control(&self, message: ControlMsg, root: &CancellationToken) -> bool {
+        // Issue #209: pause-check, stamp, and target-clone must happen
+        // under the lock, but the actual `target.send(message).await` must
+        // run AFTER the guard drops. A full target channel would otherwise
+        // park the send while still holding the router mutex, deadlocking
+        // `pause()` (reload quiesce) and any other front-door consumer that
+        // needs the lock. The stamp is baked into the message under the
+        // lock (so it's bound to the current generation), and the target
+        // is a local clone of the `mpsc::Sender` — independent of any
+        // subsequent `install_generation` that swaps `state.target` — so
+        // the message is delivered to the generation-N channel stamped
+        // for generation N regardless of any concurrent install.
+        let (target, stamped) = {
+            let mut state = self.state.lock().await;
+            if state.paused {
+                state.queued.push_back(message);
+                return true;
+            }
+            let stamped = if let (Some(registry), Some(generation)) =
+                (&state.operation_registry, state.generation_id)
+            {
+                stamp_control_operation(message, registry, generation)
+            } else {
+                message
+            };
+            let Some(target) = state.target.clone() else {
+                return false;
+            };
+            (target, stamped)
         };
         tokio::select! {
             () = root.cancelled() => false,
-            result = target.send(message) => result.is_ok(),
+            result = target.send(stamped) => result.is_ok(),
         }
     }
 }
@@ -7219,6 +7247,75 @@ mod generation_router_tests {
         cancel.cancel();
         drop(front_tx);
         forwarder.await.unwrap();
+    }
+
+    // Issue #209: `route_control` must release the router mutex before
+    // `target.send(message).await` so a full target channel cannot block
+    // `pause()` (reload quiesce). With a cap-1 channel pre-filled, the
+    // in-flight send parks; the lock guard must already be dropped for
+    // `pause()` to acquire the mutex within a short bounded window.
+    #[tokio::test]
+    async fn route_control_releases_router_lock_before_send() {
+        // Cap-1 target pre-filled so the in-flight `target.send` parks.
+        let (target_tx, _target_rx) = mpsc::channel::<ControlMsg>(1);
+        target_tx
+            .send(ControlMsg::SetPendingReload(Some("pre-fill".into())))
+            .await
+            .expect("pre-fill the target channel");
+
+        let router = Arc::new(GenerationRouter::new_with_generation(
+            target_tx,
+            GenerationId(7),
+            Arc::new(OperationRegistry::default()),
+        ));
+        let cancel = CancellationToken::new();
+
+        // Drive `route_control` on a worker — the `.await` on `target.send`
+        // parks because the cap-1 channel is full. With the bug, the router
+        // mutex is held across that await; without it, the guard is already
+        // dropped and `pause()` returns promptly.
+        let router_for_route = router.clone();
+        let cancel_for_route = cancel.clone();
+        let route_task = tokio::spawn(async move {
+            router_for_route
+                .route_control(
+                    ControlMsg::ForceWake(DisplayId("blocked-send".into())),
+                    &cancel_for_route,
+                )
+                .await
+        });
+
+        // Give the worker a chance to enter the send-await before we assert
+        // on `pause()`. A single `yield_now` is sufficient: `mpsc::Sender::send`
+        // is an immediate await when the channel is full, so the router
+        // mutex is either held (bug) or already dropped (fix) by the time
+        // this task is scheduled.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // Bounded assertion: `pause()` must acquire the router mutex
+        // WITHOUT waiting for the in-flight send to drain. A 200ms ceiling
+        // is generous (the only work inside `pause()` is two field writes
+        // + a lock acquisition) but leaves headroom for scheduler jitter
+        // on loaded CI runners.
+        match tokio::time::timeout(Duration::from_millis(200), router.pause()).await {
+            Ok(()) => {}
+            Err(elapsed) => panic!(
+                "route_control held the router mutex across target.send — \
+                 pause() must acquire the mutex while the send is parked \
+                 (issue #209): {elapsed:?}"
+            ),
+        }
+
+        // Drain the parked send so the worker can complete.
+        cancel.cancel();
+        // Receive the queued message from the channel so the parked send
+        // can return. The cancel above will also unblock the
+        // `root.cancelled()` arm of the `tokio::select!`, so the worker
+        // exits either way — but draining keeps the assertion on the
+        // exact route semantics clean.
+        drop(router);
+        let _ = tokio::time::timeout(Duration::from_secs(1), route_task).await;
     }
 }
 

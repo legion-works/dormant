@@ -379,6 +379,9 @@ fn sampler_error_reason(error: &SamplerError) -> String {
         SamplerError::NoGraphicalSession => "wear_sampling_no_graphical_session".to_owned(),
         SamplerError::CommandChannelClosed => "wear_sampling_command_closed".to_owned(),
         SamplerError::Store(_) => "wear_sampling_store_error".to_owned(),
+        SamplerError::AdministrativelySuspended => {
+            "wear_sampling_administratively_suspended".to_owned()
+        }
     }
 }
 

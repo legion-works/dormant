@@ -143,6 +143,10 @@ pub enum SamplerError {
     CommandChannelClosed,
     /// Persistent consent-record I/O failed.
     Store(crate::screencast_consent::ConsentError),
+    /// Sampling is administratively suspended (e.g. wear disabled, configured
+    /// display absent). Re-enable through configuration; the operator IPC
+    /// `Enable` cannot resume it.
+    AdministrativelySuspended,
 }
 
 /// Requests accepted by the daemon-lifetime sampler.
@@ -276,6 +280,9 @@ impl fmt::Display for SamplerError {
             Self::NoGraphicalSession => f.write_str("no graphical session is available"),
             Self::CommandChannelClosed => f.write_str("active sampling service is not running"),
             Self::Store(error) => error.fmt(f),
+            Self::AdministrativelySuspended => f.write_str(
+                "active sampling is administratively suspended; re-enable via configuration",
+            ),
         }
     }
 }
@@ -398,6 +405,16 @@ enum CaptureOutcome {
     Failed(CaptureError, u32),
 }
 
+/// Pending outcome of a `Disable` command received mid-consent-flow.
+struct PendingDisable {
+    /// `true` if the operator asked the daemon to also drop the stored grant.
+    forget: bool,
+    /// Reply channel for the original `Disable` command.
+    reply: oneshot::Sender<Result<(), SamplerError>>,
+    /// Transition the sampler applied when it took the command.
+    transition: Transition,
+}
+
 async fn connect(
     source: &mut dyn CaptureSource,
     record: &crate::screencast_consent::BoundConsent,
@@ -476,21 +493,28 @@ fn persist_rotated_token(
     Ok(())
 }
 
-fn apply_capture_failure(
+async fn apply_capture_failure(
     runtime: &mut Runtime,
+    source: &mut dyn CaptureSource,
     error: CaptureError,
     status_tx: &watch::Sender<SamplerStatus>,
 ) -> Transition {
     match error {
-        CaptureError::Auth => apply_trigger(runtime, Trigger::AuthFailed, status_tx),
-        CaptureError::SessionClosed => apply_trigger(runtime, Trigger::SessionClosed, status_tx),
-        CaptureError::Protocol(reason) if reason == WEAR_SAMPLING_WRONG_MONITOR => {
-            apply_trigger(runtime, Trigger::WrongMonitor, status_tx)
+        CaptureError::Auth => {
+            apply_trigger_with_effects(runtime, source, Trigger::AuthFailed, status_tx).await
         }
-        CaptureError::Transport(_) => apply_trigger(runtime, Trigger::TransportFailed, status_tx),
+        CaptureError::SessionClosed => {
+            apply_trigger_with_effects(runtime, source, Trigger::SessionClosed, status_tx).await
+        }
+        CaptureError::Protocol(reason) if reason == WEAR_SAMPLING_WRONG_MONITOR => {
+            apply_trigger_with_effects(runtime, source, Trigger::WrongMonitor, status_tx).await
+        }
+        CaptureError::Transport(_) => {
+            apply_trigger_with_effects(runtime, source, Trigger::TransportFailed, status_tx).await
+        }
         CaptureError::ConsentDenied | CaptureError::Timeout | CaptureError::Protocol(_) => {
             if runtime.failures >= runtime.active.failure_threshold {
-                apply_trigger(runtime, Trigger::CaptureFailed, status_tx)
+                apply_trigger_with_effects(runtime, source, Trigger::CaptureFailed, status_tx).await
             } else {
                 // Below the breaker threshold the lifecycle remains Streaming;
                 // only its uniform fallback changes for this failed tick.
@@ -527,6 +551,14 @@ async fn handle_command(
                 ));
                 return false;
             }
+            if runtime.state == SamplingState::Suspended {
+                // Suspended sampling cannot be resumed through the operator IPC
+                // enable path — only the wear/display configuration can lift it.
+                let _ = reply.send(ConsentFlowStatus::Error(
+                    SamplerError::AdministrativelySuspended.to_string(),
+                ));
+                return false;
+            }
             if runtime.state != SamplingState::NeedsConsent {
                 // Reject before reaching the capture source: in Streaming / Connecting
                 // a subsequent cancellation of the new consent flow would call
@@ -557,8 +589,7 @@ async fn handle_command(
             // prevents an abandoned dialog from retaining a daemon operation forever.
             let mut consent = Box::pin(source.request_consent(&expected));
             let mut deadline = Box::pin(tokio::time::sleep(CONSENT_INTERACTION_TIMEOUT));
-            let mut pending_disable: Option<(bool, oneshot::Sender<Result<(), SamplerError>>)> =
-                None;
+            let mut pending_disable: Option<PendingDisable> = None;
             let outcome = loop {
                 tokio::select! {
                     () = cancel.cancelled() => break None,
@@ -571,8 +602,20 @@ async fn handle_command(
                             ));
                         }
                         Some(SamplerCommand::Disable { forget, reply }) => {
-                            apply_trigger(runtime, Trigger::Forget, status_tx);
-                            pending_disable = Some((forget, reply));
+                            // Disable during a pending consent must transition
+                            // to Disabled (not NeedsConsent) so a later Enable
+                            // is rejected by the disabled-config path rather
+                            // than silently re-opening a fresh grant dialog.
+                            let transition = apply_trigger(
+                                runtime,
+                                Trigger::ConfigChanged(ConfigDelta::Enabled(false)),
+                                status_tx,
+                            );
+                            pending_disable = Some(PendingDisable {
+                                forget,
+                                reply,
+                                transition,
+                            });
                             break Some(Err(CaptureError::Protocol("wear_sampling_cancelled".to_owned())));
                         }
                         None => break None,
@@ -581,17 +624,19 @@ async fn handle_command(
             };
             drop(consent);
             drop(deadline);
-            if let Some((forget, reply)) = pending_disable {
-                source.close().await;
-                if forget {
+            if let Some(pending) = pending_disable {
+                if pending.transition.effects.contains(&Effect::CloseSession) {
+                    source.close().await;
+                }
+                if pending.forget {
                     if let Err(error) = crate::screencast_consent::forget(consent_path) {
-                        let _ = reply.send(Err(SamplerError::Store(error)));
+                        let _ = pending.reply.send(Err(SamplerError::Store(error)));
                     } else {
                         runtime.record = None;
-                        let _ = reply.send(Ok(()));
+                        let _ = pending.reply.send(Ok(()));
                     }
                 } else {
-                    let _ = reply.send(Ok(()));
+                    let _ = pending.reply.send(Ok(()));
                 }
             }
             match outcome {
@@ -738,6 +783,26 @@ async fn apply_update_with_effects(
     transition
 }
 
+/// Apply a trigger and honor the lifecycle effects it emits.
+///
+/// The pure [`decide`] table only describes intent; the run loop is what
+/// releases a live portal session when a transition asks for `CloseSession`.
+/// Skipping this helper at any `AuthFailed` / `SessionClosed` / `WrongMonitor`
+/// site leaves the warm `PipeWire` worker and portal session parked after the
+/// lifecycle has moved on to `NeedsConsent` / `Disabled`.
+async fn apply_trigger_with_effects(
+    runtime: &mut Runtime,
+    source: &mut dyn CaptureSource,
+    trigger: Trigger,
+    status_tx: &watch::Sender<SamplerStatus>,
+) -> Transition {
+    let transition = apply_trigger(runtime, trigger, status_tx);
+    if transition.effects.contains(&Effect::CloseSession) {
+        source.close().await;
+    }
+    transition
+}
+
 fn transition_to(
     runtime: &mut Runtime,
     state: SamplingState,
@@ -855,7 +920,13 @@ async fn run(
             }
             SamplingState::Connecting => {
                 let Some(record) = runtime.record.clone() else {
-                    apply_trigger(&mut runtime, Trigger::AuthFailed, &status_tx);
+                    apply_trigger_with_effects(
+                        &mut runtime,
+                        &mut *deps.source,
+                        Trigger::AuthFailed,
+                        &status_tx,
+                    )
+                    .await;
                     continue;
                 };
                 match connect(&mut *deps.source, &record, &deps.cancel).await {
@@ -867,7 +938,22 @@ async fn run(
                             && persist_rotated_token(&mut runtime, stream, &deps.consent_path)
                                 .is_err()
                         {
-                            apply_trigger(&mut runtime, Trigger::AuthFailed, &status_tx);
+                            // The rotated token could not be persisted, so the
+                            // portal session just opened by `connect()` must be
+                            // released. The pure table pins the effects vector
+                            // for `(Streaming, AuthFailed)` to
+                            // `[CloseSession, EnterUniform(WEAR_SAMPLING_TOKEN_INVALID)]`;
+                            // the helper is what honors the CloseSession at
+                            // runtime here. Without it, the warm PipeWire
+                            // worker and the portal session would leak in the
+                            // rare disk-full / permission-revoked path.
+                            apply_trigger_with_effects(
+                                &mut runtime,
+                                &mut *deps.source,
+                                Trigger::AuthFailed,
+                                &status_tx,
+                            )
+                            .await;
                             continue;
                         }
                         runtime.reconnect_backoff = Duration::from_secs(30);
@@ -879,7 +965,13 @@ async fn run(
                         } else {
                             Trigger::AuthFailed
                         };
-                        apply_trigger(&mut runtime, trigger, &status_tx);
+                        apply_trigger_with_effects(
+                            &mut runtime,
+                            &mut *deps.source,
+                            trigger,
+                            &status_tx,
+                        )
+                        .await;
                     }
                     ConnectOutcome::Transport => {
                         apply_trigger(&mut runtime, Trigger::TransportFailed, &status_tx);
@@ -935,7 +1027,8 @@ async fn run(
                     }
                     CaptureOutcome::Failed(error, overlapping) => {
                         runtime.failures = runtime.failures.saturating_add(1 + overlapping);
-                        apply_capture_failure(&mut runtime, error, &status_tx);
+                        apply_capture_failure(&mut runtime, &mut *deps.source, error, &status_tx)
+                            .await;
                     }
                 }
             }
@@ -950,7 +1043,13 @@ async fn run(
                             CaptureOutcome::Cancelled => break,
                             CaptureOutcome::Ok(captured_at) => { runtime.failures = 0; runtime.episode_warned.clear(); apply_trigger(&mut runtime, Trigger::CaptureOk, &status_tx); publish_status(&status_tx, &runtime, None, Some(captured_at)); }
                             CaptureOutcome::Failed(error, _) => {
-                                apply_capture_failure(&mut runtime, error, &status_tx);
+                                apply_capture_failure(
+                                    &mut runtime,
+                                    &mut *deps.source,
+                                    error,
+                                    &status_tx,
+                                )
+                                .await;
                             }
                         }
                     }
@@ -1328,6 +1427,15 @@ fn needs_consent(state: SamplingState, reason: &'static str) -> Transition {
     let mut effects = Vec::new();
     if state == SamplingState::ConsentPending {
         effects.push(Effect::CancelConsent);
+    }
+    // A live portal session must be released alongside the consent-record
+    // invalidation: the run loop parks in NeedsConsent indefinitely and would
+    // otherwise leak the warm PipeWire worker and portal session.
+    if matches!(
+        state,
+        SamplingState::Connecting | SamplingState::Streaming | SamplingState::Cooldown
+    ) {
+        effects.push(Effect::CloseSession);
     }
     effects.push(Effect::EnterUniform(reason));
     transition(SamplingState::NeedsConsent, effects)
@@ -2347,10 +2455,6 @@ mod tests {
                     Trigger::CaptureFailed,
                 ],
             ),
-            (
-                "suspended",
-                &[Trigger::ConfigChanged(ConfigDelta::WearEnabled(false))],
-            ),
         ];
         for (label, setup) in cases {
             let dir = tempdir().unwrap();
@@ -2407,6 +2511,64 @@ mod tests {
                 "{label}: close was called"
             );
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_sampler_rejects_enable_while_suspended() {
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        let config = active_config(Duration::from_secs(10));
+        let mut runtime = Runtime::new(&config, &consent_path);
+        let (status_tx, _) = watch::channel(initial_status(&config));
+        apply_trigger(
+            &mut runtime,
+            Trigger::ConfigChanged(ConfigDelta::WearEnabled(false)),
+            &status_tx,
+        );
+        let expected_state = runtime.state;
+        let mut source = ServiceSource {
+            connects: Mutex::new(VecDeque::new()),
+            connects_seen: Arc::new(AtomicUsize::new(0)),
+            captures: Mutex::new(VecDeque::new()),
+            captures_seen: Arc::new(AtomicUsize::new(0)),
+            closes_seen: Arc::new(AtomicUsize::new(0)),
+            grants_seen: Arc::new(AtomicUsize::new(0)),
+        };
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let (_command_tx, mut command_rx) = mpsc::channel(1);
+
+        assert!(
+            !handle_command(
+                &mut runtime,
+                &mut source,
+                &consent_path,
+                SamplerCommand::Enable { reply: reply_tx },
+                &mut command_rx,
+                &status_tx,
+                &CancellationToken::new(),
+                test_env_reader,
+            )
+            .await
+        );
+        assert_eq!(
+            reply_rx.await.unwrap(),
+            ConsentFlowStatus::Error(SamplerError::AdministrativelySuspended.to_string()),
+            "suspended: reply mismatch"
+        );
+        assert_eq!(
+            runtime.state, expected_state,
+            "suspended: state mutated by rejected Enable"
+        );
+        assert_eq!(
+            source.grants_seen.load(Ordering::SeqCst),
+            0,
+            "suspended: request_consent was called"
+        );
+        assert_eq!(
+            source.closes_seen.load(Ordering::SeqCst),
+            0,
+            "suspended: close was called"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -2751,11 +2913,16 @@ mod tests {
         let (update_tx, update_rx) = mpsc::channel(1);
         drop(update_tx);
         let cancel = CancellationToken::new();
+        let close_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let source = CloseTrackingScriptedSource {
+            inner: ScriptedCaptureSource::with_pending_consent(),
+            close_calls: close_calls.clone(),
+        };
         let (handle, join) = spawn_with_handle(ActiveSamplerDeps {
             initial_config: config,
             update_rx,
             latest_grid: new_latest_grid(),
-            source: Box::new(ScriptedCaptureSource::with_pending_consent()),
+            source: Box::new(source),
             consent_path: consent_path.clone(),
             cancel: cancel.clone(),
             env_reader: test_env_reader,
@@ -2791,8 +2958,177 @@ mod tests {
             ConsentFlowStatus::Error("cancelled".to_owned())
         );
         assert!(!consent_path.exists());
+        // Disable during a pending consent must leave the sampler Disabled so a
+        // subsequent Enable is rejected by the disabled-config path instead of
+        // being accepted as a fresh consent flow.
+        let final_status = handle.status();
+        let snapshot = final_status.borrow().clone();
+        assert_eq!(snapshot.state, SamplingState::Disabled);
+        assert!(
+            close_calls.load(Ordering::SeqCst) >= 1,
+            "Disable during pending consent must close any live sampler session"
+        );
         cancel.cancel();
         join.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_sampler_streaming_capture_auth_failure_closes_source() {
+        // A live portal session invalidated by an Auth failure during
+        // Streaming must be released: the run loop parks in NeedsConsent
+        // indefinitely, so without honoring the CloseSession effect the
+        // warm PipeWire worker and the portal session would leak.
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        test_record(&consent_path);
+        let config = active_config(Duration::from_secs(10));
+        let closes_seen = Arc::new(AtomicUsize::new(0));
+        let captures_seen = Arc::new(AtomicUsize::new(0));
+        let source = ServiceSource {
+            connects: Mutex::new(VecDeque::new()),
+            connects_seen: Arc::new(AtomicUsize::new(0)),
+            captures: Mutex::new(VecDeque::from([
+                TestCapture::Frame,
+                TestCapture::Failure(CaptureError::Auth),
+            ])),
+            captures_seen: captures_seen.clone(),
+            closes_seen: closes_seen.clone(),
+            grants_seen: Arc::new(AtomicUsize::new(0)),
+        };
+        let cancel = CancellationToken::new();
+        let (deps, _updates, _latest) = service_deps(config, source, consent_path, cancel.clone());
+        let (handle, join) = spawn_with_handle(deps);
+
+        // First cadence tick: connect succeeds, first capture returns a frame.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(captures_seen.load(Ordering::SeqCst), 1);
+        assert_eq!(handle.status().borrow().state, SamplingState::Streaming);
+
+        // Advance past the sample interval to drive a second capture, which
+        // fails with Auth and routes through needs_consent -> NeedsConsent
+        // with a CloseSession effect.
+        for _ in 0..12 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(captures_seen.load(Ordering::SeqCst), 2);
+        assert_eq!(handle.status().borrow().state, SamplingState::NeedsConsent);
+        assert!(
+            closes_seen.load(Ordering::SeqCst) >= 1,
+            "Auth failure during Streaming must close the live portal session"
+        );
+
+        cancel.cancel();
+        join.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_sampler_disable_during_pending_consent_rejects_followup_enable() {
+        // A Disable received while a consent flow is still pending must
+        // leave the sampler Disabled: the in-flight Enable replies with
+        // "cancelled", the Disable itself replies Ok(()), and any later
+        // Enable is rejected (the sampler is no longer in NeedsConsent, so
+        // it cannot silently re-open a fresh grant dialog).
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        let config = active_config(Duration::from_secs(10));
+        let (update_tx, update_rx) = mpsc::channel(1);
+        drop(update_tx);
+        let cancel = CancellationToken::new();
+        let (handle, join) = spawn_with_handle(ActiveSamplerDeps {
+            initial_config: config,
+            update_rx,
+            latest_grid: new_latest_grid(),
+            source: Box::new(ScriptedCaptureSource::with_pending_consent()),
+            consent_path: consent_path.clone(),
+            cancel: cancel.clone(),
+            env_reader: test_env_reader,
+            event_tx: None,
+        });
+
+        let (enable_tx, enable_rx) = oneshot::channel();
+        handle
+            .send(SamplerCommand::Enable { reply: enable_tx })
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+
+        let (disable_tx, disable_rx) = oneshot::channel();
+        handle
+            .send(SamplerCommand::Disable {
+                forget: true,
+                reply: disable_tx,
+            })
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), disable_rx)
+                .await
+                .is_ok()
+        );
+        // The first Enable was cancelled by the Disable.
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), enable_rx)
+                .await
+                .unwrap()
+                .unwrap(),
+            ConsentFlowStatus::Error("cancelled".to_owned())
+        );
+        // Final state is Disabled — the operator's disable took effect.
+        assert_eq!(handle.status().borrow().state, SamplingState::Disabled);
+
+        // The follow-up Enable is rejected because the sampler is no
+        // longer in NeedsConsent: the Enable handler routes any other
+        // state through the FlowAlreadyActive rejection, which surfaces
+        // to the operator as the "consent flow is already active" error.
+        let (followup_tx, followup_rx) = oneshot::channel();
+        handle
+            .send(SamplerCommand::Enable { reply: followup_tx })
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), followup_rx)
+                .await
+                .unwrap()
+                .unwrap(),
+            ConsentFlowStatus::Error(SamplerError::FlowAlreadyActive.to_string())
+        );
+
+        cancel.cancel();
+        join.await.unwrap();
+    }
+
+    /// `ScriptedCaptureSource` wrapper that counts `close()` invocations via a
+    /// shared atomic so the test can observe the run loop honoring a
+    /// `CloseSession` effect across the `Box<dyn CaptureSource>` boundary.
+    struct CloseTrackingScriptedSource {
+        inner: ScriptedCaptureSource,
+        close_calls: std::sync::Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl CaptureSource for CloseTrackingScriptedSource {
+        async fn connect(
+            &mut self,
+            binding: &ConsentBinding<'_>,
+        ) -> Result<ConnectedStream, CaptureError> {
+            self.inner.connect(binding).await
+        }
+        async fn request_consent(
+            &mut self,
+            display: &DisplayExpectation,
+        ) -> Result<Grant, CaptureError> {
+            self.inner.request_consent(display).await
+        }
+        async fn capture_one(&mut self, mode: StreamMode) -> Result<RawFrame, CaptureError> {
+            self.inner.capture_one(mode).await
+        }
+        async fn close(&mut self) {
+            self.inner.close().await;
+            self.close_calls.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     #[tokio::test]
@@ -2920,20 +3256,26 @@ mod tests {
                 effects: vec![Effect::EnterUniform("wear_sampling_portal_unreachable")],
             },
             TransitionCase {
-                name: "token rejection requires fresh consent",
+                name: "token rejection requires fresh consent and closes the live session",
                 state: SamplingState::Connecting,
                 trigger: Trigger::AuthFailed,
                 has_consent_record: true,
                 next: SamplingState::NeedsConsent,
-                effects: vec![Effect::EnterUniform("wear_sampling_token_invalid")],
+                effects: vec![
+                    Effect::CloseSession,
+                    Effect::EnterUniform("wear_sampling_token_invalid"),
+                ],
             },
             TransitionCase {
-                name: "wrong reattached monitor requires fresh consent with its distinct reason",
+                name: "wrong reattached monitor requires fresh consent with its distinct reason and closes the live session",
                 state: SamplingState::Connecting,
                 trigger: Trigger::WrongMonitor,
                 has_consent_record: true,
                 next: SamplingState::NeedsConsent,
-                effects: vec![Effect::EnterUniform("wear_sampling_wrong_monitor")],
+                effects: vec![
+                    Effect::CloseSession,
+                    Effect::EnterUniform("wear_sampling_wrong_monitor"),
+                ],
             },
             TransitionCase {
                 name: "stream capture failure opens the breaker",
@@ -2944,20 +3286,37 @@ mod tests {
                 effects: vec![Effect::EnterUniform("wear_sampling_capture_failed")],
             },
             TransitionCase {
-                name: "stream session closure invalidates consent",
+                name: "stream session closure invalidates consent and closes the live session",
                 state: SamplingState::Streaming,
                 trigger: Trigger::SessionClosed,
                 has_consent_record: true,
                 next: SamplingState::NeedsConsent,
-                effects: vec![Effect::EnterUniform("wear_sampling_token_invalid")],
+                effects: vec![
+                    Effect::CloseSession,
+                    Effect::EnterUniform("wear_sampling_token_invalid"),
+                ],
             },
             TransitionCase {
-                name: "wrong streaming monitor requires fresh consent with its distinct reason",
+                name: "wrong streaming monitor requires fresh consent with its distinct reason and closes the live session",
                 state: SamplingState::Streaming,
                 trigger: Trigger::WrongMonitor,
                 has_consent_record: true,
                 next: SamplingState::NeedsConsent,
-                effects: vec![Effect::EnterUniform("wear_sampling_wrong_monitor")],
+                effects: vec![
+                    Effect::CloseSession,
+                    Effect::EnterUniform("wear_sampling_wrong_monitor"),
+                ],
+            },
+            TransitionCase {
+                name: "stream auth rejection requires fresh consent and closes the live session",
+                state: SamplingState::Streaming,
+                trigger: Trigger::AuthFailed,
+                has_consent_record: true,
+                next: SamplingState::NeedsConsent,
+                effects: vec![
+                    Effect::CloseSession,
+                    Effect::EnterUniform("wear_sampling_token_invalid"),
+                ],
             },
             TransitionCase {
                 name: "stream transport failure reconnects without discarding consent",
@@ -2992,12 +3351,26 @@ mod tests {
                 effects: vec![Effect::EnterUniform("wear_sampling_portal_unreachable")],
             },
             TransitionCase {
-                name: "cooldown auth failure requires fresh consent",
+                name: "cooldown auth failure requires fresh consent and closes the live session",
                 state: SamplingState::Cooldown,
                 trigger: Trigger::AuthFailed,
                 has_consent_record: true,
                 next: SamplingState::NeedsConsent,
-                effects: vec![Effect::EnterUniform("wear_sampling_token_invalid")],
+                effects: vec![
+                    Effect::CloseSession,
+                    Effect::EnterUniform("wear_sampling_token_invalid"),
+                ],
+            },
+            TransitionCase {
+                name: "cooldown wrong monitor requires fresh consent and closes the live session",
+                state: SamplingState::Cooldown,
+                trigger: Trigger::WrongMonitor,
+                has_consent_record: true,
+                next: SamplingState::NeedsConsent,
+                effects: vec![
+                    Effect::CloseSession,
+                    Effect::EnterUniform("wear_sampling_wrong_monitor"),
+                ],
             },
             TransitionCase {
                 name: "renewed cooldown failure restarts the tagged cooldown",
@@ -3097,20 +3470,26 @@ mod tests {
                 effects: vec![],
             },
             TransitionCase {
-                name: "connecting session closure invalidates consent",
+                name: "connecting session closure invalidates consent and closes the live session",
                 state: SamplingState::Connecting,
                 trigger: Trigger::SessionClosed,
                 has_consent_record: true,
                 next: SamplingState::NeedsConsent,
-                effects: vec![Effect::EnterUniform("wear_sampling_token_invalid")],
+                effects: vec![
+                    Effect::CloseSession,
+                    Effect::EnterUniform("wear_sampling_token_invalid"),
+                ],
             },
             TransitionCase {
-                name: "cooldown session closure invalidates consent",
+                name: "cooldown session closure invalidates consent and closes the live session",
                 state: SamplingState::Cooldown,
                 trigger: Trigger::SessionClosed,
                 has_consent_record: true,
                 next: SamplingState::NeedsConsent,
-                effects: vec![Effect::EnterUniform("wear_sampling_token_invalid")],
+                effects: vec![
+                    Effect::CloseSession,
+                    Effect::EnterUniform("wear_sampling_token_invalid"),
+                ],
             },
             TransitionCase {
                 name: "disabling a pending flow cancels consent before closing the session",

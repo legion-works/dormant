@@ -34,7 +34,7 @@ pub enum BrokerUrlError {
 /// Accepts `tcp://`, `mqtt://`, or a bare `host:port`. When no explicit
 /// port is supplied, falls back to the MQTT default `1883`. The parser is
 /// strict about malformed ports and empty hosts — callers receive an
-/// error instead of a silently-mis-parsed URL.
+/// error instead of a silently-mishandled URL.
 ///
 /// Recognised shapes (after stripping the optional `tcp://`/`mqtt://`
 /// scheme):

@@ -661,7 +661,7 @@ pub mod mqtt_transport {
         /// `broker_url`").
         ///
         /// Returns `Err(detail)` on a malformed broker URL — callers
-        /// should surface that as a test failure rather than mis-parsing
+        /// should surface that as a test failure rather than mishandling
         /// it silently.
         ///
         /// # Errors

@@ -27,3 +27,24 @@
   border: 1px dashed var(--border);
   border-radius: var(--radius-sm);
 }
+
+
+.wear-heat-map__cell:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.wear-heat-map__variation-note,
+.wear-heat-map__tooltip {
+  margin-top: var(--space-2);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.wear-heat-map__tooltip {
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-raised);
+}

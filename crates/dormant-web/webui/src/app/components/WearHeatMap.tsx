@@ -1,40 +1,17 @@
-/**
- * Panel wear heat map — renders a display's per-cell brightness-weighted
- * on-hours / normalized heat grid as an accessible `role="grid"`.
- *
- * The backend returns row-major raw `cells` (brightness-weighted on-hours)
- * and normalized `heat` (`0..=1`), but JSON/manual fixtures can still be
- * short, long, empty, or non-finite. `normalizeWearGrid` is the single
- * source of truth: it pads/truncates both vectors to `grid_rows *
- * grid_cols`, maps every non-finite value to zero, and derives
- * `averageHeat`/`uniformity` from that same clamped vector — callers must
- * not recompute those independently.
- */
+/** Panel wear heat map derived from each cell's deviation from the panel mean. */
+import { useState } from "react";
 import type { WearDetail } from "../../api/types";
 import "./WearHeatMap.css";
 
-/**
- * Heat-map ramp stops, per the design handoff ("Design tokens" §Heat-map
- * ramp): `[v, r, g, b]`. No DS token exists for these — the handoff gives
- * literal ramp values with no token, so the raw RGB triples live here as
- * the single source (both `heatColor` and the legend gradient CSS derive
- * from the same five stops).
- */
 export const HEAT_RAMP_STOPS: readonly [number, number, number, number][] = [
   [0.0, 60, 70, 90],
-  [0.32, 195, 232, 141], // #C3E88D
-  [0.62, 255, 199, 119], // #FFC777
-  [0.82, 255, 150, 108], // #FF966C
-  [1.0, 255, 117, 127], // #FF757F
+  [0.32, 195, 232, 141],
+  [0.62, 255, 199, 119],
+  [0.82, 255, 150, 108],
+  [1.0, 255, 117, 127],
 ];
 
-/**
- * Continuous heat ramp: clamps `v` to 0..1, linearly interpolates the RGB
- * between the bracketing stops, and derives alpha as `0.22 + v*0.78` — at
- * `v=0` every cell still renders at 0.22 alpha (visible on the sunken
- * tile), never a black void, so the uniform/all-zero case reads as a
- * legible cold map instead of nothing.
- */
+/** Returns the legacy normalized-heat ramp used by the absolute-hours legend. */
 export function heatColor(value: number): string {
   const v = Math.max(0, Math.min(1, value));
   let lo = HEAT_RAMP_STOPS[0];
@@ -55,11 +32,34 @@ export function heatColor(value: number): string {
   return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
 
+const NEUTRAL_COLOR = "rgba(195, 232, 141, 0.47)";
+const COOL_COLOR = [86, 156, 214] as const;
+const AMBER_COLOR = [255, 199, 119] as const;
+const RED_COLOR = [255, 117, 127] as const;
+
+function mixColor(from: readonly number[], to: readonly number[], amount: number): string {
+  const t = Math.max(0, Math.min(1, amount));
+  const channels = from.map((value, index) => Math.round(value + (to[index] - value) * t));
+  return `rgb(${channels[0]}, ${channels[1]}, ${channels[2]})`;
+}
+
+export function deviationColor(deviation: number): string {
+  if (deviation >= -0.05 && deviation <= 0.05) return NEUTRAL_COLOR;
+  if (deviation > 0.05) {
+    return mixColor(AMBER_COLOR, RED_COLOR, (deviation - 0.05) / 0.15);
+  }
+  return mixColor(COOL_COLOR, [195, 232, 141], (deviation + 0.2) / 0.15);
+}
+
 export interface NormalizedWearGrid {
   rows: number;
   cols: number;
   weightedHours: number[];
   heat: number[];
+  deviations: number[];
+  meanHours: number;
+  sampleCount: number;
+  hasSpatialVariation: boolean;
   hasGridSamples: boolean;
   hasHeatSamples: boolean;
   averageHeat: number | null;
@@ -67,12 +67,8 @@ export interface NormalizedWearGrid {
 }
 
 export function normalizeWearGrid(detail: WearDetail | undefined): NormalizedWearGrid {
-  const rows = detail && Number.isFinite(detail.grid_rows)
-    ? Math.max(0, Math.trunc(detail.grid_rows))
-    : 0;
-  const cols = detail && Number.isFinite(detail.grid_cols)
-    ? Math.max(0, Math.trunc(detail.grid_cols))
-    : 0;
+  const rows = detail && Number.isFinite(detail.grid_rows) ? Math.max(0, Math.trunc(detail.grid_rows)) : 0;
+  const cols = detail && Number.isFinite(detail.grid_cols) ? Math.max(0, Math.trunc(detail.grid_cols)) : 0;
   const size = rows * cols;
   const weightedHours = Array.from({ length: size }, (_, index) => {
     const value = detail?.cells[index];
@@ -80,69 +76,77 @@ export function normalizeWearGrid(detail: WearDetail | undefined): NormalizedWea
   });
   const heat = Array.from({ length: size }, (_, index) => {
     const value = detail?.heat[index];
-    return typeof value === "number" && Number.isFinite(value)
-      ? Math.max(0, Math.min(1, value))
-      : 0;
+    return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0;
   });
   const validGridSamples = (detail?.cells ?? []).slice(0, size).filter(Number.isFinite).length;
   const validHeatSamples = (detail?.heat ?? []).slice(0, size).filter(Number.isFinite).length;
   const hasGridSamples = size > 0 && validGridSamples > 0;
   const hasHeatSamples = size > 0 && validHeatSamples > 0;
-  const averageHeat = hasHeatSamples
-    ? heat.reduce((sum, value) => sum + value, 0) / size
-    : null;
-  const uniformity = hasHeatSamples
-    ? Math.max(0, 1 - (Math.max(...heat) - Math.min(...heat)))
-    : null;
+  const meanHours = hasGridSamples ? weightedHours.reduce((sum, value) => sum + value, 0) / size : 0;
+  const deviations = weightedHours.map((hours) => meanHours > 0 ? (hours - meanHours) / meanHours : 0);
+  const averageHeat = hasHeatSamples ? heat.reduce((sum, value) => sum + value, 0) / size : null;
+  const uniformity = hasHeatSamples ? Math.max(0, 1 - (Math.max(...heat) - Math.min(...heat))) : null;
   return {
-    rows,
-    cols,
-    weightedHours,
-    heat,
-    hasGridSamples,
-    hasHeatSamples,
-    averageHeat,
-    uniformity,
+    rows, cols, weightedHours, heat, deviations, meanHours,
+    sampleCount: detail?.sample_count ?? 0,
+    hasSpatialVariation: deviations.some((deviation) => Math.abs(deviation) > 0.05),
+    hasGridSamples, hasHeatSamples, averageHeat, uniformity,
   };
 }
 
+function regionLabel(row: number, col: number, rows: number, cols: number): string {
+  const vertical = row <= rows / 2 ? "top" : "bottom";
+  const horizontal = col <= cols / 2 ? "left" : "right";
+  const xStart = Math.round(((col - 1) / cols) * 100);
+  const xEnd = Math.round((col / cols) * 100);
+  const yStart = Math.round(((row - 1) / rows) * 100);
+  const yEnd = Math.round((row / rows) * 100);
+  return `${vertical}-${horizontal} region, ${xStart}–${xEnd}% across, ${yStart}–${yEnd}% down`;
+}
+
+function deltaLabel(deviation: number): string {
+  const percent = Math.round(Math.abs(deviation) * 100);
+  if (percent === 0) return "at mean";
+  return deviation > 0 ? `+${percent}% above mean` : `−${percent}% below mean`;
+}
+
 export function WearHeatMap({ display, grid }: { display: string; grid: NormalizedWearGrid }) {
+  const [activeCell, setActiveCell] = useState<number | null>(null);
   if (grid.rows === 0 || grid.cols === 0 || (!grid.hasGridSamples && !grid.hasHeatSamples)) {
-    return (
-      <div className="wear-heat-map__empty">
-        No spatial wear samples for this display yet.
-      </div>
-    );
+    return <div className="wear-heat-map__empty">No spatial wear samples for this display yet.</div>;
   }
 
   return (
-    <div
-      className="wear-heat-map"
-      role="grid"
-      aria-label={`${display} panel wear heat map`}
-      style={{
+    <>
+      <div className="wear-heat-map" role="grid" aria-label={`${display} panel wear heat map`} style={{
         gridTemplateColumns: `repeat(${grid.cols}, minmax(0, 1fr))`,
         gridTemplateRows: `repeat(${grid.rows}, 1fr)`,
         aspectRatio: `${grid.cols} / ${grid.rows}`,
-      }}
-    >
-      {grid.heat.map((intensity, index) => {
-        const row = Math.floor(index / grid.cols) + 1;
-        const col = (index % grid.cols) + 1;
-        const hours = grid.weightedHours[index];
-        const percent = Math.round(intensity * 100);
-        const label = `row ${row}, column ${col}: ${hours.toFixed(2)} brightness-weighted hours at ${percent} percent normalized heat`;
-        return (
-          <div
-            key={index}
-            role="gridcell"
-            aria-label={label}
-            title={`${hours.toFixed(1)} on-hours`}
-            className="wear-heat-map__cell"
-            style={{ backgroundColor: heatColor(intensity) }}
-          />
-        );
-      })}
-    </div>
+      }}>
+        {grid.heat.map((_, index) => {
+          const row = Math.floor(index / grid.cols) + 1;
+          const col = (index % grid.cols) + 1;
+          const deviation = grid.deviations[index];
+          const tooltipId = `wear-cell-tooltip-${index}`;
+          return (
+            <div key={index} role="gridcell" tabIndex={0} aria-describedby={activeCell === index ? tooltipId : undefined}
+              aria-label={`row ${row}, column ${col}`} className="wear-heat-map__cell"
+              style={{ backgroundColor: deviationColor(deviation) }}
+              onFocus={() => setActiveCell(index)} onBlur={() => setActiveCell(null)}
+              onMouseEnter={() => setActiveCell(index)} onMouseLeave={() => setActiveCell(null)} />
+          );
+        })}
+      </div>
+      {!grid.hasSpatialVariation && (
+        <div className="wear-heat-map__variation-note">no spatial variation yet — {grid.sampleCount.toLocaleString()} samples</div>
+      )}
+      {activeCell !== null && (() => {
+        const row = Math.floor(activeCell / grid.cols) + 1;
+        const col = (activeCell % grid.cols) + 1;
+        return <div id={`wear-cell-tooltip-${activeCell}`} role="tooltip" className="wear-heat-map__tooltip">
+          row {row}, column {col} · {regionLabel(row, col, grid.rows, grid.cols)} · {grid.weightedHours[activeCell].toFixed(2)} hours · {deltaLabel(grid.deviations[activeCell])} · {Math.round(grid.heat[activeCell] * 100)}% normalized heat
+        </div>;
+      })()}
+    </>
   );
 }

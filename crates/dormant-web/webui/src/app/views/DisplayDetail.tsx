@@ -368,6 +368,9 @@ export default function DisplayDetail({ id, snapshot, config, rule, wear, wearEr
                       style={{ background: legendGradient }}
                     />
                     <span className="display-detail__legend-label">
+                      {grid.meanHours.toFixed(0)} h mean
+                    </span>
+                    <span className="display-detail__legend-label">
                       {maxCellHours.toFixed(0)} h
                     </span>
                   </div>

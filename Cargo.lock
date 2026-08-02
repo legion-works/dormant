@@ -1041,6 +1041,7 @@ dependencies = [
  "dormant-core",
  "humantime-serde",
  "indexmap",
+ "libc",
  "proptest",
  "serde",
  "serde_json",

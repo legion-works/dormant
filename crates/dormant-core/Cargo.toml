@@ -32,6 +32,13 @@ tokio = { workspace = true, features = ["test-util"] }
 test-fakes = []
 render = []
 
+[target.'cfg(unix)'.dependencies]
+# O_NOFOLLOW for the temp file open in `upsert_samsung_token` — see
+# `crates/dormant-core/src/config/mod.rs`. Gated to Unix: Windows has no
+# equivalent of `O_NOFOLLOW`; the non-Unix branch uses `create_new(true)` as
+# the only symlink defense (see issue #195).
+libc.workspace = true
+
 [lib]
 
 [[test]]

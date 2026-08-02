@@ -704,6 +704,19 @@ pub struct App {
     test_operation_busy: bool,
     #[cfg(any(test, feature = "test-util"))]
     reload_lifecycle_capture: Option<ReloadLifecycleCapture>,
+    /// Test seam (issue #196): unbounded sink that the activity-follow loop
+    /// records each pulled display into instead of calling
+    /// `DirectSwitchHandle::pull`. Set via
+    /// [`App::with_test_activity_follow_pull_recorder`].
+    #[cfg(any(test, feature = "test-util"))]
+    activity_follow_pull_recorder:
+        Option<tokio::sync::mpsc::UnboundedSender<dormant_core::types::DisplayId>>,
+    /// Test seam (issue #196): unbounded sink that the activity-follow loop
+    /// fires once on every return path (cancel, channel close), so a test
+    /// can assert the OLD task's handle actually terminated. Set via
+    /// [`App::with_test_activity_follow_terminated_sink`].
+    #[cfg(any(test, feature = "test-util"))]
+    activity_follow_terminated_sink: Option<tokio::sync::mpsc::UnboundedSender<()>>,
 }
 
 /// Result of a post-release old-engine snapshot probe.
@@ -878,6 +891,9 @@ impl App {
             test_operation_busy: false,
             #[cfg(any(test, feature = "test-util"))]
             reload_lifecycle_capture: None,
+            #[cfg(any(test, feature = "test-util"))]
+            activity_follow_pull_recorder: None,
+            activity_follow_terminated_sink: None,
         })
     }
 
@@ -929,6 +945,10 @@ impl App {
             test_operation_busy: false,
             #[cfg(any(test, feature = "test-util"))]
             reload_lifecycle_capture: None,
+            #[cfg(any(test, feature = "test-util"))]
+            activity_follow_pull_recorder: None,
+            #[cfg(any(test, feature = "test-util"))]
+            activity_follow_terminated_sink: None,
         })
     }
 
@@ -1105,6 +1125,34 @@ impl App {
     #[must_use]
     pub fn with_test_reload_lifecycle_capture(mut self, capture: ReloadLifecycleCapture) -> Self {
         self.reload_lifecycle_capture = Some(capture);
+        self
+    }
+
+    /// Inject a sender that the activity-follow loop records each pulled
+    /// display into (test seam, issue #196). Mirrors the
+    /// `ActivityFollowDeps::pull_recorder` field — production keeps it
+    /// `None` so the loop calls `DirectSwitchHandle::pull` as usual.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn with_test_activity_follow_pull_recorder(
+        mut self,
+        sender: tokio::sync::mpsc::UnboundedSender<dormant_core::types::DisplayId>,
+    ) -> Self {
+        self.activity_follow_pull_recorder = Some(sender);
+        self
+    }
+
+    /// Inject a sender that the activity-follow loop fires once on every
+    /// return path (test seam, issue #196). Mirrors the
+    /// `ActivityFollowDeps::on_terminated` field — production keeps it
+    /// `None` so the loop returns silently.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn with_test_activity_follow_terminated_sink(
+        mut self,
+        sender: tokio::sync::mpsc::UnboundedSender<()>,
+    ) -> Self {
+        self.activity_follow_terminated_sink = Some(sender);
         self
     }
 
@@ -1351,7 +1399,7 @@ impl App {
         ));
 
         // ── Spawn activity-follow on boot ───────────────────────────────────
-        let mut activity_follow_handle: Option<tokio::task::JoinHandle<()>> = None;
+        let mut activity_follow_slot: Option<ActivityFollowSlot> = None;
         if cfg_clone.coordination.activity_follow {
             let idle_rx = idle_obs_tx.subscribe();
             let filtered_rx = filtered_activity_tx.subscribe();
@@ -1365,16 +1413,21 @@ impl App {
                 .map(|(name, _)| DisplayId(name.clone()))
                 .collect();
             if !shared.is_empty() {
+                let gen_cancel = root.child_token();
                 let deps = crate::activity_follow::ActivityFollowDeps {
                     idle_rx,
                     direct_switch: Some(direct_switch.clone()),
                     display_ids: shared.into(),
                     arm_after: cfg_clone.coordination.arm_after,
-                    cancel: root.clone(),
-                    pull_recorder: None,
+                    cancel: gen_cancel.clone(),
+                    pull_recorder: self.activity_follow_pull_recorder.clone(),
+                    on_terminated: self.activity_follow_terminated_sink.clone(),
                     clock: crate::activity_follow::production_clock,
                 };
-                activity_follow_handle = Some(crate::activity_follow::spawn(deps, filtered_rx));
+                activity_follow_slot = Some(ActivityFollowSlot {
+                    handle: crate::activity_follow::spawn(deps, filtered_rx),
+                    cancel: gen_cancel,
+                });
             }
         }
 
@@ -1397,7 +1450,7 @@ impl App {
             let kvm = dormant_core::rules::KvmStatus {
                 keymap: cfg_clone.keymap.clone(),
                 switch_capable_displays: switch_capable,
-                activity_following: activity_follow_handle.is_some(),
+                activity_following: activity_follow_slot.is_some(),
                 push_capable_displays: push_capable,
             };
             let _ = spawn.ctl_tx.send(ControlMsg::SetKvmStatus(kvm)).await;
@@ -1731,7 +1784,7 @@ impl App {
             coordination: coordination.clone(),
             direct_switch: direct_switch.clone(),
             idle_obs_tx: Some(idle_obs_tx.clone()),
-            filtered_activity_tx,
+            filtered_activity_tx: filtered_activity_tx.clone(),
             sd: self.sd_notify,
             watchdog_interval,
             generation_barrier_ack_timeout,
@@ -1757,7 +1810,11 @@ impl App {
             force_generation_barrier_timeout: self.force_generation_barrier_timeout,
             #[cfg(any(test, feature = "test-util"))]
             reload_lifecycle_capture: self.reload_lifecycle_capture,
-            activity_follow_handle,
+            activity_follow_slot,
+            #[cfg(any(test, feature = "test-util"))]
+            activity_follow_pull_recorder: self.activity_follow_pull_recorder.clone(),
+            #[cfg(any(test, feature = "test-util"))]
+            activity_follow_terminated_sink: self.activity_follow_terminated_sink.clone(),
         };
 
         let join = tokio::spawn(run_loop(
@@ -1785,6 +1842,8 @@ impl App {
             _web_handle: web_handle,
             #[cfg(any(test, feature = "test-util"))]
             lkg_observed,
+            #[cfg(any(test, feature = "test-util"))]
+            filtered_activity_tx: filtered_activity_tx.clone(),
         };
 
         Ok((handle, join))
@@ -1845,6 +1904,11 @@ pub struct AppHandle {
     /// [`LkgCandidateObserved`].
     #[cfg(any(test, feature = "test-util"))]
     lkg_observed: Arc<Mutex<LkgCandidateObserved>>,
+    /// Test seam (issue #196): clone of the daemon-lifetime filtered-activity
+    /// fan-out, so a test can publish edges directly into the channel that
+    /// the activity-follow task is reading from.
+    #[cfg(any(test, feature = "test-util"))]
+    filtered_activity_tx: crate::filtered_activity::FilteredActivityTx,
 }
 
 impl AppHandle {
@@ -1980,6 +2044,17 @@ impl AppHandle {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// Test-util seam (issue #196): a clone of the daemon-lifetime
+    /// filtered-activity sender, so a test can publish activity edges
+    /// directly into the channel the activity-follow task is reading.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn filtered_activity_sender_for_test(
+        &self,
+    ) -> crate::filtered_activity::FilteredActivityTx {
+        self.filtered_activity_tx.clone()
     }
 }
 
@@ -2150,9 +2225,39 @@ struct Runner {
     force_generation_barrier_timeout: bool,
     #[cfg(any(test, feature = "test-util"))]
     reload_lifecycle_capture: Option<ReloadLifecycleCapture>,
-    /// The activity-follow task spawned on boot and re-spawned on reload.
-    activity_follow_handle: Option<tokio::task::JoinHandle<()>>,
+    /// The active activity-follow generation — its `JoinHandle` and the
+    /// per-generation cancellation token, replaced as a paired unit on every
+    /// reload so the prior task is signalled to stop and bounded-awaited
+    /// before the replacement is spawned.
+    activity_follow_slot: Option<ActivityFollowSlot>,
+    /// Test seam (issue #196): unbounded sink that the activity-follow loop
+    /// records each pulled display into instead of calling
+    /// `DirectSwitchHandle::pull`. Production keeps this `None`; tests set
+    /// it via [`App::with_test_activity_follow_pull_recorder`].
+    #[cfg(any(test, feature = "test-util"))]
+    activity_follow_pull_recorder:
+        Option<tokio::sync::mpsc::UnboundedSender<dormant_core::types::DisplayId>>,
+    /// Test seam (issue #196): unbounded sink the activity-follow loop
+    /// fires once on every return path so a test can assert the OLD
+    /// task's handle actually terminated. Production keeps this `None`.
+    #[cfg(any(test, feature = "test-util"))]
+    activity_follow_terminated_sink: Option<tokio::sync::mpsc::UnboundedSender<()>>,
 }
+
+/// Per-generation activity-follow task handle + its cancellation token
+/// (issue #196). The pair is replaced together: cancelling the token
+/// signals the loop to stop, and awaiting the handle proves the task has
+/// returned before the next generation's task is spawned.
+struct ActivityFollowSlot {
+    handle: tokio::task::JoinHandle<()>,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+/// Bounded deadline for awaiting an activity-follow task's graceful
+/// shutdown during reload and final teardown. Mirrors the wear-tracker's
+/// 5 s teardown window — a stuck loop must never block a reload or
+/// daemon shutdown.
+const ACTIVITY_FOLLOW_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One LKG promotion candidate (spec §4 Mechanism): the config bytes
 /// captured when the generation this candidate tracks became live, and the
@@ -2328,7 +2433,7 @@ impl Runner {
         dormant_core::rules::KvmStatus {
             keymap: cfg.keymap.clone(),
             switch_capable_displays: switch_capable,
-            activity_following: self.activity_follow_handle.is_some(),
+            activity_following: self.activity_follow_slot.is_some(),
             push_capable_displays: push_capable,
         }
     }
@@ -2345,15 +2450,50 @@ impl Runner {
         }
     }
 
-    /// Spawn (or re-spawn) the activity-follow task from the current
-    /// generation's config and daemon-lifetime channels.
+    /// Reap the prior generation's activity-follow task (issue #196).
     ///
-    /// Drops any prior handle; re-spawns only when
-    /// `coordination.activity_follow` is true.
-    fn spawn_activity_follow(&mut self) {
-        if self.activity_follow_handle.is_some() {
-            self.activity_follow_handle = None;
+    /// Cancels its per-generation child token and bounded-awaits its
+    /// handle with an abort fallback. Called at the START of [`Self::reload`]
+    /// so an edge that fires during `install_generation` cannot be
+    /// processed by a task whose config is already stale. The OLD task
+    /// uses a child cancellation token of [`Runner::root`] so this
+    /// reap never cascades into the wear tracker, front routers, or
+    /// other consumers that share the root.
+    async fn reap_activity_follow(&mut self) {
+        if let Some(slot) = self.activity_follow_slot.take() {
+            slot.cancel.cancel();
+            let abort = slot.handle.abort_handle();
+            match tokio::time::timeout(ACTIVITY_FOLLOW_TEARDOWN_TIMEOUT, slot.handle).await {
+                Ok(Ok(())) => {}
+                Ok(Err(join_error)) => {
+                    tracing::warn!(
+                        event = "activity_follow_join_error",
+                        error = %join_error,
+                    );
+                }
+                Err(_) => {
+                    abort.abort();
+                    tracing::warn!(event = "activity_follow_abort_forced");
+                }
+            }
         }
+    }
+
+    /// Spawn the current generation's activity-follow task (issue #196).
+    ///
+    /// Called at the END of [`Self::reload`], after [`Self::reap_activity_follow`]
+    /// has already terminated the prior generation's task. The slot
+    /// must be `None` on entry — if it's `Some`, the OLD task would
+    /// race the NEW one on `filtered_rx` and `idle_rx`.
+    #[allow(
+        clippy::unused_async,
+        reason = "future-proofs the API; cancel+await may move here later"
+    )]
+    async fn spawn_activity_follow(&mut self) {
+        debug_assert!(
+            self.activity_follow_slot.is_none(),
+            "spawn_activity_follow called before reap_activity_follow — prior generation would race the new one on `filtered_rx`",
+        );
         if self.generation.cfg.coordination.activity_follow
             && let Some(idle_tx) = self.idle_obs_tx.as_ref()
         {
@@ -2372,17 +2512,21 @@ impl Runner {
                 .collect();
 
             if !shared.is_empty() {
+                let gen_cancel = self.root.child_token();
                 let deps = crate::activity_follow::ActivityFollowDeps {
                     idle_rx,
                     direct_switch: Some(self.direct_switch.clone()),
                     display_ids: shared.into(),
                     arm_after: self.generation.cfg.coordination.arm_after,
-                    cancel: self.root.clone(),
-                    pull_recorder: None,
+                    cancel: gen_cancel.clone(),
+                    pull_recorder: self.activity_follow_pull_recorder.clone(),
+                    on_terminated: self.activity_follow_terminated_sink.clone(),
                     clock: crate::activity_follow::production_clock,
                 };
-                self.activity_follow_handle =
-                    Some(crate::activity_follow::spawn(deps, filtered_rx));
+                self.activity_follow_slot = Some(ActivityFollowSlot {
+                    handle: crate::activity_follow::spawn(deps, filtered_rx),
+                    cancel: gen_cancel,
+                });
             }
         }
     }
@@ -2765,6 +2909,13 @@ impl Runner {
         };
         match spawn_result {
             Ok(spawn) => {
+                // Issue #196: reap the OLD activity-follow task BEFORE
+                // `install_generation` runs. The OLD task's config is
+                // about to become stale; an edge that fires during
+                // `install_generation`'s republish / quiesce would be
+                // processed by a task whose display list and arm_after
+                // are no longer the live generation's.
+                self.reap_activity_follow().await;
                 self.install_generation(spawn).await;
                 self.applied_revision = requested_revision.clone();
                 self.generation_id = next_generation;
@@ -2776,7 +2927,7 @@ impl Runner {
                 // Republish executor/config watches BEFORE activity-follow
                 // or any new edge can write — an edge that fires against a
                 // stale executor writes to the wrong panel.
-                self.spawn_activity_follow();
+                self.spawn_activity_follow().await;
                 self.publish_kvm_status().await;
 
                 // Rollback recovery (rollback-recovery plan, Task 2 §3): a
@@ -3521,7 +3672,35 @@ async fn run_loop(
         quiesce_inputs(&mut runner.generation).await;
         teardown(&mut runner.generation).await;
     };
-    tokio::join!(generation_teardown, wear_teardown, front_teardown,);
+    // #196 (final teardown): the activity-follow task uses a per-
+    // generation child cancellation token of `root`, so reload teardown
+    // cancels the child WITHOUT cascading up to root consumers (the
+    // wear tracker / front routers sharing root must stay live across a
+    // reload). On shutdown, root.cancel() DOES reach the child token
+    // (tokio_util child semantics) — the explicit cancel below is for
+    // bounded reaping, not cancellation propagation: it proves the
+    // loop actually returned before `daemon_stopped` is logged, with
+    // abort as backstop. A stuck loop must never hang daemon shutdown.
+    let activity_follow_slot = runner.activity_follow_slot.take();
+    let activity_follow_teardown = async {
+        if let Some(slot) = activity_follow_slot {
+            slot.cancel.cancel();
+            let abort = slot.handle.abort_handle();
+            if tokio::time::timeout(ACTIVITY_FOLLOW_TEARDOWN_TIMEOUT, slot.handle)
+                .await
+                .is_err()
+            {
+                abort.abort();
+                tracing::warn!(event = "activity_follow_abort_forced");
+            }
+        }
+    };
+    tokio::join!(
+        generation_teardown,
+        wear_teardown,
+        front_teardown,
+        activity_follow_teardown,
+    );
     tracing::info!(event = "daemon_stopped");
 }
 
@@ -3571,6 +3750,17 @@ async fn execute_reload_batch(
     requests: &mut mpsc::Receiver<ReloadRequest>,
     first: ReloadRequest,
 ) {
+    // Issue #196: reap the OLD activity-follow task at the very
+    // start of the reload batch — BEFORE the debounce window, the
+    // disk load, the controller probes, and the install_generation.
+    // The OLD task is subscribed to the daemon-lifetime
+    // filtered-activity channel and would otherwise commit a pull
+    // against the OLD config's display list during the entire reload
+    // window (debounce + load + assemble + install). The reap is a
+    // bounded-await on the OLD handle; it returns as soon as the
+    // task observes its per-generation child-token cancellation.
+    runner.reap_activity_follow().await;
+
     let mut batch = ReloadBatch::new(first);
     let window = runner.generation.cfg.daemon.reload_debounce;
     if !window.is_zero() {

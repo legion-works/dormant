@@ -22,6 +22,7 @@ use dormant_core::types::{DisplayId, PresenceEvent, SensorId, SensorState, Times
 use dormantd::app::{
     App, GenerationBarrierGate, ReloadLifecycleCapture, ReloadOutcome, validate_only,
 };
+use dormantd::filtered_activity::FilteredActivity;
 use tempfile::TempDir;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing_subscriber::fmt::MakeWriter;
@@ -6133,6 +6134,208 @@ async fn coordinator_config_watcher_suppression_is_effective() {
     assert!(
         !saw_reload,
         "real watcher fired a ReloadStarted — suppression is ineffective"
+    );
+
+    shutdown(handle, join).await;
+}
+// ── Issue #196 — activity-follow task must be replaced on reload ───────────────
+
+/// Build a coordinator config whose single shared display is named `name`
+/// (so a test can swap the name across a reload) and which has
+/// `coordination.activity_follow = true` with `arm_after = "0s"` and
+/// `cooldown = "0s"` so a single filtered-activity edge commits a pull in
+/// the same select iteration.
+#[allow(dead_code, reason = "shared with the reload test below")]
+fn activity_follow_config(name: &str, marker: &Path) -> String {
+    format!(
+        r#"config_version = 1
+[daemon]
+startup_holdoff = "0s"
+reload_debounce = "100ms"
+
+[sensors.desk]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "x"
+
+[zones.office]
+mode = "any"
+members = ["desk"]
+
+[displays.{name}]
+controllers = ["command", "ddcci"]
+scope = "shared"
+shared_input_code = 0x0f
+blank_mode = "brightness_zero"
+blank_command = "printf B >> '{m}'"
+wake_command = "printf W >> '{m}'"
+modes = ["brightness_zero"]
+
+[coordination]
+activity_follow = true
+arm_after = "0s"
+cooldown = "0s"
+
+[rules.r]
+zone = "office"
+displays = ["{name}"]
+grace_period = "1s"
+min_wake_time = "0s"
+wake_retries = 0
+wake_retry_backoff = "10ms"
+wake_retry_interval = "1s"
+"#,
+        m = marker.display(),
+    )
+}
+
+/// Wait up to `timeout` for a pull recorder entry.
+async fn wait_for_pull(
+    pull_rx: &mut mpsc::UnboundedReceiver<DisplayId>,
+    timeout: Duration,
+) -> Option<DisplayId> {
+    match tokio::time::timeout(timeout, pull_rx.recv()).await {
+        Ok(Some(display)) => Some(display),
+        Ok(None) | Err(_) => None,
+    }
+}
+
+/// Activity-follow task must be replaced atomically on reload (issue
+/// #196). Two assertions, both required:
+///   1. The OLD generation's task handle has fired `on_terminated` (the
+///      loop's drop guard) — proves the bounded-await reaped it, not
+///      merely "is currently idle".
+///   2. The post-reload edge produces ONLY `beta` and no stale `alpha`
+///      within a 500 ms drain window — proves no in-flight pull from
+///      the prior generation escaped cancellation. The race window is
+///      widened by a side-task edge injector that fires every 1 ms
+///      across the reload: while `spawn_activity_follow`'s bounded-await
+///      is reaping the OLD task, `top-of-loop select` may pick
+///      `filtered_rx` over `cancel.cancelled()` (50/50), and the body
+///      runs — only the in-loop biased select! around the pull effect
+///      prevents a stale `recorder.send()` from escaping.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn activity_follow_replaces_task_on_reload_no_stale_generation() {
+    let paths = TestAppPaths::new();
+
+    // Generation 0: shared display "alpha", activity-follow on.
+    let config_path = write_file(
+        paths.root(),
+        "config.toml",
+        &activity_follow_config("alpha", &paths.marker),
+    );
+    let creds_path = write_credentials(paths.root(), "");
+
+    let (pull_tx, mut pull_rx) = mpsc::unbounded_channel::<DisplayId>();
+    let (term_tx, mut term_rx) = mpsc::unbounded_channel::<()>();
+
+    let (handle, join) = App::build_with_sources(
+        config_path.clone(),
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", Vec::new()),
+    )
+    .expect("build app")
+    .with_notify_sink_builder(noop_factory)
+    .with_state_dir(paths.state.clone())
+    .disable_ipc()
+    .disable_config_watcher()
+    .with_test_activity_follow_pull_recorder(pull_tx)
+    .with_test_activity_follow_terminated_sink(term_tx)
+    .start()
+    .await
+    .expect("start app");
+
+    let filtered_tx = handle.filtered_activity_sender_for_test();
+
+    // Generation 0: ONE filtered-activity edge → expect a pull on `alpha`.
+    let t0 = Instant::now();
+    filtered_tx.send_replace(FilteredActivity {
+        last_activity: Some(t0),
+        observed_at: t0,
+        available: true,
+        edge_seq: 1,
+    });
+    let first = wait_for_pull(&mut pull_rx, Duration::from_secs(2)).await;
+    assert_eq!(
+        first,
+        Some(DisplayId("alpha".into())),
+        "generation-0 edge must pull `alpha`"
+    );
+
+    // Reload to a config whose only shared display is `beta`. While
+    // `reap_activity_follow` (called at the start of
+    // `execute_reload_batch`) reaps the OLD task via bounded-await,
+    // inject edges every 1 ms — the OLD task's top-of-loop select is
+    // racy on which ready branch to pick; with the pre-dispatch
+    // `is_cancelled()` check + in-loop biased select! absent, a
+    // `filtered_rx` win drives a stale `alpha` pull that escapes
+    // cancellation.
+    let injector_tx = filtered_tx.clone();
+    let injector = tokio::spawn(async move {
+        for seq in 2..200u64 {
+            let t = Instant::now();
+            injector_tx.send_replace(FilteredActivity {
+                last_activity: Some(t),
+                observed_at: t,
+                available: true,
+                edge_seq: seq,
+            });
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    });
+    fs::write(&config_path, activity_follow_config("beta", &paths.marker)).expect("rewrite config");
+    let receipt = reload_from_file(&handle).await;
+    injector.abort();
+    assert_eq!(receipt.outcome, ReloadOutcome::Reloaded);
+
+    // Assertion (1): the OLD task's drop guard fired — its handle
+    // returned and the on_terminated sink was sent `()` for the gen-0
+    // task. The reaper path is what proves termination, not "loop is
+    // currently idle". Bounded-await on this within 5 s.
+    let terminated = tokio::time::timeout(Duration::from_secs(5), term_rx.recv()).await;
+    assert!(
+        matches!(&terminated, Ok(Some(()))),
+        "OLD generation's activity-follow task did not signal termination after reload: {terminated:?}",
+    );
+
+    // From here, the OLD task's handle has resolved and only the NEW
+    // task is alive. Any subsequent pull must be `beta` — the OLD
+    // task's processing of `alpha` edges during the reload window
+    // (before `reap_activity_follow` ran) was legitimate processing
+    // under the OLD config and is drained below.
+    while let Ok(display) = pull_rx.try_recv() {
+        assert_eq!(
+            display,
+            DisplayId("alpha".into()),
+            "pre-reload drain saw a non-alpha pull — the OLD task was already terminated when this edge fired: {display:?}",
+        );
+    }
+
+    // Generation 1: ONE filtered-activity edge → MUST produce ONLY `beta`.
+    // The in-loop biased select! around the pull effect is what closes
+    // the original must-1 race: a cancellation that lands mid-iteration
+    // can no longer let a recorder.send escape.
+    let t1 = Instant::now();
+    filtered_tx.send_replace(FilteredActivity {
+        last_activity: Some(t1),
+        observed_at: t1,
+        available: true,
+        edge_seq: 1000,
+    });
+    let second = wait_for_pull(&mut pull_rx, Duration::from_secs(2)).await;
+    assert_eq!(
+        second,
+        Some(DisplayId("beta".into())),
+        "generation-1 edge must pull `beta` only; got {second:?}",
+    );
+
+    // Drain any further pulls within a short window. A stale `alpha`
+    // pull from a leaked OLD task would arrive here.
+    let stale = tokio::time::timeout(Duration::from_millis(500), pull_rx.recv()).await;
+    assert!(
+        matches!(&stale, Err(_) | Ok(None)),
+        "stale pull arrived from a leaked previous generation: {stale:?}",
     );
 
     shutdown(handle, join).await;

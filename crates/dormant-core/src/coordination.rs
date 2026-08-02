@@ -302,17 +302,24 @@ impl CoordinationHandle {
     ///
     /// Idempotent: if the display is already marked owned, this is a no-op.
     /// Unknown displays (private, or concurrently removed) are silently ignored.
-    pub fn mark_owned_immediate(&self, display: &DisplayId) {
+    ///
+    /// `verified_code` is the raw input-source code that was read back and
+    /// verified to be the local input.  It is stored as `last_observed_code`
+    /// so the next poll observation sees the same code and correctly enters
+    /// the "no-change" reset path instead of triggering a spurious
+    /// disagreement (issue #206).
+    pub fn mark_owned_immediate(&self, display: &DisplayId, verified_code: u8) {
         let mut records = self.records.write().unwrap_or_else(PoisonError::into_inner);
-        if let Some(record) = records.get_mut(display)
-            && !record.owned
-        {
+        if let Some(record) = records.get_mut(display) {
             record.owned = true;
             // Clear any pending transition so the poller's subsequent
             // agreeing reads don't double-fire or register a disagreement.
             record.pending_transition_count = 0;
             record.pending_transition_code = None;
             record.consecutive_failures = 0;
+            // Set to the verified local code so the next observation of the
+            // same code correctly sees "no change" rather than a disagreement.
+            record.last_observed_code = Some(verified_code);
         }
     }
 
@@ -880,5 +887,61 @@ mod tests {
         assert_eq!(outcome.committed_prior_owned, Some(false));
         assert_eq!(outcome.deferred_gain_count, None);
         assert!(handle.snapshot()[&aoc].owned);
+    }
+
+    /// Regression test for issue #206: `mark_owned_immediate` must set
+    /// `last_observed_code` to the verified code so the next local poll
+    /// observation matches and does not trigger a spurious disagreement
+    /// against the peer-owned era's code.
+    #[test]
+    fn mark_owned_immediate_accepts_verified_code_to_avoid_spurious_disagreement() {
+        let handle = CoordinationHandle::new([display("aoc")]);
+        let aoc = display("aoc");
+        let al = aliases(0x11); // local code
+
+        // Drive the record into a peer-owned state with a known last code.
+        // First, make it not-owned via loss path.
+        for _ in 0..3 {
+            let _ = handle.record_input_observation(&aoc, 0x22, &al, 3, None); // peer code
+        }
+        assert!(!handle.snapshot()[&aoc].owned);
+
+        // Manually set the last observed code to simulate the peer-owned era
+        // (stale code from before we owned the display).
+        {
+            let mut records = handle.records.write().unwrap();
+            if let Some(rec) = records.get_mut(&aoc) {
+                rec.last_observed_code = Some(0x22); // stale peer-era code
+            }
+        }
+
+        // Call mark_owned_immediate with the verified local code (the #139
+        // immediate-ownership path).  This sets last_observed_code to the
+        // verified local code, so the next observation of the same code does
+        // NOT trigger a spurious disagreement.
+        handle.mark_owned_immediate(&aoc, 0x11); // verified local code
+
+        // Feed the next local observation — must NOT trigger disagreement.
+        let outcome = handle.record_input_observation(&aoc, 0x11, &al, 3, None);
+        assert!(
+            outcome.disagreement_with.is_none(),
+            "local observation after mark_owned_immediate must not disagree, \
+             but got disagreement_with={:?}",
+            outcome.disagreement_with
+        );
+        // Since last_observed_code now equals the observed code, this is a
+        // "no change" observation — pending transitions reset, no gain/loss
+        // path is entered, so deferred_gain_count is None.
+        assert_eq!(
+            outcome.deferred_gain_count, None,
+            "no-change observation should not start a pending gain"
+        );
+        // After mark_owned_immediate the display IS owned (immediate-ownership path).
+        // The next local observation does NOT disagree (verified code was accepted)
+        // and does NOT start a new pending gain (no-change path).
+        assert!(
+            handle.snapshot()[&aoc].owned,
+            "display should be owned after mark_owned_immediate"
+        );
     }
 }

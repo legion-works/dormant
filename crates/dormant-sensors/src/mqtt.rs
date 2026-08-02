@@ -243,14 +243,16 @@ impl MqttSource {
     /// client, event loop, and queued subscription count.
     ///
     /// `broker_url` is expected in the form `host:port` (e.g. `localhost:1883`)
-    /// or `tcp://host:port`.
+    /// or `tcp://host:port`. A malformed URL surfaces as an `anyhow::Error`
+    /// so the caller can fail fast rather than connect to a garbage host.
     async fn connect(
         broker_url: &str,
         client_id: &str,
         topics: &[String],
         credential: Option<&MqttCredential>,
-    ) -> (AsyncClient, EventLoop, usize) {
-        let (host, port) = parse_broker_url(broker_url);
+    ) -> anyhow::Result<(AsyncClient, EventLoop, usize)> {
+        let (host, port) = parse_broker_url(broker_url)
+            .map_err(|e| anyhow::anyhow!("invalid mqtt broker_url {broker_url:?}: {e}"))?;
         let mut mqttopts = MqttOptions::new(client_id, host, port);
         mqttopts.set_clean_session(true);
         if let Some(cred) = credential {
@@ -259,7 +261,7 @@ impl MqttSource {
         let cap = topics.len() + CAP_HEADROOM;
         let (client, eventloop) = AsyncClient::new(mqttopts, cap);
         let queued_subscriptions = Self::subscribe_topics(&client, topics).await;
-        (client, eventloop, queued_subscriptions)
+        Ok((client, eventloop, queued_subscriptions))
     }
 
     /// Dispatch a publish on a sensor topic: parse each matching binding's
@@ -393,7 +395,7 @@ impl SensorSource for MqttSource {
             &topics,
             self.credential.as_ref(),
         )
-        .await;
+        .await?;
         let mut pending_subacks: HashMap<u16, String> = HashMap::new();
         let mut acknowledged_subscriptions = 0;
         let mut outgoing_subscriptions = 0;
@@ -508,7 +510,8 @@ impl SensorSource for MqttSource {
                                 &client_id,
                                 &topics,
                                 self.credential.as_ref(),
-                            ).await;
+                            )
+                            .await?;
                             client = new_pair.0;
                             eventloop = new_pair.1;
                             queued_subscriptions = new_pair.2;

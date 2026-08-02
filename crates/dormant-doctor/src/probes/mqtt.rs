@@ -35,7 +35,12 @@ pub(crate) async fn probe_mqtt_one(
 ) -> ProbeResult {
     let name = format!("mqtt {id}");
 
-    let (mqttopts, _username) = probe_options(id, cfg, creds);
+    let (mqttopts, _username) = match probe_options(id, cfg, creds) {
+        Ok(pair) => pair,
+        Err(detail) => {
+            return ProbeResult::fail(name, detail);
+        }
+    };
     let (client, mut eventloop) = AsyncClient::new(mqttopts, 100);
 
     // Subscribe to the sensor topic.
@@ -126,8 +131,9 @@ fn probe_options(
     id: &str,
     cfg: &MqttSensorCfg,
     creds: &Credentials,
-) -> (MqttOptions, Option<MqttCredential>) {
-    let (host, port) = parse_broker_url(&cfg.broker_url);
+) -> Result<(MqttOptions, Option<MqttCredential>), String> {
+    let (host, port) = parse_broker_url(&cfg.broker_url)
+        .map_err(|e| format!("invalid broker_url {:?}: {e}", cfg.broker_url))?;
     let client_id = format!("dormant-doctor-{id}-{}", std::process::id());
     let mut mqttopts = MqttOptions::new(&client_id, host, port);
     mqttopts.set_clean_session(true);
@@ -137,7 +143,7 @@ fn probe_options(
         mqttopts.set_credentials(cred.username.clone(), cred.password.clone());
     }
 
-    (mqttopts, applied)
+    Ok((mqttopts, applied))
 }
 
 /// Build the detail string for a `NotAuthorized` connection failure.
@@ -190,21 +196,21 @@ mod tests {
 
     #[test]
     fn parse_broker_url_tcp() {
-        let (host, port) = parse_broker_url("tcp://mqtt.local:1883");
+        let (host, port) = parse_broker_url("tcp://mqtt.local:1883").expect("valid URL must parse");
         assert_eq!(host, "mqtt.local");
         assert_eq!(port, 1883);
     }
 
     #[test]
     fn parse_broker_url_plain() {
-        let (host, port) = parse_broker_url("127.0.0.1:1883");
+        let (host, port) = parse_broker_url("127.0.0.1:1883").expect("valid URL must parse");
         assert_eq!(host, "127.0.0.1");
         assert_eq!(port, 1883);
     }
 
     #[test]
     fn parse_broker_url_default_port() {
-        let (host, port) = parse_broker_url("mqtt.local");
+        let (host, port) = parse_broker_url("mqtt.local").expect("host-only URL must parse");
         assert_eq!(host, "mqtt.local");
         assert_eq!(port, 1883);
     }
@@ -223,7 +229,7 @@ mod tests {
             },
         )]));
 
-        let (opts, applied) = probe_options("desk", &cfg, &creds);
+        let (opts, applied) = probe_options("desk", &cfg, &creds).expect("valid URL must parse");
 
         assert!(applied.is_some(), "credentials should be applied");
         assert_eq!(applied.unwrap().username, "icetea");
@@ -243,7 +249,7 @@ mod tests {
         let cfg = test_mqtt_cfg(broker);
         let creds = test_creds(IndexMap::new());
 
-        let (opts, applied) = probe_options("desk", &cfg, &creds);
+        let (opts, applied) = probe_options("desk", &cfg, &creds).expect("valid URL must parse");
 
         assert!(applied.is_none(), "no credentials should be applied");
         assert!(
@@ -263,7 +269,7 @@ mod tests {
             },
         )]));
 
-        let (opts, applied) = probe_options("desk", &cfg, &creds);
+        let (opts, applied) = probe_options("desk", &cfg, &creds).expect("valid URL must parse");
 
         assert!(applied.is_none());
         assert!(opts.credentials().is_none());

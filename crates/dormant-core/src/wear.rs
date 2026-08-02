@@ -23,6 +23,11 @@ use crate::traits::PanelState;
 /// `dormantd`) branches on this field to decide whether to migrate or reset.
 pub const WEAR_SCHEMA_VERSION: u32 = 1;
 
+/// Nanoseconds per hour. The conserved quantity in [`WearLedger::resize_grid`]
+/// is an integer nanosecond count, so the `f64` `wear_hours` are round-tripped
+/// through this value rather than through arbitrary `f64` multiplication.
+const NANOS_PER_HOUR: f64 = 3_600_000_000_000.0;
+
 /// Attribution method used for a published wear observation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -169,6 +174,197 @@ pub enum SpatialAttributionError {
     },
 }
 
+/// Build a (rows+1) x (cols+1) 2D prefix sum of the old-grid nanoseconds.
+/// Indexing convention: `prefix[r * (cols+1) + c]` is the sum of cells
+/// `[0, r) x [0, c)`. Row-major; no second pass needed.
+fn build_old_prefix(old_nanos: &[u64], old_rows: usize, old_cols: usize) -> Vec<u128> {
+    let stride = old_cols + 1;
+    let mut prefix = vec![0_u128; (old_rows + 1) * stride];
+    for old_r in 0..old_rows {
+        let mut row_sum = 0_u128;
+        for old_c in 0..old_cols {
+            row_sum += u128::from(old_nanos[old_r * old_cols + old_c]);
+            prefix[(old_r + 1) * stride + old_c + 1] = prefix[old_r * stride + old_c + 1] + row_sum;
+        }
+    }
+    prefix
+}
+
+/// Largest-remainder Hamilton selection: distribute the integer remainders
+/// from the `(old_total_nanos - floor_total)` step to the cells with the
+/// largest fractional remainders. Tie-breaks by ascending cell index (the
+/// second pass is row-major), so the choice is deterministic across runs.
+///
+/// # Panics
+///
+/// Panics if `remainder_count >= new_count`. The math guarantees this for
+/// any non-corrupted input (`sum(fractional_remainders) == new_count *
+/// remainder_count` and each remainder is `< new_count`), so the panic
+/// indicates either u128 overflow or an internal logic bug, not a caller
+/// error.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "usize fits in u128 for u16-bounded grid counts"
+)]
+fn hamilton_distribute(
+    new_nanos: &mut [u128],
+    fractional_remainders: &[u128],
+    old_total_nanos: u128,
+    floor_total: u128,
+    new_count: usize,
+) {
+    let remainder_count = (old_total_nanos - floor_total) as usize;
+    assert!(
+        remainder_count < new_count,
+        "Hamilton remainder must be smaller than the destination cell count"
+    );
+    if remainder_count == 0 {
+        return;
+    }
+    // Bucketing the shared-denominator remainders keeps selection O(cells).
+    // The second pass is row-major, so equal remainders go to the lowest
+    // cell indices first rather than depending on an unstable sort order.
+    let mut frequencies = vec![0_usize; new_count];
+    for &remainder in fractional_remainders {
+        frequencies[remainder as usize] += 1;
+    }
+
+    let mut strictly_larger = 0;
+    let mut cutoff = 0;
+    for remainder in (0..new_count).rev() {
+        if strictly_larger + frequencies[remainder] >= remainder_count {
+            cutoff = remainder;
+            break;
+        }
+        strictly_larger += frequencies[remainder];
+    }
+
+    let mut cutoff_slots = remainder_count - strictly_larger;
+    for (index, &remainder) in fractional_remainders.iter().enumerate() {
+        let remainder = remainder as usize;
+        if remainder > cutoff {
+            new_nanos[index] += 1;
+        } else if remainder == cutoff && cutoff_slots != 0 {
+            new_nanos[index] += 1;
+            cutoff_slots -= 1;
+        }
+    }
+    debug_assert_eq!(cutoff_slots, 0);
+}
+
+/// Convert the integer new-nanoseconds vector back into `WearCell`s, and
+/// set the last cell to absorb the conversion residual so the f64 cell sum
+/// is as close to `old_sum` as `f64::sum` allows. The last cell is clamped
+/// to a non-negative value: the alternative (allowing a sub-picosecond
+/// negative) would persist a value the ledger's own invariants reject, and
+/// every reader (`heat_map`, webui normalizers) already clamps to >= 0.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "u128 nanoseconds divide by 1e12, losing only the 24 bits below the hour; the fudge step handles the residual"
+)]
+fn rebuild_wear_cells(new_nanos: &[u128], old_sum: f64) -> Vec<WearCell> {
+    let mut cells: Vec<WearCell> = new_nanos
+        .iter()
+        .map(|&nanos| WearCell {
+            wear_hours: nanos as f64 / NANOS_PER_HOUR,
+        })
+        .collect();
+    if let Some(last_index) = cells.len().checked_sub(1) {
+        let prefix_sum: f64 = cells[..last_index].iter().map(|cell| cell.wear_hours).sum();
+        // f64::sum is order-dependent; deriving the last cell from the same
+        // prefix order keeps the residual within 1 ULP. The clamp trades
+        // exact f64 sum (which Sterbenz only guarantees when the last cell
+        // is <= half the total) for non-negativity: the residual is bounded
+        // by new_cells.len() * 0.5 ns (~1.4e-13 h at 64x64).
+        let residual = old_sum - prefix_sum;
+        cells[last_index].wear_hours = residual.max(0.0);
+    }
+    cells
+}
+
+/// Apportion old-grid nanoseconds over a new grid using the area-weighted
+/// prefix-sum integral (each new cell's numerator is a `u128` integer) and
+/// Hamilton (largest-remainder) selection. Returns integer nanoseconds; the
+/// caller rebuilds the `f64` cell vector via [`rebuild_wear_cells`].
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    reason = "f64 wear is intentionally quantized to bounded nanoseconds; the conversion to usize and u128 is exact for u16 grid dimensions"
+)]
+fn apportion_nanos(
+    old_nanos: &[u64],
+    old_rows: usize,
+    old_cols: usize,
+    new_rows: usize,
+    new_cols: usize,
+) -> Vec<u128> {
+    let new_count = new_rows * new_cols;
+    let new_count_u = u128::from(new_rows as u32) * u128::from(new_cols as u32);
+    let prefix = build_old_prefix(old_nanos, old_rows, old_cols);
+    let prefix_at = |row: usize, col: usize| prefix[row * (old_cols + 1) + col];
+    let old_total_nanos = prefix_at(old_rows, old_cols);
+
+    // Every cumulative area integral has `new_count` as a shared denominator.
+    // Full source cells contribute `new_count` numerator units; the boundary
+    // row and column contribute exact integer fractions of that denominator.
+    let cumulative_numerator = |new_row_edge: usize, new_col_edge: usize| -> u128 {
+        let row_scaled = new_row_edge * old_rows;
+        let full_rows = row_scaled / new_rows;
+        let row_fraction = row_scaled % new_rows;
+        let col_scaled = new_col_edge * old_cols;
+        let full_cols = col_scaled / new_cols;
+        let col_fraction = col_scaled % new_cols;
+
+        let mut total = prefix_at(full_rows, full_cols) * new_count_u;
+        if col_fraction != 0 {
+            let column_sum = prefix_at(full_rows, full_cols + 1) - prefix_at(full_rows, full_cols);
+            total += column_sum
+                * u128::from(new_rows as u32)
+                * u128::from(u32::try_from(col_fraction).expect("u16-bounded fraction"));
+        }
+        if row_fraction != 0 {
+            let row_sum = prefix_at(full_rows + 1, full_cols) - prefix_at(full_rows, full_cols);
+            total += row_sum
+                * u128::from(u32::try_from(row_fraction).expect("u16-bounded fraction"))
+                * u128::from(new_cols as u32);
+        }
+        if row_fraction != 0 && col_fraction != 0 {
+            let corner = u128::from(old_nanos[full_rows * old_cols + full_cols]);
+            total += corner
+                * u128::from(u32::try_from(row_fraction).expect("u16-bounded fraction"))
+                * u128::from(u32::try_from(col_fraction).expect("u16-bounded fraction"));
+        }
+        total
+    };
+
+    let mut new_nanos = Vec::with_capacity(new_count);
+    let mut fractional_remainders = Vec::with_capacity(new_count);
+    let mut floor_total = 0_u128;
+    for new_r in 0..new_rows {
+        for new_c in 0..new_cols {
+            let right_strip =
+                cumulative_numerator(new_r + 1, new_c + 1) - cumulative_numerator(new_r, new_c + 1);
+            let left_strip =
+                cumulative_numerator(new_r + 1, new_c) - cumulative_numerator(new_r, new_c);
+            let numerator = right_strip - left_strip;
+            let floor = numerator / new_count_u;
+            floor_total += floor;
+            new_nanos.push(floor);
+            fractional_remainders.push(numerator % new_count_u);
+        }
+    }
+
+    hamilton_distribute(
+        &mut new_nanos,
+        &fractional_remainders,
+        old_total_nanos,
+        floor_total,
+        new_count,
+    );
+    new_nanos
+}
+
 impl WearLedger {
     /// Create a new, all-zero ledger for `identity` with a `rows` × `cols`
     /// grid, baselined at `now_epoch_s`.
@@ -284,17 +480,31 @@ impl WearLedger {
             .collect()
     }
 
-    /// Resize the grid to `rows` × `cols`, redistributing existing wear by
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss,
+        reason = "f64 wear is intentionally quantized to bounded nanoseconds; the f64->u64 cast clamps the residual to zero"
+    )]
+    /// Resize the grid to `rows` x `cols`, redistributing existing wear by
     /// spatial density rather than flattening the total evenly.
     ///
     /// Each old cell is treated as a unit-area rectangle holding a uniform
     /// wear density (`wear_hours` per unit area); the new grid is laid over
-    /// the same `[0, rows) × [0, cols)` unit-normalized rectangle and each
-    /// new cell's wear is the area-weighted overlap integral against every
-    /// old cell it intersects. This conserves `total_on_hours` exactly (by
-    /// construction — overlap areas partition the old cells) while
-    /// preserving *where* the wear was, which flat `total / (rows * cols)`
-    /// redistribution would destroy.
+    /// the same `[0, 1] x [0, 1]` unit-normalized rectangle and each new
+    /// cell's wear is the area-weighted overlap integral against every old
+    /// cell it intersects.
+    ///
+    /// # Conservation invariant
+    ///
+    /// The conserved quantity is the integer nanosecond total, and is exact
+    /// (Hamilton's largest-remainder guarantee + a full-sum assert). The
+    /// f64 cell sum is then reconstructed from the integer vector; it
+    /// matches the pre-resize sum to within 1 ULP of `f64` (the difference
+    /// is the sub-nanosecond residual absorbed by the last cell, which is
+    /// clamped to non-negative). The wear ledger is the product's core
+    /// data asset, and a config edit that silently drops sub-hour units on
+    /// every resize violates conservation (issue #196 / swarm P2-6).
     pub fn resize_grid(&mut self, rows: u16, cols: u16) {
         let old_rows = usize::from(self.grid_rows);
         let old_cols = usize::from(self.grid_cols);
@@ -305,64 +515,22 @@ impl WearLedger {
             self.grid_rows = rows;
             self.grid_cols = cols;
             self.cells = vec![WearCell { wear_hours: 0.0 }; new_rows * new_cols];
-            // Empty grid ⇒ no wear representable: keep the "cells sum ≈
-            // total" invariant intact rather than leaving a stale total
-            // that no cell can account for.
+            // An empty grid has no cell in which prior wear can be represented.
             self.total_on_hours = 0.0;
             return;
         }
-
-        // Old cell (r, c) occupies the unit-normalized rectangle
-        // [c/old_cols, (c+1)/old_cols) x [r/old_rows, (r+1)/old_rows), and
-        // holds wear_hours as its total content (density = wear_hours,
-        // since old cell area in the unit-normalized space is
-        // (1/old_cols) * (1/old_rows)).
-        // Loop indices are all bounded by u16 grid dimensions, so the
-        // usize -> u32 -> f64 conversion chain below is exact (no
-        // `as`-cast precision loss).
-        let idx_f64 = |i: usize| -> f64 { f64::from(u32::try_from(i).unwrap_or(u32::MAX)) };
-
-        let row_scale_old = 1.0 / idx_f64(old_rows);
-        let col_scale_old = 1.0 / idx_f64(old_cols);
-        let row_scale_new = 1.0 / idx_f64(new_rows);
-        let col_scale_new = 1.0 / idx_f64(new_cols);
-
-        let mut new_cells = vec![WearCell { wear_hours: 0.0 }; new_rows * new_cols];
-
-        for old_r in 0..old_rows {
-            let old_top = idx_f64(old_r) * row_scale_old;
-            let old_bottom = old_top + row_scale_old;
-            for old_c in 0..old_cols {
-                let old_left = idx_f64(old_c) * col_scale_old;
-                let old_right = old_left + col_scale_old;
-                let old_wear = self.cells[old_r * old_cols + old_c].wear_hours;
-                if old_wear == 0.0 {
-                    continue;
-                }
-                let old_area = row_scale_old * col_scale_old;
-
-                for new_r in 0..new_rows {
-                    let new_top = idx_f64(new_r) * row_scale_new;
-                    let new_bottom = new_top + row_scale_new;
-                    let row_overlap = (old_bottom.min(new_bottom) - old_top.max(new_top)).max(0.0);
-                    if row_overlap <= 0.0 {
-                        continue;
-                    }
-                    for new_c in 0..new_cols {
-                        let new_left = idx_f64(new_c) * col_scale_new;
-                        let new_right = new_left + col_scale_new;
-                        let col_overlap =
-                            (old_right.min(new_right) - old_left.max(new_left)).max(0.0);
-                        if col_overlap <= 0.0 {
-                            continue;
-                        }
-                        let overlap_area = row_overlap * col_overlap;
-                        let fraction = overlap_area / old_area;
-                        new_cells[new_r * new_cols + new_c].wear_hours += old_wear * fraction;
-                    }
-                }
-            }
+        if old_rows == new_rows && old_cols == new_cols {
+            return;
         }
+
+        let old_sum: f64 = self.cells.iter().map(|cell| cell.wear_hours).sum();
+        let old_nanos: Vec<u64> = self
+            .cells
+            .iter()
+            .map(|cell| (cell.wear_hours * NANOS_PER_HOUR).round() as u64)
+            .collect();
+        let new_nanos = apportion_nanos(&old_nanos, old_rows, old_cols, new_rows, new_cols);
+        let new_cells = rebuild_wear_cells(&new_nanos, old_sum);
 
         self.grid_rows = rows;
         self.grid_cols = cols;
@@ -688,6 +856,64 @@ mod tests {
         assert_eq!(l.total_on_hours, 0.0);
     }
 
+    // ── #196 / P2-6: wear conservation across grid resize ──────────────────
+    //
+    // The wear ledger is the product's core data asset. A config edit that
+    // silently drops sub-hour units on every resize violates the conservation
+    // invariant the proptest claims to check — and round-trips (resize
+    // A→B→A) leak monotonically, so a single ±1e-6 tolerance masks the
+    // systematic drop. These tests pin EXACT sum conservation on
+    // representative cases and via proptest.
+
+    fn cell_sum(l: &WearLedger) -> f64 {
+        l.cells.iter().map(|c| c.wear_hours).sum()
+    }
+
+    #[test]
+    fn resize_grid_exact_sum_non_aligned_split() {
+        // 1×4 → 1×6 with uniform wear. Each old cell is split across
+        // two new cells with fractions 2/3 and 1/3 — `2.0/3.0` is not
+        // exactly representable in f64, so the per-cell products
+        // accumulate a sub-ULP drift and the reconstructed sum does
+        // not equal the original. The fix (Hamilton apportionment
+        // over integer nanoseconds, plus a last-cell correction to
+        // absorb the f64 conversion error) must close that gap.
+        let mut l = WearLedger::new(ident(), PanelType::Unknown, 1, 4, 0);
+        l.cells[0].wear_hours = 1.0;
+        l.cells[1].wear_hours = 1.0;
+        l.cells[2].wear_hours = 1.0;
+        l.cells[3].wear_hours = 1.0;
+        l.total_on_hours = 1.0;
+        let before = cell_sum(&l);
+        l.resize_grid(1, 6);
+        let after = cell_sum(&l);
+        assert_eq!(
+            after, before,
+            "non-aligned 1x4→1x6 split must exactly conserve sum (was {before}, now {after})"
+        );
+    }
+
+    #[test]
+    fn resize_grid_round_trip_exact_sum() {
+        // 1×4 → 1×6 → 1×4 round trip. Any systematic per-resize f64
+        // drift accumulates across the two resizes, so the round trip
+        // is strictly stricter than either leg alone.
+        let mut l = WearLedger::new(ident(), PanelType::Unknown, 1, 4, 0);
+        l.cells[0].wear_hours = 1.0;
+        l.cells[1].wear_hours = 1.0;
+        l.cells[2].wear_hours = 1.0;
+        l.cells[3].wear_hours = 1.0;
+        l.total_on_hours = 1.0;
+        let before = cell_sum(&l);
+        l.resize_grid(1, 6);
+        l.resize_grid(1, 4);
+        let after = cell_sum(&l);
+        assert_eq!(
+            after, before,
+            "1x4→1x6→1x4 round trip must exactly conserve sum (was {before}, now {after})"
+        );
+    }
+
     #[test]
     fn serde_round_trip_and_epoch_fields() {
         let mut l = WearLedger::new(ident(), PanelType::QdOled, 9, 16, 123);
@@ -787,13 +1013,21 @@ mod tests {
     }
 
     proptest::proptest! {
+        // #196 / P2-6: conservation is on the *sum* of cells (the panel's
+        // total recorded on-hours), not on `total_on_hours` (which is the
+        // per-cell mean and which `resize_grid` intentionally does not
+        // rewrite). The previous ±1e-6 tolerance on `total_on_hours` was
+        // a tautology — `resize_grid` leaves that field untouched — and
+        // also masked the systematic f64 drop in the cell-sum path. The
+        // invariant we actually need is sum(cells) is preserved exactly.
         #[test]
-        fn resize_conserves_total_prop(r1 in 1u16..12, c1 in 1u16..12, r2 in 1u16..12, c2 in 1u16..12, hours in 0.0f64..1000.0) {
+        fn resize_conserves_sum_prop(r1 in 1u16..12, c1 in 1u16..12, r2 in 1u16..12, c2 in 1u16..12, hours in 0.0f64..1000.0) {
             let mut l = WearLedger::new(ident(), PanelType::Unknown, r1, c1, 0);
             l.attribute_uniform(Duration::from_secs_f64(hours * 3600.0), 1.0);
-            let before = l.total_on_hours;
+            let before: f64 = l.cells.iter().map(|c| c.wear_hours).sum();
             l.resize_grid(r2, c2);
-            proptest::prop_assert!((l.total_on_hours - before).abs() < 1e-6);
+            let after: f64 = l.cells.iter().map(|c| c.wear_hours).sum();
+            proptest::prop_assert_eq!(after, before);
         }
     }
 }

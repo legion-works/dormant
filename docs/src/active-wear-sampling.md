@@ -112,6 +112,11 @@ To cancel a pending flow, close the session, and erase the record, run:
 dormantctl wear disable-sampling --forget
 ```
 
+Without `--forget`, `disable-sampling` closes the active portal session but
+retains its consent record; a later `enable-sampling` reattaches silently
+without opening a consent dialog. A pending consent flow remains disabled
+after cancellation, so enabling it again requires a saved consent record.
+
 The compositor grant can also be revoked outside dormant at **KDE System
 Settings → Applications → Screen Sharing permissions**. Revoking there makes
 the next attach fall back to uniform attribution and request consent only via
@@ -143,6 +148,8 @@ stale, suspended, denied, timed out, the circuit is open, or reattach
 validation fails. The fallback is tagged `uniform`; it does not block blank,
 wake, screensaver, reload, or shutdown paths. A changed `sampled_display` also
 invalidates the old consent and requires a fresh grant.
+When the cooldown retry itself fails, status retains the
+`wear_sampling_cooldown` reason while the saved portal session is renegotiated.
 
 The `wear-sampling` doctor probe is **live-only**. It runs from the web Doctor
 view or through the daemon's IPC service and checks the running sampler; there

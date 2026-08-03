@@ -651,6 +651,7 @@ fn run_warm_stream(
         capturing: false,
         frames,
     }));
+    let frames_for_state = state.borrow().frames.clone();
     let state_for_format = state.clone();
     let state_for_process = state.clone();
     let display_for_state = display_id.clone();
@@ -658,7 +659,12 @@ fn run_warm_stream(
     let stream_for_process = stream.clone();
     let _listener = stream
         .add_local_listener_with_user_data(())
-        .state_changed(move |_, (), _, state| log_stream_state(&state, &display_for_state))
+        .state_changed(move |_, (), _, state| {
+            log_stream_state(&state, &display_for_state);
+            if let Some(error) = stream_state_capture_error(&state) {
+                let _ = frames_for_state.try_send(Err(error));
+            }
+        })
         .param_changed(move |stream, (), id, param| {
             let Some(param) = param else { return };
             if id != pw::spa::param::ParamType::Format.as_raw() {
@@ -963,6 +969,17 @@ fn log_stream_state(state: &pw::stream::StreamState, display_id: &DisplayId) {
     }
 }
 
+fn stream_capture_error(error: impl std::fmt::Display) -> CaptureError {
+    CaptureError::Transport(format!("PipeWire stream: {error}"))
+}
+
+fn stream_state_capture_error(state: &pw::stream::StreamState) -> Option<CaptureError> {
+    match state {
+        pw::stream::StreamState::Error(error) => Some(stream_capture_error(error)),
+        _ => None,
+    }
+}
+
 fn acquire_one_frame(
     fd: OwnedFd,
     node_id: u32,
@@ -987,6 +1004,7 @@ fn acquire_one_frame(
     )
     .map_err(|error| CaptureError::Transport(format!("PipeWire stream: {error}")))?;
     let (reply, frame) = std::sync::mpsc::channel();
+    let reply_for_state = reply.clone();
     let loop_for_process = mainloop.clone();
     let display_for_state = display_id.clone();
     let display_for_format = display_id;
@@ -997,6 +1015,9 @@ fn acquire_one_frame(
         })
         .state_changed(move |_, _, _, stream_state| {
             log_stream_state(&stream_state, &display_for_state);
+            if let Some(error) = stream_state_capture_error(&stream_state) {
+                let _ = reply_for_state.send(Err(error));
+            }
         })
         .param_changed(move |stream, state, id, param| {
             let Some(param) = param else {
@@ -1853,6 +1874,17 @@ mod tests {
                 "missing display field: {line}"
             );
         }
+    }
+
+    #[test]
+    fn pipewire_stream_error_becomes_transport_capture_failure() {
+        let state = pw::stream::StreamState::Error("no target node available".to_owned());
+        assert_eq!(
+            stream_state_capture_error(&state),
+            Some(CaptureError::Transport(
+                "PipeWire stream: no target node available".to_owned()
+            ))
+        );
     }
 
     #[test]

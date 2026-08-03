@@ -530,5 +530,47 @@ describe("WearCard", () => {
       expect(nudges).toHaveLength(1);
       expect(within(nudges[0]).getByRole("button", { name: "Enable active sampling" })).toBeInTheDocument();
     });
+
+    it("shows the nudge only on the row whose own sampling status needs consent", async () => {
+      // Both rows are uniform, so wear_attribution_mode cannot be the
+      // discriminator: the ONLY difference is each row's own sampling status.
+      // Correct per-row logic reads perDisplayStatus[display_name] and nudges
+      // desk alone; a global bypass that reads one status for every row
+      // nudges both or neither.
+      mocks.getConfig.mockResolvedValue({ inventory: { wear: { active_sampling: { enabled: true } } } });
+      mocks.getWearSamplingStatusFor.mockImplementation((display: string) =>
+        Promise.resolve(
+          display === "desk"
+            ? { status: "error", reason: "wear_sampling_needs_consent" }
+            : { status: "ok", reason: null },
+        ),
+      );
+      mocks.postWearSamplingNudgeDismiss.mockResolvedValue(undefined);
+      mocks.getDaemon.mockResolvedValue({
+        pid: 1, started_epoch_s: 0, version: "test", socket: "/tmp/dormant.sock",
+        wear_sampling_supported: true,
+        wear_sampling_nudge_dismissed: false,
+      });
+      setState({
+        wear: {
+          displays: [
+            summary({ display_name: "desk", wear_attribution_mode: "uniform" }),
+            summary({ display_name: "tv", wear_attribution_mode: "uniform" }),
+          ],
+        },
+      });
+
+      render(<WearCard />);
+
+      await waitFor(() => expect(screen.getByText("desk")).toBeInTheDocument());
+      expect(screen.getByText("tv")).toBeInTheDocument();
+
+      const nudges = await screen.findAllByTestId("wear-sampling-nudge");
+      expect(nudges).toHaveLength(1);
+      const deskRow = screen.getByTestId("wear-row-desk");
+      expect(within(deskRow).getByTestId("wear-sampling-nudge")).toBeInTheDocument();
+      const tvRow = screen.getByTestId("wear-row-tv");
+      expect(within(tvRow).queryByTestId("wear-sampling-nudge")).not.toBeInTheDocument();
+    });
   });
 });

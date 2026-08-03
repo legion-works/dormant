@@ -293,6 +293,45 @@ fn publish_per_display_statuses(
     tx.send_replace(map);
 }
 
+/// Forward observed sampler-status changes to the legacy web-status channel
+/// and the per-display status watch channel. Extracted from
+/// [`spawn_active_sampler_runtime`] so the status-change publish path — the
+/// [`publish_per_display_statuses`] call fired on every `status_rx` change —
+/// is unit-testable without a live `PipeWire` portal: a test builds its own
+/// `watch::channel::<SamplerStatus>`, drives a change through the sender, and
+/// asserts the per-display map advances.
+#[cfg(target_os = "linux")]
+fn spawn_sampler_status_forwarder(
+    display_id: DisplayId,
+    mut status_rx: watch::Receiver<active_sampler::SamplerStatus>,
+    status_map: SamplerStatuses,
+    status_web: watch::Sender<Option<dormant_core::wear::WearSamplingStatus>>,
+    status_per_display_tx: watch::Sender<
+        std::collections::BTreeMap<String, dormant_core::wear::WearSamplingStatus>,
+    >,
+    status_cancel: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = status_cancel.cancelled() => break,
+                changed = status_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    publish_sampler_status(
+                        &status_map,
+                        &status_web,
+                        &display_id,
+                        Some(status_rx.borrow().clone()),
+                    );
+                    publish_per_display_statuses(&status_map, &status_per_display_tx);
+                }
+            }
+        }
+    })
+}
+
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 async fn spawn_active_sampler_runtime(
@@ -351,7 +390,7 @@ async fn spawn_active_sampler_runtime(
     if let Ok(mut registry) = registry.write() {
         registry.insert(display_id.clone(), handle.clone());
     }
-    let mut status_rx = handle.status();
+    let status_rx = handle.status();
     publish_sampler_status(
         statuses,
         web_status,
@@ -359,30 +398,14 @@ async fn spawn_active_sampler_runtime(
         Some(status_rx.borrow().clone()),
     );
     publish_per_display_statuses(statuses, per_display_statuses_tx);
-    let status_display = display_id.clone();
-    let status_map = statuses.clone();
-    let status_web = web_status.clone();
-    let status_per_display_tx = per_display_statuses_tx.clone();
-    let status_cancel = cancel.clone();
-    let status_join = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                () = status_cancel.cancelled() => break,
-                changed = status_rx.changed() => {
-                    if changed.is_err() {
-                        break;
-                    }
-                    publish_sampler_status(
-                        &status_map,
-                        &status_web,
-                        &status_display,
-                        Some(status_rx.borrow().clone()),
-                    );
-                    publish_per_display_statuses(&status_map, &status_per_display_tx);
-                }
-            }
-        }
-    });
+    let status_join = spawn_sampler_status_forwarder(
+        display_id.clone(),
+        status_rx,
+        statuses.clone(),
+        web_status.clone(),
+        per_display_statuses_tx.clone(),
+        cancel.clone(),
+    );
     Some(ActiveSamplerRuntime {
         updates,
         cancel,
@@ -423,8 +446,19 @@ async fn stop_active_sampler_runtime(
     if let Ok(mut grids) = latest_grids.write() {
         grids.remove(display_id);
     }
+    // Capture per-display status before publish_sampler_status removes it
+    // from `statuses` (None argument triggers statuses.remove(display_id)).
+    let per_display_capture = statuses
+        .read()
+        .ok()
+        .and_then(|s| s.get(display_id).cloned());
     publish_sampler_status(statuses, web_status, display_id, None);
-    publish_per_display_statuses(statuses, per_display_statuses_tx);
+    if let Some(captured) = per_display_capture {
+        let now = Tick::now();
+        let map =
+            std::collections::BTreeMap::from([(display_id.to_string(), captured.redacted(now))]);
+        per_display_statuses_tx.send_replace(map);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -917,8 +951,133 @@ mod active_sampler_reload_tests {
         .await;
         assert!(cancel_b.is_cancelled());
     }
-}
+    /// Verifies [`stop_active_sampler_runtime`] calls
+    /// [`publish_per_display_statuses`] so the per-display status watch
+    /// channel carries the removed display's redacted entry.
+    #[tokio::test]
+    async fn stop_active_sampler_runtime_publishes_per_display_status() {
+        let display_id = DisplayId("oled-test".to_owned());
+        let cancel = CancellationToken::new();
+        let runtime = fake_sampler_runtime(&cancel);
+        let latest_grids = active_sampler::new_latest_grids();
+        let statuses = active_sampler::new_sampler_statuses();
+        statuses
+            .write()
+            .unwrap()
+            .insert(display_id.clone(), test_sampler_status(&display_id.0));
+        let registry = Arc::new(std::sync::RwLock::new(BTreeMap::new()));
+        let (web_status, _) = watch::channel(None);
+        let (per_display_statuses_tx, per_display_statuses_rx) =
+            watch::channel(std::collections::BTreeMap::default());
 
+        stop_active_sampler_runtime(
+            &display_id,
+            runtime,
+            &latest_grids,
+            &registry,
+            &statuses,
+            &web_status,
+            &per_display_statuses_tx,
+        )
+        .await;
+
+        // The removed display's redacted SamplerStatus must appear in the
+        // per-display status map.
+        let map = per_display_statuses_rx.borrow();
+        assert!(
+            map.contains_key(&display_id.0),
+            "expected per-display status map to contain {display_id}, got {map:?}",
+            display_id = display_id.0,
+            map = map
+        );
+        let entry = map.get(&display_id.0).unwrap();
+        assert_eq!(entry.bound_display.as_ref(), Some(&display_id.0));
+    }
+
+    /// Verifies [`publish_per_display_statuses`] — the status-change publish
+    /// path inside the [`spawn_active_sampler_runtime`] status loop — sends
+    /// a redacted map through the supplied watch channel.
+    ///
+    /// This covers the initial spawn publish (app.rs:361) and the
+    /// status-change publish (app.rs:381) without requiring `PipeWire`.
+    #[tokio::test]
+    async fn publish_per_display_statuses_sends_redacted_map() {
+        use active_sampler::new_sampler_statuses;
+
+        let display_id = DisplayId("oled-pub".to_owned());
+        let statuses = new_sampler_statuses();
+        statuses
+            .write()
+            .unwrap()
+            .insert(display_id.clone(), test_sampler_status(&display_id.0));
+        let (tx, rx) = watch::channel(std::collections::BTreeMap::default());
+
+        publish_per_display_statuses(&statuses, &tx);
+
+        let map = rx.borrow();
+        assert!(
+            map.contains_key(&display_id.0),
+            "expected redacted map to contain {display_id}, got {map:?}",
+            display_id = display_id.0,
+            map = map
+        );
+    }
+
+    /// Drives a status change through the spawned status-forwarding loop
+    /// ([`spawn_sampler_status_forwarder`], extracted from
+    /// [`spawn_active_sampler_runtime`]) and asserts the per-display status
+    /// watch channel receives the redacted entry. Reds when the
+    /// `publish_per_display_statuses` call in the loop's `changed()` arm is
+    /// removed: the forwarder still updates the shared status map but never
+    /// publishes it, so the bounded wait times out.
+    #[tokio::test]
+    async fn status_forwarder_publishes_per_display_status_on_change() {
+        use active_sampler::SamplingState;
+        use tokio::time::{Duration, timeout};
+
+        let display_id = DisplayId("oled-fwd".to_owned());
+        let (status_tx, status_rx) = watch::channel(test_sampler_status(&display_id.0));
+        let statuses = active_sampler::new_sampler_statuses();
+        let (web_status, _web_rx) = watch::channel(None);
+        let (per_display_statuses_tx, mut per_display_statuses_rx) =
+            watch::channel(std::collections::BTreeMap::default());
+        let cancel = CancellationToken::new();
+
+        let status_join = spawn_sampler_status_forwarder(
+            display_id.clone(),
+            status_rx,
+            statuses,
+            web_status,
+            per_display_statuses_tx,
+            cancel.clone(),
+        );
+
+        // Drive a status change the forwarder observes via its watch receiver.
+        let mut changed = test_sampler_status(&display_id.0);
+        changed.state = SamplingState::Suspended;
+        status_tx.send_replace(changed);
+
+        // Bounded wait: the forwarder must publish the redacted per-display map.
+        // `wait_for` checks the current value, then waits for changes, so it
+        // returns only when the forwarded entry actually lands — no race on
+        // scheduler ordering. Reds (times out) when the `publish_per_display_statuses`
+        // call is removed, since the forwarder then never sends on this channel.
+        let map = timeout(
+            Duration::from_millis(500),
+            per_display_statuses_rx.wait_for(|m| m.contains_key(&display_id.0)),
+        )
+        .await
+        .expect("per-display status watch must receive the forwarded change")
+        .expect("per-display status watch closed");
+        let entry = map.get(&display_id.0).unwrap();
+        assert_eq!(entry.bound_display.as_ref(), Some(&display_id.0));
+
+        cancel.cancel();
+        let _ = timeout(Duration::from_millis(500), status_join)
+            .await
+            .expect("status forwarder must exit on cancel");
+    }
+}
 #[cfg(feature = "render")]
 #[allow(clippy::cast_possible_truncation)]
 fn runtime_seed() -> u64 {

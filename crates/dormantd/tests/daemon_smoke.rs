@@ -6417,7 +6417,7 @@ async fn activity_follow_replaces_task_on_reload_no_stale_generation() {
                 available: true,
                 edge_seq: seq,
             });
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
         }
     });
     fs::write(&config_path, activity_follow_config("beta", &paths.marker)).expect("rewrite config");

@@ -189,6 +189,23 @@ pub struct CoordinationConfig {
     #[serde(default = "default_coordination_loss_confirmations")]
     pub loss_confirmations: u32,
 
+    /// Number of consecutive failed input-source reads before an on-demand
+    /// controller re-probe is attempted. This heals stale DDC/CI state after a
+    /// display hotplug without re-probing on every transient read failure.
+    #[serde(default = "default_coordination_reprobe_failure_threshold")]
+    pub reprobe_failure_threshold: u32,
+
+    /// Minimum interval between on-demand controller re-probes after failed
+    /// input-source reads. Failed attempts exponentially back off to the
+    /// policy cap [`defaults::COORDINATION_REPROBE_MAX_INTERVAL`]; a
+    /// successful read resets the next delay to this floor while retaining the
+    /// last-attempt timestamp across flap boundaries.
+    #[serde(
+        default = "default_coordination_reprobe_interval",
+        with = "humantime_serde"
+    )]
+    pub reprobe_interval: Duration,
+
     /// Whether local activity edges automatically pull a shared display.
     #[serde(default = "default_activity_follow")]
     pub activity_follow: bool,
@@ -208,6 +225,8 @@ impl Default for CoordinationConfig {
             poll_interval: defaults::COORDINATION_POLL_INTERVAL,
             state_poll_interval: None,
             loss_confirmations: defaults::COORDINATION_LOSS_CONFIRMATIONS,
+            reprobe_failure_threshold: defaults::COORDINATION_REPROBE_FAILURE_THRESHOLD,
+            reprobe_interval: defaults::COORDINATION_REPROBE_INTERVAL,
             activity_follow: defaults::ACTIVITY_FOLLOW,
             arm_after: defaults::ARM_AFTER,
             cooldown: defaults::COOLDOWN,
@@ -1866,6 +1885,14 @@ fn default_coordination_loss_confirmations() -> u32 {
     defaults::COORDINATION_LOSS_CONFIRMATIONS
 }
 
+fn default_coordination_reprobe_failure_threshold() -> u32 {
+    defaults::COORDINATION_REPROBE_FAILURE_THRESHOLD
+}
+
+fn default_coordination_reprobe_interval() -> Duration {
+    defaults::COORDINATION_REPROBE_INTERVAL
+}
+
 fn default_activity_follow() -> bool {
     defaults::ACTIVITY_FOLLOW
 }
@@ -2916,6 +2943,8 @@ idle_source = "macos"
         );
         // loss_confirmations default — defends against issue #134 garbled reads.
         assert_eq!(cfg.coordination.loss_confirmations, 3);
+        assert_eq!(cfg.coordination.reprobe_failure_threshold, 3);
+        assert_eq!(cfg.coordination.reprobe_interval, Duration::from_secs(30));
         assert_eq!(cfg.coordination.arm_after, Duration::from_secs(7));
         assert_eq!(cfg.coordination.cooldown, Duration::from_secs(3));
     }
@@ -2923,7 +2952,7 @@ idle_source = "macos"
     #[test]
     fn coordination_parses_surviving_fields() {
         let cfg: Config = toml::from_str(
-            "config_version = 1\n[coordination]\npoll_interval = \"3s\"\nstate_poll_interval = \"30s\"\nactivity_follow = true\narm_after = \"5s\"\ncooldown = \"10s\"\n",
+            "config_version = 1\n[coordination]\npoll_interval = \"3s\"\nstate_poll_interval = \"30s\"\nloss_confirmations = 4\nreprobe_failure_threshold = 5\nreprobe_interval = \"45s\"\nactivity_follow = true\narm_after = \"5s\"\ncooldown = \"10s\"\n",
         )
         .unwrap();
 
@@ -2933,6 +2962,9 @@ idle_source = "macos"
             cfg.coordination.state_poll_interval,
             Some(Duration::from_secs(30))
         );
+        assert_eq!(cfg.coordination.loss_confirmations, 4);
+        assert_eq!(cfg.coordination.reprobe_failure_threshold, 5);
+        assert_eq!(cfg.coordination.reprobe_interval, Duration::from_secs(45));
         assert_eq!(cfg.coordination.arm_after, Duration::from_secs(5));
         assert_eq!(cfg.coordination.cooldown, Duration::from_secs(10));
     }

@@ -43,6 +43,8 @@ const HELP: Record<string, string> = {
   poll_interval: "How often the daemon polls the panel's input code (VCP 0x60). Minimum 1s.",
   state_poll_interval: "How often coordination state is refreshed. Defaults to max(30s, poll_interval) when unset; must be ≥ poll_interval.",
   loss_confirmations: "Number of consecutive poll results that report the peer's code before the daemon concedes ownership. 1–10.",
+  reprobe_failure_threshold: "Number of consecutive failed input reads before on-demand DDC healing. 1–10; defaults to 3.",
+  reprobe_interval: "Floor between DDC healing attempts. Failed attempts back off to 60s then 120s; the first successful read resets this floor.",
   activity_follow: "When true, a local keystroke/mouse event pulls the panel to this machine automatically.",
   arm_after: "How long after the last local activity the follow-bind arms. Disabled when activity_follow is false.",
   cooldown: "Cooldown after a successful pull before the next pull is accepted. Activity pulls only — hotkey/CLI/tray/web bypass this.",
@@ -66,6 +68,10 @@ export default function CoordinationSection({ coordination = {}, store, onDirty,
     ?? coordination.state_poll_interval ?? "";
   const lossConfirmations = (store.getEdit([...root, "loss_confirmations"]) as number | undefined)
     ?? coordination.loss_confirmations ?? 3;
+  const reprobeFailureThreshold = (store.getEdit([...root, "reprobe_failure_threshold"]) as number | undefined)
+    ?? coordination.reprobe_failure_threshold ?? 3;
+  const reprobeInterval = (store.getEdit([...root, "reprobe_interval"]) as string | undefined)
+    ?? coordination.reprobe_interval ?? "30s";
   const activityFollow = (store.getEdit([...root, "activity_follow"]) as boolean | undefined)
     ?? coordination.activity_follow ?? false;
   const armAfter = (store.getEdit([...root, "arm_after"]) as string | undefined)
@@ -80,6 +86,9 @@ export default function CoordinationSection({ coordination = {}, store, onDirty,
   const lossError = typeof lossConfirmations === "number"
     && (lossConfirmations < 1 || lossConfirmations > 10)
     ? `must be 1–10, got ${lossConfirmations}` : undefined;
+  const reprobeThresholdError = typeof reprobeFailureThreshold === "number"
+    && (reprobeFailureThreshold < 1 || reprobeFailureThreshold > 10)
+    ? `must be 1–10, got ${reprobeFailureThreshold}` : undefined;
 
   function edit(key: string, value: unknown) {
     store.trackEdit([...root, key], value);
@@ -141,12 +150,26 @@ export default function CoordinationSection({ coordination = {}, store, onDirty,
           </button>
 
           {showAdvanced && (
-            <div className="cf-field cf-field--row" data-field-id="coordination.state_poll_interval">
-              <DurationField path={[...root, "state_poll_interval"]} label="state_poll_interval"
-                value={statePollInterval} locked={false} help={HELP.state_poll_interval}
-                placeholder="max(30s, poll_interval)" error={fieldErrors["coordination.state_poll_interval"]}
-                onEdit={(_, v) => edit("state_poll_interval", v)} />
-            </div>
+            <>
+              <div className="cf-field cf-field--row" data-field-id="coordination.state_poll_interval">
+                <DurationField path={[...root, "state_poll_interval"]} label="state_poll_interval"
+                  value={statePollInterval} locked={false} help={HELP.state_poll_interval}
+                  placeholder="max(30s, poll_interval)" error={fieldErrors["coordination.state_poll_interval"]}
+                  onEdit={(_, v) => edit("state_poll_interval", v)} />
+              </div>
+              <div className="cf-field cf-field--row" data-field-id="coordination.reprobe_failure_threshold">
+                <NumberField path={[...root, "reprobe_failure_threshold"]} label="reprobe_failure_threshold"
+                  value={reprobeFailureThreshold} locked={false} help={HELP.reprobe_failure_threshold}
+                  error={reprobeThresholdError ?? fieldErrors["coordination.reprobe_failure_threshold"]} placeholder="3"
+                  onEdit={(_, v) => edit("reprobe_failure_threshold", v)} />
+              </div>
+              <div className="cf-field cf-field--row" data-field-id="coordination.reprobe_interval">
+                <DurationField path={[...root, "reprobe_interval"]} label="reprobe_interval"
+                  value={reprobeInterval} locked={false} help={HELP.reprobe_interval} placeholder="30s"
+                  error={fieldErrors["coordination.reprobe_interval"]}
+                  onEdit={(_, v) => edit("reprobe_interval", v)} />
+              </div>
+            </>
           )}
         </div>
       </div>

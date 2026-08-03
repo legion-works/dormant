@@ -333,6 +333,18 @@ pub trait CommandSink: Send + Sync {
         Ok(None)
     }
 
+    /// Re-probe the composed controller chain after sustained input-read
+    /// failures. Sinks without a re-probeable hardware path retain the
+    /// default unsupported result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the sink has no re-probeable controller or all
+    /// controller re-probes fail.
+    async fn reprobe(&self) -> Result<(), String> {
+        Err("command sink does not support reprobe".to_string())
+    }
+
     /// Select the active input-source code through the controller chain.
     ///
     /// Default returns the stable unsupported result because a bare command
@@ -511,6 +523,7 @@ mod tests {
             "default read_state_sampled must delegate to read_state"
         );
         assert_eq!(s.read_usage_hours().await, None);
+        assert!(s.reprobe().await.is_err());
         let error = s
             .write_input_source(InputSourceTarget {
                 write_code: 0x12,

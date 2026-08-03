@@ -133,6 +133,22 @@ pub const COORDINATION_STATE_POLL_INTERVAL: Duration = Duration::from_secs(30);
 /// all) and `<= 10` (a defensive upper bound; production defaults are small).
 pub const COORDINATION_LOSS_CONFIRMATIONS: u32 = 3;
 
+/// Number of consecutive failed shared-display input reads before the daemon
+/// attempts an on-demand controller re-probe. A sustained transport failure
+/// warrants healing; transient DDC contention does not.
+pub const COORDINATION_REPROBE_FAILURE_THRESHOLD: u32 = 3;
+
+/// Minimum interval between on-demand shared-display controller re-probes
+/// after input-read failures. The delay prevents an unreachable panel from
+/// turning the ownership poll into a re-probe storm.
+pub const COORDINATION_REPROBE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Hard cap for the exponential backoff applied after repeated failed
+/// coordination re-probes. This is policy, not an operator knob: it bounds
+/// recovery latency while preventing an unplugged display from causing a
+/// re-probe storm indefinitely.
+pub const COORDINATION_REPROBE_MAX_INTERVAL: Duration = Duration::from_secs(120);
+
 /// Timeout for one shared-display hook action.
 pub const HOOK_TIMEOUT: Duration = Duration::from_secs(5);
 

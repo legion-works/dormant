@@ -835,6 +835,24 @@ impl CommandSink for DisplayExecutor {
         }
     }
 
+    /// Re-probe every controller in the chain once so a stale transport handle
+    /// can be rebuilt without issuing a blank or wake command.
+    async fn reprobe(&self) -> Result<(), String> {
+        let mut last_error = None;
+        let mut succeeded = false;
+        for controller in &self.chain {
+            match controller.reprobe().await {
+                Ok(()) => succeeded = true,
+                Err(error) => last_error = Some(format!("{}: {error}", controller.name())),
+            }
+        }
+        if succeeded {
+            Ok(())
+        } else {
+            Err(last_error.unwrap_or_else(|| "display chain has no controllers".to_string()))
+        }
+    }
+
     /// Select the input source through the first controller that exposes a
     /// write surface. Unsupported controllers are skipped; an I/O failure
     /// from the selected writer is final so claim orchestration can retain

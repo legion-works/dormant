@@ -575,6 +575,8 @@ export interface CoordinationConfig {
   poll_interval?: string;
   state_poll_interval?: string;
   loss_confirmations?: number;
+  reprobe_failure_threshold?: number;
+  reprobe_interval?: string;
   activity_follow?: boolean;
   arm_after?: string;
   cooldown?: string;

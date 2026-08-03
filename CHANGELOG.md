@@ -4,7 +4,42 @@ All notable changes to `dormant` are recorded here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims at [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.11.0] - 2026-08-04
+
+### Highlights
+
+**Wake-path hardening** — several paths could report a successful wake while leaving the panel dark. They now confirm the panel actually came back, or fail loudly.
+
+**Displays recover from being unplugged** — replugging a monitor used to leave the daemon polling a dead DDC handle until it was restarted. It now heals itself, typically within a couple of seconds. See [the Multi-machine chapter](./docs/src/multi-machine.md).
+
+**Active wear sampling** — opt in to content-weighted OLED wear tracking from the KDE Wayland compositor, on one display or several. See [the Active wear sampling chapter](./docs/src/active-wear-sampling.md).
+
+### Added
+
+- Active wear sampling captures one compositor frame per wear tick, reduces it to a luma grid, and weights panel exposure by what was actually on screen. Capture that is unavailable or stale falls back to uniform attribution rather than guessing.
+- `[wear.active_sampling].sampled_displays` samples several displays at once. Each gets its own consent record, capture stream, and lifecycle, so one display's portal failure does not disturb another. `dormantctl wear enable-sampling --display <id>` picks a target; existing single-display configs keep working unchanged and carry their consent over without a new prompt.
+
+### Changed
+
+- `dormantctl blank` performs a soft blank by default, walking the configured render ladder. `--hard` powers the panel off and prompts first on a terminal; `--yes` skips the prompt for scripts.
+- The wear heat map is scaled against the panel's own mean rather than its min and max, so a healthy panel with small variation no longer renders as a wall of red. Hovering a cell reports its coordinates, hours, and deviation from the mean.
+- The Web UI receives operation status over the existing event stream instead of polling once a second.
+
+### Fixed
+
+- A failed DDC power-on during a `brightness_zero` wake was discarded, so `wake()` reported success while the panel stayed off. The failure now propagates and the wake retries escalate as intended.
+- Samsung wake checked whether the TV was reachable immediately after sending Wake-on-LAN, before it had time to power on. It now waits for the panel to answer.
+- A dropped Samsung `KEY_RETURN` went unnoticed because the TV's REST endpoint reports `on` during picture-off. Wake confirmation now uses socket liveness, with the REST state kept only as a supplementary standby check.
+- When a display controller chain healed itself after an I/O failure, the recorded blank owner was left stale, so a later wake could try the wrong controller first.
+- Shared-display ownership polling heals stale DDC/CI state after a display hotplug without restarting the daemon. Healing waits for repeated failures and backs off progressively, so an unreachable panel does not cause a re-probe storm.
+- Active wear sampling renegotiates its portal session after persistent capture failures, including recovery from a display hotplug. `disable-sampling` without `--forget` can now be undone with `enable-sampling` and no second consent dialog. A tripped capture breaker keeps its own `wear_sampling_cooldown` status while it renegotiates, so it stays distinguishable from a portal that was never reachable.
+- Wear attribution measures elapsed time on a monotonic clock. A backward system-clock step no longer produces zero-length exposure spans.
+- Resizing a wear grid apportions hours exactly instead of dividing in floating point, so total accumulated wear is conserved across a grid dimension change.
+- A redundant request to enable active sampling while it was already running tripped a debug assertion, and in release builds silently destroyed the live capture session. It is now rejected at the command boundary.
+- MQTT subscriptions are issued once per broker connection acknowledgement, so a reconnect no longer accumulates duplicate subscription batches.
+- Malformed MQTT broker URLs — empty host, a non-numeric port such as `host:1883x`, an unclosed bracket — are rejected instead of silently connecting somewhere unintended. Bare and bracketed IPv6 forms both resolve correctly.
+- A retained `online` availability signal is bounded by the sensor's `stale_timeout`. A sensor that publishes `online` and then goes silent is demoted to unavailable, so a dead broker cannot hold stale presence open forever. Zone policy still treats unavailable as present.
+- `upsert_samsung_token` serializes its read, edit, write and rename through a per-path lock, creates its temporary file with `create_new(true)` and `O_NOFOLLOW` on Unix, and uses a unique sibling name, so two concurrent calls cannot clobber each other.
 
 ## [0.10.0] - 2026-07-31
 

@@ -2,7 +2,7 @@
 //! socket with a fake control loop, then connect as a client and verify
 //! request/response round-trips.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -291,7 +291,7 @@ async fn setup_server() -> (
         dormant_core::reload::ReloadRequester::new(reload_tx),
         doctor,
         ds,
-        None,
+        Arc::new(std::sync::RwLock::new(BTreeMap::default())),
         cancel.clone(),
         std::sync::Arc::new(Vec::new),
     )
@@ -598,7 +598,7 @@ async fn socket_file_permissions_0600() {
         dormant_core::reload::ReloadRequester::new(reload_tx),
         doctor,
         ds,
-        None,
+        Arc::new(std::sync::RwLock::new(BTreeMap::default())),
         cancel.clone(),
         std::sync::Arc::new(Vec::new),
     )
@@ -639,7 +639,7 @@ async fn stale_socket_replacement() {
         dormant_core::reload::ReloadRequester::new(reload_tx),
         doctor,
         ds,
-        None,
+        Arc::new(std::sync::RwLock::new(BTreeMap::default())),
         cancel.clone(),
         std::sync::Arc::new(Vec::new),
     );
@@ -768,7 +768,7 @@ async fn setup_server_with_display(
         dormant_core::reload::ReloadRequester::new(reload_tx),
         doctor,
         ds,
-        None,
+        Arc::new(std::sync::RwLock::new(BTreeMap::default())),
         cancel.clone(),
         std::sync::Arc::new(Vec::new),
     )

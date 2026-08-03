@@ -6,8 +6,9 @@ use dormant_core::ipc_proto::WearSamplingStatus;
 use dormant_core::rules::{ControlMsg, DaemonEvent};
 use dormant_core::spatial_grid::LumaGrid;
 use dormant_core::state_machine::Phase;
-use dormant_core::types::Tick;
+use dormant_core::types::{DisplayId, Tick};
 use dormant_core::wear::{WearSamplingState, WearSamplingStatus as RedactedWearSamplingStatus};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -51,8 +52,17 @@ pub struct SampledGrid {
     pub phase_at_capture: Phase,
 }
 
-/// Most recent privacy-preserving sample shared with the wear tracker.
-pub type LatestGrid = Arc<RwLock<Option<SampledGrid>>>;
+/// Most recent privacy-preserving sample for every configured sampling display.
+pub type LatestGrids = Arc<RwLock<HashMap<DisplayId, SampledGrid>>>;
+
+/// Sampler command handles keyed by configured display id.
+pub type SamplerRegistry = BTreeMap<DisplayId, ActiveSamplerHandle>;
+
+/// Shared sampler registry used by daemon control surfaces across reloads.
+pub type SharedSamplerRegistry = Arc<RwLock<SamplerRegistry>>;
+
+/// Latest lifecycle status for every independently owned sampler.
+pub type SamplerStatuses = Arc<RwLock<BTreeMap<DisplayId, SamplerStatus>>>;
 
 /// Public lifecycle snapshot for future IPC and status consumers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,7 +104,7 @@ impl SamplerStatus {
     }
 }
 
-/// Sender and status subscription for the daemon's single sampler service.
+/// Sender and status subscription for one display's sampler service.
 #[derive(Clone)]
 pub struct ActiveSamplerHandle {
     command_tx: mpsc::Sender<SamplerCommand>,
@@ -188,10 +198,12 @@ pub struct ReconfigurePlan {
 pub struct ActiveSamplerDeps {
     /// Initial daemon configuration used before reload updates arrive.
     pub initial_config: Arc<Config>,
+    /// Display permanently owned by this sampler instance.
+    pub display_id: DisplayId,
     /// Reload and generation-context updates.
     pub update_rx: mpsc::Receiver<SamplerUpdate>,
-    /// Daemon-lifetime latest-value handoff to the wear tracker.
-    pub latest_grid: LatestGrid,
+    /// Daemon-lifetime keyed latest-value handoff to the wear tracker.
+    pub latest_grids: LatestGrids,
     /// Platform capture implementation.
     pub source: Box<dyn CaptureSource + Send + Sync + 'static>,
     /// Secure persisted portal-consent record path.
@@ -219,15 +231,21 @@ pub struct DisplaySamplingContext {
     pub stage_active: bool,
 }
 
-/// Allocate the daemon-lifetime latest-sample slot.
+/// Allocate the daemon-lifetime latest-sample map.
 #[must_use]
-pub fn new_latest_grid() -> LatestGrid {
-    Arc::new(RwLock::new(None))
+pub fn new_latest_grids() -> LatestGrids {
+    Arc::new(RwLock::new(HashMap::new()))
 }
 
-fn replace_latest(latest: &LatestGrid, sample: SampledGrid) {
-    if let Ok(mut slot) = latest.write() {
-        *slot = Some(sample);
+/// Allocate the daemon-lifetime sampler-status map.
+#[must_use]
+pub fn new_sampler_statuses() -> SamplerStatuses {
+    Arc::new(RwLock::new(BTreeMap::new()))
+}
+
+fn replace_latest(latest: &LatestGrids, display: &DisplayId, sample: SampledGrid) {
+    if let Ok(mut grids) = latest.write() {
+        grids.insert(display.clone(), sample);
     }
 }
 
@@ -344,14 +362,16 @@ struct Runtime {
 }
 
 impl Runtime {
-    fn new(config: &Config, consent_path: &std::path::Path) -> Self {
+    fn new(config: &Config, consent_path: &std::path::Path, display_id: &DisplayId) -> Self {
         let display = DisplaySamplingContext {
             display: config
                 .wear
                 .active_sampling
-                .first_sampled_display()
-                .map(|display| DisplayExpectation {
-                    display: display.to_owned(),
+                .selected_displays()
+                .iter()
+                .any(|display| display == &display_id.0)
+                .then(|| DisplayExpectation {
+                    display: display_id.0.clone(),
                 }),
             phase: Phase::Active,
             stage_active: true,
@@ -431,11 +451,16 @@ async fn connect(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the capture boundary keeps the sampler key beside its independently owned source, cadence, and cancellation state"
+)]
 async fn capture_one(
     source: &mut dyn CaptureSource,
     active: &ActiveSamplingConfig,
     phase: Phase,
-    latest: &LatestGrid,
+    latest: &LatestGrids,
+    display: &DisplayId,
     cancel: &CancellationToken,
     cadence: &mut tokio::time::Interval,
     reset_stream: bool,
@@ -459,7 +484,7 @@ async fn capture_one(
                     ) {
                         Ok(grid) => {
                             let captured_at = Tick::now();
-                            replace_latest(latest, SampledGrid {
+                            replace_latest(latest, display, SampledGrid {
                                 grid,
                                 captured_at,
                                 phase_at_capture: phase,
@@ -657,7 +682,11 @@ async fn handle_command(
             match outcome {
                 None => return false,
                 Some(Err(CaptureError::Timeout)) => {
-                    tracing::warn!(event = "wear_sampling_consent_failed", reason = "timeout");
+                    tracing::warn!(
+                        event = "wear_sampling_consent_failed",
+                        display = %runtime.display_name(),
+                        reason = "timeout"
+                    );
                     apply_trigger(runtime, Trigger::ConsentTimedOut, status_tx);
                     let _ = reply.send(ConsentFlowStatus::TimedOut);
                 }
@@ -673,6 +702,7 @@ async fn handle_command(
                     }
                     tracing::warn!(
                         event = "wear_sampling_consent_failed",
+                        display = %runtime.display_name(),
                         reason = ?error
                     );
                     let trigger = if matches!(error, CaptureError::Protocol(ref text) if text == WEAR_SAMPLING_WRONG_MONITOR)
@@ -710,6 +740,7 @@ async fn handle_command(
                             .ok();
                             tracing::info!(
                                 event = "wear_sampling_stage",
+                                display = %record.sampled_display,
                                 stage = "token_persisted"
                             );
                             let transition = apply_trigger(runtime, Trigger::Granted, status_tx);
@@ -901,7 +932,7 @@ async fn run(
     mut command_rx: mpsc::Receiver<SamplerCommand>,
     status_tx: watch::Sender<SamplerStatus>,
 ) {
-    let mut runtime = Runtime::new(&deps.initial_config, &deps.consent_path);
+    let mut runtime = Runtime::new(&deps.initial_config, &deps.consent_path, &deps.display_id);
     runtime.event_tx = deps.event_tx.take();
     // Push the configured per-capture deadline into the platform source at
     // startup so the inner warm-mode bound is in lockstep with the daemon
@@ -1035,7 +1066,8 @@ async fn run(
                     &mut *deps.source,
                     &runtime.active,
                     runtime.display.phase.clone(),
-                    &deps.latest_grid,
+                    &deps.latest_grids,
+                    &deps.display_id,
                     &deps.cancel,
                     &mut cadence,
                     std::mem::take(&mut runtime.pending_stream_reset),
@@ -1062,7 +1094,7 @@ async fn run(
                     () = tokio::time::sleep(runtime.active.circuit_reset_after) => {
                         let transition = apply_trigger(&mut runtime, Trigger::CooldownElapsed, &status_tx);
                         debug_assert!(transition.effects.contains(&Effect::Capture), "only CooldownElapsed may schedule a cooldown retry");
-                        let attempt = capture_one(&mut *deps.source, &runtime.active, runtime.display.phase.clone(), &deps.latest_grid, &deps.cancel, &mut cadence, std::mem::take(&mut runtime.pending_stream_reset)).await;
+                        let attempt = capture_one(&mut *deps.source, &runtime.active, runtime.display.phase.clone(), &deps.latest_grids, &deps.display_id, &deps.cancel, &mut cadence, std::mem::take(&mut runtime.pending_stream_reset)).await;
                         match attempt {
                             CaptureOutcome::Cancelled => break,
                             CaptureOutcome::Ok(captured_at) => { runtime.failures = 0; runtime.episode_warned.clear(); apply_trigger(&mut runtime, Trigger::CaptureOk, &status_tx); publish_status(&status_tx, &runtime, None, Some(captured_at)); }
@@ -1676,9 +1708,11 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn active_sampler_latest_replaces_capture_results() {
-        let latest = new_latest_grid();
+        let latest = new_latest_grids();
+        let display = DisplayId("oled".to_owned());
         replace_latest(
             &latest,
+            &display,
             SampledGrid {
                 grid: dormant_core::spatial_grid::LumaGrid::new(vec![0.1; 16 * 9]).unwrap(),
                 captured_at: dormant_core::types::Tick::now(),
@@ -1687,6 +1721,7 @@ mod tests {
         );
         replace_latest(
             &latest,
+            &display,
             SampledGrid {
                 grid: dormant_core::spatial_grid::LumaGrid::new(vec![0.9; 16 * 9]).unwrap(),
                 captured_at: dormant_core::types::Tick::now(),
@@ -1694,7 +1729,7 @@ mod tests {
             },
         );
 
-        let sample = latest.read().unwrap().clone().unwrap();
+        let sample = latest.read().unwrap().get(&display).cloned().unwrap();
         assert_eq!(sample.grid.cells, vec![0.9; 16 * 9]);
     }
 
@@ -1704,7 +1739,7 @@ mod tests {
         let consent_path = dir.path().join("consent.json");
         test_record(&consent_path);
         let config = active_config(Duration::from_secs(10));
-        let mut runtime = Runtime::new(&config, &consent_path);
+        let mut runtime = Runtime::new(&config, &consent_path, &DisplayId("oled".to_owned()));
         let (status_tx, _) = watch::channel(initial_status(&config));
 
         let transition = apply_update(
@@ -1747,6 +1782,7 @@ mod tests {
     #[derive(Clone)]
     enum TestCapture {
         Frame,
+        FrameValue(u8),
         Failure(CaptureError),
         Pending,
     }
@@ -1795,6 +1831,12 @@ mod tests {
                 .unwrap_or(TestCapture::Frame);
             match outcome {
                 TestCapture::Frame => Ok(test_frame()),
+                TestCapture::FrameValue(value) => Ok(RawFrame {
+                    rgba: vec![value; 16 * 9 * 4],
+                    width: 16,
+                    height: 9,
+                    stride: 16 * 4,
+                }),
                 TestCapture::Failure(error) => Err(error),
                 TestCapture::Pending => std::future::pending().await,
             }
@@ -1882,6 +1924,12 @@ mod tests {
                 .unwrap_or(TestCapture::Frame);
             match outcome {
                 TestCapture::Frame => Ok(test_frame()),
+                TestCapture::FrameValue(value) => Ok(RawFrame {
+                    rgba: vec![value; 16 * 9 * 4],
+                    width: 16,
+                    height: 9,
+                    stride: 16 * 4,
+                }),
                 TestCapture::Failure(error) => Err(error),
                 TestCapture::Pending => std::future::pending().await,
             }
@@ -1961,19 +2009,21 @@ mod tests {
         .unwrap();
     }
 
-    fn service_deps(
+    fn service_deps_for_with_grids(
+        display: &str,
         config: Arc<Config>,
         source: ServiceSource,
         consent_path: PathBuf,
         cancel: CancellationToken,
-    ) -> (ActiveSamplerDeps, mpsc::Sender<SamplerUpdate>, LatestGrid) {
-        let latest_grid = new_latest_grid();
+        latest_grids: LatestGrids,
+    ) -> (ActiveSamplerDeps, mpsc::Sender<SamplerUpdate>, LatestGrids) {
         let (update_tx, update_rx) = mpsc::channel(2);
         (
             ActiveSamplerDeps {
                 initial_config: config,
+                display_id: DisplayId(display.to_owned()),
                 update_rx,
-                latest_grid: latest_grid.clone(),
+                latest_grids: latest_grids.clone(),
                 source: Box::new(source),
                 consent_path,
                 cancel,
@@ -1981,8 +2031,284 @@ mod tests {
                 event_tx: None,
             },
             update_tx,
-            latest_grid,
+            latest_grids,
         )
+    }
+
+    fn service_deps_for(
+        display: &str,
+        config: Arc<Config>,
+        source: ServiceSource,
+        consent_path: PathBuf,
+        cancel: CancellationToken,
+    ) -> (ActiveSamplerDeps, mpsc::Sender<SamplerUpdate>, LatestGrids) {
+        service_deps_for_with_grids(
+            display,
+            config,
+            source,
+            consent_path,
+            cancel,
+            new_latest_grids(),
+        )
+    }
+
+    fn service_deps(
+        config: Arc<Config>,
+        source: ServiceSource,
+        consent_path: PathBuf,
+        cancel: CancellationToken,
+    ) -> (ActiveSamplerDeps, mpsc::Sender<SamplerUpdate>, LatestGrids) {
+        service_deps_for("oled", config, source, consent_path, cancel)
+    }
+
+    fn multi_active_config(interval: Duration) -> Arc<Config> {
+        let mut config = (*active_config(interval)).clone();
+        config.wear.active_sampling.sampled_display = None;
+        config.wear.active_sampling.sampled_displays =
+            vec!["oled-a".to_owned(), "oled-b".to_owned()];
+        Arc::new(config)
+    }
+
+    fn test_record_for(path: &std::path::Path, display: &str) {
+        crate::screencast_consent::store_atomic(
+            path,
+            &crate::screencast_consent::ConsentRecord {
+                token: format!("saved-{display}"),
+                sampled_display: display.to_owned(),
+                granted_at: OffsetDateTime::UNIX_EPOCH,
+                portal_persistent_ids: vec![format!("panel-{display}")],
+                granted_width: 16,
+                granted_height: 9,
+            },
+        )
+        .unwrap();
+    }
+
+    async fn wait_for_state(handle: &ActiveSamplerHandle, expected: SamplingState) {
+        let mut status = handle.status();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if status.borrow().state == expected {
+                    return;
+                }
+                status
+                    .changed()
+                    .await
+                    .expect("sampler status channel remains open");
+            }
+        })
+        .await
+        .expect("sampler reached expected state");
+    }
+
+    fn service_source(
+        captures: impl IntoIterator<Item = TestCapture>,
+    ) -> (
+        ServiceSource,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+    ) {
+        let captures_seen = Arc::new(AtomicUsize::new(0));
+        let closes_seen = Arc::new(AtomicUsize::new(0));
+        let grants_seen = Arc::new(AtomicUsize::new(0));
+        (
+            ServiceSource {
+                connects: Mutex::new(VecDeque::new()),
+                connects_seen: Arc::new(AtomicUsize::new(0)),
+                captures: Mutex::new(captures.into_iter().collect()),
+                captures_seen: captures_seen.clone(),
+                closes_seen: closes_seen.clone(),
+                grants_seen: grants_seen.clone(),
+            },
+            captures_seen,
+            closes_seen,
+            grants_seen,
+        )
+    }
+
+    #[tokio::test]
+    async fn two_selected_displays_open_independent_consent_flows_and_records() {
+        let dir = tempdir().unwrap();
+        let config = multi_active_config(Duration::from_secs(10));
+        let path_a = dir.path().join("consent-a.json");
+        let path_b = dir.path().join("consent-b.json");
+        let (source_a, _, _, grants_a) = service_source([TestCapture::Frame]);
+        let (source_b, _, _, grants_b) = service_source([TestCapture::Frame]);
+        let cancel_a = CancellationToken::new();
+        let cancel_b = CancellationToken::new();
+        let (deps_a, _, _) = service_deps_for(
+            "oled-a",
+            config.clone(),
+            source_a,
+            path_a.clone(),
+            cancel_a.clone(),
+        );
+        let (deps_b, _, _) =
+            service_deps_for("oled-b", config, source_b, path_b.clone(), cancel_b.clone());
+        let (handle_a, join_a) = spawn_with_handle(deps_a);
+        let (handle_b, join_b) = spawn_with_handle(deps_b);
+
+        let (reply_a_tx, reply_a_rx) = oneshot::channel();
+        handle_a
+            .send(SamplerCommand::Enable { reply: reply_a_tx })
+            .await
+            .unwrap();
+        let (reply_b_tx, reply_b_rx) = oneshot::channel();
+        handle_b
+            .send(SamplerCommand::Enable { reply: reply_b_tx })
+            .await
+            .unwrap();
+
+        assert_eq!(reply_a_rx.await.unwrap(), ConsentFlowStatus::Granted);
+        assert_eq!(reply_b_rx.await.unwrap(), ConsentFlowStatus::Granted);
+        assert_eq!(grants_a.load(Ordering::SeqCst), 1);
+        assert_eq!(grants_b.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            crate::screencast_consent::load(&path_a, "oled-a")
+                .unwrap()
+                .record()
+                .sampled_display,
+            "oled-a"
+        );
+        assert_eq!(
+            crate::screencast_consent::load(&path_b, "oled-b")
+                .unwrap()
+                .record()
+                .sampled_display,
+            "oled-b"
+        );
+
+        cancel_a.cancel();
+        cancel_b.cancel();
+        join_a.await.unwrap();
+        join_b.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn one_display_cooldown_does_not_move_the_other_sampler() {
+        let dir = tempdir().unwrap();
+        let config = multi_active_config(Duration::from_secs(10));
+        let path_a = dir.path().join("consent-a.json");
+        let path_b = dir.path().join("consent-b.json");
+        test_record_for(&path_a, "oled-a");
+        test_record_for(&path_b, "oled-b");
+        let (source_a, _, _, _) = service_source([TestCapture::Failure(CaptureError::Timeout)]);
+        let (source_b, _, _, _) = service_source([TestCapture::Frame]);
+        let cancel_a = CancellationToken::new();
+        let cancel_b = CancellationToken::new();
+        let (deps_a, _, _) =
+            service_deps_for("oled-a", config.clone(), source_a, path_a, cancel_a.clone());
+        let (deps_b, _, _) = service_deps_for("oled-b", config, source_b, path_b, cancel_b.clone());
+        let (handle_a, join_a) = spawn_with_handle(deps_a);
+        let (handle_b, join_b) = spawn_with_handle(deps_b);
+
+        wait_for_state(&handle_a, SamplingState::Cooldown).await;
+        wait_for_state(&handle_b, SamplingState::Streaming).await;
+        assert_eq!(handle_a.status().borrow().state, SamplingState::Cooldown);
+        assert_eq!(handle_b.status().borrow().state, SamplingState::Streaming);
+
+        cancel_a.cancel();
+        cancel_b.cancel();
+        join_a.await.unwrap();
+        join_b.await.unwrap();
+    }
+
+    /// Proves the production [`spawn_with_handle`] path gives each display an
+    /// independently owned cancellation token: cancelling sampler A must not
+    /// affect sampler B's liveliness.
+    #[tokio::test]
+    async fn sampler_runtime_lifecycles_are_independent() {
+        let dir = tempdir().unwrap();
+        let config = multi_active_config(Duration::from_secs(10));
+        let path_a = dir.path().join("consent-a.json");
+        let path_b = dir.path().join("consent-b.json");
+        test_record_for(&path_a, "oled-a");
+        test_record_for(&path_b, "oled-b");
+        let (source_a, _, _, _) = service_source([TestCapture::Frame]);
+        let (source_b, _, _, _) = service_source([TestCapture::Frame]);
+        let cancel_a = CancellationToken::new();
+        let cancel_b = CancellationToken::new();
+        let (deps_a, _, _) =
+            service_deps_for("oled-a", config.clone(), source_a, path_a, cancel_a.clone());
+        let (deps_b, _, _) = service_deps_for("oled-b", config, source_b, path_b, cancel_b.clone());
+        let (handle_a, join_a) = spawn_with_handle(deps_a);
+        let (handle_b, join_b) = spawn_with_handle(deps_b);
+
+        wait_for_state(&handle_a, SamplingState::Streaming).await;
+        wait_for_state(&handle_b, SamplingState::Streaming).await;
+
+        // Cancel A; B must remain live — its join handle must not be finished
+        // and its status must still show Streaming.
+        cancel_a.cancel();
+        let _ = tokio::time::timeout(Duration::from_millis(50), handle_a.status().changed())
+            .await
+            .expect("handle_a status should change after cancel");
+        assert_eq!(
+            handle_b.status().borrow().state,
+            SamplingState::Streaming,
+            "cancelling display A must not affect display B's sampler state"
+        );
+        assert!(
+            !join_b.is_finished(),
+            "display B's join must not finish when display A is cancelled"
+        );
+
+        cancel_b.cancel();
+        join_a.await.unwrap();
+        join_b.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn two_samplers_never_cross_deliver_latest_grids() {
+        let dir = tempdir().unwrap();
+        let config = multi_active_config(Duration::from_secs(10));
+        let path_a = dir.path().join("consent-a.json");
+        let path_b = dir.path().join("consent-b.json");
+        test_record_for(&path_a, "oled-a");
+        test_record_for(&path_b, "oled-b");
+        let (source_a, _, _, _) = service_source([TestCapture::FrameValue(32)]);
+        let (source_b, _, _, _) = service_source([TestCapture::FrameValue(224)]);
+        let cancel_a = CancellationToken::new();
+        let cancel_b = CancellationToken::new();
+        let latest_grids = new_latest_grids();
+        let (deps_a, _, _) = service_deps_for_with_grids(
+            "oled-a",
+            config.clone(),
+            source_a,
+            path_a,
+            cancel_a.clone(),
+            latest_grids.clone(),
+        );
+        let (deps_b, _, _) = service_deps_for_with_grids(
+            "oled-b",
+            config,
+            source_b,
+            path_b,
+            cancel_b.clone(),
+            latest_grids.clone(),
+        );
+        let (handle_a, join_a) = spawn_with_handle(deps_a);
+        let (handle_b, join_b) = spawn_with_handle(deps_b);
+
+        wait_for_state(&handle_a, SamplingState::Streaming).await;
+        wait_for_state(&handle_b, SamplingState::Streaming).await;
+        {
+            let grids = latest_grids.read().unwrap();
+            assert_eq!(grids.len(), 2);
+            let grid_a = grids
+                .get(&DisplayId("oled-a".to_owned()))
+                .expect("display A sample");
+            let grid_b = grids
+                .get(&DisplayId("oled-b".to_owned()))
+                .expect("display B sample");
+            assert_ne!(grid_a.grid, grid_b.grid);
+        }
+
+        cancel_a.cancel();
+        cancel_b.cancel();
+        join_a.await.unwrap();
+        join_b.await.unwrap();
     }
 
     #[test]
@@ -1990,7 +2316,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let config = active_config(Duration::from_secs(10));
         let (event_tx, mut event_rx) = mpsc::channel(4);
-        let mut runtime = Runtime::new(&config, &dir.path().join("consent.json"));
+        let mut runtime = Runtime::new(
+            &config,
+            &dir.path().join("consent.json"),
+            &DisplayId("oled".to_owned()),
+        );
         runtime.event_tx = Some(event_tx);
         let (status_tx, _) = watch::channel(initial_status(&config));
 
@@ -2011,7 +2341,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let config = active_config(Duration::from_secs(10));
         let (event_tx, mut event_rx) = mpsc::channel(4);
-        let mut runtime = Runtime::new(&config, &dir.path().join("consent.json"));
+        let mut runtime = Runtime::new(
+            &config,
+            &dir.path().join("consent.json"),
+            &DisplayId("oled".to_owned()),
+        );
         runtime.event_tx = Some(event_tx);
         let (status_tx, _) = watch::channel(SamplerStatus {
             state: SamplingState::Disabled,
@@ -2091,7 +2425,12 @@ mod tests {
         tokio::time::advance(Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
         assert_eq!(captures_seen.load(Ordering::SeqCst), 2);
-        assert!(latest.read().unwrap().is_some());
+        assert!(
+            latest
+                .read()
+                .unwrap()
+                .contains_key(&DisplayId("oled".to_owned()))
+        );
 
         cancel.cancel();
         join.await.unwrap();
@@ -2115,8 +2454,9 @@ mod tests {
         let (updates_tx, updates_rx) = mpsc::channel(2);
         let deps = ActiveSamplerDeps {
             initial_config: config.clone(),
+            display_id: DisplayId("oled".to_owned()),
             update_rx: updates_rx,
-            latest_grid: new_latest_grid(),
+            latest_grids: new_latest_grids(),
             source: Box::new(source),
             consent_path,
             cancel: cancel.clone(),
@@ -2496,7 +2836,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let consent_path = dir.path().join("consent.json");
         let config = active_config(Duration::from_secs(10));
-        let mut runtime = Runtime::new(&config, &consent_path);
+        let mut runtime = Runtime::new(&config, &consent_path, &DisplayId("oled".to_owned()));
         let (status_tx, _) = watch::channel(initial_status(&config));
         apply_trigger(&mut runtime, Trigger::GrantStarted, &status_tx);
         let mut source = ServiceSource {
@@ -2551,7 +2891,7 @@ mod tests {
             let dir = tempdir().unwrap();
             let consent_path = dir.path().join("consent.json");
             let config = active_config(Duration::from_secs(10));
-            let mut runtime = Runtime::new(&config, &consent_path);
+            let mut runtime = Runtime::new(&config, &consent_path, &DisplayId("oled".to_owned()));
             let (status_tx, _) = watch::channel(initial_status(&config));
             for trigger in *setup {
                 apply_trigger(&mut runtime, *trigger, &status_tx);
@@ -2609,7 +2949,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let consent_path = dir.path().join("consent.json");
         let config = active_config(Duration::from_secs(10));
-        let mut runtime = Runtime::new(&config, &consent_path);
+        let mut runtime = Runtime::new(&config, &consent_path, &DisplayId("oled".to_owned()));
         let (status_tx, _) = watch::channel(initial_status(&config));
         apply_trigger(
             &mut runtime,
@@ -2672,8 +3012,9 @@ mod tests {
         let cancel = CancellationToken::new();
         let (handle, join) = spawn_with_handle(ActiveSamplerDeps {
             initial_config: config,
+            display_id: DisplayId("oled".to_owned()),
             update_rx,
-            latest_grid: new_latest_grid(),
+            latest_grids: new_latest_grids(),
             source: Box::new(ScriptedCaptureSource::with_pending_consent()),
             consent_path,
             cancel: cancel.clone(),
@@ -2707,7 +3048,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let consent_path = dir.path().join("consent.json");
         let config = active_config(Duration::from_secs(10));
-        let mut runtime = Runtime::new(&config, &consent_path);
+        let mut runtime = Runtime::new(&config, &consent_path, &DisplayId("oled".to_owned()));
         let initial_state = runtime.state;
         let (status_tx, _) = watch::channel(initial_status(&config));
         let mut source = ScriptedCaptureSource::with_pending_consent();
@@ -2741,7 +3082,7 @@ mod tests {
         let consent_path = dir.path().join("consent.json");
         let mut config = (*active_config(Duration::from_secs(10))).clone();
         config.wear.active_sampling.enabled = false;
-        let mut runtime = Runtime::new(&config, &consent_path);
+        let mut runtime = Runtime::new(&config, &consent_path, &DisplayId("oled".to_owned()));
         let (status_tx, _) = watch::channel(initial_status(&config));
         let mut source = ScriptedCaptureSource::default();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -2771,7 +3112,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let consent_path = dir.path().join("consent.json");
         let config = active_config(Duration::from_secs(10));
-        let mut runtime = Runtime::new(&config, &consent_path);
+        let mut runtime = Runtime::new(&config, &consent_path, &DisplayId("oled".to_owned()));
         let (status_tx, _) = watch::channel(initial_status(&config));
         let mut source = ScriptedCaptureSource::with_pending_consent();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -2795,8 +3136,12 @@ mod tests {
 
         assert_eq!(reply_rx.await.unwrap(), ConsentFlowStatus::TimedOut);
         let log = traced_output(&buffer);
-        assert!(log.contains("wear_sampling_consent_failed"), "{log}");
-        assert!(log.contains("reason=\"timeout\""), "{log}");
+        let failure = log
+            .lines()
+            .find(|line| line.contains("wear_sampling_consent_failed"))
+            .expect("timeout failure log");
+        assert!(failure.contains("reason=\"timeout\""), "{failure}");
+        assert!(failure.contains("display=oled"), "{failure}");
     }
 
     #[tokio::test]
@@ -2804,7 +3149,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let consent_path = dir.path().join("consent.json");
         let config = active_config(Duration::from_secs(10));
-        let mut runtime = Runtime::new(&config, &consent_path);
+        let mut runtime = Runtime::new(&config, &consent_path, &DisplayId("oled".to_owned()));
         let (status_tx, _) = watch::channel(initial_status(&config));
         let mut source = ScriptedCaptureSource {
             grants: VecDeque::from([ScriptedOutcome::Ready(Err(CaptureError::ConsentDenied))]),
@@ -2834,7 +3179,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let consent_path = dir.path().join("consent.json");
         let config = active_config(Duration::from_secs(10));
-        let mut runtime = Runtime::new(&config, &consent_path);
+        let mut runtime = Runtime::new(&config, &consent_path, &DisplayId("oled".to_owned()));
         let (status_tx, _) = watch::channel(initial_status(&config));
         let mut source = ScriptedCaptureSource {
             grants: VecDeque::from([ScriptedOutcome::Ready(Err(CaptureError::Transport(
@@ -2863,8 +3208,14 @@ mod tests {
             ConsentFlowStatus::Error(WEAR_SAMPLING_CONSENT_TIMEOUT.to_owned())
         );
         let log = traced_output(&buffer);
-        assert!(log.contains("wear_sampling_consent_failed"), "{log}");
-        assert!(log.contains("open_pipewire_remote_timeout"), "{log}");
+        let failure = log
+            .lines()
+            .find(|line| {
+                line.contains("wear_sampling_consent_failed")
+                    && line.contains("open_pipewire_remote_timeout")
+            })
+            .expect("transport failure log");
+        assert!(failure.contains("display=oled"), "{failure}");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2872,7 +3223,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let consent_path = dir.path().join("consent.json");
         let config = active_config(Duration::from_secs(10));
-        let mut runtime = Runtime::new(&config, &consent_path);
+        let mut runtime = Runtime::new(&config, &consent_path, &DisplayId("oled".to_owned()));
         let (status_tx, _) = watch::channel(initial_status(&config));
         let mut stream = test_stream();
         stream.restore_token = "unlogged-rotated-token".to_owned();
@@ -2904,6 +3255,7 @@ mod tests {
         for stage in ["wear_sampling_stage", "token_persisted"] {
             assert!(log.contains(stage), "missing {stage} stage: {log}");
         }
+        assert!(log.contains("display=oled"), "{log}");
         assert!(!log.contains("unlogged-rotated-token"), "{log}");
     }
 
@@ -2913,7 +3265,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let consent_path = dir.path().join("consent.json");
         let config = active_config(Duration::from_secs(10));
-        let mut runtime = Runtime::new(&config, &consent_path);
+        let mut runtime = Runtime::new(&config, &consent_path, &DisplayId("oled".to_owned()));
         let (status_tx, _) = watch::channel(initial_status(&config));
         let mut stream = test_stream();
         stream.width = 3072;
@@ -2970,7 +3322,7 @@ mod tests {
         let consent_path = dir.path().join("consent.json");
         test_record(&consent_path);
         let config = active_config(Duration::from_secs(10));
-        let mut runtime = Runtime::new(&config, &consent_path);
+        let mut runtime = Runtime::new(&config, &consent_path, &DisplayId("oled".to_owned()));
         let (status_tx, _) = watch::channel(initial_status(&config));
         let mut source = ScriptedCaptureSource::default();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -3011,8 +3363,9 @@ mod tests {
         };
         let (handle, join) = spawn_with_handle(ActiveSamplerDeps {
             initial_config: config,
+            display_id: DisplayId("oled".to_owned()),
             update_rx,
-            latest_grid: new_latest_grid(),
+            latest_grids: new_latest_grids(),
             source: Box::new(source),
             consent_path: consent_path.clone(),
             cancel: cancel.clone(),
@@ -3130,8 +3483,9 @@ mod tests {
         let cancel = CancellationToken::new();
         let (handle, join) = spawn_with_handle(ActiveSamplerDeps {
             initial_config: config,
+            display_id: DisplayId("oled".to_owned()),
             update_rx,
-            latest_grid: new_latest_grid(),
+            latest_grids: new_latest_grids(),
             source: Box::new(ScriptedCaptureSource::with_pending_consent()),
             consent_path: consent_path.clone(),
             cancel: cancel.clone(),
@@ -3227,7 +3581,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let consent_path = dir.path().join("consent.json");
         let config = active_config(Duration::from_secs(10));
-        let mut runtime = Runtime::new(&config, &consent_path);
+        let mut runtime = Runtime::new(&config, &consent_path, &DisplayId("oled".to_owned()));
         let (status_tx, _) = watch::channel(initial_status(&config));
         let mut source = ScriptedCaptureSource {
             grants: VecDeque::from([ScriptedOutcome::Ready(Err(CaptureError::Protocol(
@@ -3806,8 +4160,9 @@ mod tests {
         let (updates_tx, updates_rx) = mpsc::channel(2);
         let deps = ActiveSamplerDeps {
             initial_config: config.clone(),
+            display_id: DisplayId("oled".to_owned()),
             update_rx: updates_rx,
-            latest_grid: new_latest_grid(),
+            latest_grids: new_latest_grids(),
             source: Box::new(source),
             consent_path,
             cancel: cancel.clone(),
@@ -3875,12 +4230,13 @@ mod tests {
             .wear
             .active_sampling
             .capture_timeout = Duration::from_millis(50);
-        let latest_grid = new_latest_grid();
+        let latest_grids = new_latest_grids();
         let (update_tx, update_rx) = mpsc::channel(2);
         let deps = ActiveSamplerDeps {
             initial_config: config,
+            display_id: DisplayId("oled".to_owned()),
             update_rx,
-            latest_grid: latest_grid.clone(),
+            latest_grids: latest_grids.clone(),
             source,
             consent_path,
             cancel: cancel.clone(),

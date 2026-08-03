@@ -11,7 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use dormant_core::ipc_proto::{BlankRequestMode, IpcRequest, IpcResponse, WearSamplingStatus};
+use dormant_core::ipc_proto::{
+    BlankRequestMode, IpcRequest, IpcResponse, WearSamplingStatus, WearSamplingStatusMapEntry,
+};
 use dormant_core::observation::ReloadSource;
 use dormant_core::reload::ReloadRequester;
 use dormant_core::rules::{ControlMsg, DaemonEvent, StateSnapshot};
@@ -22,7 +24,9 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::active_sampler::{ActiveSamplerHandle, SamplerCommand, SamplerError, SamplingState};
+use crate::active_sampler::{
+    ActiveSamplerHandle, SamplerCommand, SamplerError, SamplingState, SharedSamplerRegistry,
+};
 use crate::direct_switch::{DirectSwitchHandle, SwitchReason};
 
 /// Maximum line length for IPC requests/responses (1 MB).
@@ -57,7 +61,7 @@ pub fn spawn(
     reload_requester: ReloadRequester,
     doctor_service: DoctorService,
     direct_switch: Arc<DirectSwitchHandle>,
-    active_sampler: Option<ActiveSamplerHandle>,
+    sampler_registry: SharedSamplerRegistry,
     cancel: CancellationToken,
     selected_displays: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
 ) -> Result<JoinHandle<()>> {
@@ -141,7 +145,7 @@ pub fn spawn(
             reload_requester,
             doctor_service,
             direct_switch,
-            active_sampler,
+            sampler_registry,
             cancel,
             &socket_owned,
             selected_displays,
@@ -163,7 +167,7 @@ async fn run(
     reload_requester: ReloadRequester,
     doctor_service: DoctorService,
     direct_switch: Arc<DirectSwitchHandle>,
-    active_sampler: Option<ActiveSamplerHandle>,
+    sampler_registry: SharedSamplerRegistry,
     cancel: CancellationToken,
     socket_path: &std::path::Path,
     selected_displays: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
@@ -183,9 +187,9 @@ async fn run(
                         let reload = reload_requester.clone();
                         let doctor = doctor_service.clone();
                         let ds = direct_switch.clone();
-                        let sampler = active_sampler.clone();
+                        let samplers = sampler_registry.clone();
                         let selected = selected_displays.clone();
-                        tokio::spawn(handle_connection(stream, ctl, reload, doctor, ds, sampler, selected));
+                        tokio::spawn(handle_connection(stream, ctl, reload, doctor, ds, samplers, selected));
                         let _ = addr; // Unix socket peer address (debug).
                     }
                     Err(e) => {
@@ -210,7 +214,7 @@ async fn handle_connection(
     reload_requester: ReloadRequester,
     doctor_service: DoctorService,
     direct_switch: Arc<DirectSwitchHandle>,
-    active_sampler: Option<ActiveSamplerHandle>,
+    sampler_registry: SharedSamplerRegistry,
     selected_displays: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
 ) {
     let (reader, mut writer) = tokio::io::split(stream);
@@ -242,7 +246,7 @@ async fn handle_connection(
 
         match request {
             IpcRequest::Status => {
-                let resp = handle_status(&ctl_tx, active_sampler.as_ref()).await;
+                let resp = handle_status(&ctl_tx, &sampler_registry).await;
                 let _ = write_json(&mut writer, &resp).await;
             }
             IpcRequest::Pause { rule, duration_s } => {
@@ -296,34 +300,30 @@ async fn handle_connection(
                 let _ = write_json(&mut writer, &resp).await;
             }
             IpcRequest::WearSamplingEnable => {
-                let resp =
-                    handle_wear_enable_unit(active_sampler.as_ref(), &selected_displays).await;
+                let resp = handle_wear_enable_unit(&sampler_registry, &selected_displays).await;
                 let _ = write_json(&mut writer, &resp).await;
             }
             IpcRequest::WearSamplingStatus => {
-                let resp = handle_wear_status_unit(active_sampler.as_ref(), &selected_displays);
+                let resp = handle_wear_status_unit(&sampler_registry, &selected_displays);
                 let _ = write_json(&mut writer, &resp).await;
             }
             IpcRequest::WearSamplingDisable { forget } => {
                 let resp =
-                    handle_wear_disable_unit(active_sampler.as_ref(), forget, &selected_displays)
-                        .await;
+                    handle_wear_disable_unit(&sampler_registry, forget, &selected_displays).await;
                 let _ = write_json(&mut writer, &resp).await;
             }
             IpcRequest::WearSamplingEnableFor { display } => {
                 let resp =
-                    handle_wear_enable_for(active_sampler.as_ref(), &display, &selected_displays)
-                        .await;
+                    handle_wear_enable_for(&sampler_registry, &display, &selected_displays).await;
                 let _ = write_json(&mut writer, &resp).await;
             }
             IpcRequest::WearSamplingStatusFor { display } => {
-                let resp =
-                    handle_wear_status_for(active_sampler.as_ref(), &display, &selected_displays);
+                let resp = handle_wear_status_for(&sampler_registry, &display, &selected_displays);
                 let _ = write_json(&mut writer, &resp).await;
             }
             IpcRequest::WearSamplingDisableFor { display, forget } => {
                 let resp = handle_wear_disable_for(
-                    active_sampler.as_ref(),
+                    &sampler_registry,
                     &display,
                     forget,
                     &selected_displays,
@@ -335,41 +335,41 @@ async fn handle_connection(
     }
 }
 
+fn sampler_for_display(
+    sampler_registry: &SharedSamplerRegistry,
+    display: &str,
+) -> Option<ActiveSamplerHandle> {
+    sampler_registry.read().ok().and_then(|registry| {
+        registry
+            .get(&dormant_core::types::DisplayId(display.to_owned()))
+            .cloned()
+    })
+}
+
+fn unsupported_sampling_response() -> IpcResponse {
+    IpcResponse::wear_sampling(WearSamplingStatus::Error(
+        "wear_sampling_unsupported".to_owned(),
+    ))
+}
+
 async fn handle_wear_enable_unit(
-    active_sampler: Option<&ActiveSamplerHandle>,
+    sampler_registry: &SharedSamplerRegistry,
     selected_displays: &Arc<dyn Fn() -> Vec<String> + Send + Sync>,
 ) -> IpcResponse {
-    // IPC alias strategy: the unit variant resolves to the single
-    // configured display. >1 selected is an operator-visible error
-    // because the unit form is ambiguous once sampling spans multiple
-    // displays.
     let selected = selected_displays();
     if selected.len() > 1 {
         return IpcResponse::error(
             "E_CONFIG_INVALID: multiple displays configured — use the per-display request",
         );
     }
-    let Some(active_sampler) = active_sampler else {
-        return IpcResponse::wear_sampling(WearSamplingStatus::Error(
-            "wear_sampling_unsupported".to_owned(),
-        ));
+    let Some(display) = selected.first() else {
+        return unsupported_sampling_response();
     };
-    let (reply_tx, reply_rx) = oneshot::channel();
-    if let Err(error) = active_sampler
-        .send(SamplerCommand::Enable { reply: reply_tx })
-        .await
-    {
-        return IpcResponse::wear_sampling(WearSamplingStatus::Error(sampler_error_reason(&error)));
-    }
-    let status = match reply_rx.await {
-        Ok(status) => status.into_ipc_status(),
-        Err(_) => WearSamplingStatus::Error("wear_sampling_command_closed".to_owned()),
-    };
-    IpcResponse::wear_sampling(status)
+    handle_wear_enable_for(sampler_registry, display, selected_displays).await
 }
 
 fn handle_wear_status_unit(
-    active_sampler: Option<&ActiveSamplerHandle>,
+    sampler_registry: &SharedSamplerRegistry,
     selected_displays: &Arc<dyn Fn() -> Vec<String> + Send + Sync>,
 ) -> IpcResponse {
     let selected = selected_displays();
@@ -378,27 +378,14 @@ fn handle_wear_status_unit(
             "E_CONFIG_INVALID: multiple displays configured — use the per-display request",
         );
     }
-    let Some(active_sampler) = active_sampler else {
-        return IpcResponse::wear_sampling(WearSamplingStatus::Error(
-            "wear_sampling_unsupported".to_owned(),
-        ));
+    let Some(display) = selected.first() else {
+        return unsupported_sampling_response();
     };
-    let status = active_sampler.status().borrow().state;
-    let status = match status {
-        SamplingState::ConsentPending => WearSamplingStatus::AwaitingConsent,
-        SamplingState::NeedsConsent => {
-            WearSamplingStatus::Error("wear_sampling_needs_consent".to_owned())
-        }
-        SamplingState::Connecting | SamplingState::Streaming => WearSamplingStatus::Granted,
-        SamplingState::Disabled | SamplingState::Suspended | SamplingState::Cooldown => {
-            WearSamplingStatus::Error("wear_sampling_not_active".to_owned())
-        }
-    };
-    IpcResponse::wear_sampling(status)
+    handle_wear_status_for(sampler_registry, display, selected_displays)
 }
 
 async fn handle_wear_disable_unit(
-    active_sampler: Option<&ActiveSamplerHandle>,
+    sampler_registry: &SharedSamplerRegistry,
     forget: bool,
     selected_displays: &Arc<dyn Fn() -> Vec<String> + Send + Sync>,
 ) -> IpcResponse {
@@ -408,46 +395,27 @@ async fn handle_wear_disable_unit(
             "E_CONFIG_INVALID: multiple displays configured — use the per-display request",
         );
     }
-    let Some(active_sampler) = active_sampler else {
-        return IpcResponse::wear_sampling(WearSamplingStatus::Error(
-            "wear_sampling_unsupported".to_owned(),
-        ));
+    let Some(display) = selected.first() else {
+        return unsupported_sampling_response();
     };
-    let (reply_tx, reply_rx) = oneshot::channel();
-    if let Err(error) = active_sampler
-        .send(SamplerCommand::Disable {
-            forget,
-            reply: reply_tx,
-        })
-        .await
-    {
-        return IpcResponse::wear_sampling(WearSamplingStatus::Error(sampler_error_reason(&error)));
-    }
-    match reply_rx.await {
-        Ok(Ok(())) => IpcResponse::wear_sampling(WearSamplingStatus::Granted),
-        Ok(Err(error)) => {
-            IpcResponse::wear_sampling(WearSamplingStatus::Error(sampler_error_reason(&error)))
-        }
-        Err(_) => IpcResponse::wear_sampling(WearSamplingStatus::Error(
-            "wear_sampling_command_closed".to_owned(),
-        )),
-    }
+    handle_wear_disable_for(sampler_registry, display, forget, selected_displays).await
 }
 
 async fn handle_wear_enable_for(
-    active_sampler: Option<&ActiveSamplerHandle>,
+    sampler_registry: &SharedSamplerRegistry,
     display: &str,
     selected_displays: &Arc<dyn Fn() -> Vec<String> + Send + Sync>,
 ) -> IpcResponse {
-    if !selected_displays().iter().any(|d| d == display) {
+    if !selected_displays()
+        .iter()
+        .any(|selected| selected == display)
+    {
         return IpcResponse::error(format!(
             "E_CONFIG_INVALID: display '{display}' is not a selected wear-sampling display",
         ));
     }
-    let Some(active_sampler) = active_sampler else {
-        return IpcResponse::wear_sampling(WearSamplingStatus::Error(
-            "wear_sampling_unsupported".to_owned(),
-        ));
+    let Some(active_sampler) = sampler_for_display(sampler_registry, display) else {
+        return unsupported_sampling_response();
     };
     let (reply_tx, reply_rx) = oneshot::channel();
     if let Err(error) = active_sampler
@@ -464,19 +432,20 @@ async fn handle_wear_enable_for(
 }
 
 fn handle_wear_status_for(
-    active_sampler: Option<&ActiveSamplerHandle>,
+    sampler_registry: &SharedSamplerRegistry,
     display: &str,
     selected_displays: &Arc<dyn Fn() -> Vec<String> + Send + Sync>,
 ) -> IpcResponse {
-    if !selected_displays().iter().any(|d| d == display) {
+    if !selected_displays()
+        .iter()
+        .any(|selected| selected == display)
+    {
         return IpcResponse::error(format!(
             "E_CONFIG_INVALID: display '{display}' is not a selected wear-sampling display",
         ));
     }
-    let Some(active_sampler) = active_sampler else {
-        return IpcResponse::wear_sampling(WearSamplingStatus::Error(
-            "wear_sampling_unsupported".to_owned(),
-        ));
+    let Some(active_sampler) = sampler_for_display(sampler_registry, display) else {
+        return unsupported_sampling_response();
     };
     let status = active_sampler.status().borrow().state;
     let status = match status {
@@ -493,20 +462,21 @@ fn handle_wear_status_for(
 }
 
 async fn handle_wear_disable_for(
-    active_sampler: Option<&ActiveSamplerHandle>,
+    sampler_registry: &SharedSamplerRegistry,
     display: &str,
     forget: bool,
     selected_displays: &Arc<dyn Fn() -> Vec<String> + Send + Sync>,
 ) -> IpcResponse {
-    if !selected_displays().iter().any(|d| d == display) {
+    if !selected_displays()
+        .iter()
+        .any(|selected| selected == display)
+    {
         return IpcResponse::error(format!(
             "E_CONFIG_INVALID: display '{display}' is not a selected wear-sampling display",
         ));
     }
-    let Some(active_sampler) = active_sampler else {
-        return IpcResponse::wear_sampling(WearSamplingStatus::Error(
-            "wear_sampling_unsupported".to_owned(),
-        ));
+    let Some(active_sampler) = sampler_for_display(sampler_registry, display) else {
+        return unsupported_sampling_response();
     };
     let (reply_tx, reply_rx) = oneshot::channel();
     if let Err(error) = active_sampler
@@ -544,22 +514,65 @@ fn sampler_error_reason(error: &SamplerError) -> String {
 
 // ── Request handlers ──────────────────────────────────────────────────────────
 
+fn sampler_status_views(
+    statuses: Vec<(
+        dormant_core::types::DisplayId,
+        crate::active_sampler::SamplerStatus,
+    )>,
+    now: dormant_core::types::Tick,
+) -> (
+    Option<dormant_core::wear::WearSamplingStatus>,
+    dormant_core::ipc_proto::WearSamplingStatusMap,
+) {
+    let mut redacted = Vec::with_capacity(statuses.len());
+    let mut status_map = std::collections::BTreeMap::new();
+    for (display_id, status) in statuses {
+        let wire = status.redacted(now);
+        status_map.insert(
+            display_id.0,
+            WearSamplingStatusMapEntry {
+                state: wire.state,
+                uniform_reason: wire.uniform_reason.clone(),
+            },
+        );
+        redacted.push(wire);
+    }
+    let singular = (redacted.len() == 1)
+        .then(|| redacted.into_iter().next())
+        .flatten();
+    (singular, status_map)
+}
+
 /// Fetch a snapshot and return it.
 async fn handle_status(
     ctl_tx: &mpsc::Sender<ControlMsg>,
-    active_sampler: Option<&ActiveSamplerHandle>,
+    sampler_registry: &SharedSamplerRegistry,
 ) -> IpcResponse {
     match request_snapshot(ctl_tx).await {
         Some(mut snap) => {
-            let status = active_sampler.map(|sampler| {
-                sampler
-                    .status()
-                    .borrow()
-                    .redacted(dormant_core::types::Tick::now())
-            });
+            let now = dormant_core::types::Tick::now();
+            let handles = sampler_registry.read().map_or_else(
+                |_| Vec::new(),
+                |registry| {
+                    registry
+                        .iter()
+                        .map(|(display, handle)| (display.clone(), handle.clone()))
+                        .collect::<Vec<_>>()
+                },
+            );
+            let statuses = handles
+                .into_iter()
+                .map(|(display_id, handle)| {
+                    let status_rx = handle.status();
+                    let status = status_rx.borrow().clone();
+                    (display_id, status)
+                })
+                .collect();
+            let (status, statuses) = sampler_status_views(statuses, now);
             snap.wear_sampling_status.clone_from(&status);
             let mut response = IpcResponse::ok(Some(snap));
             response.wear_sampling_status = status;
+            response.wear_sampling_statuses = Some(statuses);
             response
         }
         None => IpcResponse::error("engine not available"),
@@ -891,8 +904,51 @@ mod tests {
     use dormant_doctor::DoctorService;
 
     use super::DirectSwitchHandle;
-    use super::switch_outcome_to_response;
+    use super::{sampler_status_views, switch_outcome_to_response};
     use crate::direct_switch::SwitchOutcome;
+
+    #[test]
+    fn sampler_status_views_keep_two_display_lifecycles_independent() {
+        let now = dormant_core::types::Tick::now();
+        let statuses = vec![
+            (
+                dormant_core::types::DisplayId("oled-a".to_owned()),
+                crate::active_sampler::SamplerStatus {
+                    state: crate::active_sampler::SamplingState::Streaming,
+                    last_capture: Some(now),
+                    uniform_reason: None,
+                    bound_display: Some("oled-a".to_owned()),
+                    granted_at: None,
+                },
+            ),
+            (
+                dormant_core::types::DisplayId("oled-b".to_owned()),
+                crate::active_sampler::SamplerStatus {
+                    state: crate::active_sampler::SamplingState::Cooldown,
+                    last_capture: None,
+                    uniform_reason: Some(crate::active_sampler::WEAR_SAMPLING_COOLDOWN),
+                    bound_display: Some("oled-b".to_owned()),
+                    granted_at: None,
+                },
+            ),
+        ];
+
+        let (singular, status_map) = sampler_status_views(statuses, now);
+
+        assert!(singular.is_none());
+        assert_eq!(
+            status_map["oled-a"].state,
+            dormant_core::wear::WearSamplingState::Streaming
+        );
+        assert_eq!(
+            status_map["oled-b"].state,
+            dormant_core::wear::WearSamplingState::Cooldown
+        );
+        assert_eq!(
+            status_map["oled-b"].uniform_reason.as_deref(),
+            Some(crate::active_sampler::WEAR_SAMPLING_COOLDOWN)
+        );
+    }
 
     /// Minimal fake engine for unit tests.
     fn fake_engine() -> (mpsc::Sender<super::ControlMsg>, CancellationToken) {
@@ -1002,7 +1058,7 @@ mod tests {
             dormant_core::reload::ReloadRequester::new(reload_tx),
             doctor,
             ds,
-            None,
+            Arc::new(std::sync::RwLock::new(std::collections::BTreeMap::default())),
             cancel,
             std::sync::Arc::new(Vec::new),
         );
@@ -1030,7 +1086,7 @@ mod tests {
             dormant_core::reload::ReloadRequester::new(reload_tx),
             doctor,
             ds,
-            None,
+            Arc::new(std::sync::RwLock::new(std::collections::BTreeMap::default())),
             cancel.clone(),
             std::sync::Arc::new(Vec::new),
         );

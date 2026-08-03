@@ -510,6 +510,16 @@ distinct and must not collide after the on-disk name is sanitized
 (`[a-z0-9._-]`, 64 chars max) — the daemon writes per-display consent
 records to `screencast-consent-<sanitized>.json`.
 
+> **Runtime status:** `sampled_displays` is the canonical *config*
+> surface as of this change, but the *runtime* still selects its single
+> active stream via the singular path. A 1-element `sampled_displays`
+> list transparently drives that path; a list with more than one entry
+> will load and pass validation but the sampler lands in `Suspended`
+> until multi-display sampling and plural-driven selection land in a
+> following change. The legacy `screencast-consent.json` filename is
+> still the on-disk record today; the per-display `screencast-consent-<id>.json`
+> layout is contract-tested but only the singular sampler writes.
+
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `enabled` | boolean | `false` | Enable the explicit ScreenCast consent flow |

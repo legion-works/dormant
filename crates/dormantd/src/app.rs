@@ -164,6 +164,13 @@ fn active_sampler_display_context(
         _ => Phase::Active,
     };
     let stage_active = display_exists && matches!(phase, Phase::Active | Phase::Grace { .. });
+    // Reads the singular `sampled_display` directly. A 1-element
+    // `sampled_displays` list needs to be folded in here too, and any
+    // multi-display config (length > 1) must fan out to one
+    // `DisplayExpectation` per entry. The site moves to a per-display
+    // map when the multi-display sampler registry lands; until then
+    // a >1-element plural list publishes `display: None` and the
+    // sampler lands in `Suspended`.
     DisplaySamplingContext {
         display: display_exists
             .then(|| {

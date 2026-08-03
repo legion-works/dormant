@@ -64,6 +64,17 @@ circuit_reset_after = "5m"
 | `wear.active_sampling.failure_threshold` | `5` | Consecutive failures before the circuit opens |
 | `wear.active_sampling.circuit_reset_after` | `"5m"` | Delay before retrying an open circuit |
 
+> **Runtime status:** `sampled_displays` is the canonical *config*
+> surface as of this change, but the *runtime* still selects its single
+> active stream via the singular path. A 1-element `sampled_displays`
+> list transparently drives that path; a list with more than one entry
+> will load and pass validation but the sampler lands in `Suspended`
+> until multi-display sampling and plural-driven selection land in a
+> following change. The legacy `screencast-consent.json` filename is
+> still the on-disk record today; the per-display
+> `screencast-consent-<id>.json` layout is contract-tested but only the
+> singular sampler writes.
+
 The active capture timeout must be no more than half of `wear.sample_interval`.
 When active sampling is enabled, `wear.sample_interval` must therefore be at
 least `2s`; there is no separate active-sampling cadence knob. Existing wear
@@ -79,12 +90,14 @@ capture and recreates it on the next tick, without requiring consent again.
 ## Consent and revocation
 
 Enabling grants the daemon's graphical session persistent screen-capture access
-through **xdg-desktop-portal ScreenCast** with `persist_mode=2`. The daemon
-stores one consent record per selected display at
-`$XDG_STATE_HOME/dormant/screencast-consent-<sanitized-display>.json` (or the
-platform state-dir fallback). The legacy un-suffixed
-`screencast-consent.json` is preserved as a one-time source for the
-legacy-selected display only. The parent directory is mode `0700`; each
+through **xdg-desktop-portal ScreenCast** with `persist_mode=2`. Today the
+runtime writes the legacy un-suffixed
+`$XDG_STATE_HOME/dormant/screencast-consent.json` (or the platform state-dir
+fallback) for the singular display; the per-display
+`$XDG_STATE_HOME/dormant/screencast-consent-<sanitized-display>.json` layout
+is the contract the config and helpers define and the consent unit tests
+pin, but the runtime writes through the legacy filename until
+multi-display sampling lands. The parent directory is mode `0700`; each
 consent file is mode `0600`; every record is written with fsync and atomic
 rename. The record contains the restore token, the selected display, grant
 time, and portal persistent IDs. The token rotates on every reattach. Tokens

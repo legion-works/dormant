@@ -6,9 +6,9 @@ Wayland session. Each frame becomes a luma grid for the existing wear ledger;
 raw pixels are not stored.
 
 **Scope.** This feature is Linux/KDE Wayland only. It uses the xdg-desktop-
-portal ScreenCast flow and supports the per-display `sampled_displays` list
-introduced in M6 (Task 23); the legacy `sampled_display` singular form
-remains accepted for backward compatibility. macOS and Windows remain on
+portal ScreenCast flow and samples every display in the per-display
+`sampled_displays` list independently; the legacy `sampled_display` singular
+form remains accepted for backward compatibility. macOS and Windows remain on
 uniform attribution; this feature does not provide capture support for those
 platforms, GNOME, X11, or TVs.
 
@@ -26,7 +26,7 @@ interval. It stands in for the content shown during that window. A future
 version may average multiple frames; v1 does not.
 
 Content luma is measured before the panel LUT/night-color transform. It is a
-host-side estimate, not calibrated panel luminance or panel telemetry. The
+host-side estimate, not calibrated panel luminance or panel telemetry. Each
 sampled display's `total_on_hours` becomes luma-weighted, so it will generally
 be smaller and is not comparable 1:1 with pre-M2 or unsampled ledgers.
 
@@ -64,16 +64,11 @@ circuit_reset_after = "5m"
 | `wear.active_sampling.failure_threshold` | `5` | Consecutive failures before the circuit opens |
 | `wear.active_sampling.circuit_reset_after` | `"5m"` | Delay before retrying an open circuit |
 
-> **Runtime status:** `sampled_displays` is the canonical *config*
-> surface as of this change, but the *runtime* still selects its single
-> active stream via the singular path. A 1-element `sampled_displays`
-> list transparently drives that path; a list with more than one entry
-> will load and pass validation but the sampler lands in `Suspended`
-> until multi-display sampling and plural-driven selection land in a
-> following change. The legacy `screencast-consent.json` filename is
-> still the on-disk record today; the per-display
-> `screencast-consent-<id>.json` layout is contract-tested but only the
-> singular sampler writes.
+Each id in `sampled_displays` drives an independent sampler with its own
+consent record, PipeWire stream, lifecycle status, and cancellation token, so
+one display's consent failure or open circuit does not affect the others.
+Consent records are per-display files (see [Consent and
+revocation](#consent-and-revocation)).
 
 The active capture timeout must be no more than half of `wear.sample_interval`.
 When active sampling is enabled, `wear.sample_interval` must therefore be at
@@ -82,22 +77,23 @@ defaults remain `wear.grid_rows = 9`, `wear.grid_cols = 16`, and
 `wear.sample_interval = "60s"`.
 
 `stream_mode = "warm"` is the shipped default. The warm-paused stream measured
-zero marginal idle cost in the Task 1 measurement (kwin −0.09 percentage
-points and PipeWire −0.008 percentage points over 30-minute windows), with
-pause→resume p95 of 14.4ms. `"per-tick"` tears down the stream after each
+zero marginal idle cost in the daemon-identity gate of the M2 capture spike
+(`docs/research/2026-07-31-m2-capture-spike.md`: `kwin_wayland` −0.089 and
+PipeWire −0.008 percentage points over 30-minute windows), with pause→resume
+p95 of 14.4 ms. `"per-tick"` tears down the stream after each
 capture and recreates it on the next tick, without requiring consent again.
 
 ## Consent and revocation
 
 Enabling grants the daemon's graphical session persistent screen-capture access
-through **xdg-desktop-portal ScreenCast** with `persist_mode=2`. Today the
-runtime writes the legacy un-suffixed
-`$XDG_STATE_HOME/dormant/screencast-consent.json` (or the platform state-dir
-fallback) for the singular display; the per-display
-`$XDG_STATE_HOME/dormant/screencast-consent-<sanitized-display>.json` layout
-is the contract the config and helpers define and the consent unit tests
-pin, but the runtime writes through the legacy filename until
-multi-display sampling lands. The parent directory is mode `0700`; each
+through **xdg-desktop-portal ScreenCast** with `persist_mode=2`. Each sampled
+display has its own consent record at
+`$XDG_STATE_HOME/dormant/screencast-consent-<sanitized-display>.json` (or the
+platform state-dir fallback). On the first boot after upgrading from a
+singular `sampled_display` config, the legacy un-suffixed
+`screencast-consent.json` is copied to the per-display record for that
+display; after that one-way copy the per-display file is authoritative and the
+legacy file is never read again. The parent directory is mode `0700`; each
 consent file is mode `0600`; every record is written with fsync and atomic
 rename. The record contains the restore token, the selected display, grant
 time, and portal persistent IDs. The token rotates on every reattach. Tokens

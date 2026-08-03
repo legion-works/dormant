@@ -510,15 +510,17 @@ distinct and must not collide after the on-disk name is sanitized
 (`[a-z0-9._-]`, 64 chars max) — the daemon writes per-display consent
 records to `screencast-consent-<sanitized>.json`.
 
-> **Runtime status:** `sampled_displays` is the canonical *config*
-> surface as of this change, but the *runtime* still selects its single
-> active stream via the singular path. A 1-element `sampled_displays`
-> list transparently drives that path; a list with more than one entry
-> will load and pass validation but the sampler lands in `Suspended`
-> until multi-display sampling and plural-driven selection land in a
-> following change. The legacy `screencast-consent.json` filename is
-> still the on-disk record today; the per-display `screencast-consent-<id>.json`
-> layout is contract-tested but only the singular sampler writes.
+Each id in `sampled_displays` drives an independent sampler with its own
+ScreenCast consent record, PipeWire stream, and lifecycle status. Consent
+records are per-display files named `screencast-consent-<sanitized>.json`. On
+the first boot after upgrading from a singular `sampled_display` config, the
+legacy `screencast-consent.json` is copied to the per-display record for that
+display; after that one-way copy the per-display file is authoritative and the
+legacy file is never read again. `dormantctl wear enable-sampling` and
+`disable-sampling` take `--display <id>` to pick a sampler; the flag is
+required when more than one display is selected and optional when exactly one
+is. See [Active wear sampling](./active-wear-sampling.md) for the per-display
+CLI, HTTP, doctor, and web UI surface.
 
 | Key | Type | Default | Description |
 |---|---|---|---|

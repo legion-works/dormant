@@ -475,15 +475,14 @@ pub struct WearConfig {
 /// legacy singular `sampled_display` remains accepted for backward
 /// compatibility within `config_version = 1`; supplying both keys is a
 /// parse error so the operator's intent is unambiguous (see
-/// [`selected_displays`]).
+/// [`ActiveSamplingConfig::selected_displays`]).
 ///
-/// The runtime still selects its single active stream via the singular
-/// path. A 1-element `sampled_displays` list transparently drives that
-/// path; lists with more than one entry land in `Suspended` until
-/// multi-display sampling and plural-driven selection land. See
-/// [`ActiveSamplingConfig::first_sampled_display`] for the runtime
-/// helper and `app::active_sampler_display_context` for the publish
-/// site that must move to the per-display map.
+/// Every id in [`ActiveSamplingConfig::selected_displays`] drives an
+/// independent sampler with
+/// its own consent record, capture stream, lifecycle status, and
+/// cancellation token. [`ActiveSamplingConfig::first_sampled_display`]
+/// remains as the single-display accessor for consumers that classify
+/// one status at a time (the doctor probes).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ActiveSamplingConfig {
     /// Enable active sampling.

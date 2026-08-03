@@ -501,7 +501,9 @@ async fn handle_wear_disable_for(
 
 fn sampler_error_reason(error: &SamplerError) -> String {
     match error {
-        SamplerError::DisabledByConfig => "wear_sampling_disabled".to_owned(),
+        SamplerError::DisabledByConfig | SamplerError::SamplingDisabled => {
+            "wear_sampling_disabled".to_owned()
+        }
         SamplerError::FlowAlreadyActive => "wear_sampling_flow_already_active".to_owned(),
         SamplerError::NoGraphicalSession => "wear_sampling_no_graphical_session".to_owned(),
         SamplerError::CommandChannelClosed => "wear_sampling_command_closed".to_owned(),
@@ -926,7 +928,7 @@ mod tests {
                 crate::active_sampler::SamplerStatus {
                     state: crate::active_sampler::SamplingState::Cooldown,
                     last_capture: None,
-                    uniform_reason: Some(crate::active_sampler::WEAR_SAMPLING_COOLDOWN),
+                    uniform_reason: Some(crate::active_sampler::WEAR_SAMPLING_CAPTURE_FAILED),
                     bound_display: Some("oled-b".to_owned()),
                     granted_at: None,
                 },
@@ -946,7 +948,7 @@ mod tests {
         );
         assert_eq!(
             status_map["oled-b"].uniform_reason.as_deref(),
-            Some(crate::active_sampler::WEAR_SAMPLING_COOLDOWN)
+            Some(crate::active_sampler::WEAR_SAMPLING_CAPTURE_FAILED)
         );
     }
 

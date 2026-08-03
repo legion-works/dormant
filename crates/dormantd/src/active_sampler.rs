@@ -145,6 +145,8 @@ impl ConsentFlowStatus {
 pub enum SamplerError {
     /// Active sampling is disabled in configuration.
     DisabledByConfig,
+    /// Sampling was disabled by an operator command.
+    SamplingDisabled,
     /// Another consent request is already active.
     FlowAlreadyActive,
     /// The portal source could not be created for this graphical session.
@@ -292,6 +294,7 @@ impl fmt::Display for SamplerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::DisabledByConfig => f.write_str("active sampling is disabled by configuration"),
+            Self::SamplingDisabled => f.write_str("active sampling is disabled"),
             Self::FlowAlreadyActive => {
                 f.write_str("an active sampling consent flow is already active")
             }
@@ -588,6 +591,21 @@ async fn handle_command(
             if !runtime.active.enabled {
                 let _ = reply.send(ConsentFlowStatus::Error(
                     "active sampling is disabled".to_owned(),
+                ));
+                return false;
+            }
+            if runtime.state == SamplingState::Disabled {
+                if runtime.record.is_some() {
+                    let transition = apply_trigger(
+                        runtime,
+                        Trigger::ConfigChanged(ConfigDelta::Enabled(true)),
+                        status_tx,
+                    );
+                    let _ = reply.send(ConsentFlowStatus::Granted);
+                    return transition.effects.contains(&Effect::Connect);
+                }
+                let _ = reply.send(ConsentFlowStatus::Error(
+                    SamplerError::SamplingDisabled.to_string(),
                 ));
                 return false;
             }
@@ -1462,16 +1480,16 @@ pub fn decide(state: SamplingState, trigger: Trigger, has_consent_record: bool) 
             SamplingState::Connecting,
             vec![Effect::EnterUniform(WEAR_SAMPLING_PORTAL_UNREACHABLE)],
         ),
+        Trigger::CaptureFailed if state == SamplingState::Cooldown => transition(
+            SamplingState::Connecting,
+            vec![Effect::EnterUniform(WEAR_SAMPLING_COOLDOWN)],
+        ),
         Trigger::AuthFailed | Trigger::SessionClosed if state == SamplingState::Cooldown => {
             needs_consent(state, WEAR_SAMPLING_TOKEN_INVALID)
         }
         Trigger::WrongMonitor if state == SamplingState::Cooldown => {
             needs_consent(state, WEAR_SAMPLING_WRONG_MONITOR)
         }
-        Trigger::CaptureFailed if state == SamplingState::Cooldown => transition(
-            SamplingState::Cooldown,
-            vec![Effect::EnterUniform(WEAR_SAMPLING_COOLDOWN)],
-        ),
         Trigger::ConfigChanged(ConfigDelta::LimitsChanged) if state == SamplingState::Cooldown => {
             transition(SamplingState::Streaming, vec![Effect::Capture])
         }
@@ -2673,6 +2691,73 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn active_sampler_persistent_capture_failure_reattaches_saved_session() {
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        test_record(&consent_path);
+        let connects_seen = Arc::new(AtomicUsize::new(0));
+        let captures_seen = Arc::new(AtomicUsize::new(0));
+        let source = ServiceSource {
+            connects: Mutex::new(VecDeque::from([Ok(test_stream()), Ok(test_stream())])),
+            connects_seen: connects_seen.clone(),
+            captures: Mutex::new(VecDeque::from([
+                TestCapture::Failure(CaptureError::Timeout),
+                TestCapture::Failure(CaptureError::Timeout),
+                TestCapture::Frame,
+            ])),
+            captures_seen: captures_seen.clone(),
+            closes_seen: Arc::new(AtomicUsize::new(0)),
+            grants_seen: Arc::new(AtomicUsize::new(0)),
+        };
+        let cancel = CancellationToken::new();
+        let (deps, _updates, _) = service_deps(
+            active_config(Duration::from_secs(10)),
+            source,
+            consent_path,
+            cancel.clone(),
+        );
+        let (handle, join) = spawn_with_handle(deps);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while captures_seen.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        wait_for_state(&handle, SamplingState::Cooldown).await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(connects_seen.load(Ordering::SeqCst), 2);
+        assert_eq!(handle.status().borrow().state, SamplingState::Streaming);
+
+        cancel.cancel();
+        join.await.unwrap();
+    }
+
+    #[test]
+    fn cooldown_capture_failure_keeps_reason_while_reattaching() {
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        test_record(&consent_path);
+        let config = active_config(Duration::from_secs(10));
+        let mut runtime = Runtime::new(&config, &consent_path, &DisplayId("oled".to_owned()));
+        runtime.state = SamplingState::Cooldown;
+        let (status_tx, _) = watch::channel(initial_status(&config));
+
+        apply_trigger(&mut runtime, Trigger::CaptureFailed, &status_tx);
+
+        let wire = status_tx.borrow().redacted(Tick::now());
+        assert_eq!(runtime.state, SamplingState::Connecting);
+        assert_eq!(wire.uniform_reason.as_deref(), Some(WEAR_SAMPLING_COOLDOWN));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn active_sampler_reconnects_after_exponential_backoff() {
         let dir = tempdir().unwrap();
         let consent_path = dir.path().join("consent.json");
@@ -3349,6 +3434,71 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn active_sampler_disable_then_enable_stops_and_resumes_without_consent() {
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        test_record(&consent_path);
+        let connects_seen = Arc::new(AtomicUsize::new(0));
+        let captures_seen = Arc::new(AtomicUsize::new(0));
+        let closes_seen = Arc::new(AtomicUsize::new(0));
+        let grants_seen = Arc::new(AtomicUsize::new(0));
+        let source = ServiceSource {
+            connects: Mutex::new(VecDeque::from([Ok(test_stream()), Ok(test_stream())])),
+            connects_seen: connects_seen.clone(),
+            captures: Mutex::new(VecDeque::from([TestCapture::Frame])),
+            captures_seen: captures_seen.clone(),
+            closes_seen: closes_seen.clone(),
+            grants_seen: grants_seen.clone(),
+        };
+        let cancel = CancellationToken::new();
+        let (deps, _updates, _) = service_deps(
+            active_config(Duration::from_secs(10)),
+            source,
+            consent_path,
+            cancel.clone(),
+        );
+        let (handle, join) = spawn_with_handle(deps);
+
+        tokio::task::yield_now().await;
+        assert_eq!(handle.status().borrow().state, SamplingState::Streaming);
+        let captures_before_disable = captures_seen.load(Ordering::SeqCst);
+
+        let (disable_tx, disable_rx) = oneshot::channel();
+        handle
+            .send(SamplerCommand::Disable {
+                forget: false,
+                reply: disable_tx,
+            })
+            .await
+            .unwrap();
+        assert!(disable_rx.await.unwrap().is_ok());
+        assert_eq!(handle.status().borrow().state, SamplingState::Disabled);
+        assert_eq!(closes_seen.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            captures_seen.load(Ordering::SeqCst),
+            captures_before_disable
+        );
+        assert_eq!(closes_seen.load(Ordering::SeqCst), 1);
+
+        let (enable_tx, enable_rx) = oneshot::channel();
+        handle
+            .send(SamplerCommand::Enable { reply: enable_tx })
+            .await
+            .unwrap();
+        assert_eq!(enable_rx.await.unwrap(), ConsentFlowStatus::Granted);
+        tokio::task::yield_now().await;
+        assert_eq!(handle.status().borrow().state, SamplingState::Streaming);
+        assert_eq!(grants_seen.load(Ordering::SeqCst), 0);
+        assert_eq!(connects_seen.load(Ordering::SeqCst), 2);
+
+        cancel.cancel();
+        join.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn active_sampler_forget_cancels_pending_consent_and_deletes_record() {
         let dir = tempdir().unwrap();
         let consent_path = dir.path().join("consent.json");
@@ -3524,10 +3674,8 @@ mod tests {
         // Final state is Disabled — the operator's disable took effect.
         assert_eq!(handle.status().borrow().state, SamplingState::Disabled);
 
-        // The follow-up Enable is rejected because the sampler is no
-        // longer in NeedsConsent: the Enable handler routes any other
-        // state through the FlowAlreadyActive rejection, which surfaces
-        // to the operator as the "consent flow is already active" error.
+        // The follow-up Enable is rejected because the sampler is disabled
+        // and no consent record exists to resume.
         let (followup_tx, followup_rx) = oneshot::channel();
         handle
             .send(SamplerCommand::Enable { reply: followup_tx })
@@ -3538,7 +3686,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap(),
-            ConsentFlowStatus::Error(SamplerError::FlowAlreadyActive.to_string())
+            ConsentFlowStatus::Error(SamplerError::SamplingDisabled.to_string())
         );
 
         cancel.cancel();
@@ -3818,11 +3966,11 @@ mod tests {
                 ],
             },
             TransitionCase {
-                name: "renewed cooldown failure restarts the tagged cooldown",
+                name: "renewed cooldown failure renegotiates the portal session",
                 state: SamplingState::Cooldown,
                 trigger: Trigger::CaptureFailed,
                 has_consent_record: true,
-                next: SamplingState::Cooldown,
+                next: SamplingState::Connecting,
                 effects: vec![Effect::EnterUniform("wear_sampling_cooldown")],
             },
             TransitionCase {

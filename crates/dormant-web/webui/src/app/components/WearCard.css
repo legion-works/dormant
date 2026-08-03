@@ -163,3 +163,97 @@
 .wear-row__tone--error {
   color: var(--danger);
 }
+
+/* Per-display sampling controls (issue #185 cycle B) */
+.wear-row__sampling {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.wear-row__sampling-state {
+  font-weight: 500;
+  color: var(--text-body);
+}
+.wear-row__sampling-reason {
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+/* Per-row onboarding nudge (issue #185 cycle B — same visual language
+   as the card-level nudge, scoped to the row) */
+.wear-row__nudge {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in oklab, var(--accent) 35%, transparent);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  background: color-mix(in oklab, var(--accent) 6%, transparent);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-body);
+}
+.wear-row__nudge-text {
+  line-height: 1.4;
+}
+.wear-row__nudge-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.wear-row__nudge-actions button[type="button"],
+.wear-row__nudge-actions a[role="link"] {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 4px 10px;
+  border: 1px solid color-mix(in oklab, var(--accent) 40%, transparent);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: none;
+}
+.wear-row__nudge-actions button[type="button"]:hover,
+.wear-row__nudge-actions a[role="link"]:hover {
+  background: color-mix(in oklab, var(--accent) 12%, transparent);
+}
+.wear-row__nudge-actions button[type="button"]:disabled,
+.wear-row__nudge-actions a[role="link"]:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Degraded-state variant (portal/pipewire unreachable) */
+.wear-row__nudge--degraded {
+  border-color: color-mix(in oklab, var(--warning) 40%, transparent);
+  border-left-color: var(--warning);
+  background: color-mix(in oklab, var(--warning) 6%, transparent);
+}
+.wear-row__nudge--degraded .wear-row__nudge-actions button[type="button"],
+.wear-row__nudge--degraded .wear-row__nudge-actions a[role="link"] {
+  border-color: color-mix(in oklab, var(--warning) 50%, transparent);
+  color: var(--warning);
+}
+
+/* Disable sampling button */
+.wear-row__disable-btn {
+  align-self: flex-start;
+  margin-top: 4px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 4px 10px;
+  border: 1px solid color-mix(in oklab, var(--text-body) 20%, transparent);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.wear-row__disable-btn:hover {
+  background: color-mix(in oklab, var(--text-body) 8%, transparent);
+}

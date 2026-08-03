@@ -219,6 +219,31 @@ export function postWearSamplingDisable(forget: boolean): Promise<WearSamplingSt
   return postWearSampling("/wear/sampling/disable", { forget });
 }
 
+// ── Issue #185 cycle B — per-display wear-sampling API ────────────────────────
+
+/** GET /api/wear/sampling?display=<id> — poll per-display daemon consent status. */
+export function getWearSamplingStatusFor(display: string): Promise<WearSamplingStatus> {
+  return request<WearSamplingStatus>(
+    `/wear/sampling?display=${encodeURIComponent(display)}`,
+  );
+}
+
+/** POST /api/wear/sampling/enable?display=<id> — start per-display portal flow. */
+export function postWearSamplingEnableFor(display: string): Promise<WearSamplingStatus> {
+  return postWearSampling(`/wear/sampling/enable?display=${encodeURIComponent(display)}`);
+}
+
+/** POST /api/wear/sampling/disable?display=<id> — close per-display sampling. */
+export function postWearSamplingDisableFor(
+  display: string,
+  forget: boolean,
+): Promise<WearSamplingStatus> {
+  return postWearSampling(
+    `/wear/sampling/disable?display=${encodeURIComponent(display)}`,
+    { forget },
+  );
+}
+
 async function postWearSampling(path: string, body?: unknown): Promise<WearSamplingStatus> {
   const res = await fetch(BASE + path, {
     method: "POST",

@@ -5,9 +5,18 @@
 //! issue #186). The dismiss handler persists a flag file beside the
 //! star-nudge persistence path so the operator sees a coherent cluster of
 //! UI-state files in the config directory.
+//!
+//! Per-display forwarding (issue #185): every endpoint takes an optional
+//! `?display=<id>` query parameter. When present, the request is routed to
+//! the matching `WearSamplingEnableFor`/`StatusFor`/`DisableFor` IPC
+//! variant — that is the only path that reaches a specific display under
+//! multi-display configuration. Omission preserves the legacy unit-variant
+//! wire tag, which the daemon only honors for exactly one selected display
+//! (the daemon returns `E_CONFIG_INVALID: multiple displays configured` if
+//! more than one is selected).
 
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use dormant_core::ipc_proto::{IpcRequest, IpcResponse, WearSamplingStatus};
@@ -17,15 +26,29 @@ use crate::error::WebError;
 use crate::request_daemon_ipc;
 use crate::routes::dismiss_flag::write_dismiss_flag;
 
+/// Optional `?display=<id>` query parameter carried by every
+/// wear-sampling endpoint. Issue #185: the per-display `*For` IPC variants
+/// take an explicit display id; this query parameter is how the web UI
+/// picks one. Absence is the legacy ergonomics path.
+#[derive(serde::Deserialize, Default)]
+pub(crate) struct DisplayQuery {
+    /// Configured display id, when present.
+    pub(crate) display: Option<String>,
+}
+
 fn status(response: IpcResponse) -> Result<WearSamplingStatus, WebError> {
     response
         .wear_sampling
         .ok_or(WebError::CoordinationUnavailable)
 }
 
-/// `POST /api/wear/sampling/enable` — start consent without waiting for its portal window.
+/// `POST /api/wear/sampling/enable?display=<id>` — start consent without
+/// waiting for its portal window. The optional `display` query parameter
+/// routes to `WearSamplingEnableFor { display }` when present; absence
+/// preserves the legacy unit variant (single-display case).
 pub(crate) async fn post_enable(
     State(state): State<WebState>,
+    Query(query): Query<DisplayQuery>,
 ) -> Result<(StatusCode, Json<WearSamplingStatus>), WebError> {
     let Ok(guard) = std::sync::Arc::clone(&state.inner.wear_sampling_lock).try_lock_owned() else {
         return Ok((
@@ -35,9 +58,15 @@ pub(crate) async fn post_enable(
             )),
         ));
     };
+    let request = match query.display.as_deref() {
+        Some(display) => IpcRequest::WearSamplingEnableFor {
+            display: display.to_owned(),
+        },
+        None => IpcRequest::WearSamplingEnable,
+    };
     tokio::spawn(async move {
         let _guard = guard;
-        let _ = request_daemon_ipc(&state, IpcRequest::WearSamplingEnable).await;
+        let _ = request_daemon_ipc(&state, request).await;
     });
     Ok((
         StatusCode::ACCEPTED,
@@ -45,26 +74,43 @@ pub(crate) async fn post_enable(
     ))
 }
 
-/// `GET /api/wear/sampling` — poll the daemon-owned consent status.
+/// `GET /api/wear/sampling?display=<id>` — poll the daemon-owned consent
+/// status. The optional `display` query parameter routes to
+/// `WearSamplingStatusFor { display }` when present; absence preserves the
+/// legacy unit variant (single-display case).
 pub(crate) async fn get_status(
     State(state): State<WebState>,
+    Query(query): Query<DisplayQuery>,
 ) -> Result<Json<WearSamplingStatus>, WebError> {
-    let response = request_daemon_ipc(&state, IpcRequest::WearSamplingStatus).await?;
+    let request = match query.display.as_deref() {
+        Some(display) => IpcRequest::WearSamplingStatusFor {
+            display: display.to_owned(),
+        },
+        None => IpcRequest::WearSamplingStatus,
+    };
+    let response = request_daemon_ipc(&state, request).await?;
     Ok(Json(status(response)?))
 }
 
-/// `POST /api/wear/sampling/disable` — close sampling, optionally forgetting consent.
+/// `POST /api/wear/sampling/disable?display=<id>` — close sampling,
+/// optionally forgetting consent. The optional `display` query parameter
+/// routes to `WearSamplingDisableFor { display, forget }` when present;
+/// absence preserves the legacy unit variant (single-display case).
 pub(crate) async fn post_disable(
     State(state): State<WebState>,
+    Query(query): Query<DisplayQuery>,
     Json(request): Json<DisableRequest>,
 ) -> Result<Json<WearSamplingStatus>, WebError> {
-    let response = request_daemon_ipc(
-        &state,
-        IpcRequest::WearSamplingDisable {
+    let ipc_request = match query.display.as_deref() {
+        Some(display) => IpcRequest::WearSamplingDisableFor {
+            display: display.to_owned(),
             forget: request.forget,
         },
-    )
-    .await?;
+        None => IpcRequest::WearSamplingDisable {
+            forget: request.forget,
+        },
+    };
+    let response = request_daemon_ipc(&state, ipc_request).await?;
     Ok(Json(status(response)?))
 }
 
@@ -225,16 +271,25 @@ mod tests {
         });
         let state = test_state(fake.clone());
 
-        let (code, Json(enable)) = post_enable(State(state.clone())).await.unwrap();
+        let (code, Json(enable)) =
+            post_enable(State(state.clone()), Query(DisplayQuery::default()))
+                .await
+                .unwrap();
         assert_eq!(code, StatusCode::ACCEPTED);
         assert_eq!(enable, WearSamplingStatus::AwaitingConsent);
         tokio::task::yield_now().await;
 
-        let Json(poll) = get_status(State(state.clone())).await.unwrap();
-        assert_eq!(poll, WearSamplingStatus::TimedOut);
-        let Json(disable) = post_disable(State(state), Json(DisableRequest { forget: true }))
+        let Json(poll) = get_status(State(state.clone()), Query(DisplayQuery::default()))
             .await
             .unwrap();
+        assert_eq!(poll, WearSamplingStatus::TimedOut);
+        let Json(disable) = post_disable(
+            State(state),
+            Query(DisplayQuery::default()),
+            Json(DisableRequest { forget: true }),
+        )
+        .await
+        .unwrap();
         assert_eq!(disable, WearSamplingStatus::Granted);
         assert_eq!(
             *fake.requests.lock().await,
@@ -255,9 +310,13 @@ mod tests {
             hold_enable: true,
         });
         let state = test_state(fake.clone());
-        let _ = post_enable(State(state.clone())).await.unwrap();
+        let _ = post_enable(State(state.clone()), Query(DisplayQuery::default()))
+            .await
+            .unwrap();
         fake.enable_started.notified().await;
-        let (code, Json(body)) = post_enable(State(state)).await.unwrap();
+        let (code, Json(body)) = post_enable(State(state), Query(DisplayQuery::default()))
+            .await
+            .unwrap();
         assert_eq!(code, StatusCode::CONFLICT);
         assert_eq!(
             body,
@@ -377,5 +436,154 @@ mod tests {
             "do NOT derive the event name from the filename — silently emits the doubled suffix \
              and breaks grep-based monitoring; pass the literal at the call site instead"
         );
+    }
+
+    // ── #185 Task 24b — per-display HTTP forwarding ────────────────────
+    //
+    // Issue #185: every endpoint must accept `?display=<id>` and forward
+    // it to the matching `*For` IPC variant. Omission preserves the
+    // legacy unit variant so the existing single-display ergonomics
+    // survive. The tests below pin the wire-traffic contract; the IPC
+    // daemon-side validation of the display id is the daemon's job.
+
+    /// `?display=<id>` on `enable` MUST reach `WearSamplingEnableFor`.
+    /// Pin the exact display id the handler forwarded — a regression
+    /// that drops the parameter (or rewrites it from `display_name` to
+    /// some derived string) would silently re-route to a different
+    /// sampler.
+    #[tokio::test]
+    async fn enable_forwards_display_query_to_wear_sampling_enable_for() {
+        let fake = Arc::new(FakeIpc {
+            requests: Mutex::new(Vec::new()),
+            responses: Mutex::new(VecDeque::new()),
+            enable_started: Notify::new(),
+            hold_enable: false,
+        });
+        let state = test_state(fake.clone());
+        let query = DisplayQuery {
+            display: Some("desk".to_owned()),
+        };
+        let _ = post_enable(State(state.clone()), Query(query))
+            .await
+            .unwrap();
+        // The `enable` handler spawns an IPC task; let it run.
+        tokio::task::yield_now().await;
+        let requests = fake.requests.lock().await.clone();
+        assert_eq!(
+            requests.len(),
+            1,
+            "expected one Enable request, got {requests:?}"
+        );
+        assert!(
+            matches!(
+                &requests[0],
+                IpcRequest::WearSamplingEnableFor { display } if display == "desk"
+            ),
+            "enable must forward display=\"desk\" to WearSamplingEnableFor, got {:?}",
+            requests[0]
+        );
+    }
+
+    /// `?display=<id>` on `get_status` MUST reach `WearSamplingStatusFor`.
+    #[tokio::test]
+    async fn get_status_forwards_display_query_to_wear_sampling_status_for() {
+        let fake = Arc::new(FakeIpc {
+            requests: Mutex::new(Vec::new()),
+            responses: Mutex::new(VecDeque::from([IpcResponse::wear_sampling(
+                WearSamplingStatus::Granted,
+            )])),
+            enable_started: Notify::new(),
+            hold_enable: false,
+        });
+        let state = test_state(fake.clone());
+        let query = DisplayQuery {
+            display: Some("tv".to_owned()),
+        };
+        let Json(body) = get_status(State(state), Query(query)).await.unwrap();
+        assert_eq!(body, WearSamplingStatus::Granted);
+        let requests = fake.requests.lock().await.clone();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            matches!(
+                &requests[0],
+                IpcRequest::WearSamplingStatusFor { display } if display == "tv"
+            ),
+            "status must forward display=\"tv\" to WearSamplingStatusFor, got {:?}",
+            requests[0]
+        );
+    }
+
+    /// `?display=<id>` on `disable` MUST reach `WearSamplingDisableFor`.
+    #[tokio::test]
+    async fn disable_forwards_display_query_to_wear_sampling_disable_for() {
+        let fake = Arc::new(FakeIpc {
+            requests: Mutex::new(Vec::new()),
+            responses: Mutex::new(VecDeque::from([IpcResponse::wear_sampling(
+                WearSamplingStatus::Granted,
+            )])),
+            enable_started: Notify::new(),
+            hold_enable: false,
+        });
+        let state = test_state(fake.clone());
+        let query = DisplayQuery {
+            display: Some("desk".to_owned()),
+        };
+        let Json(body) = post_disable(
+            State(state),
+            Query(query),
+            Json(DisableRequest { forget: true }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(body, WearSamplingStatus::Granted);
+        let requests = fake.requests.lock().await.clone();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            matches!(
+                &requests[0],
+                IpcRequest::WearSamplingDisableFor { display, forget } if display == "desk" && *forget
+            ),
+            "disable must forward display=\"desk\" + forget=true to WearSamplingDisableFor, got {:?}",
+            requests[0]
+        );
+    }
+
+    /// Omitting `?display` MUST preserve the legacy unit-variant wire
+    /// tag on every endpoint (issue #185 backward compatibility).
+    #[tokio::test]
+    async fn omission_preserves_legacy_unit_variant_wire_tag() {
+        let fake = Arc::new(FakeIpc {
+            requests: Mutex::new(Vec::new()),
+            responses: Mutex::new(VecDeque::from([
+                IpcResponse::wear_sampling(WearSamplingStatus::AwaitingConsent),
+                IpcResponse::wear_sampling(WearSamplingStatus::Granted),
+                IpcResponse::wear_sampling(WearSamplingStatus::Granted),
+            ])),
+            enable_started: Notify::new(),
+            hold_enable: false,
+        });
+        let state = test_state(fake.clone());
+        let _ = post_enable(State(state.clone()), Query(DisplayQuery::default()))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        let _ = get_status(State(state.clone()), Query(DisplayQuery::default()))
+            .await
+            .unwrap();
+        let _ = post_disable(
+            State(state),
+            Query(DisplayQuery::default()),
+            Json(DisableRequest { forget: false }),
+        )
+        .await
+        .unwrap();
+        let requests = fake.requests.lock().await.clone();
+        assert_eq!(requests.len(), 3, "got {requests:?}");
+        assert!(matches!(requests[0], IpcRequest::WearSamplingEnable));
+        assert!(matches!(requests[1], IpcRequest::WearSamplingStatus));
+        assert!(matches!(
+            requests[2],
+            IpcRequest::WearSamplingDisable { forget: false }
+        ));
     }
 }

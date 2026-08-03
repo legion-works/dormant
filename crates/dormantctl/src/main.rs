@@ -53,12 +53,31 @@ enum PairTarget {
 #[derive(Subcommand, Debug)]
 enum WearCommand {
     /// Request portal consent and enable active sampling.
-    EnableSampling,
+    ///
+    /// With one configured sampling display the command accepts the legacy
+    /// bare form and targets that single display. With multiple configured
+    /// displays `--display <id>` is required (the CLI queries `Status` to
+    /// count them and refuses without a selector).
+    EnableSampling {
+        /// Configured display id to enable sampling on. Required when
+        /// `[wear.active_sampling].sampled_displays` configures more than
+        /// one display; optional when exactly one is selected.
+        #[arg(long)]
+        display: Option<String>,
+    },
     /// Disable active sampling.
+    ///
+    /// Same display-selection rule as `enable-sampling`: required when
+    /// multiple displays are configured, optional under the legacy single-
+    /// display configuration.
     DisableSampling {
         /// Delete the stored consent record after closing the session.
         #[arg(long)]
         forget: bool,
+        /// Configured display id to disable sampling on. Required when
+        /// multiple displays are selected; optional when exactly one is.
+        #[arg(long)]
+        display: Option<String>,
     },
 }
 
@@ -426,9 +445,11 @@ fn main() -> ExitCode {
             Err(e) => Err(e),
         },
         Command::Wear { subcommand } => match subcommand {
-            WearCommand::EnableSampling => dormantctl::cmd_wear::run_enable(&socket_path),
-            WearCommand::DisableSampling { forget } => {
-                dormantctl::cmd_wear::run_disable(&socket_path, forget)
+            WearCommand::EnableSampling { display } => {
+                dormantctl::cmd_wear::run_enable(&socket_path, display.as_deref())
+            }
+            WearCommand::DisableSampling { forget, display } => {
+                dormantctl::cmd_wear::run_disable(&socket_path, forget, display.as_deref())
             }
         },
     };

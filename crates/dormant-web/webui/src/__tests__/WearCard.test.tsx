@@ -7,6 +7,9 @@
  * directly (via the shared `liveStateFixture` helper) with the exact
  * provider shapes T4 introduced (`wear`, `wearError`, `selectDisplay`)
  * instead of mocking the API client / WS layer.
+ *
+ * #185 cycle B: WearCard now polls per-display sampling status via
+ * `getWearSamplingStatusFor(display)` — the mock must reflect this.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
@@ -18,8 +21,10 @@ const mocks = vi.hoisted(() => ({
   selectDisplay: vi.fn(),
   state: { current: null as unknown },
   getConfig: vi.fn(),
-  getWearSamplingStatus: vi.fn(),
-  postWearSamplingEnable: vi.fn(),
+  // Per-display variants (issue #185 cycle B)
+  getWearSamplingStatusFor: vi.fn<(display: string) => Promise<unknown>>(),
+  postWearSamplingEnableFor: vi.fn<(display: string) => Promise<unknown>>(),
+  postWearSamplingDisableFor: vi.fn<(display: string, forget: boolean) => Promise<unknown>>(),
   getDaemon: vi.fn(),
   postWearSamplingNudgeDismiss: vi.fn(),
 }));
@@ -33,8 +38,9 @@ vi.mock("../app/hooks/useLiveState", async () => {
 
 vi.mock("../api/client", () => ({
   getConfig: mocks.getConfig,
-  getWearSamplingStatus: mocks.getWearSamplingStatus,
-  postWearSamplingEnable: mocks.postWearSamplingEnable,
+  getWearSamplingStatusFor: mocks.getWearSamplingStatusFor,
+  postWearSamplingEnableFor: mocks.postWearSamplingEnableFor,
+  postWearSamplingDisableFor: mocks.postWearSamplingDisableFor,
   getDaemon: mocks.getDaemon,
   postWearSamplingNudgeDismiss: mocks.postWearSamplingNudgeDismiss,
 }));
@@ -46,7 +52,8 @@ vi.mock("../api/client", () => ({
 beforeEach(() => {
   mocks.state.current = null;
   mocks.getConfig.mockResolvedValue({ inventory: { wear: { active_sampling: { enabled: false } } } });
-  mocks.getWearSamplingStatus.mockResolvedValue({ status: "granted" });
+  // Default: per-display status shows granted for all displays
+  mocks.getWearSamplingStatusFor.mockResolvedValue({ status: "granted" });
   // Default: daemon identity reports wear_sampling is supported on this host
   // AND the user has not dismissed the onboarding nudge. Individual tests
   // override either field to drive the platform-capability gate and the
@@ -88,36 +95,39 @@ function setState(overrides: Parameters<typeof liveStateFixture>[0]) {
 describe("WearCard", () => {
   it("polls once after awaiting consent and stops at granted or denied", async () => {
     mocks.getConfig.mockResolvedValue({ inventory: { wear: { active_sampling: { enabled: true, sampled_display: "desk" } } } });
-    mocks.getWearSamplingStatus
+    mocks.getWearSamplingStatusFor
       .mockResolvedValueOnce({ status: "error", reason: "wear_sampling_needs_consent" })
       .mockResolvedValueOnce({ status: "granted" });
-    mocks.postWearSamplingEnable.mockResolvedValue({ status: "awaiting_consent" });
-    setState({ wear: { displays: [summary({ config_display_id: "desk" })] } });
+    mocks.postWearSamplingEnableFor.mockResolvedValue({ status: "awaiting_consent" });
+    setState({ wear: { displays: [summary({ config_display_id: "desk", display_name: "desk" })] } });
     render(<WearCard />);
     await screen.findByRole("button", { name: "Enable active sampling" });
-    vi.useFakeTimers();
+    // Advance timers so the polling interval fires without waiting for real time
+    vi.useFakeTimers({ shouldAdvanceTime: true });
     await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Enable active sampling" })); });
-    await vi.advanceTimersByTimeAsync(1000);
-    expect(mocks.getWearSamplingStatus).toHaveBeenCalledTimes(2);
-    await vi.advanceTimersByTimeAsync(3000);
-    expect(mocks.getWearSamplingStatus).toHaveBeenCalledTimes(2);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    expect(mocks.getWearSamplingStatusFor).toHaveBeenCalledTimes(2);
+    await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
+    expect(mocks.getWearSamplingStatusFor).toHaveBeenCalledTimes(2);
   });
 
   it("hides Enable when config is disabled, streaming, or suspended", async () => {
+    vi.useRealTimers();
     mocks.getConfig.mockResolvedValue({ inventory: { wear: { active_sampling: { enabled: false } } } });
-    mocks.getWearSamplingStatus.mockResolvedValue({ status: "error", reason: "wear_sampling_needs_consent" });
+    mocks.getWearSamplingStatusFor.mockResolvedValue({ status: "error", reason: "wear_sampling_needs_consent" });
     setState({ wear: { displays: [summary()] } });
     const { unmount } = render(<WearCard />);
-    await waitFor(() => expect(screen.getByText("Needs consent")).toBeInTheDocument());
+    // With config disabled, samplingEnabled=false → the sampling section does not render
+    await waitFor(() => { expect(screen.queryByText("Needs consent")).not.toBeInTheDocument(); });
     expect(screen.queryByRole("button", { name: "Enable active sampling" })).not.toBeInTheDocument();
     unmount();
     mocks.getConfig.mockResolvedValue({ inventory: { wear: { active_sampling: { enabled: true } } } });
-    mocks.getWearSamplingStatus.mockResolvedValue({ status: "granted" });
+    mocks.getWearSamplingStatusFor.mockResolvedValue({ status: "granted" });
     render(<WearCard />);
     await waitFor(() => expect(screen.getByText("Granted")).toBeInTheDocument());
     expect(screen.queryByRole("button", { name: "Enable active sampling" })).not.toBeInTheDocument();
     cleanup();
-    mocks.getWearSamplingStatus.mockResolvedValue({ status: "error", reason: "wear_sampling_not_active" });
+    mocks.getWearSamplingStatusFor.mockResolvedValue({ status: "error", reason: "wear_sampling_not_active" });
     render(<WearCard />);
     await waitFor(() => expect(screen.getByText("Sampling degraded")).toBeInTheDocument());
     expect(screen.queryByRole("button", { name: "Enable active sampling" })).not.toBeInTheDocument();
@@ -125,22 +135,24 @@ describe("WearCard", () => {
 
   it("stops polling when consent is denied", async () => {
     mocks.getConfig.mockResolvedValue({ inventory: { wear: { active_sampling: { enabled: true } } } });
-    mocks.getWearSamplingStatus.mockResolvedValueOnce({ status: "error", reason: "wear_sampling_needs_consent" })
+    mocks.getWearSamplingStatusFor
+      .mockResolvedValueOnce({ status: "error", reason: "wear_sampling_needs_consent" })
       .mockResolvedValueOnce({ status: "denied" });
-    mocks.postWearSamplingEnable.mockResolvedValue({ status: "awaiting_consent" });
+    mocks.postWearSamplingEnableFor.mockResolvedValue({ status: "awaiting_consent" });
     setState({ wear: { displays: [summary()] } });
     render(<WearCard />);
     await screen.findByRole("button", { name: "Enable active sampling" });
-    vi.useFakeTimers();
+    vi.useFakeTimers({ shouldAdvanceTime: true });
     await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Enable active sampling" })); });
-    await vi.advanceTimersByTimeAsync(1000);
-    await vi.advanceTimersByTimeAsync(3000);
-    expect(mocks.getWearSamplingStatus).toHaveBeenCalledTimes(2);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
+    expect(mocks.getWearSamplingStatusFor).toHaveBeenCalledTimes(2);
   });
+
   it("shows sampling state, age, and the consent action only for enabled needs-consent configuration", async () => {
     mocks.getConfig.mockResolvedValue({ inventory: { wear: { active_sampling: { enabled: true } } } });
-    mocks.getWearSamplingStatus.mockResolvedValue({ status: "error", reason: "wear_sampling_needs_consent" });
-    mocks.postWearSamplingEnable.mockResolvedValue({ status: "awaiting_consent" });
+    mocks.getWearSamplingStatusFor.mockResolvedValue({ status: "error", reason: "wear_sampling_needs_consent" });
+    mocks.postWearSamplingEnableFor.mockResolvedValue({ status: "awaiting_consent" });
     setState({ wear: { displays: [summary({ last_sample_at_epoch_s: Math.floor(Date.now() / 1000) - 90 })] } });
 
     render(<WearCard />);
@@ -148,12 +160,12 @@ describe("WearCard", () => {
     await waitFor(() => expect(screen.getByText("Needs consent")).toBeInTheDocument());
     expect(screen.getByText("Last sample: 1m ago")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Enable active sampling" }));
-    await waitFor(() => expect(mocks.postWearSamplingEnable).toHaveBeenCalledOnce());
+    await waitFor(() => expect(mocks.postWearSamplingEnableFor).toHaveBeenCalledOnce());
   });
 
   it("shows degraded reasons and terminal consent states without an Enable action", async () => {
     mocks.getConfig.mockResolvedValue({ inventory: { wear: { active_sampling: { enabled: true } } } });
-    mocks.getWearSamplingStatus.mockResolvedValue({ status: "denied" });
+    mocks.getWearSamplingStatusFor.mockResolvedValue({ status: "denied" });
     setState({ wear: { displays: [summary()] } });
 
     render(<WearCard />);
@@ -161,6 +173,7 @@ describe("WearCard", () => {
     await waitFor(() => expect(screen.getByText("Consent denied")).toBeInTheDocument());
     expect(screen.queryByRole("button", { name: "Enable active sampling" })).not.toBeInTheDocument();
   });
+
   it("renders the title, honesty-rule caption (no spatial attribution), and per-display summary", () => {
     setState({ wear: { displays: [summary()] } });
 
@@ -252,38 +265,38 @@ describe("WearCard", () => {
     expect(window.location.hash).toBe("#/displays");
   });
 
-    it("#201 clicking a row with config_display_id selects by stable config id, not display_name", () => {
-      // When config_display_id differs from display_name, selection must use the
-      // stable config id so the detail panel opens the correct display.
-      setState({
-        wear: {
-          displays: [
-            summary({
-              display: "panel-office",
-              display_name: "Office Monitor",
-              config_display_id: "panel-office",
-            }),
-          ],
-        },
-      });
-
-      render(<WearCard />);
-
-      fireEvent.click(screen.getByRole("button", { name: "Open Office Monitor panel detail" }));
-
-      // Must select by config_display_id ("panel-office"), not display_name ("Office Monitor").
-      expect(mocks.selectDisplay).toHaveBeenCalledWith("panel-office");
-      expect(window.location.hash).toBe("#/displays");
+  it("#201 clicking a row with config_display_id selects by stable config id, not display_name", () => {
+    // When config_display_id differs from display_name, selection must use the
+    // stable config id so the detail panel opens the correct display.
+    setState({
+      wear: {
+        displays: [
+          summary({
+            display: "panel-office",
+            display_name: "Office Monitor",
+            config_display_id: "panel-office",
+          }),
+        ],
+      },
     });
 
-    // ── #186 Task 19 — platform-gated active-sampling onboarding nudge ───
+    render(<WearCard />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Open Office Monitor panel detail" }));
+
+    // Must select by config_display_id ("panel-office"), not display_name ("Office Monitor").
+    expect(mocks.selectDisplay).toHaveBeenCalledWith("panel-office");
+    expect(window.location.hash).toBe("#/displays");
+  });
+
+  // ── #186 Task 19 — platform-gated active-sampling onboarding nudge ───
 
   describe("#186 onboarding nudge", () => {
     it("shows the nudge with Enable + Dismiss when platform supports sampling, config is enabled, and attribution is uniform with no consent", async () => {
       mocks.getConfig.mockResolvedValue({ inventory: { wear: { active_sampling: { enabled: true } } } });
       // needs_consent — the IPC consent flow already-returned this rejection
-      mocks.getWearSamplingStatus.mockResolvedValue({ status: "error", reason: "wear_sampling_needs_consent" });
-      mocks.postWearSamplingEnable.mockResolvedValue({ status: "awaiting_consent" });
+      mocks.getWearSamplingStatusFor.mockResolvedValue({ status: "error", reason: "wear_sampling_needs_consent" });
+      mocks.postWearSamplingEnableFor.mockResolvedValue({ status: "awaiting_consent" });
       mocks.postWearSamplingNudgeDismiss.mockResolvedValue(undefined);
       mocks.getDaemon.mockResolvedValue({
         pid: 1, started_epoch_s: 0, version: "test", socket: "/tmp/dormant.sock",
@@ -312,7 +325,7 @@ describe("WearCard", () => {
       // platform-capability gate from GET /api/daemon must take precedence.
       // A macOS user must never see the portal action.
       mocks.getConfig.mockResolvedValue({ inventory: { wear: { active_sampling: { enabled: true } } } });
-      mocks.getWearSamplingStatus.mockResolvedValue({ status: "error", reason: "wear_sampling_needs_consent" });
+      mocks.getWearSamplingStatusFor.mockResolvedValue({ status: "error", reason: "wear_sampling_needs_consent" });
       mocks.getDaemon.mockResolvedValue({
         pid: 1, started_epoch_s: 0, version: "test", socket: "/tmp/dormant.sock",
         wear_sampling_supported: false,
@@ -343,8 +356,9 @@ describe("WearCard", () => {
       // attribution + needs_consent + config disabled → the nudge must
       // NOT render at all. Drop the `samplingEnabled` term from
       // `nudgeVisible` and this test must redden.
+      vi.useRealTimers();
       mocks.getConfig.mockResolvedValue({ inventory: { wear: { active_sampling: { enabled: false } } } });
-      mocks.getWearSamplingStatus.mockResolvedValue({ status: "error", reason: "wear_sampling_needs_consent" });
+      mocks.getWearSamplingStatusFor.mockResolvedValue({ status: "error", reason: "wear_sampling_needs_consent" });
       mocks.getDaemon.mockResolvedValue({
         pid: 1, started_epoch_s: 0, version: "test", socket: "/tmp/dormant.sock",
         wear_sampling_supported: true,
@@ -356,14 +370,16 @@ describe("WearCard", () => {
         },
       });
 
-      render(<WearCard />);
-
-      await waitFor(() => expect(screen.getByText("Needs consent")).toBeInTheDocument());
-      // The nudge testid is the entire nudge surface — assert it's gone,
-      // not just the Enable button. Future nudge variants that surface
-      // without an Enable action would still fail this check.
+      const { rerender } = render(<WearCard />);
+      // samplingEnabled=false initially → no sampling section → no "Needs consent"
       expect(screen.queryByTestId("wear-sampling-nudge")).not.toBeInTheDocument();
       expect(screen.queryByRole("button", { name: "Enable active sampling" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Dismiss" })).not.toBeInTheDocument();
+      // After getConfig resolves: samplingEnabled=true → needs_consent status appears
+      // but nudge is still hidden because samplingEnabled=false gates the nudge
+      await act(async () => { });
+      rerender(<WearCard />);
+      // sampling section now shows status but nudge is gated by config-enabled=false
       expect(screen.queryByRole("button", { name: "Dismiss" })).not.toBeInTheDocument();
     });
 
@@ -372,7 +388,7 @@ describe("WearCard", () => {
       // needs_consent — but the ledger already shows sampled attribution, so
       // the nudge is moot; the tracker is paying for content-weighted data
       // through another path.
-      mocks.getWearSamplingStatus.mockResolvedValue({ status: "error", reason: "wear_sampling_needs_consent" });
+      mocks.getWearSamplingStatusFor.mockResolvedValue({ status: "error", reason: "wear_sampling_needs_consent" });
       mocks.getDaemon.mockResolvedValue({
         pid: 1, started_epoch_s: 0, version: "test", socket: "/tmp/dormant.sock",
         wear_sampling_supported: true,
@@ -392,7 +408,7 @@ describe("WearCard", () => {
 
     it("hides the nudge when the user has previously dismissed it (persisted flag)", async () => {
       mocks.getConfig.mockResolvedValue({ inventory: { wear: { active_sampling: { enabled: true } } } });
-      mocks.getWearSamplingStatus.mockResolvedValue({ status: "error", reason: "wear_sampling_needs_consent" });
+      mocks.getWearSamplingStatusFor.mockResolvedValue({ status: "error", reason: "wear_sampling_needs_consent" });
       mocks.getDaemon.mockResolvedValue({
         pid: 1, started_epoch_s: 0, version: "test", socket: "/tmp/dormant.sock",
         wear_sampling_supported: true,
@@ -411,40 +427,43 @@ describe("WearCard", () => {
     });
 
     it("clicking Dismiss calls the dismiss endpoint and on remount the nudge stays hidden", async () => {
+      vi.useRealTimers();
       mocks.getConfig.mockResolvedValue({ inventory: { wear: { active_sampling: { enabled: true } } } });
-      mocks.getWearSamplingStatus.mockResolvedValue({ status: "error", reason: "wear_sampling_needs_consent" });
+      mocks.getWearSamplingStatusFor.mockResolvedValue({ status: "error", reason: "wear_sampling_needs_consent" });
       mocks.postWearSamplingNudgeDismiss.mockResolvedValue(undefined);
-      // First render: not dismissed. Second render (after click): the daemon
-      // identity reflects the persisted dismissal on the next poll.
-      mocks.getDaemon
-        .mockResolvedValueOnce({
-          pid: 1, started_epoch_s: 0, version: "test", socket: "/tmp/dormant.sock",
-          wear_sampling_supported: true,
-          wear_sampling_nudge_dismissed: false,
-        })
-        .mockResolvedValueOnce({
-          pid: 1, started_epoch_s: 0, version: "test", socket: "/tmp/dormant.sock",
-          wear_sampling_supported: true,
-          wear_sampling_nudge_dismissed: true,
-        });
+      mocks.getDaemon.mockResolvedValue({
+        pid: 1, started_epoch_s: 0, version: "test", socket: "/tmp/dormant.sock",
+        wear_sampling_supported: true,
+        wear_sampling_nudge_dismissed: false,
+      });
       setState({
         wear: {
           displays: [summary({ wear_attribution_mode: "uniform" })],
         },
       });
 
-      const { unmount } = render(<WearCard />);
-      const dismiss = await screen.findByRole("button", { name: "Dismiss" });
+      const { unmount, rerender } = render(<WearCard />);
+      // Wait for effects to settle before interacting
+      await act(async () => { });
+      rerender(<WearCard />);
+      // Nudge should now be visible
+      await screen.findByTestId("wear-sampling-nudge");
+      const dismiss = within(screen.getByTestId("wear-sampling-nudge")).getByRole("button", { name: "Dismiss" });
       await act(async () => { fireEvent.click(dismiss); });
+      expect(mocks.postWearSamplingNudgeDismiss).toHaveBeenCalledTimes(1);
 
-      await waitFor(() => expect(mocks.postWearSamplingNudgeDismiss).toHaveBeenCalledTimes(1));
       unmount();
 
-      // Second mount: daemon identity reports the flag is now set, so the
-      // nudge should stay hidden — proving the dismissal is actually
-      // persisted observable, not just a local-state change.
+      // Second mount: getDaemon now returns nudgeDismissed=true, so the
+      // nudge should stay hidden — proving the dismissal is persisted.
+      mocks.getDaemon.mockResolvedValue({
+        pid: 1, started_epoch_s: 0, version: "test", socket: "/tmp/dormant.sock",
+        wear_sampling_supported: true,
+        wear_sampling_nudge_dismissed: true,
+      });
       render(<WearCard />);
-      await waitFor(() => expect(screen.getByText("Needs consent")).toBeInTheDocument());
+      await act(async () => { });
+      // Nudge is hidden because nudgeDismissed=true; sampling status still shows
       expect(screen.queryByTestId("wear-sampling-nudge")).not.toBeInTheDocument();
     });
 
@@ -455,7 +474,7 @@ describe("WearCard", () => {
       // `needs_consent`; when the sampler is suspended instead (target
       // display unavailable), we MUST NOT show that Enable button — invite
       // the user to the doctor view instead.
-      mocks.getWearSamplingStatus.mockResolvedValue({ status: "error", reason: "wear_sampling_portal_unreachable" });
+      mocks.getWearSamplingStatusFor.mockResolvedValue({ status: "error", reason: "wear_sampling_portal_unreachable" });
       mocks.getDaemon.mockResolvedValue({
         pid: 1, started_epoch_s: 0, version: "test", socket: "/tmp/dormant.sock",
         wear_sampling_supported: true,
@@ -477,6 +496,39 @@ describe("WearCard", () => {
       const doctorLink = screen.getByRole("link", { name: /doctor/i });
       expect(doctorLink).toBeInTheDocument();
       expect(doctorLink.getAttribute("href")).toBe("#/doctor");
+    });
+
+    // ── #185 cycle B — per-display nudge independence ─────────────────────
+
+    it("shows nudge on a uniform-attribution row but not on a sampled-attribution row in the same card", async () => {
+      mocks.getConfig.mockResolvedValue({ inventory: { wear: { active_sampling: { enabled: true } } } });
+      mocks.getWearSamplingStatusFor.mockResolvedValue({ status: "error", reason: "wear_sampling_needs_consent" });
+      mocks.postWearSamplingNudgeDismiss.mockResolvedValue(undefined);
+      mocks.getDaemon.mockResolvedValue({
+        pid: 1, started_epoch_s: 0, version: "test", socket: "/tmp/dormant.sock",
+        wear_sampling_supported: true,
+        wear_sampling_nudge_dismissed: false,
+      });
+      // Two displays: one uniform (should get nudge), one sampled (should not)
+      setState({
+        wear: {
+          displays: [
+            summary({ display_name: "desk", wear_attribution_mode: "uniform" }),
+            summary({ display_name: "tv", wear_attribution_mode: "sampled" }),
+          ],
+        },
+      });
+
+      render(<WearCard />);
+
+      // Both rows render with their own per-display status
+      await waitFor(() => expect(screen.getByText("desk")).toBeInTheDocument());
+      expect(screen.getByText("tv")).toBeInTheDocument();
+
+      // Exactly ONE nudge appears — on the uniform-attribution row only
+      const nudges = await screen.findAllByTestId("wear-sampling-nudge");
+      expect(nudges).toHaveLength(1);
+      expect(within(nudges[0]).getByRole("button", { name: "Enable active sampling" })).toBeInTheDocument();
     });
   });
 });

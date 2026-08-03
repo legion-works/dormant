@@ -273,6 +273,26 @@ fn publish_sampler_status(
     web_status.send_replace(legacy);
 }
 
+/// Convert the daemon-internal `SamplerStatuses` map (per-display
+/// `SamplerStatus`) to the portable `WearSamplingStatus` map and publish it
+/// to the per-display status watch channel so doctor and web UI get fresh
+/// per-display data on every status change.
+#[cfg(target_os = "linux")]
+fn publish_per_display_statuses(
+    statuses: &SamplerStatuses,
+    tx: &watch::Sender<std::collections::BTreeMap<String, dormant_core::wear::WearSamplingStatus>>,
+) {
+    let Ok(statuses) = statuses.read() else {
+        return;
+    };
+    let now = Tick::now();
+    let map: std::collections::BTreeMap<String, dormant_core::wear::WearSamplingStatus> = statuses
+        .iter()
+        .map(|(id, s)| (id.to_string(), s.redacted(now)))
+        .collect();
+    tx.send_replace(map);
+}
+
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 async fn spawn_active_sampler_runtime(
@@ -285,6 +305,9 @@ async fn spawn_active_sampler_runtime(
     registry: &SharedSamplerRegistry,
     statuses: &SamplerStatuses,
     web_status: &watch::Sender<Option<dormant_core::wear::WearSamplingStatus>>,
+    per_display_statuses_tx: &watch::Sender<
+        std::collections::BTreeMap<String, dormant_core::wear::WearSamplingStatus>,
+    >,
     event_tx: &mpsc::Sender<ControlMsg>,
 ) -> Option<ActiveSamplerRuntime> {
     let source = match active_sampler::linux::PortalPipeWireSource::new().await {
@@ -335,9 +358,11 @@ async fn spawn_active_sampler_runtime(
         &display_id,
         Some(status_rx.borrow().clone()),
     );
+    publish_per_display_statuses(statuses, per_display_statuses_tx);
     let status_display = display_id.clone();
     let status_map = statuses.clone();
     let status_web = web_status.clone();
+    let status_per_display_tx = per_display_statuses_tx.clone();
     let status_cancel = cancel.clone();
     let status_join = tokio::spawn(async move {
         loop {
@@ -353,6 +378,7 @@ async fn spawn_active_sampler_runtime(
                         &status_display,
                         Some(status_rx.borrow().clone()),
                     );
+                    publish_per_display_statuses(&status_map, &status_per_display_tx);
                 }
             }
         }
@@ -373,6 +399,9 @@ async fn stop_active_sampler_runtime(
     registry: &SharedSamplerRegistry,
     statuses: &SamplerStatuses,
     web_status: &watch::Sender<Option<dormant_core::wear::WearSamplingStatus>>,
+    per_display_statuses_tx: &watch::Sender<
+        std::collections::BTreeMap<String, dormant_core::wear::WearSamplingStatus>,
+    >,
 ) {
     runtime.cancel.cancel();
     for handle in [runtime.join, runtime.status_join] {
@@ -395,6 +424,7 @@ async fn stop_active_sampler_runtime(
         grids.remove(display_id);
     }
     publish_sampler_status(statuses, web_status, display_id, None);
+    publish_per_display_statuses(statuses, per_display_statuses_tx);
 }
 
 #[cfg(target_os = "linux")]
@@ -405,6 +435,9 @@ async fn remove_unselected_active_samplers(
     registry: &SharedSamplerRegistry,
     statuses: &SamplerStatuses,
     web_status: &watch::Sender<Option<dormant_core::wear::WearSamplingStatus>>,
+    per_display_statuses_tx: &watch::Sender<
+        std::collections::BTreeMap<String, dormant_core::wear::WearSamplingStatus>,
+    >,
 ) {
     let removed: Vec<DisplayId> = runtimes
         .keys()
@@ -420,6 +453,7 @@ async fn remove_unselected_active_samplers(
                 registry,
                 statuses,
                 web_status,
+                per_display_statuses_tx,
             )
             .await;
         }
@@ -850,6 +884,7 @@ mod active_sampler_reload_tests {
         ]);
         let registry = Arc::new(std::sync::RwLock::new(BTreeMap::new()));
         let (web_status, _) = watch::channel(None);
+        let (per_display_statuses_tx, _) = watch::channel(std::collections::BTreeMap::default());
 
         remove_unselected_active_samplers(
             &mut runtimes,
@@ -858,6 +893,7 @@ mod active_sampler_reload_tests {
             &registry,
             &statuses,
             &web_status,
+            &per_display_statuses_tx,
         )
         .await;
 
@@ -876,6 +912,7 @@ mod active_sampler_reload_tests {
             &registry,
             &statuses,
             &web_status,
+            &per_display_statuses_tx,
         )
         .await;
         assert!(cancel_b.is_cancelled());
@@ -2020,6 +2057,24 @@ impl App {
         #[cfg(not(target_os = "linux"))]
         let (_web_sampling_tx, web_sampling_rx) =
             watch::channel::<Option<dormant_core::wear::WearSamplingStatus>>(None);
+        // Issue #185 cycle B — per-display sampler status watch. The
+        // daemon's sampler registry aggregates one redacted status per
+        // configured display; the doctor emits ONE wear-sampling check
+        // PER configured display from this map so the operator can see
+        // each display's health individually. Off-Linux / pre-cycle-B
+        // builds leave this empty and the doctor falls back to the
+        // singular probe.
+        #[cfg(target_os = "linux")]
+        let (per_display_statuses_tx, per_display_statuses_rx) =
+            watch::channel::<
+                std::collections::BTreeMap<String, dormant_core::wear::WearSamplingStatus>,
+            >(std::collections::BTreeMap::default());
+        #[cfg(not(target_os = "linux"))]
+        let per_display_statuses_rx: Option<
+            watch::Receiver<
+                std::collections::BTreeMap<String, dormant_core::wear::WearSamplingStatus>,
+            >,
+        > = None;
 
         // Wear tracker: daemon-lifetime, reads config via watch, publishes
         // over the front ctl channel (rides the `GenerationRouter`'s
@@ -2055,6 +2110,7 @@ impl App {
                 &sampler_registry,
                 &sampler_statuses,
                 &web_sampling_tx,
+                &per_display_statuses_tx,
                 &front_ctl_tx,
             )
         })
@@ -2101,11 +2157,18 @@ impl App {
         // both surfaces see the SAME instance — the singleflight
         // coalesce then dedupes a simultaneous CLI `dormantctl doctor`
         // and a browser click on "Run Doctor".
-        let doctor_service = DoctorService::new_with_sampler_status(
+        //
+        // Issue #185 cycle B — per-display sampler status watch. The
+        // daemon's sampler registry aggregates one redacted status per
+        let doctor_service = DoctorService::new_with_sampler_statuses(
             front_ctl_tx.clone(),
             config_rx.clone(),
             creds_rx.clone(),
             Some(web_sampling_rx.clone()),
+            #[cfg(target_os = "linux")]
+            Some(per_display_statuses_rx.clone()),
+            #[cfg(not(target_os = "linux"))]
+            None,
         );
 
         #[cfg(unix)]
@@ -2270,6 +2333,8 @@ impl App {
             latest_grids,
             #[cfg(target_os = "linux")]
             sampler_statuses,
+            #[cfg(target_os = "linux")]
+            per_display_statuses_tx,
             #[cfg(target_os = "linux")]
             web_sampling_tx,
             #[cfg(target_os = "linux")]
@@ -2610,6 +2675,11 @@ struct Runner {
     /// Per-display lifecycle status shared with attribution and control surfaces.
     #[cfg(target_os = "linux")]
     sampler_statuses: SamplerStatuses,
+    /// Per-display redacted sampler status published from the status loop
+    /// for doctor and web per-display status polling.
+    #[cfg(target_os = "linux")]
+    per_display_statuses_tx:
+        watch::Sender<std::collections::BTreeMap<String, dormant_core::wear::WearSamplingStatus>>,
     /// Legacy single-display status projection retained for cycle-B consumers.
     #[cfg(target_os = "linux")]
     web_sampling_tx: watch::Sender<Option<dormant_core::wear::WearSamplingStatus>>,
@@ -2901,6 +2971,7 @@ impl Runner {
             &self.sampler_registry,
             &self.sampler_statuses,
             &self.web_sampling_tx,
+            &self.per_display_statuses_tx,
         )
         .await;
 
@@ -2918,6 +2989,7 @@ impl Runner {
                 &self.sampler_registry,
                 &self.sampler_statuses,
                 &self.web_sampling_tx,
+                &self.per_display_statuses_tx,
                 &self.sampler_event_tx,
             )
             .await
@@ -4211,6 +4283,7 @@ async fn run_loop(
         let registry = runner.sampler_registry.clone();
         let statuses = runner.sampler_statuses.clone();
         let web_status = runner.web_sampling_tx.clone();
+        let per_display_statuses_tx = runner.per_display_statuses_tx.clone();
         async move {
             for (display, runtime) in runtimes {
                 stop_active_sampler_runtime(
@@ -4220,6 +4293,7 @@ async fn run_loop(
                     &registry,
                     &statuses,
                     &web_status,
+                    &per_display_statuses_tx,
                 )
                 .await;
             }

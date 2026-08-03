@@ -9,19 +9,12 @@ cargo-dist-version = "0.32.0"
 ci = "github"
 # The installers to generate for each app
 installers = ["shell", "homebrew"]
-# Target platforms to build apps for (Rust target-triple syntax).
-# GNU, not musl: zbus (DBus) and libudev make static musl builds painful.
-# macOS targets ship the DDC/CI, macos-gamma-black, macos-display-sleep, and
-# CoreGraphics-idle controllers, the read-only macOS doctor arms, and the
-# native AppKit `dormant-tray` menu-bar item. See docs/src/installation.md.
-# Windows remains excluded — dormant still uses facilities with no Windows
-# port (KWin DBus, DDC/CI via /dev/i2c or IOKit, udev, Wayland/X11 DPMS,
-# CoreGraphics gamma/idle).
+# Target platforms to build apps for (Rust target-triple syntax)
 targets = [
-  "x86_64-unknown-linux-gnu",
-  "aarch64-unknown-linux-gnu",
   "aarch64-apple-darwin",
+  "aarch64-unknown-linux-gnu",
   "x86_64-apple-darwin",
+  "x86_64-unknown-linux-gnu",
 ]
 # Path that installers should place binaries in
 install-path = "~/.local/bin"
@@ -29,22 +22,19 @@ install-path = "~/.local/bin"
 hosting = "github"
 # Whether to install an updater program
 install-updater = false
-# Homebrew tap to publish formulae to (must already exist, operator-provisioned)
-# The release workflow needs a HOMEBREW_TAP_TOKEN secret (PAT with write access
-# to the tap repo legion-works/homebrew-tap).
+# A GitHub repo to push Homebrew formulas to
 tap = "legion-works/homebrew-tap"
-# Publish jobs to run after a release
+# Publish jobs to run in CI
 publish-jobs = ["homebrew"]
-# AUR sources only resolve after GitHub release assets are public.
+# Post-announce jobs to run in CI
 post-announce-jobs = ["./publish-aur"]
 # Generate checksums for release artifacts
 checksums = true
-# Verify packaged Linux binaries actually run before publishing (#38)
+# Global artifacts jobs to run in CI
 global-artifacts-jobs = ["./release-artifact-smoke", "./release-changelog-gate"]
-# Build with the web UI embedded. The release CI must build the frontend
-# dist before the Rust build so rust-embed can bundle the real SPA.
-# The github-build-setup snippet handles Node + npm ci + npm run build.
+# Features to pass to cargo build
 features = ["web-ui"]
+# Whether to pass --all-features to cargo build
 all-features = false
 github-build-setup = "../dist-build-setup.yml"
 
@@ -77,7 +67,10 @@ libmpv-dev = { targets = [
   "x86_64-unknown-linux-gnu",
   "aarch64-unknown-linux-gnu",
 ] }
-libpipewire-0.3-dev = { targets = [
+# Quoted: TOML reads a bare `libpipewire-0.3-dev` as the dotted key
+# `libpipewire-0` → `3-dev`, so apt is handed the package name
+# `libpipewire-0`, which does not exist.
+"libpipewire-0.3-dev" = { targets = [
   "x86_64-unknown-linux-gnu",
   "aarch64-unknown-linux-gnu",
 ] }

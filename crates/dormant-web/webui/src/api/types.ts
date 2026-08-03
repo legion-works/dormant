@@ -60,6 +60,7 @@ export const DAEMON_EVENT_TAGS = [
   "blank_recovered",
   "wake_recovered",
   "ownership",
+  "operations_changed",
 ] as const;
 export type DaemonEventTag = (typeof DAEMON_EVENT_TAGS)[number];
 
@@ -240,6 +241,21 @@ export interface DaemonIdentity {
    *  "Star the repo" nudge has been dismissed (flag file in config dir).
    *  Omitted by old daemons so the API client defaults it to false. */
   star_nudge_dismissed?: boolean;
+  /** rust: DaemonIdentity::wear_sampling_supported — whether the daemon's
+   *  active wear-sampling pipeline is **platform-capable** on this host.
+   *  Derived from `wear_sampling_rx.borrow().is_some()`: non-Linux builds
+   *  never spawn the active sampler (the module is
+   *  `#[cfg(target_os = "linux")]`), so the watch stays `None` and this
+   *  is `false`. Critically, this is independent of the user's
+   *  `wear.active_sampling.enabled` config flag — that is the user's
+   *  *intent*, this is the system's *capability*. The wear-card
+   *  onboarding nudge (issue #186) MUST read this field, not the config
+   *  flag, to decide whether to show the portal action. */
+  wear_sampling_supported?: boolean;
+  /** rust: DaemonIdentity::wear_sampling_nudge_dismissed — whether the
+   *  wear-card onboarding nudge has been dismissed (flag file in config
+   *  dir). Omitted by old daemons so the API client defaults it to false. */
+  wear_sampling_nudge_dismissed?: boolean;
 }
 
 /**
@@ -285,7 +301,8 @@ export type DaemonEvent =
   | BlankFailureEvent
   | BlankRecoveredEvent
   | WakeRecoveredEvent
-  | OwnershipEvent;
+  | OwnershipEvent
+  | OperationsChangedEvent;
 
 export interface SensorChangedEvent {
   event: "sensor_changed";
@@ -414,6 +431,20 @@ export interface OwnershipEvent {
 }
 
 /**
+ * rust: rules.rs DaemonEvent::OperationsChanged (issue #184).
+ * Pushed by the HTTP layer after every exercise / emergency-wake guard mutation
+ * (insert AND remove, including the detached completion monitor). Lets the
+ * webui replace the 1 Hz paired poll with event-driven UI.
+ */
+export interface OperationsChangedEvent {
+  event: "operations_changed";
+  /** Display ids with a web exercise currently awaiting engine completion. */
+  exercise_in_flight: string[];
+  /** Whether a global web emergency wake is currently awaiting engine completion. */
+  emergency_wake_in_flight: boolean;
+}
+
+/**
  * rust: doctor.rs Check
  * serde: `detail` is `#[serde(default, skip_serializing_if = "Option::is_none")]`
  * `category` / `subject` are added by BG-7.
@@ -507,10 +538,21 @@ export interface ConfigInventory {
   rules: Record<string, RuleConfig>;
 }
 
-/** rust: config/schema.rs ActiveSamplingConfig — `[wear.active_sampling]`. */
+/** rust: config/schema.rs ActiveSamplingConfig — `[wear.active_sampling]`.
+ *
+ * `sampled_displays` is the canonical multi-display field. The legacy
+ * singular `sampled_display` is still accepted for backward
+ * compatibility inside `config_version = 1`; the editor surfaces
+ * `sampled_displays` and the server validates that exactly one of the
+ * two keys is present. When `sampled_displays` is omitted (legacy
+ * configs), the form keeps rendering the single `sampled_display`
+ * row. */
 export interface ActiveSamplingConfig {
   enabled: boolean;
+  /** Legacy singular form. Mutually exclusive with `sampled_displays`. */
   sampled_display?: string | null;
+  /** Canonical plural form. */
+  sampled_displays?: string[];
   stream_mode: "warm" | "per-tick";
   capture_timeout: string;
   failure_threshold: number;

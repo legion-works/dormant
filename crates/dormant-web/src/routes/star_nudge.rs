@@ -3,9 +3,7 @@
 //! renders again. The star route additionally attempts to star the repo
 //! via `gh api` before dismissing.
 
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -17,6 +15,7 @@ use serde::Serialize;
 
 use crate::WebState;
 use crate::error::WebError;
+use crate::routes::dismiss_flag::write_dismiss_flag;
 
 /// Fixed PATH for the `gh` child process — never inherits the daemon's
 /// session PATH (which may contain user-writable directories like
@@ -107,71 +106,6 @@ impl GhStar {
     }
 }
 
-/// Write the `star-nudge-dismissed` flag file atomically (tempfile +
-/// rename). Idempotent: if the file already exists this is a no-op.
-///
-/// SEC S3: the temp file is opened with `create_new(true)` — fails on an
-/// existing file or symlink, preventing a predictable-name symlink attack.
-/// A stale temp left by a prior crash is removed once and retried.
-fn write_dismiss_flag(path: &Path) -> Result<(), WebError> {
-    if path.exists() {
-        return Ok(());
-    }
-
-    // CORR 3: if parent is None or empty (e.g. relative `config.toml`),
-    // fall back to the current directory so the flag file still lands
-    // somewhere reachable rather than panicking.
-    let dir = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let tmp_path = dir.join("star-nudge-dismissed.tmp");
-
-    let mut f = match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp_path)
-    {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Stale tmp from a prior crash — remove and retry once.
-            let _ = std::fs::remove_file(&tmp_path);
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp_path)
-                .map_err(|e2| {
-                    WebError::ConfigReadError(format!(
-                        "cannot create star-nudge temp after stale cleanup: {e2}"
-                    ))
-                })?
-        }
-        Err(e) => {
-            return Err(WebError::ConfigReadError(format!(
-                "cannot create star-nudge temp: {e}"
-            )));
-        }
-    };
-    f.write_all(b"dismissed\n")
-        .and_then(|()| f.sync_all())
-        .map_err(|e| WebError::ConfigReadError(format!("cannot write star-nudge temp: {e}")))?;
-    drop(f);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::metadata(&tmp_path) {
-            let mut perms = meta.permissions();
-            perms.set_mode(0o644);
-            let _ = std::fs::set_permissions(&tmp_path, perms);
-        }
-    }
-    std::fs::rename(&tmp_path, path)
-        .map_err(|e| WebError::ConfigReadError(format!("cannot rename star-nudge temp: {e}")))?;
-    tracing::info!(event = "star_nudge_dismissed", ?path);
-    Ok(())
-}
-
 /// `POST /api/star-nudge/dismiss` — write the `star-nudge-dismissed` flag
 /// file so the nudge never renders again. Idempotent.
 pub(crate) async fn post_star_nudge_dismiss(
@@ -182,7 +116,7 @@ pub(crate) async fn post_star_nudge_dismiss(
         tracing::debug!(event = "star_nudge_dismissed", ?path, "already dismissed");
         return Ok(StatusCode::NO_CONTENT);
     }
-    write_dismiss_flag(path)?;
+    write_dismiss_flag(path, "star_nudge_dismissed")?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -204,7 +138,7 @@ pub(crate) async fn post_star_nudge_star(
         gh.test_path = Some(d.clone());
     }
     let starred = gh.star(Duration::from_secs(5)).await;
-    write_dismiss_flag(&state.inner.star_nudge_path)?;
+    write_dismiss_flag(&state.inner.star_nudge_path, "star_nudge_dismissed")?;
 
     if starred {
         tracing::info!(event = "star_nudge_starred");
@@ -344,6 +278,40 @@ mod tests {
             StatusCode::NO_CONTENT
         );
         assert_eq!(flag_path.metadata().unwrap().modified().unwrap(), mtime);
+    }
+
+    /// Pin the literal log event name emitted by `post_star_nudge_dismiss`.
+    /// The pre-extraction (`5a18e4a`) literal was `star_nudge_dismissed`;
+    /// the extraction must preserve it byte-for-byte. A regression that
+    /// derives the name from the filename (`star_nudge_dismissed_dismissed`)
+    /// would silently break dashboard greps and operator alerting.
+    #[tokio::test]
+    async fn dismiss_emits_star_nudge_dismissed_event_literal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _cancel) = state_in_dir(dir.path());
+
+        crate::test_support::start_capturing();
+        let result = post_star_nudge_dismiss(State(state)).await;
+        assert!(result.is_ok());
+        let events = crate::test_support::take_captured();
+
+        // Event is captured as `event="star_nudge_dismissed"` (the
+        // `FieldDumpVisitor` formats Debug fields with `name={value:?}`).
+        assert!(
+            events
+                .iter()
+                .any(|e| e.contains("event=\"star_nudge_dismissed\"")),
+            "missing literal event=star_nudge_dismissed in captured events: {events:?}"
+        );
+        // Negative pin: the doubled-suffix regression would emit
+        // `event="star_nudge_dismissed_dismissed"` — guard against it.
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.contains("star_nudge_dismissed_dismissed")),
+            "do NOT derive the event name from the filename — silently emits the doubled suffix \
+             and breaks grep-based monitoring; pass the literal at the call site instead"
+        );
     }
 
     #[tokio::test]

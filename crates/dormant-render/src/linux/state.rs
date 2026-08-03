@@ -194,9 +194,56 @@ where
     })
 }
 
+/// Abstracts the three side-effect steps performed when a Wayland
+/// output is destroyed and matches the cached target. The trait solves
+/// the borrow conflict that two `&mut self` calls would create — a
+/// single `&mut impl OutputTeardown` receiver carries both the decision
+/// and the ordered teardown sequence into the tested unit.
+///
+/// The documented order is:
+/// 1. `destroy_proxy_bound_state` — releases the proxy-bound surface
+/// 2. `clear_target`             — forgets the cached output
+/// 3. `log_removed`             — emits the `render_output_removed` event
+pub(super) trait OutputTeardown {
+    fn destroy_proxy_bound_state(&mut self);
+    fn clear_target(&mut self);
+    fn log_removed(&mut self);
+}
+
 /// Return whether an output removal invalidates the cached target proxy.
 pub(super) fn should_clear_target<T: PartialEq>(destroyed_id: &T, cached_id: Option<&T>) -> bool {
     cached_id == Some(destroyed_id)
+}
+
+/// Run the body of `OutputHandler::output_destroyed` over abstract
+/// arguments. One implementation, two callers — production passes a
+/// `WaylandState` (which implements `OutputTeardown` by delegating to
+/// the existing methods); tests pass a `TestTeardown` recorder that
+/// captures the call sequence.
+///
+/// Extracted from the `OutputHandler::output_destroyed` handler so the
+/// decision AND the side-effect ORDER live in one place — testable
+/// without a live compositor. The hotplug regression trap — a stale
+/// surface outliving its proxy — is guarded by the documented order
+/// being asserted in the unit tests.
+///
+/// Generic over the id type so production passes `ObjectId` and tests
+/// pass plain `u32`.
+///
+/// Returns whether the cached target was cleared.
+pub(super) fn output_destroyed_impl<T: PartialEq>(
+    destroyed_id: &T,
+    cached_target_id: Option<&T>,
+    state: &mut impl OutputTeardown,
+) -> bool {
+    if should_clear_target(destroyed_id, cached_target_id) {
+        state.destroy_proxy_bound_state();
+        state.clear_target();
+        state.log_removed();
+        true
+    } else {
+        false
+    }
 }
 
 /// Build a `CmdFailure` for one of the render sub-controllers.
@@ -3015,6 +3062,116 @@ mod tests {
         assert!(!should_clear_target(&7_u32, None));
     }
 
+    // ── Task 21 / issue #182: hotplug recovery on the render side ──
+    //
+    // The unit tests above cover the pure decision logic
+    // (`should_clear_target`, `select_output_by_name`). The handler
+    // call site needs a real `WaylandState` (SCTK proxies) — that
+    // lives in the live smoke gate, not here. These tests cover the
+    // EXTRACTED `output_destroyed_impl` body, which is the one
+    // implementation the production handler also runs. Two-record
+    // closure signature (`destroy_surface` then `clear_target`) —
+    // removing either closure or inverting the order flips the
+    // assertion. The pattern mirrors `should_clear_target`'s
+    // extraction above: pure function over abstract arguments, test
+    // exercises the function, production calls it.
+
+    /// Task 21 / issue #182: when the destroyed proxy's id matches the
+    /// cached target, the teardown sequence fires in the documented
+    /// order. The sequence is enforced by `output_destroyed_impl` —
+    /// a regression that reorders the teardown calls or drops
+    /// `destroy_proxy_bound_state` fails this test.
+    #[test]
+    fn output_destroyed_impl_invokes_on_match_when_cached_target_removed() {
+        struct TestTeardown(Vec<&'static str>);
+        impl OutputTeardown for TestTeardown {
+            fn destroy_proxy_bound_state(&mut self) {
+                self.0.push("destroy");
+            }
+            fn clear_target(&mut self) {
+                self.0.push("clear");
+            }
+            fn log_removed(&mut self) {
+                self.0.push("log");
+            }
+        }
+        let mut state = TestTeardown(Vec::new());
+        let result = output_destroyed_impl(&42_u32, Some(&42_u32), &mut state);
+        assert!(result, "target was cleared");
+        assert_eq!(
+            state.0,
+            vec!["destroy", "clear", "log"],
+            "documented order is destroy → clear → log"
+        );
+    }
+
+    /// Task 21: a destroyed proxy that is NOT the cached target is a
+    /// no-op. Stale removal events for unrelated outputs must not
+    /// tear down state.
+    #[test]
+    fn output_destroyed_impl_is_noop_when_destroyed_output_is_not_cached() {
+        struct TestTeardown(Vec<&'static str>);
+        impl OutputTeardown for TestTeardown {
+            fn destroy_proxy_bound_state(&mut self) {
+                self.0.push("destroy");
+            }
+            fn clear_target(&mut self) {
+                self.0.push("clear");
+            }
+            fn log_removed(&mut self) {
+                self.0.push("log");
+            }
+        }
+        let mut state = TestTeardown(Vec::new());
+        let result = output_destroyed_impl(&42_u32, Some(&99_u32), &mut state);
+        assert!(!result, "target was NOT cleared");
+        assert!(
+            state.0.is_empty(),
+            "no side effects for unrelated output removal"
+        );
+    }
+
+    /// Task 21 / issue #77: rebinding by connector name, not by
+    /// proxy id. After a destroyed output is replaced with a new
+    /// proxy carrying the SAME connector name, the next show must
+    /// select the new proxy — not the stale cached id.
+    ///
+    /// The selection logic is `select_output_by_name` (already tested
+    /// above); this test verifies the rebinding invariant through a
+    /// combined sequence: cached id is cleared, replacement output
+    /// arrives, next show resolves to the replacement.
+    #[test]
+    fn select_output_by_name_returns_replacement_with_same_name_after_rebind() {
+        // Old: proxy id 42, name "DP-1". It was destroyed and the
+        // cached target cleared (mirrors the new output_destroyed
+        // behaviour). A new proxy arrives with the same name "DP-1"
+        // but a NEW id 99.
+        let candidates = [
+            (42_u32, Some("DP-1")),
+            (99_u32, Some("DP-1")),
+            (17_u32, Some("HDMI-A-1")),
+        ];
+        // The old proxy id is no longer in the iterator (it's been
+        // destroyed) — simulates removing the output from
+        // OutputState before the new one is added.
+        let candidates_after_destroy = [(99_u32, Some("DP-1")), (17_u32, Some("HDMI-A-1"))];
+        let resolved = select_output_by_name(candidates_after_destroy.into_iter(), "DP-1");
+        assert_eq!(
+            resolved,
+            Some(99),
+            "next show must bind the REPLACEMENT proxy id, not the stale one"
+        );
+        // Sanity: the full set has two matches with the same name —
+        // `select_output_by_name` returns the first one walking the
+        // iterator. Order matters here.
+        let resolved_first = select_output_by_name(candidates.into_iter(), "DP-1");
+        assert_eq!(
+            resolved_first,
+            Some(42),
+            "select_output_by_name picks the first match — confirms the rebind invariant is `remove the old, then resolve`, not `keep the old and skip the new`"
+        );
+    }
+
     // ── black_attach_strategy: pure selection-logic unit coverage
     //    (U5: black never shifts) ────────────────────────────────────
     //
@@ -3620,14 +3777,29 @@ impl OutputHandler for WaylandState {
     fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, output: WlOutput) {
         let destroyed_id = output.id();
         let cached_id = self.target_output.as_ref().map(Proxy::id);
-        if should_clear_target(&destroyed_id, cached_id.as_ref()) {
-            self.target_output = None;
-            tracing::info!(
-                event = "render_output_removed",
-                display_id = %self.display_id,
-                output = %self.output_name,
-            );
-        }
+        // Task 21 / issue #182: defer to the extracted body so the
+        // decision AND the ordered teardown live in one place
+        // (testable without a live compositor). The hotplug regression
+        // trap — a stale surface outliving its proxy — is guarded by
+        // the documented order (destroy → clear → log) being enforced
+        // by `output_destroyed_impl` and asserted in its unit tests.
+        output_destroyed_impl(&destroyed_id, cached_id.as_ref(), self);
+    }
+}
+
+impl OutputTeardown for WaylandState {
+    fn destroy_proxy_bound_state(&mut self) {
+        self.destroy_surface();
+    }
+    fn clear_target(&mut self) {
+        self.target_output = None;
+    }
+    fn log_removed(&mut self) {
+        tracing::info!(
+            event = "render_output_removed",
+            display_id = %self.display_id,
+            output = %self.output_name,
+        );
     }
 }
 

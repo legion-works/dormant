@@ -292,7 +292,7 @@ impl DirectSwitchHandle {
                 // for the debounced poll (~loss_confirmations × poll_interval)
                 // adds visible latency on the acquiring side (issue #139).
                 if let Some(ref coord) = self.coordination {
-                    coord.mark_owned_immediate(&display);
+                    coord.mark_owned_immediate(&display, target.write_code);
                     // Feed ownership immediately to the rules engine so the
                     // state machine wakes the display without waiting for the
                     // next debounced poll confirmation.

@@ -59,7 +59,10 @@ const { api, fixtures } = vi.hoisted(() => ({
     },
   },
 }));
-const ws = vi.hoisted(() => ({ onMessage: null as null | ((event: unknown) => void) }));
+const ws = vi.hoisted(() => ({
+  onMessage: null as null | ((event: unknown) => void),
+  onConnect: null as null | (() => void),
+}));
 
 vi.mock("../api/client", () => ({
   ...api,
@@ -74,8 +77,9 @@ vi.mock("../api/client", () => ({
   },
 }));
 vi.mock("../api/ws", () => ({
-  useEvents: vi.fn((opts: { onMessage: (event: unknown) => void }) => {
+  useEvents: vi.fn((opts: { onMessage: (event: unknown) => void; onConnect?: () => void }) => {
     ws.onMessage = opts.onMessage;
+    ws.onConnect = opts.onConnect ?? null;
     return { connected: true, close: vi.fn() };
   }),
 }));
@@ -141,79 +145,122 @@ describe("LiveStateProvider v2", () => {
     expect(screen.getByTestId("selected")).toHaveTextContent("main");
   });
 
-  it("polls state and authoritative operation guards roughly once per second", async () => {
-    vi.useFakeTimers();
+  // issue #184: operations are driven by WS events, not 1Hz HTTP polling.
+  it("operations: initial load from HTTP, then WS events drive updates", async () => {
     api.getState.mockResolvedValue(fixtures.state);
     api.getConfig.mockResolvedValue(fixtures.config);
     api.getWear.mockResolvedValue({ displays: [] });
-
-    render(<LiveStateProvider><Consumer /></LiveStateProvider>);
-    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
-    expect(api.getState).toHaveBeenCalledTimes(1);
-    expect(api.getOperations).toHaveBeenCalledTimes(1);
-
-    await act(async () => {
-      vi.advanceTimersByTime(1000);
-      await Promise.resolve();
-      await Promise.resolve();
+    // HTTP returns idle on mount.
+    api.getOperations.mockResolvedValue({
+      exercise_in_flight: [],
+      emergency_wake_in_flight: false,
     });
-    expect(api.getState).toHaveBeenCalledTimes(2);
-    expect(api.getOperations).toHaveBeenCalledTimes(2);
-    expect(api.getConfig).toHaveBeenCalledTimes(1);
-    expect(api.getWear).toHaveBeenCalledTimes(1);
-  });
-
-  it("shows a transient poll warning and clears it on the next successful poll", async () => {
-    vi.useFakeTimers();
-    api.getState
-      .mockResolvedValueOnce(fixtures.state)
-      .mockRejectedValueOnce(new Error("temporary disconnect"))
-      .mockResolvedValueOnce({ ...fixtures.state, pending_reload: "recovered" });
-    api.getConfig.mockResolvedValue(fixtures.config);
-    api.getWear.mockResolvedValue({ displays: [] });
-    render(<LiveStateProvider><Consumer /></LiveStateProvider>);
-    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
-
-    await act(async () => {
-      vi.advanceTimersByTime(1000);
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-    expect(screen.getByTestId("fatal-error")).toHaveTextContent("none");
-    expect(screen.getByTestId("poll-warning")).toHaveTextContent("temporary disconnect");
-
-    await act(async () => {
-      vi.advanceTimersByTime(1000);
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-    expect(screen.getByTestId("poll-warning")).toHaveTextContent("none");
-  });
-
-  it("loads operation guards on mount and refreshes them with the status poll", async () => {
-    vi.useFakeTimers();
-    api.getState.mockResolvedValue(fixtures.state);
-    api.getConfig.mockResolvedValue(fixtures.config);
-    api.getWear.mockResolvedValue({ displays: [] });
-    api.getOperations
-      .mockResolvedValueOnce(fixtures.operations)
-      .mockResolvedValueOnce({
-        exercise_in_flight: ["main"],
-        emergency_wake_in_flight: true,
-      });
 
     render(<LiveStateProvider><Consumer /></LiveStateProvider>);
     await act(async () => { await Promise.resolve(); await Promise.resolve(); });
     expect(screen.getByTestId("operations")).toHaveTextContent("false:");
-    expect(screen.getByTestId("operations-request-id")).toHaveTextContent("1");
 
-    await act(async () => {
-      vi.advanceTimersByTime(1000);
-      await Promise.resolve();
-      await Promise.resolve();
+    // WS event drives an exercise-in-flight state.
+    act(() => {
+      ws.onMessage?.({
+        event: "operations_changed",
+        exercise_in_flight: ["studio"],
+        emergency_wake_in_flight: true,
+      });
     });
-    expect(screen.getByTestId("operations")).toHaveTextContent("true:main");
-    expect(screen.getByTestId("operations-request-id")).toHaveTextContent("2");
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(screen.getByTestId("operations")).toHaveTextContent("true:studio");
+
+    // WS event clears the in-flight state.
+    act(() => {
+      ws.onMessage?.({
+        event: "operations_changed",
+        exercise_in_flight: [],
+        emergency_wake_in_flight: false,
+      });
+    });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(screen.getByTestId("operations")).toHaveTextContent("false:");
+  });
+
+  // issue #184: 1Hz poll replaced by WS-driven updates + 30s reconciliation.
+  // Transient warnings now only come from HTTP-level errors (initial/reconnect).
+  it("shows a transient HTTP-level warning and clears it on the next successful reconciliation", async () => {
+    // HTTP resolves on mount with state (no warning).
+    api.getState.mockResolvedValue(fixtures.state);
+    api.getConfig.mockResolvedValue(fixtures.config);
+    api.getWear.mockResolvedValue({ displays: [] });
+    api.getOperations.mockResolvedValue({
+      exercise_in_flight: [],
+      emergency_wake_in_flight: false,
+    });
+
+    render(<LiveStateProvider><Consumer /></LiveStateProvider>);
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(screen.getByTestId("poll-warning")).toHaveTextContent("none");
+
+    // HTTP failure on reconnect (triggered via ws.onConnect).
+    api.getState.mockRejectedValue(new Error("reconnect failure"));
+    api.getOperations.mockResolvedValue({
+      exercise_in_flight: [],
+      emergency_wake_in_flight: false,
+    });
+    act(() => { ws.onConnect?.(); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(screen.getByTestId("poll-warning")).toHaveTextContent("reconnect failure");
+
+    // Successful reconnect clears the warning.
+    api.getState.mockResolvedValue(fixtures.state);
+    act(() => { ws.onConnect?.(); });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(screen.getByTestId("poll-warning")).toHaveTextContent("none");
+  });
+
+  // issue #184: WS events update operations state immediately (no polling needed).
+  it("WS operations_changed event drives operations state; HTTP response does not clobber a newer WS update", async () => {
+    api.getState.mockResolvedValue(fixtures.state);
+    api.getConfig.mockResolvedValue(fixtures.config);
+    api.getWear.mockResolvedValue({ displays: [] });
+
+    function Deferred<T>() {
+      let resolve!: (v: T) => void;
+      const promise = new Promise<T>((r) => { resolve = r; });
+      return { promise, resolve };
+    }
+
+    // Initial mount: HTTP returns idle operations so component renders with data.
+    api.getOperations.mockResolvedValueOnce({
+      exercise_in_flight: [],
+      emergency_wake_in_flight: false,
+    });
+
+    const deferredOps = Deferred<typeof fixtures.operations>();
+    // After initial mount, subsequent calls return a pending promise to simulate
+    // an in-flight HTTP request that hasn't resolved yet.
+    api.getOperations.mockReturnValue(deferredOps.promise);
+
+    render(<LiveStateProvider><Consumer /></LiveStateProvider>);
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(screen.getByTestId("operations")).toHaveTextContent("false:");
+
+    // WS event arrives while HTTP is still pending — WS must win.
+    act(() => {
+      ws.onMessage?.({
+        event: "operations_changed",
+        exercise_in_flight: ["studio"],
+        emergency_wake_in_flight: true,
+      });
+    });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(screen.getByTestId("operations")).toHaveTextContent("true:studio");
+
+    // HTTP finally resolves with stale idle data — must NOT clobber WS update.
+    deferredOps.resolve({
+      exercise_in_flight: [],
+      emergency_wake_in_flight: false,
+    });
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(screen.getByTestId("operations")).toHaveTextContent("true:studio");
   });
 
   it("assigns request ids at start and refuses an older delayed operations commit", async () => {

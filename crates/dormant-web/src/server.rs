@@ -144,6 +144,11 @@ pub(crate) fn build_router(state: WebState) -> Router {
     );
     let api = route_post!(
         api,
+        "/wear/sampling/nudge/dismiss",
+        post(wear_sampling::post_wear_sampling_nudge_dismiss)
+    );
+    let api = route_post!(
+        api,
         "/doctor/exercise/:display",
         post(doctor::post_exercise)
     );
@@ -402,6 +407,14 @@ mod tests {
              below would vacuously pass with nothing to check"
         );
 
+        // Sentinel subset, NOT exhaustive. The one-direction check
+        // (`derived.contains(&known)`) only catches a forgotten
+        // `route_post!` conversion for the entries listed here. New
+        // POST routes added via `route_post!` join the `derived` set
+        // automatically and are still covered by the INVERTED
+        // `derived_post_routes_are_classified_strict_or_weak` test
+        // below, which scans every entry. Keep this list small and
+        // meaningful — a "// every POST route" comment here is a lie.
         let known_post_routes = [
             "/api/config/apply",
             "/api/blank",
@@ -522,8 +535,14 @@ mod tests {
         let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
         let (state, _cancel, mut ctl_rx) = test_web_state_with_bind(bind);
         tokio::spawn(async move {
-            let Some(ControlMsg::EmergencyWake { reply }) = ctl_rx.recv().await else {
-                panic!("expected EmergencyWake");
+            // Drain PublishDaemonEvent frames (#184) before reaching the
+            // EmergencyWake control message.
+            let reply = loop {
+                match ctl_rx.recv().await.unwrap() {
+                    ControlMsg::EmergencyWake { reply } => break reply,
+                    ControlMsg::PublishDaemonEvent(_) => {}
+                    other => panic!("expected EmergencyWake, got {other:?}"),
+                }
             };
             let _ = reply.send(EmergencyWakeReport {
                 operation_id: None,
@@ -691,6 +710,9 @@ mod tests {
                         });
                         break;
                     }
+                    // Issue #184: routes publish a guard snapshot on insert;
+                    // this test only exercises the exercise control flow.
+                    ControlMsg::PublishDaemonEvent(_) => {}
                     other => panic!("unexpected route message: {other:?}"),
                 }
             }
@@ -783,5 +805,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    // ── #186 Task 19 — onboarding-nudge identity fields ─────────────────
+
+    /// The wear-sampling onboarding nudge (issue #186) derives its
+    /// platform-capability gate from `GET /api/daemon` — crucially NOT
+    /// from the config `enabled` flag, which is the user's *intent* not
+    /// the system's *capability*. The watch-channel-backed
+    /// `wear_sampling_rx` is `None` on non-Linux builds (the active sampler
+    /// is `#[cfg(target_os = "linux")]`), so the field MUST be `false` on
+    /// this test host (non-Linux CI) and the wire shape MUST carry both
+    /// fields under those exact names.
+    #[tokio::test]
+    async fn build_router_daemon_reports_wear_sampling_supported_and_dismissed() {
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+        let (state, _cancel, _ctl_rx) = test_web_state_with_bind(bind);
+
+        let response = build_router(state)
+            .oneshot(
+                Request::get("/api/daemon")
+                    .header(axum::http::header::HOST, "127.0.0.1:8080")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        // Both fields MUST be present on the wire (not gated by
+        // `skip_serializing_if` — the web UI reads them as affordance
+        // gates and must always observe a real boolean).
+        assert!(
+            body.get("wear_sampling_supported").is_some(),
+            "`wear_sampling_supported` must be present on /api/daemon so the web UI can gate the portal affordance"
+        );
+        assert!(
+            body.get("wear_sampling_nudge_dismissed").is_some(),
+            "`wear_sampling_nudge_dismissed` must be present on /api/daemon so the web UI can hide the nudge"
+        );
+        // On a non-Linux test host (this CI box), the active sampler is
+        // never spawned and the watch stays `None`, so the platform is
+        // incapable of running active sampling and the field MUST be false.
+        assert_eq!(
+            body["wear_sampling_supported"], false,
+            "non-Linux test host must report supported=false (the active-sampler module is cfg(target_os=linux)"
+        );
+        assert_eq!(
+            body["wear_sampling_nudge_dismissed"], false,
+            "fresh tempdir must report the dismiss flag as not yet set"
+        );
     }
 }

@@ -470,15 +470,40 @@ pub struct WearConfig {
 }
 
 /// Active-time spatial wear sampling configuration.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// `sampled_displays` is the canonical multi-display config field. The
+/// legacy singular `sampled_display` remains accepted for backward
+/// compatibility within `config_version = 1`; supplying both keys is a
+/// parse error so the operator's intent is unambiguous (see
+/// [`ActiveSamplingConfig::selected_displays`]).
+///
+/// Every id in [`ActiveSamplingConfig::selected_displays`] drives an
+/// independent sampler with
+/// its own consent record, capture stream, lifecycle status, and
+/// cancellation token. [`ActiveSamplingConfig::first_sampled_display`]
+/// remains as the single-display accessor for consumers that classify
+/// one status at a time (the doctor probes).
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ActiveSamplingConfig {
     /// Enable active sampling.
     #[serde(default = "default_active_sampling_enabled")]
     pub enabled: bool,
 
-    /// Configured display whose active surface is sampled.
-    #[serde(default)]
+    /// Legacy single-display selector. Mutually exclusive with
+    /// `sampled_displays` at the wire — exactly one of the two keys may
+    /// be present in a config.
+    ///
+    /// The `skip_serializing_if` keeps the singular form out of the
+    /// wire when the canonical plural list is in use, so a config that
+    /// was authored with `sampled_displays` round-trips to the same key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sampled_display: Option<String>,
+
+    /// Multi-display selector. The canonical field; the singular
+    /// `sampled_display` legacy form is translated into a one-element
+    /// list at deserialization time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sampled_displays: Vec<String>,
 
     /// `PipeWire` stream lifecycle strategy.
     #[serde(default = "default_active_sampling_stream_mode")]
@@ -508,11 +533,223 @@ impl Default for ActiveSamplingConfig {
         Self {
             enabled: default_active_sampling_enabled(),
             sampled_display: None,
+            sampled_displays: Vec::new(),
             stream_mode: default_active_sampling_stream_mode(),
             capture_timeout: default_active_sampling_capture_timeout(),
             failure_threshold: default_active_sampling_failure_threshold(),
             circuit_reset_after: default_active_sampling_circuit_reset_after(),
         }
+    }
+}
+
+impl ActiveSamplingConfig {
+    /// Returns the configured display ids in declaration order.
+    ///
+    /// This is the single source of truth for which displays are sampled.
+    /// Legacy singular configs and the canonical plural list both surface
+    /// here. Callers MUST go through this method rather than reading
+    /// `sampled_display` directly, so the per-display path is consistent
+    /// across the daemon.
+    #[must_use]
+    pub fn selected_displays(&self) -> Vec<String> {
+        if !self.sampled_displays.is_empty() {
+            return self.sampled_displays.clone();
+        }
+        match self.sampled_display.as_ref() {
+            Some(display) => vec![display.clone()],
+            None => Vec::new(),
+        }
+    }
+
+    /// Returns the singular display id the single-display runtime path
+    /// operates on, borrowing from either the legacy singular field or
+    /// the first element of a 1-element plural list.
+    ///
+    /// The runtime's consent flow, daemon-lifetime sampler, and IPC
+    /// `display_exists` check all predate the multi-display registry
+    /// and read a single display id. A 1-element `sampled_displays` list
+    /// therefore drives that runtime path so an operator who adopts the
+    /// canonical plural form for forward-compat with multi-display
+    /// sampling does not silently suspend on this branch. Lists with
+    /// `> 1` entries return `None` and stay suspended until the
+    /// multi-display registry lands.
+    #[must_use]
+    pub fn first_sampled_display(&self) -> Option<&str> {
+        if let Some(display) = self.sampled_display.as_deref() {
+            return Some(display);
+        }
+        match self.sampled_displays.first() {
+            Some(display) if self.sampled_displays.len() == 1 => Some(display.as_str()),
+            _ => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ActiveSamplingConfig {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "each branch handles a distinct config key; the visitor pattern keeps the keys visible"
+    )]
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{Error as _, MapAccess, Visitor};
+        use std::fmt;
+
+        // The wire shape is a flat table. Each known key is optional;
+        // its default matches the corresponding `#[serde(default = ...)]`
+        // shim on the struct fields so an empty `{}` parses to the same
+        // shape as the impl-Default values. `#[serde(other)]` on the
+        // catch-all `Other` arm keeps the repo's two-stage discipline
+        // intact: unknown keys are consumed here and the
+        // `validate::collect_unknown_keys` walker surfaces them with
+        // `E_CONFIG_UNKNOWN_KEY` rather than being rejected at parse.
+        #[derive(Default, Deserialize)]
+        #[serde(field_identifier, rename_all = "snake_case")]
+        enum Field {
+            Enabled,
+            SampledDisplay,
+            SampledDisplays,
+            StreamMode,
+            CaptureTimeout,
+            FailureThreshold,
+            CircuitResetAfter,
+            #[serde(other)]
+            #[default]
+            Other,
+        }
+
+        struct ActiveSamplingConfigVisitor;
+
+        impl<'de> Visitor<'de> for ActiveSamplingConfigVisitor {
+            type Value = ActiveSamplingConfig;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("active sampling configuration")
+            }
+
+            fn visit_map<V>(self, mut map: V) -> Result<ActiveSamplingConfig, V::Error>
+            where
+                V: MapAccess<'de>,
+            {
+                let mut enabled: Option<bool> = None;
+                let mut sampled_display: Option<Option<String>> = None;
+                let mut sampled_displays: Option<Vec<String>> = None;
+                let mut stream_mode: Option<StreamMode> = None;
+                let mut capture_timeout: Option<Duration> = None;
+                let mut failure_threshold: Option<u32> = None;
+                let mut circuit_reset_after: Option<Duration> = None;
+
+                while let Some(key) = map.next_key::<Field>()? {
+                    match key {
+                        Field::Enabled => {
+                            if enabled.is_some() {
+                                return Err(V::Error::duplicate_field("enabled"));
+                            }
+                            enabled = Some(map.next_value()?);
+                        }
+                        Field::SampledDisplay => {
+                            if sampled_display.is_some() {
+                                return Err(V::Error::duplicate_field("sampled_display"));
+                            }
+                            sampled_display = Some(map.next_value()?);
+                        }
+                        Field::SampledDisplays => {
+                            if sampled_displays.is_some() {
+                                return Err(V::Error::duplicate_field("sampled_displays"));
+                            }
+                            sampled_displays = Some(map.next_value()?);
+                        }
+                        Field::StreamMode => {
+                            if stream_mode.is_some() {
+                                return Err(V::Error::duplicate_field("stream_mode"));
+                            }
+                            stream_mode = Some(map.next_value()?);
+                        }
+                        Field::CaptureTimeout => {
+                            if capture_timeout.is_some() {
+                                return Err(V::Error::duplicate_field("capture_timeout"));
+                            }
+                            // humantime string → Duration; delegates to the
+                            // humantime_serde adapter used by the previous
+                            // serde-generated code so existing configs
+                            // (`capture_timeout = "3s"`) keep parsing.
+                            let raw: String = map.next_value()?;
+                            capture_timeout =
+                                Some(humantime::parse_duration(&raw).map_err(V::Error::custom)?);
+                        }
+                        Field::FailureThreshold => {
+                            if failure_threshold.is_some() {
+                                return Err(V::Error::duplicate_field("failure_threshold"));
+                            }
+                            failure_threshold = Some(map.next_value()?);
+                        }
+                        Field::CircuitResetAfter => {
+                            if circuit_reset_after.is_some() {
+                                return Err(V::Error::duplicate_field("circuit_reset_after"));
+                            }
+                            let raw: String = map.next_value()?;
+                            circuit_reset_after =
+                                Some(humantime::parse_duration(&raw).map_err(V::Error::custom)?);
+                        }
+                        Field::Other => {
+                            // Unknown keys are surfaced by the unknown-key
+                            // walker in `validate`; here we just consume
+                            // the value to keep parsing forward.
+                            let _: serde::de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+
+                let sampled_display = sampled_display.unwrap_or(None);
+                let sampled_displays = sampled_displays.unwrap_or_default();
+
+                // Mutually exclusive: both keys present is an error so
+                // the operator's intent is unambiguous (the plan trap).
+                if sampled_display.is_some() && !sampled_displays.is_empty() {
+                    return Err(V::Error::custom(
+                        "wear.active_sampling.sampled_display and sampled_displays are mutually exclusive; supply only one",
+                    ));
+                }
+
+                // Within a plural list, duplicates and sanitized-collision
+                // ids would race for the same on-disk consent file; reject
+                // both up front so the operator learns at config parse.
+                let mut seen_raw: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                let mut seen_sanitized: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for display in &sampled_displays {
+                    if !seen_raw.insert(display.clone()) {
+                        return Err(V::Error::custom(format!(
+                            "wear.active_sampling.sampled_displays contains duplicate id '{display}'"
+                        )));
+                    }
+                    let sanitized = crate::wear::sanitize_identity_key(display);
+                    if !seen_sanitized.insert(sanitized.clone()) {
+                        return Err(V::Error::custom(format!(
+                            "wear.active_sampling.sampled_displays contains ids that sanitize to the same key '{sanitized}'; rename one to keep consent records distinct"
+                        )));
+                    }
+                }
+
+                Ok(ActiveSamplingConfig {
+                    enabled: enabled.unwrap_or_else(default_active_sampling_enabled),
+                    sampled_display,
+                    sampled_displays,
+                    stream_mode: stream_mode.unwrap_or_else(default_active_sampling_stream_mode),
+                    capture_timeout: capture_timeout
+                        .unwrap_or_else(default_active_sampling_capture_timeout),
+                    failure_threshold: failure_threshold
+                        .unwrap_or_else(default_active_sampling_failure_threshold),
+                    circuit_reset_after: circuit_reset_after
+                        .unwrap_or_else(default_active_sampling_circuit_reset_after),
+                })
+            }
+        }
+
+        deserializer.deserialize_map(ActiveSamplingConfigVisitor)
     }
 }
 
@@ -2248,6 +2485,10 @@ advisory_after = "48h"
                 Some("desk")
             );
             assert_eq!(
+                cfg.wear.active_sampling.selected_displays(),
+                vec!["desk".to_owned()]
+            );
+            assert_eq!(
                 cfg.wear.active_sampling.capture_timeout,
                 Duration::from_secs(3)
             );
@@ -2265,6 +2506,185 @@ advisory_after = "48h"
                 }
             );
         }
+    }
+
+    #[test]
+    fn active_sampling_accepts_legacy_singular_sampled_display() {
+        // Backward compatibility: a config that supplies only the legacy
+        // singular `sampled_display` is treated as one selected display.
+        let toml_str = r#"
+config_version = 1
+[displays.desk]
+controllers = ["kwin-dpms"]
+[wear.active_sampling]
+enabled = true
+sampled_display = "desk"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            cfg.wear.active_sampling.sampled_display.as_deref(),
+            Some("desk")
+        );
+        assert_eq!(
+            cfg.wear.active_sampling.selected_displays(),
+            vec!["desk".to_owned()]
+        );
+    }
+
+    #[test]
+    fn active_sampling_plural_sampled_displays_parses_two() {
+        let toml_str = r#"
+config_version = 1
+[displays.desk]
+controllers = ["kwin-dpms"]
+[displays.tv]
+controllers = ["samsung-tizen"]
+[wear.active_sampling]
+enabled = true
+sampled_displays = ["desk", "tv"]
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            cfg.wear.active_sampling.selected_displays(),
+            vec!["desk".to_owned(), "tv".to_owned()]
+        );
+    }
+
+    #[test]
+    fn active_sampling_rejects_both_singular_and_plural_keys() {
+        // Supplying both keys is rejected explicitly so the operator's
+        // intent is unambiguous. Silent precedence between the two
+        // forms would make config review misrepresent which displays
+        // are captured.
+        let toml_str = r#"
+config_version = 1
+[displays.desk]
+controllers = ["kwin-dpms"]
+[wear.active_sampling]
+enabled = true
+sampled_display = "desk"
+sampled_displays = ["desk"]
+"#;
+        let error = toml::from_str::<Config>(toml_str).unwrap_err().to_string();
+        assert!(
+            error.contains("sampled_display") && error.contains("sampled_displays"),
+            "expected error to mention both keys, got: {error}"
+        );
+    }
+
+    #[test]
+    fn active_sampling_rejects_duplicate_ids_in_plural_list() {
+        let toml_str = r#"
+config_version = 1
+[displays.desk]
+controllers = ["kwin-dpms"]
+[wear.active_sampling]
+enabled = true
+sampled_displays = ["desk", "desk"]
+"#;
+        let error = toml::from_str::<Config>(toml_str).unwrap_err().to_string();
+        assert!(
+            error.to_lowercase().contains("duplicate"),
+            "expected duplicate-key error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn active_sampling_rejects_sanitized_collision_ids() {
+        // "desk!" and "desk?" both sanitize to "desk-" (the `!` and
+        // `?` collapse to `-`), so they would race for the same
+        // on-disk consent record. Reject at config parse so the
+        // operator is told up front rather than discovering it at
+        // sampler spawn.
+        let toml_str = r#"
+config_version = 1
+[displays."desk!"]
+controllers = ["kwin-dpms"]
+[displays."desk?"]
+controllers = ["kwin-dpms"]
+[wear.active_sampling]
+enabled = true
+sampled_displays = ["desk!", "desk?"]
+"#;
+        let error = toml::from_str::<Config>(toml_str).unwrap_err().to_string();
+        assert!(
+            error.to_lowercase().contains("collision") || error.to_lowercase().contains("sanitiz"),
+            "expected sanitized-collision error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn active_sampling_unknown_key_passes_parse_for_walker() {
+        // The repo's two-stage discipline: an unknown key under
+        // [wear.active_sampling] must PARSE successfully so the
+        // `validate::collect_unknown_keys` walker can surface it with
+        // `E_CONFIG_UNKNOWN_KEY`. A hand-rolled deserializer that hard-
+        // errors on unknown keys bypasses the walker and changes the
+        // error stage; the dispatch's parity test pins the soft path.
+        let toml_str = r#"
+config_version = 1
+[wear.active_sampling]
+sampled_display = "desk"
+bogus_key = "should be flagged by the walker, not rejected at parse"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            cfg.wear.active_sampling.sampled_display.as_deref(),
+            Some("desk"),
+            "known keys must still bind cleanly when an unknown is present",
+        );
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let unknown = super::super::validate::collect_unknown_keys(&value);
+        assert!(
+            unknown
+                .iter()
+                .any(|u| u.key_path == "wear.active_sampling.bogus_key"),
+            "walker must surface the unknown key, got {:?}",
+            unknown.iter().map(|u| &u.key_path).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn first_sampled_display_prefers_singular_then_one_element_plural() {
+        // The runtime's single-display path reads `first_sampled_display`
+        // so a 1-element `sampled_displays` list drives the existing
+        // consent flow without waiting for the multi-display registry.
+        // 0- and >1-element plural lists return `None` (suspended).
+        let singular = ActiveSamplingConfig {
+            enabled: true,
+            sampled_display: Some("desk".to_owned()),
+            sampled_displays: Vec::new(),
+            stream_mode: StreamMode::Warm,
+            capture_timeout: Duration::from_secs(2),
+            failure_threshold: 5,
+            circuit_reset_after: Duration::from_secs(300),
+        };
+        assert_eq!(singular.first_sampled_display(), Some("desk"));
+
+        let one_element = ActiveSamplingConfig {
+            enabled: true,
+            sampled_display: None,
+            sampled_displays: vec!["tv".to_owned()],
+            stream_mode: StreamMode::Warm,
+            capture_timeout: Duration::from_secs(2),
+            failure_threshold: 5,
+            circuit_reset_after: Duration::from_secs(300),
+        };
+        assert_eq!(one_element.first_sampled_display(), Some("tv"));
+
+        let two_elements = ActiveSamplingConfig {
+            enabled: true,
+            sampled_display: None,
+            sampled_displays: vec!["desk".to_owned(), "tv".to_owned()],
+            stream_mode: StreamMode::Warm,
+            capture_timeout: Duration::from_secs(2),
+            failure_threshold: 5,
+            circuit_reset_after: Duration::from_secs(300),
+        };
+        assert_eq!(two_elements.first_sampled_display(), None);
+
+        let none = ActiveSamplingConfig::default();
+        assert_eq!(none.first_sampled_display(), None);
     }
 
     // ── DisplayConfig::panel_type ───────────────────────────────────────────

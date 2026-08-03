@@ -249,15 +249,38 @@ pub fn load_credentials_from_str(raw: &str) -> Result<Credentials, DormantError>
 /// The write is atomic (temp file in the same directory + rename) and the file
 /// is created with mode `0o600` on Unix. The temp file is cleaned up on error.
 ///
+/// Two concurrent calls for the SAME `creds_path` (e.g. the CLI pair command
+/// and the web pair route writing to the same file) are serialized through a
+/// process-wide, per-path `Mutex<()>`, so the read→edit→write window is
+/// never interleaved (issue #195). The temp file is opened with
+/// `create_new(true)` and (on Unix) `O_NOFOLLOW` so a pre-planted symlink at
+/// the temp path cannot capture the credential bytes — the unique temp name
+/// makes a pre-existing file unreachable in practice, `O_NOFOLLOW` is the
+/// defense in depth if the unique name ever collides.
+///
 /// # Errors
 ///
 /// Returns [`DormantError::ConfigInvalid`] on I/O or parse errors.
+///
+/// # Panics
+///
+/// Panics only if the process-wide per-path `Mutex<()>` is poisoned — that
+/// requires a prior thread to have panicked while holding the lock for this
+/// `creds_path`. In practice the lock is held for a few filesystem syscalls,
+/// so a panic here is a programming error, not a runtime condition.
 pub fn upsert_samsung_token(
     creds_path: &Path,
     host: &str,
     token: &str,
 ) -> Result<(), DormantError> {
     use std::io::Write as _;
+
+    // ── Per-path serialization (issue #195) ──────────────────────────────────
+    // Hold the per-path `Mutex<()>` across the read→edit→temp-write→rename
+    // window. Without this, two callers see a stale read AND race the temp
+    // filename; one token is lost.
+    let lock = lock_for(creds_path);
+    let _guard = lock.lock().expect("creds lock poisoned");
 
     let mut doc: toml_edit::DocumentMut = if creds_path.exists() {
         let raw = std::fs::read_to_string(creds_path).map_err(|e| DormantError::ConfigInvalid {
@@ -289,46 +312,65 @@ pub fn upsert_samsung_token(
     let dir = creds_path
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."));
-    let tmp_path = dir.join(".credentials.toml.tmp");
+    let tmp_path = unique_temp_path(dir);
 
-    let write_result = (|| -> Result<(), DormantError> {
-        // Create with 0o600 before writing secret bytes.
+    let write_result: Result<(), DormantError> = (|| {
         #[cfg(unix)]
-        let mut f = {
+        {
             use std::os::unix::fs::OpenOptionsExt;
-            std::fs::OpenOptions::new()
+            // `create_new(true)` refuses to open any pre-existing file (regular,
+            // symlink, fifo, anything). `O_NOFOLLOW` is defense in depth: if
+            // somehow a symlink slipped in at the temp path (a TOCTOU race
+            // between name generation and open), the kernel refuses to follow
+            // it, so credential bytes never reach the attacker-controlled
+            // target.
+            let mut f = std::fs::OpenOptions::new()
                 .write(true)
-                .create(true)
-                .truncate(true)
+                .create_new(true)
                 .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
                 .open(&tmp_path)
                 .map_err(|e| DormantError::ConfigInvalid {
                     detail: format!("cannot create temp credentials file: {e}"),
-                })?
-        };
-
+                })?;
+            f.write_all(serialized.as_bytes())
+                .map_err(|e| DormantError::ConfigInvalid {
+                    detail: format!("cannot write temp credentials file: {e}"),
+                })?;
+            f.flush().map_err(|e| DormantError::ConfigInvalid {
+                detail: format!("cannot flush temp credentials file: {e}"),
+            })?;
+            f.sync_all().map_err(|e| DormantError::ConfigInvalid {
+                detail: format!("cannot sync temp credentials file: {e}"),
+            })?;
+            Ok(())
+        }
         #[cfg(not(unix))]
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp_path)
-            .map_err(|e| DormantError::ConfigInvalid {
-                detail: format!("cannot create temp credentials file: {e}"),
+        {
+            // Non-Unix has no portable `O_NOFOLLOW`; the symlink defense here
+            // is `create_new(true)` alone. The unique temp name makes a
+            // pre-existing file (symlink or otherwise) practically
+            // unreachable, and `create_new(true)` is the formal guarantee: if
+            // the path exists for any reason, open fails rather than follows.
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)
+                .map_err(|e| DormantError::ConfigInvalid {
+                    detail: format!("cannot create temp credentials file: {e}"),
+                })?;
+            f.write_all(serialized.as_bytes())
+                .map_err(|e| DormantError::ConfigInvalid {
+                    detail: format!("cannot write temp credentials file: {e}"),
+                })?;
+            f.flush().map_err(|e| DormantError::ConfigInvalid {
+                detail: format!("cannot flush temp credentials file: {e}"),
             })?;
-
-        f.write_all(serialized.as_bytes())
-            .map_err(|e| DormantError::ConfigInvalid {
-                detail: format!("cannot write temp credentials file: {e}"),
+            f.sync_all().map_err(|e| DormantError::ConfigInvalid {
+                detail: format!("cannot sync temp credentials file: {e}"),
             })?;
-        f.flush().map_err(|e| DormantError::ConfigInvalid {
-            detail: format!("cannot flush temp credentials file: {e}"),
-        })?;
-        f.sync_all().map_err(|e| DormantError::ConfigInvalid {
-            detail: format!("cannot sync temp credentials file: {e}"),
-        })?;
-
-        Ok(())
+            Ok(())
+        }
     })();
 
     match write_result {
@@ -339,11 +381,71 @@ pub fn upsert_samsung_token(
             Ok(())
         }
         Err(e) => {
-            // Best-effort cleanup of the temp file.
+            // Best-effort cleanup of the caller-owned temp.
             let _ = std::fs::remove_file(&tmp_path);
             Err(e)
         }
     }
+}
+
+// ── upsert_samsung_token helpers ─────────────────────────────────────────────
+
+/// Process-global counter disambiguating concurrent `upsert_samsung_token`
+/// calls so the unique temp name never repeats within this process.
+static UPSERT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Per-path serialization registry. Two calls for the same `creds_path` MUST
+/// hold the per-path `Mutex<()>` for the entire read→edit→temp-write→rename
+/// window (issue #195). Distinct paths use distinct `Mutex<()>` instances so
+/// unrelated writes don't serialize against each other.
+static CREDS_LOCKS: std::sync::OnceLock<
+    std::sync::Mutex<
+        std::collections::HashMap<std::path::PathBuf, std::sync::Arc<std::sync::Mutex<()>>>,
+    >,
+> = std::sync::OnceLock::new();
+
+fn creds_locks() -> &'static std::sync::Mutex<
+    std::collections::HashMap<std::path::PathBuf, std::sync::Arc<std::sync::Mutex<()>>>,
+> {
+    CREDS_LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Return the per-path `Mutex<()>`. The path is normalized so two literal
+/// paths that refer to the same physical file (relative vs absolute, symlink
+/// vs resolved) share one lock.
+fn lock_for(creds_path: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+    let key = lock_key_for(creds_path);
+    let mut map = creds_locks().lock().expect("creds locks map poisoned");
+    map.entry(key)
+        .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
+        .clone()
+}
+
+/// Normalize `creds_path` into a stable lock key. Canonicalize the parent so
+/// `./credentials.toml` and the absolute path to the same file share one
+/// `Mutex<()>`. Fall back to the literal parent if canonicalization fails
+/// (the parent doesn't exist yet on a fresh install, for example).
+fn lock_key_for(creds_path: &Path) -> std::path::PathBuf {
+    let parent = creds_path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = creds_path
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    let canonical_parent = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    canonical_parent.join(file_name)
+}
+
+/// Generate a unique sibling temp path in `dir`. Each call yields a fresh
+/// name: pid + monotonic clock + process-global sequence. The unique name
+/// alone is necessary but not sufficient — the per-path `Mutex<()>` above
+/// covers the read/edit window.
+fn unique_temp_path(dir: &Path) -> std::path::PathBuf {
+    let seq = UPSERT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0u128, |d| d.as_nanos());
+    dir.join(format!(".credentials.toml.tmp.{pid}.{nanos}.{seq}"))
 }
 
 #[cfg(test)]
@@ -445,6 +547,121 @@ password = "secret"
         assert_eq!(
             load_credentials_from_bytes(b"").unwrap(),
             Credentials::default()
+        );
+    }
+
+    /// Two concurrent `upsert_samsung_token` calls against the SAME credentials
+    /// file with DISTINCT host keys must not lose either token. Issue #195: the
+    /// fixed temp filename clobbered one call's write/rename pair, and even
+    /// without clobber the read→edit→write window is wide open without
+    /// serialization. This test races two threads on a barrier; the final file
+    /// MUST contain both `[samsung]` entries.
+    #[test]
+    fn upsert_samsung_token_concurrent_distinct_hosts_both_persist() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let creds_path = dir.path().join("credentials.toml");
+        seed_creds(&creds_path);
+
+        // Two distinct hosts, two distinct tokens — both must survive.
+        let barrier = Arc::new(Barrier::new(2));
+        let path_a = creds_path.clone();
+        let path_b = creds_path.clone();
+        let barrier_a = Arc::clone(&barrier);
+        let barrier_b = Arc::clone(&barrier);
+
+        let host_a = "192.0.2.10";
+        let host_b = "192.0.2.11";
+        let token_a = "token-alpha-1234";
+        let token_b = "token-bravo-5678";
+
+        let t_a = std::thread::spawn(move || {
+            barrier_a.wait();
+            upsert_samsung_token(&path_a, host_a, token_a)
+        });
+        let t_b = std::thread::spawn(move || {
+            barrier_b.wait();
+            upsert_samsung_token(&path_b, host_b, token_b)
+        });
+
+        // Both upserts must individually succeed; the bug is data loss, not
+        // I/O failure.
+        t_a.join().expect("thread a panicked").unwrap();
+        t_b.join().expect("thread b panicked").unwrap();
+
+        let raw = std::fs::read_to_string(&creds_path).unwrap();
+        let creds: Credentials = toml::from_str(&raw).expect("final creds must parse");
+        assert_eq!(
+            creds.samsung.get(host_a).map(String::as_str),
+            Some(token_a),
+            "host A token lost after concurrent upsert; final file:\n{raw}"
+        );
+        assert_eq!(
+            creds.samsung.get(host_b).map(String::as_str),
+            Some(token_b),
+            "host B token lost after concurrent upsert; final file:\n{raw}"
+        );
+        // The pre-existing samsung entry (and mqtt/comments) from `seed_creds`
+        // must also survive — the race fix must not regress atomicity.
+        assert_eq!(
+            creds.samsung.get("1.2.3.4").map(String::as_str),
+            Some("old"),
+            "pre-existing samsung entry lost; final file:\n{raw}"
+        );
+        assert!(
+            creds.mqtt.contains_key("mqtt://x:1883"),
+            "pre-existing mqtt entry lost; final file:\n{raw}"
+        );
+    }
+
+    /// Unix TOCTOU guard for the temp filename. If an attacker pre-plants a
+    /// symlink at the temp path the upsert previously used, the old
+    /// implementation followed it and wrote credential bytes through the
+    /// symlink to the attacker's target. The fix must NEVER open a path that
+    /// resolves through a symlink for credential bytes.
+    #[cfg(unix)]
+    #[test]
+    fn upsert_samsung_token_does_not_follow_symlinked_temp_on_unix() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let creds_path = dir.path().join("credentials.toml");
+
+        // Sentinel the symlink points to — the old fixed-name code would have
+        // written the new credentials to THIS file through the symlink.
+        let sentinel = dir.path().join("attacker-target.toml");
+        let sentinel_content = "PWNED-BY-SYMLINK\n";
+        std::fs::write(&sentinel, sentinel_content).unwrap();
+
+        // Plant a symlink at the historical fixed temp name. The fixed name is
+        // the trap — the hardened implementation must pick a different
+        // sibling name and never touch this path.
+        let symlinked_temp = dir.path().join(".credentials.toml.tmp");
+        symlink(&sentinel, &symlinked_temp).expect("plant symlink at fixed temp name");
+
+        // Run the upsert — it must succeed AND leave the sentinel untouched.
+        upsert_samsung_token(&creds_path, "192.0.2.20", "fresh-token-9abc").unwrap();
+
+        // Real credentials file got the new host.
+        let raw = std::fs::read_to_string(&creds_path).unwrap();
+        let creds: Credentials = toml::from_str(&raw).expect("creds must parse");
+        assert_eq!(
+            creds.samsung.get("192.0.2.20").map(String::as_str),
+            Some("fresh-token-9abc"),
+            "real credentials file did not receive the new host; contents:\n{raw}"
+        );
+
+        // The sentinel MUST be byte-for-byte what we wrote — no credential
+        // bytes leaked through the symlink.
+        let sentinel_after = std::fs::read_to_string(&sentinel).unwrap();
+        assert_eq!(
+            sentinel_after,
+            sentinel_content,
+            "credential bytes leaked through pre-planted symlink at {}\n\
+             sentinel now contains:\n{sentinel_after}\n\
+             expected:\n{sentinel_content}",
+            symlinked_temp.display()
         );
     }
 }

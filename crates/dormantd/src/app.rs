@@ -40,7 +40,9 @@
 //! (above) covers the physically-dark-but-Active gap. Removed-display verified
 //! wake is fully implemented.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(target_os = "linux")]
+use std::collections::BTreeSet;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 #[cfg(any(test, feature = "test-util"))]
 use std::sync::OnceLock;
@@ -90,8 +92,8 @@ use dormant_render::{HeatSnapshotHandle, LayerShellRenderSink};
 
 #[cfg(target_os = "linux")]
 use crate::active_sampler::{
-    self, ActiveSamplerDeps, ConfigDelta, DisplayExpectation, DisplaySamplingContext,
-    ReconfigurePlan, SamplerUpdate,
+    self, ActiveSamplerDeps, ConfigDelta, DisplayExpectation, DisplaySamplingContext, LatestGrids,
+    ReconfigurePlan, SamplerStatuses, SamplerUpdate, SharedSamplerRegistry,
 };
 use crate::boot_guard::{self, PromoteVerdict};
 use crate::coordination_poll::{self, CoordinationPollDeps};
@@ -102,6 +104,7 @@ use crate::inhibit_audio::{self, AudioRule};
 use crate::macos_idle;
 use crate::notifier::{self, NotifierDeps, NotifySink, NotifyState};
 use crate::reload;
+use crate::screencast_consent;
 use crate::sd_notify::{self, SdNotify};
 use crate::watchdog_schedule::WatchdogSchedule;
 
@@ -113,7 +116,7 @@ fn active_sampler_reconfigure_plans(old: &Config, new: &Config) -> Vec<Reconfigu
     let new_active = &new.wear.active_sampling;
     let mut triggers = Vec::new();
     if new_active.enabled {
-        if old_active.sampled_display != new_active.sampled_display {
+        if old_active.selected_displays() != new_active.selected_displays() {
             triggers.push(ConfigDelta::SampledDisplayChanged);
         }
         if new.wear.enabled {
@@ -151,7 +154,7 @@ fn active_sampler_reconfigure_plans(old: &Config, new: &Config) -> Vec<Reconfigu
 
 #[cfg(target_os = "linux")]
 fn active_sampler_display_context(
-    cfg: &Config,
+    display: &DisplayId,
     display_exists: bool,
     phase: Option<&str>,
 ) -> DisplaySamplingContext {
@@ -164,19 +167,330 @@ fn active_sampler_display_context(
     };
     let stage_active = display_exists && matches!(phase, Phase::Active | Phase::Grace { .. });
     DisplaySamplingContext {
-        display: display_exists
-            .then(|| {
-                cfg.wear
-                    .active_sampling
-                    .sampled_display
-                    .as_ref()
-                    .map(|display| DisplayExpectation {
-                        display: display.clone(),
-                    })
-            })
-            .flatten(),
+        display: display_exists.then(|| DisplayExpectation {
+            display: display.0.clone(),
+        }),
         phase,
         stage_active,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn sampler_cancellation_token(root: &CancellationToken) -> CancellationToken {
+    root.child_token()
+}
+
+#[cfg(target_os = "linux")]
+async fn spawn_selected_sampler_runtimes<T, F, Fut>(
+    cfg: &Config,
+    mut spawn: F,
+) -> BTreeMap<DisplayId, T>
+where
+    F: FnMut(DisplayId) -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    let mut runtimes = BTreeMap::new();
+    for display_id in cfg.wear.active_sampling.selected_displays() {
+        let display_id = DisplayId(display_id);
+        if let Some(runtime) = spawn(display_id.clone()).await {
+            runtimes.insert(display_id, runtime);
+        }
+    }
+    runtimes
+}
+
+#[cfg(target_os = "linux")]
+struct ActiveSamplerRuntime {
+    updates: mpsc::Sender<SamplerUpdate>,
+    cancel: CancellationToken,
+    join: JoinHandle<()>,
+    status_join: JoinHandle<()>,
+}
+
+#[cfg(target_os = "linux")]
+/// One-way migration: the legacy `screencast-consent.json` is copied to the
+/// per-display record (`screencast-consent-<display>.json`) on first boot. After
+/// that copy the per-display file is the authoritative record; the legacy file
+/// remains on disk but is never consulted again.
+fn migrate_legacy_consent(state_dir: &Path, cfg: &Config, display_id: &DisplayId) -> PathBuf {
+    let target = screencast_consent::consent_path(state_dir, &display_id.0);
+    if target.exists()
+        || cfg.wear.active_sampling.sampled_display.as_deref() != Some(display_id.0.as_str())
+    {
+        return target;
+    }
+    let legacy = screencast_consent::legacy_consent_path(state_dir);
+    match screencast_consent::load(&legacy, &display_id.0) {
+        Ok(record) => {
+            if let Err(error) = screencast_consent::store_atomic(&target, record.record()) {
+                tracing::warn!(
+                    event = "wear_sampling_consent_migration_failed",
+                    display = %display_id,
+                    ?error,
+                );
+            }
+        }
+        Err(screencast_consent::ConsentError::NotFound) => {}
+        Err(error) => {
+            tracing::warn!(
+                event = "wear_sampling_consent_migration_failed",
+                display = %display_id,
+                ?error,
+            );
+        }
+    }
+    target
+}
+
+#[cfg(target_os = "linux")]
+fn publish_sampler_status(
+    statuses: &SamplerStatuses,
+    web_status: &watch::Sender<Option<dormant_core::wear::WearSamplingStatus>>,
+    display: &DisplayId,
+    status: Option<active_sampler::SamplerStatus>,
+) {
+    let legacy = {
+        let Ok(mut statuses) = statuses.write() else {
+            return;
+        };
+        match status {
+            Some(status) => {
+                statuses.insert(display.clone(), status);
+            }
+            None => {
+                statuses.remove(display);
+            }
+        }
+        (statuses.len() == 1)
+            .then(|| {
+                statuses
+                    .values()
+                    .next()
+                    .map(|status| status.redacted(Tick::now()))
+            })
+            .flatten()
+    };
+    web_status.send_replace(legacy);
+}
+
+/// Convert the daemon-internal `SamplerStatuses` map (per-display
+/// `SamplerStatus`) to the portable `WearSamplingStatus` map and publish it
+/// to the per-display status watch channel so doctor and web UI get fresh
+/// per-display data on every status change.
+#[cfg(target_os = "linux")]
+fn publish_per_display_statuses(
+    statuses: &SamplerStatuses,
+    tx: &watch::Sender<std::collections::BTreeMap<String, dormant_core::wear::WearSamplingStatus>>,
+) {
+    let Ok(statuses) = statuses.read() else {
+        return;
+    };
+    let now = Tick::now();
+    let map: std::collections::BTreeMap<String, dormant_core::wear::WearSamplingStatus> = statuses
+        .iter()
+        .map(|(id, s)| (id.to_string(), s.redacted(now)))
+        .collect();
+    tx.send_replace(map);
+}
+
+/// Forward observed sampler-status changes to the legacy web-status channel
+/// and the per-display status watch channel. Extracted from
+/// [`spawn_active_sampler_runtime`] so the status-change publish path — the
+/// [`publish_per_display_statuses`] call fired on every `status_rx` change —
+/// is unit-testable without a live `PipeWire` portal: a test builds its own
+/// `watch::channel::<SamplerStatus>`, drives a change through the sender, and
+/// asserts the per-display map advances.
+#[cfg(target_os = "linux")]
+fn spawn_sampler_status_forwarder(
+    display_id: DisplayId,
+    mut status_rx: watch::Receiver<active_sampler::SamplerStatus>,
+    status_map: SamplerStatuses,
+    status_web: watch::Sender<Option<dormant_core::wear::WearSamplingStatus>>,
+    status_per_display_tx: watch::Sender<
+        std::collections::BTreeMap<String, dormant_core::wear::WearSamplingStatus>,
+    >,
+    status_cancel: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = status_cancel.cancelled() => break,
+                changed = status_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    publish_sampler_status(
+                        &status_map,
+                        &status_web,
+                        &display_id,
+                        Some(status_rx.borrow().clone()),
+                    );
+                    publish_per_display_statuses(&status_map, &status_per_display_tx);
+                }
+            }
+        }
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+async fn spawn_active_sampler_runtime(
+    cfg: Arc<Config>,
+    display_id: DisplayId,
+    display_exists: bool,
+    root: &CancellationToken,
+    state_dir: &Path,
+    latest_grids: &LatestGrids,
+    registry: &SharedSamplerRegistry,
+    statuses: &SamplerStatuses,
+    web_status: &watch::Sender<Option<dormant_core::wear::WearSamplingStatus>>,
+    per_display_statuses_tx: &watch::Sender<
+        std::collections::BTreeMap<String, dormant_core::wear::WearSamplingStatus>,
+    >,
+    event_tx: &mpsc::Sender<ControlMsg>,
+) -> Option<ActiveSamplerRuntime> {
+    let source = match active_sampler::linux::PortalPipeWireSource::new().await {
+        Ok(source) => source
+            .with_display(display_id.clone())
+            .with_capture_timeout(cfg.wear.active_sampling.capture_timeout),
+        Err(error) => {
+            tracing::warn!(
+                event = "wear_sampling_portal_unreachable",
+                display = %display_id,
+                ?error,
+                "active sampler unavailable; uniform attribution remains active"
+            );
+            return None;
+        }
+    };
+    let consent_path = migrate_legacy_consent(state_dir, &cfg, &display_id);
+    let (updates, update_rx) = mpsc::channel::<SamplerUpdate>(16);
+    let cancel = sampler_cancellation_token(root);
+    let (handle, join) = active_sampler::spawn_with_handle(ActiveSamplerDeps {
+        initial_config: cfg,
+        display_id: display_id.clone(),
+        update_rx,
+        latest_grids: latest_grids.clone(),
+        source: Box::new(source),
+        consent_path,
+        cancel: cancel.clone(),
+        env_reader: crate::active_sampler::production_env_reader,
+        event_tx: Some(event_tx.clone()),
+    });
+    if let Err(error) = updates.try_send(SamplerUpdate::DisplayContext(
+        active_sampler_display_context(&display_id, display_exists, Some("active")),
+    )) {
+        tracing::warn!(
+            event = "wear_sampling_update_dropped",
+            display = %display_id,
+            ?error,
+            "could not publish initial active-sampler display context"
+        );
+    }
+    if let Ok(mut registry) = registry.write() {
+        registry.insert(display_id.clone(), handle.clone());
+    }
+    let status_rx = handle.status();
+    publish_sampler_status(
+        statuses,
+        web_status,
+        &display_id,
+        Some(status_rx.borrow().clone()),
+    );
+    publish_per_display_statuses(statuses, per_display_statuses_tx);
+    let status_join = spawn_sampler_status_forwarder(
+        display_id.clone(),
+        status_rx,
+        statuses.clone(),
+        web_status.clone(),
+        per_display_statuses_tx.clone(),
+        cancel.clone(),
+    );
+    Some(ActiveSamplerRuntime {
+        updates,
+        cancel,
+        join,
+        status_join,
+    })
+}
+
+#[cfg(target_os = "linux")]
+async fn stop_active_sampler_runtime(
+    display_id: &DisplayId,
+    runtime: ActiveSamplerRuntime,
+    latest_grids: &LatestGrids,
+    registry: &SharedSamplerRegistry,
+    statuses: &SamplerStatuses,
+    web_status: &watch::Sender<Option<dormant_core::wear::WearSamplingStatus>>,
+    per_display_statuses_tx: &watch::Sender<
+        std::collections::BTreeMap<String, dormant_core::wear::WearSamplingStatus>,
+    >,
+) {
+    runtime.cancel.cancel();
+    for handle in [runtime.join, runtime.status_join] {
+        let abort = handle.abort_handle();
+        if tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .is_err()
+        {
+            abort.abort();
+            tracing::warn!(
+                event = "wear_sampling_sampler_abort_forced",
+                display = %display_id,
+            );
+        }
+    }
+    if let Ok(mut registry) = registry.write() {
+        registry.remove(display_id);
+    }
+    if let Ok(mut grids) = latest_grids.write() {
+        grids.remove(display_id);
+    }
+    // Capture per-display status before publish_sampler_status removes it
+    // from `statuses` (None argument triggers statuses.remove(display_id)).
+    let per_display_capture = statuses
+        .read()
+        .ok()
+        .and_then(|s| s.get(display_id).cloned());
+    publish_sampler_status(statuses, web_status, display_id, None);
+    if let Some(captured) = per_display_capture {
+        let now = Tick::now();
+        let map =
+            std::collections::BTreeMap::from([(display_id.to_string(), captured.redacted(now))]);
+        per_display_statuses_tx.send_replace(map);
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn remove_unselected_active_samplers(
+    runtimes: &mut BTreeMap<DisplayId, ActiveSamplerRuntime>,
+    selected: &BTreeSet<DisplayId>,
+    latest_grids: &LatestGrids,
+    registry: &SharedSamplerRegistry,
+    statuses: &SamplerStatuses,
+    web_status: &watch::Sender<Option<dormant_core::wear::WearSamplingStatus>>,
+    per_display_statuses_tx: &watch::Sender<
+        std::collections::BTreeMap<String, dormant_core::wear::WearSamplingStatus>,
+    >,
+) {
+    let removed: Vec<DisplayId> = runtimes
+        .keys()
+        .filter(|display_id| !selected.contains(*display_id))
+        .cloned()
+        .collect();
+    for display_id in removed {
+        if let Some(runtime) = runtimes.remove(&display_id) {
+            stop_active_sampler_runtime(
+                &display_id,
+                runtime,
+                latest_grids,
+                registry,
+                statuses,
+                web_status,
+                per_display_statuses_tx,
+            )
+            .await;
+        }
     }
 }
 
@@ -333,19 +647,437 @@ mod active_sampler_reload_tests {
         let mut cfg = config();
         cfg.wear.active_sampling.sampled_display = Some("oled".to_owned());
 
-        let missing = active_sampler_display_context(&cfg, false, Some("active"));
+        let display = DisplayId("oled".to_owned());
+        let missing = active_sampler_display_context(&display, false, Some("active"));
         assert_eq!(missing.display, None);
         assert!(!missing.stage_active);
 
-        let restored = active_sampler_display_context(&cfg, true, Some("grace"));
+        let restored = active_sampler_display_context(&display, true, Some("grace"));
         assert_eq!(restored.display.unwrap().display, "oled");
         assert!(restored.stage_active);
 
-        let blanked = active_sampler_display_context(&cfg, true, Some("blanked"));
+        let blanked = active_sampler_display_context(&display, true, Some("blanked"));
         assert!(!blanked.stage_active);
     }
-}
 
+    /// Verifies the context published for each display carries that display's identity.
+    /// Mutation 5 (wrong display literal in `active_sampler_display_context`) reddens this.
+    #[test]
+    fn plural_selection_context_reflects_per_display_identity() {
+        let display_a = DisplayId("oled-a".to_owned());
+        let display_b = DisplayId("oled-b".to_owned());
+
+        let ctx_a = active_sampler_display_context(&display_a, true, Some("active"));
+        let ctx_b = active_sampler_display_context(&display_b, true, Some("active"));
+
+        assert_eq!(
+            ctx_a
+                .display
+                .clone()
+                .expect("selected display context")
+                .display,
+            "oled-a",
+        );
+        assert_eq!(
+            ctx_b
+                .display
+                .clone()
+                .expect("selected display context")
+                .display,
+            "oled-b",
+        );
+        assert_ne!(ctx_a.display, ctx_b.display);
+    }
+
+    #[test]
+    fn plural_selection_change_is_an_active_sampler_reload_delta() {
+        let mut old = config();
+        old.wear.enabled = true;
+        old.wear.active_sampling.enabled = true;
+        old.wear.active_sampling.sampled_displays = vec!["oled-a".to_owned(), "oled-b".to_owned()];
+        let mut new = old.clone();
+        new.wear.active_sampling.sampled_displays = vec!["oled-b".to_owned()];
+
+        assert_eq!(
+            active_sampler_reconfigure_plans(&old, &new)
+                .into_iter()
+                .map(|plan| plan.trigger)
+                .collect::<Vec<_>>(),
+            vec![ConfigDelta::SampledDisplayChanged]
+        );
+    }
+
+    #[test]
+    fn plural_selection_publishes_a_display_context() {
+        let mut cfg = config();
+        cfg.wear.active_sampling.sampled_displays = vec!["oled-a".to_owned(), "oled-b".to_owned()];
+
+        let context =
+            active_sampler_display_context(&DisplayId("oled-a".to_owned()), true, Some("active"));
+        assert_eq!(
+            context.display.expect("selected display context").display,
+            "oled-a"
+        );
+    }
+
+    #[test]
+    fn plural_sampler_consent_paths_are_distinct_per_display() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config();
+        cfg.wear.active_sampling.sampled_displays = vec!["oled-a".to_owned(), "oled-b".to_owned()];
+        let path_a = migrate_legacy_consent(dir.path(), &cfg, &DisplayId("oled-a".to_owned()));
+        let path_b = migrate_legacy_consent(dir.path(), &cfg, &DisplayId("oled-b".to_owned()));
+
+        assert_eq!(
+            path_a,
+            screencast_consent::consent_path(dir.path(), "oled-a")
+        );
+        assert_eq!(
+            path_b,
+            screencast_consent::consent_path(dir.path(), "oled-b")
+        );
+        assert_ne!(path_a, path_b);
+    }
+
+    #[test]
+    fn legacy_consent_is_copied_once_to_the_display_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let display_id = DisplayId("oled".to_owned());
+        let mut cfg = config();
+        cfg.wear.active_sampling.sampled_display = Some(display_id.0.clone());
+        let legacy = screencast_consent::legacy_consent_path(dir.path());
+        screencast_consent::store_atomic(
+            &legacy,
+            &screencast_consent::ConsentRecord {
+                token: "legacy-token".to_owned(),
+                sampled_display: display_id.0.clone(),
+                granted_at: time::OffsetDateTime::UNIX_EPOCH,
+                portal_persistent_ids: vec!["panel-oled".to_owned()],
+                granted_width: 1920,
+                granted_height: 1080,
+            },
+        )
+        .unwrap();
+
+        let migrated = migrate_legacy_consent(dir.path(), &cfg, &display_id);
+
+        assert_eq!(
+            migrated,
+            screencast_consent::consent_path(dir.path(), &display_id.0)
+        );
+        assert_ne!(migrated, legacy);
+        assert_eq!(
+            screencast_consent::load(&migrated, &display_id.0)
+                .unwrap()
+                .record()
+                .token,
+            "legacy-token"
+        );
+    }
+
+    #[test]
+    fn sampler_cancellation_tokens_are_independent_root_children() {
+        let root = CancellationToken::new();
+        let display_a = sampler_cancellation_token(&root);
+        let display_b = sampler_cancellation_token(&root);
+
+        display_a.cancel();
+
+        assert!(display_a.is_cancelled());
+        assert!(!display_b.is_cancelled());
+        assert!(!root.is_cancelled());
+    }
+
+    /// Proves [`CancellationToken::child_token()`] isolation: cancelling one
+    /// display's token leaves the other's task running. The production wiring
+    /// through [`spawn_active_sampler_runtime`] has one call site and needs
+    /// a live portal session, so it is covered by the two-stream
+    /// hardware gate rather than by this test.
+    #[tokio::test]
+    async fn sampler_cancellation_child_tokens_are_independent() {
+        use tokio::time::{Duration, timeout};
+        let root = CancellationToken::new();
+        // Each display gets its own token via the production helper.
+        let cancel_a = sampler_cancellation_token(&root);
+        let cancel_b = sampler_cancellation_token(&root);
+
+        // Spawn two no-op futures that run until their token is cancelled.
+        // Clone tokens so we can still use the originals after the spawn.
+        let tok_a = cancel_a.clone();
+        let tok_b = cancel_b.clone();
+        let handle_a = tokio::spawn(async move {
+            tok_a.cancelled().await;
+        });
+        let handle_b = tokio::spawn(async move {
+            tok_b.cancelled().await;
+        });
+
+        // Give the tasks time to start.
+        timeout(Duration::from_millis(10), tokio::task::yield_now())
+            .await
+            .ok();
+
+        // Cancel A; B must still be running.
+        cancel_a.cancel();
+        let _ = timeout(Duration::from_millis(50), handle_a)
+            .await
+            .expect("handle_a must exit");
+        assert!(
+            !handle_b.is_finished(),
+            "handle_b must not finish when cancel_a is cancelled"
+        );
+
+        // Clean up B.
+        cancel_b.cancel();
+        handle_b.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_registry_spawns_one_distinct_runtime_per_selected_display() {
+        let mut cfg = config();
+        cfg.wear.active_sampling.sampled_displays = vec!["oled-a".to_owned(), "oled-b".to_owned()];
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let runtimes = spawn_selected_sampler_runtimes(&cfg, {
+            let seen = seen.clone();
+            move |display_id| {
+                seen.lock().unwrap().push(display_id.clone());
+                std::future::ready(Some(format!("runtime-{}", display_id.0)))
+            }
+        })
+        .await;
+
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            [
+                DisplayId("oled-a".to_owned()),
+                DisplayId("oled-b".to_owned())
+            ]
+        );
+        assert_eq!(
+            runtimes.keys().collect::<Vec<_>>(),
+            vec![
+                &DisplayId("oled-a".to_owned()),
+                &DisplayId("oled-b".to_owned())
+            ]
+        );
+        assert_ne!(
+            runtimes[&DisplayId("oled-a".to_owned())],
+            runtimes[&DisplayId("oled-b".to_owned())]
+        );
+    }
+
+    fn fake_sampler_runtime(cancel: &CancellationToken) -> ActiveSamplerRuntime {
+        let (updates, _update_rx) = mpsc::channel(1);
+        let sampler_cancel = cancel.clone();
+        let status_cancel = cancel.clone();
+        ActiveSamplerRuntime {
+            updates,
+            cancel: cancel.clone(),
+            join: tokio::spawn(async move { sampler_cancel.cancelled().await }),
+            status_join: tokio::spawn(async move { status_cancel.cancelled().await }),
+        }
+    }
+
+    fn test_sampler_status(display: &str) -> active_sampler::SamplerStatus {
+        active_sampler::SamplerStatus {
+            state: active_sampler::SamplingState::Streaming,
+            last_capture: None,
+            uniform_reason: None,
+            bound_display: Some(display.to_owned()),
+            granted_at: None,
+        }
+    }
+
+    fn test_grid(value: f32) -> active_sampler::SampledGrid {
+        active_sampler::SampledGrid {
+            grid: dormant_core::spatial_grid::LumaGrid::new(vec![value; 16 * 9]).unwrap(),
+            captured_at: Tick::now(),
+            phase_at_capture: Phase::Active,
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_removal_cancels_only_the_removed_display_sampler() {
+        let display_a = DisplayId("oled-a".to_owned());
+        let display_b = DisplayId("oled-b".to_owned());
+        let cancel_a = CancellationToken::new();
+        let cancel_b = CancellationToken::new();
+        let mut runtimes = BTreeMap::from([
+            (display_a.clone(), fake_sampler_runtime(&cancel_a)),
+            (display_b.clone(), fake_sampler_runtime(&cancel_b)),
+        ]);
+        let latest_grids = active_sampler::new_latest_grids();
+        latest_grids.write().unwrap().extend([
+            (display_a.clone(), test_grid(0.2)),
+            (display_b.clone(), test_grid(0.8)),
+        ]);
+        let statuses = active_sampler::new_sampler_statuses();
+        statuses.write().unwrap().extend([
+            (display_a.clone(), test_sampler_status(&display_a.0)),
+            (display_b.clone(), test_sampler_status(&display_b.0)),
+        ]);
+        let registry = Arc::new(std::sync::RwLock::new(BTreeMap::new()));
+        let (web_status, _) = watch::channel(None);
+        let (per_display_statuses_tx, _) = watch::channel(std::collections::BTreeMap::default());
+
+        remove_unselected_active_samplers(
+            &mut runtimes,
+            &BTreeSet::from([display_b.clone()]),
+            &latest_grids,
+            &registry,
+            &statuses,
+            &web_status,
+            &per_display_statuses_tx,
+        )
+        .await;
+
+        assert!(cancel_a.is_cancelled());
+        assert!(!cancel_b.is_cancelled());
+        assert_eq!(runtimes.keys().collect::<Vec<_>>(), vec![&display_b]);
+        assert!(!latest_grids.read().unwrap().contains_key(&display_a));
+        assert!(latest_grids.read().unwrap().contains_key(&display_b));
+        assert!(!statuses.read().unwrap().contains_key(&display_a));
+        assert!(statuses.read().unwrap().contains_key(&display_b));
+
+        remove_unselected_active_samplers(
+            &mut runtimes,
+            &BTreeSet::new(),
+            &latest_grids,
+            &registry,
+            &statuses,
+            &web_status,
+            &per_display_statuses_tx,
+        )
+        .await;
+        assert!(cancel_b.is_cancelled());
+    }
+    /// Verifies [`stop_active_sampler_runtime`] calls
+    /// [`publish_per_display_statuses`] so the per-display status watch
+    /// channel carries the removed display's redacted entry.
+    #[tokio::test]
+    async fn stop_active_sampler_runtime_publishes_per_display_status() {
+        let display_id = DisplayId("oled-test".to_owned());
+        let cancel = CancellationToken::new();
+        let runtime = fake_sampler_runtime(&cancel);
+        let latest_grids = active_sampler::new_latest_grids();
+        let statuses = active_sampler::new_sampler_statuses();
+        statuses
+            .write()
+            .unwrap()
+            .insert(display_id.clone(), test_sampler_status(&display_id.0));
+        let registry = Arc::new(std::sync::RwLock::new(BTreeMap::new()));
+        let (web_status, _) = watch::channel(None);
+        let (per_display_statuses_tx, per_display_statuses_rx) =
+            watch::channel(std::collections::BTreeMap::default());
+
+        stop_active_sampler_runtime(
+            &display_id,
+            runtime,
+            &latest_grids,
+            &registry,
+            &statuses,
+            &web_status,
+            &per_display_statuses_tx,
+        )
+        .await;
+
+        // The removed display's redacted SamplerStatus must appear in the
+        // per-display status map.
+        let map = per_display_statuses_rx.borrow();
+        assert!(
+            map.contains_key(&display_id.0),
+            "expected per-display status map to contain {display_id}, got {map:?}",
+            display_id = display_id.0,
+            map = map
+        );
+        let entry = map.get(&display_id.0).unwrap();
+        assert_eq!(entry.bound_display.as_ref(), Some(&display_id.0));
+    }
+
+    /// Verifies [`publish_per_display_statuses`] — the status-change publish
+    /// path inside the [`spawn_active_sampler_runtime`] status loop — sends
+    /// a redacted map through the supplied watch channel.
+    ///
+    /// This covers the initial spawn publish (app.rs:361) and the
+    /// status-change publish (app.rs:381) without requiring `PipeWire`.
+    #[tokio::test]
+    async fn publish_per_display_statuses_sends_redacted_map() {
+        use active_sampler::new_sampler_statuses;
+
+        let display_id = DisplayId("oled-pub".to_owned());
+        let statuses = new_sampler_statuses();
+        statuses
+            .write()
+            .unwrap()
+            .insert(display_id.clone(), test_sampler_status(&display_id.0));
+        let (tx, rx) = watch::channel(std::collections::BTreeMap::default());
+
+        publish_per_display_statuses(&statuses, &tx);
+
+        let map = rx.borrow();
+        assert!(
+            map.contains_key(&display_id.0),
+            "expected redacted map to contain {display_id}, got {map:?}",
+            display_id = display_id.0,
+            map = map
+        );
+    }
+
+    /// Drives a status change through the spawned status-forwarding loop
+    /// ([`spawn_sampler_status_forwarder`], extracted from
+    /// [`spawn_active_sampler_runtime`]) and asserts the per-display status
+    /// watch channel receives the redacted entry. Reds when the
+    /// `publish_per_display_statuses` call in the loop's `changed()` arm is
+    /// removed: the forwarder still updates the shared status map but never
+    /// publishes it, so the bounded wait times out.
+    #[tokio::test]
+    async fn status_forwarder_publishes_per_display_status_on_change() {
+        use active_sampler::SamplingState;
+        use tokio::time::{Duration, timeout};
+
+        let display_id = DisplayId("oled-fwd".to_owned());
+        let (status_tx, status_rx) = watch::channel(test_sampler_status(&display_id.0));
+        let statuses = active_sampler::new_sampler_statuses();
+        let (web_status, _web_rx) = watch::channel(None);
+        let (per_display_statuses_tx, mut per_display_statuses_rx) =
+            watch::channel(std::collections::BTreeMap::default());
+        let cancel = CancellationToken::new();
+
+        let status_join = spawn_sampler_status_forwarder(
+            display_id.clone(),
+            status_rx,
+            statuses,
+            web_status,
+            per_display_statuses_tx,
+            cancel.clone(),
+        );
+
+        // Drive a status change the forwarder observes via its watch receiver.
+        let mut changed = test_sampler_status(&display_id.0);
+        changed.state = SamplingState::Suspended;
+        status_tx.send_replace(changed);
+
+        // Bounded wait: the forwarder must publish the redacted per-display map.
+        // `wait_for` checks the current value, then waits for changes, so it
+        // returns only when the forwarded entry actually lands — no race on
+        // scheduler ordering. Reds (times out) when the `publish_per_display_statuses`
+        // call is removed, since the forwarder then never sends on this channel.
+        let map = timeout(
+            Duration::from_millis(500),
+            per_display_statuses_rx.wait_for(|m| m.contains_key(&display_id.0)),
+        )
+        .await
+        .expect("per-display status watch must receive the forwarded change")
+        .expect("per-display status watch closed");
+        let entry = map.get(&display_id.0).unwrap();
+        assert_eq!(entry.bound_display.as_ref(), Some(&display_id.0));
+
+        cancel.cancel();
+        let _ = timeout(Duration::from_millis(500), status_join)
+            .await
+            .expect("status forwarder must exit on cancel");
+    }
+}
 #[cfg(feature = "render")]
 #[allow(clippy::cast_possible_truncation)]
 fn runtime_seed() -> u64 {
@@ -704,6 +1436,19 @@ pub struct App {
     test_operation_busy: bool,
     #[cfg(any(test, feature = "test-util"))]
     reload_lifecycle_capture: Option<ReloadLifecycleCapture>,
+    /// Test seam (issue #196): unbounded sink that the activity-follow loop
+    /// records each pulled display into instead of calling
+    /// `DirectSwitchHandle::pull`. Set via
+    /// [`App::with_test_activity_follow_pull_recorder`].
+    #[cfg(any(test, feature = "test-util"))]
+    activity_follow_pull_recorder:
+        Option<tokio::sync::mpsc::UnboundedSender<dormant_core::types::DisplayId>>,
+    /// Test seam (issue #196): unbounded sink that the activity-follow loop
+    /// fires once on every return path (cancel, channel close), so a test
+    /// can assert the OLD task's handle actually terminated. Set via
+    /// [`App::with_test_activity_follow_terminated_sink`].
+    #[cfg(any(test, feature = "test-util"))]
+    activity_follow_terminated_sink: Option<tokio::sync::mpsc::UnboundedSender<()>>,
 }
 
 /// Result of a post-release old-engine snapshot probe.
@@ -878,6 +1623,10 @@ impl App {
             test_operation_busy: false,
             #[cfg(any(test, feature = "test-util"))]
             reload_lifecycle_capture: None,
+            #[cfg(any(test, feature = "test-util"))]
+            activity_follow_pull_recorder: None,
+            #[cfg(any(test, feature = "test-util"))]
+            activity_follow_terminated_sink: None,
         })
     }
 
@@ -929,6 +1678,10 @@ impl App {
             test_operation_busy: false,
             #[cfg(any(test, feature = "test-util"))]
             reload_lifecycle_capture: None,
+            #[cfg(any(test, feature = "test-util"))]
+            activity_follow_pull_recorder: None,
+            #[cfg(any(test, feature = "test-util"))]
+            activity_follow_terminated_sink: None,
         })
     }
 
@@ -1105,6 +1858,34 @@ impl App {
     #[must_use]
     pub fn with_test_reload_lifecycle_capture(mut self, capture: ReloadLifecycleCapture) -> Self {
         self.reload_lifecycle_capture = Some(capture);
+        self
+    }
+
+    /// Inject a sender that the activity-follow loop records each pulled
+    /// display into (test seam, issue #196). Mirrors the
+    /// `ActivityFollowDeps::pull_recorder` field — production keeps it
+    /// `None` so the loop calls `DirectSwitchHandle::pull` as usual.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn with_test_activity_follow_pull_recorder(
+        mut self,
+        sender: tokio::sync::mpsc::UnboundedSender<dormant_core::types::DisplayId>,
+    ) -> Self {
+        self.activity_follow_pull_recorder = Some(sender);
+        self
+    }
+
+    /// Inject a sender that the activity-follow loop fires once on every
+    /// return path (test seam, issue #196). Mirrors the
+    /// `ActivityFollowDeps::on_terminated` field — production keeps it
+    /// `None` so the loop returns silently.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn with_test_activity_follow_terminated_sink(
+        mut self,
+        sender: tokio::sync::mpsc::UnboundedSender<()>,
+    ) -> Self {
+        self.activity_follow_terminated_sink = Some(sender);
         self
     }
 
@@ -1351,7 +2132,7 @@ impl App {
         ));
 
         // ── Spawn activity-follow on boot ───────────────────────────────────
-        let mut activity_follow_handle: Option<tokio::task::JoinHandle<()>> = None;
+        let mut activity_follow_slot: Option<ActivityFollowSlot> = None;
         if cfg_clone.coordination.activity_follow {
             let idle_rx = idle_obs_tx.subscribe();
             let filtered_rx = filtered_activity_tx.subscribe();
@@ -1365,16 +2146,31 @@ impl App {
                 .map(|(name, _)| DisplayId(name.clone()))
                 .collect();
             if !shared.is_empty() {
+                let gen_cancel = root.child_token();
+                #[cfg(any(test, feature = "test-util"))]
+                let pull_recorder = self.activity_follow_pull_recorder.clone();
+                #[cfg(any(test, feature = "test-util"))]
+                let on_terminated = self.activity_follow_terminated_sink.clone();
+                #[cfg(not(any(test, feature = "test-util")))]
+                let pull_recorder: Option<
+                    tokio::sync::mpsc::UnboundedSender<dormant_core::types::DisplayId>,
+                > = None;
+                #[cfg(not(any(test, feature = "test-util")))]
+                let on_terminated: Option<tokio::sync::mpsc::UnboundedSender<()>> = None;
                 let deps = crate::activity_follow::ActivityFollowDeps {
                     idle_rx,
                     direct_switch: Some(direct_switch.clone()),
                     display_ids: shared.into(),
                     arm_after: cfg_clone.coordination.arm_after,
-                    cancel: root.clone(),
-                    pull_recorder: None,
+                    cancel: gen_cancel.clone(),
+                    pull_recorder,
+                    on_terminated,
                     clock: crate::activity_follow::production_clock,
                 };
-                activity_follow_handle = Some(crate::activity_follow::spawn(deps, filtered_rx));
+                activity_follow_slot = Some(ActivityFollowSlot {
+                    handle: crate::activity_follow::spawn(deps, filtered_rx),
+                    cancel: gen_cancel,
+                });
             }
         }
 
@@ -1397,7 +2193,7 @@ impl App {
             let kvm = dormant_core::rules::KvmStatus {
                 keymap: cfg_clone.keymap.clone(),
                 switch_capable_displays: switch_capable,
-                activity_following: activity_follow_handle.is_some(),
+                activity_following: activity_follow_slot.is_some(),
                 push_capable_displays: push_capable,
             };
             let _ = spawn.ctl_tx.send(ControlMsg::SetKvmStatus(kvm)).await;
@@ -1409,19 +2205,35 @@ impl App {
             ReloadRequester::new_with_observations(reload_request_tx, self.observations.clone());
         let observations = reload_requester.observations();
 
-        let latest_grid = crate::active_sampler::new_latest_grid();
-        #[cfg(target_os = "linux")]
-        let (sampler_tracker_tx, sampler_tracker_rx) =
-            watch::channel::<Option<crate::active_sampler::SamplerStatus>>(None);
-        #[cfg(not(target_os = "linux"))]
-        let (_sampler_tracker_tx, sampler_tracker_rx) =
-            watch::channel::<Option<crate::active_sampler::SamplerStatus>>(None);
+        let latest_grids = crate::active_sampler::new_latest_grids();
+        let sampler_statuses = crate::active_sampler::new_sampler_statuses();
+        #[cfg(unix)]
+        let sampler_registry: crate::active_sampler::SharedSamplerRegistry =
+            Arc::new(std::sync::RwLock::new(BTreeMap::new()));
         #[cfg(target_os = "linux")]
         let (web_sampling_tx, web_sampling_rx) =
             watch::channel::<Option<dormant_core::wear::WearSamplingStatus>>(None);
         #[cfg(not(target_os = "linux"))]
         let (_web_sampling_tx, web_sampling_rx) =
             watch::channel::<Option<dormant_core::wear::WearSamplingStatus>>(None);
+        // Issue #185 cycle B — per-display sampler status watch. The
+        // daemon's sampler registry aggregates one redacted status per
+        // configured display; the doctor emits ONE wear-sampling check
+        // PER configured display from this map so the operator can see
+        // each display's health individually. Off-Linux / pre-cycle-B
+        // builds leave this empty and the doctor falls back to the
+        // singular probe.
+        #[cfg(target_os = "linux")]
+        let (per_display_statuses_tx, per_display_statuses_rx) =
+            watch::channel::<
+                std::collections::BTreeMap<String, dormant_core::wear::WearSamplingStatus>,
+            >(std::collections::BTreeMap::default());
+        #[cfg(not(target_os = "linux"))]
+        let per_display_statuses_rx: Option<
+            watch::Receiver<
+                std::collections::BTreeMap<String, dormant_core::wear::WearSamplingStatus>,
+            >,
+        > = None;
 
         // Wear tracker: daemon-lifetime, reads config via watch, publishes
         // over the front ctl channel (rides the `GenerationRouter`'s
@@ -1433,8 +2245,8 @@ impl App {
                 ctl_tx: front_ctl_tx.clone(),
                 executors_rx: executors_rx.clone(),
                 handle: wear_handle.clone(),
-                latest_grid: latest_grid.clone(),
-                sampler_status_rx: sampler_tracker_rx,
+                latest_grids: latest_grids.clone(),
+                sampler_statuses: sampler_statuses.clone(),
                 #[cfg(feature = "render")]
                 heat_snapshots: render_context.heat_snapshots.clone(),
                 cancel: root.clone(),
@@ -1445,80 +2257,23 @@ impl App {
             });
 
         #[cfg(target_os = "linux")]
-        let (active_sampler_handle, active_sampler_updates) = {
-            let (update_tx, update_rx) = mpsc::channel::<SamplerUpdate>(16);
-            match active_sampler::linux::PortalPipeWireSource::new().await {
-                Ok(source) => {
-                    let consent_path = self.state_dir.join("screencast-consent.json");
-                    let (handle, _join) = active_sampler::spawn_with_handle(ActiveSamplerDeps {
-                        initial_config: Arc::new(cfg_clone.clone()),
-                        update_rx,
-                        latest_grid: latest_grid.clone(),
-                        source: Box::new(source),
-                        consent_path,
-                        cancel: root.clone(),
-                        env_reader: crate::active_sampler::production_env_reader,
-                        event_tx: Some(front_ctl_tx.clone()),
-                    });
-                    let display_exists = cfg_clone
-                        .wear
-                        .active_sampling
-                        .sampled_display
-                        .as_ref()
-                        .is_some_and(|display| {
-                            spawn
-                                .generation
-                                .display_executors
-                                .contains_key(&DisplayId(display.clone()))
-                        });
-                    if let Err(error) = update_tx.try_send(SamplerUpdate::DisplayContext(
-                        active_sampler_display_context(&cfg_clone, display_exists, Some("active")),
-                    )) {
-                        tracing::warn!(
-                            event = "wear_sampling_update_dropped",
-                            ?error,
-                            "could not publish initial active-sampler display context"
-                        );
-                    }
-                    (Some(handle), Some(update_tx))
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        event = "wear_sampling_portal_unreachable",
-                        ?error,
-                        "active sampler unavailable; uniform attribution remains active"
-                    );
-                    (None, None)
-                }
-            }
-        };
-        #[cfg(not(target_os = "linux"))]
-        let active_sampler_handle: Option<crate::active_sampler::ActiveSamplerHandle> = None;
-
-        #[cfg(target_os = "linux")]
-        if let Some(active_sampler) = &active_sampler_handle {
-            let mut sampler_status_rx = active_sampler.status();
-            let initial = sampler_status_rx.borrow().clone();
-            let _ = sampler_tracker_tx.send_replace(Some(initial.clone()));
-            let _ = web_sampling_tx.send_replace(Some(initial.redacted(Tick::now())));
-            let cancel = root.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        () = cancel.cancelled() => break,
-                        changed = sampler_status_rx.changed() => {
-                            if changed.is_err() {
-                                break;
-                            }
-                            let _ = sampler_tracker_tx.send_replace(Some(sampler_status_rx.borrow().clone()));
-                            let _ = web_sampling_tx.send_replace(Some(
-                                sampler_status_rx.borrow().redacted(Tick::now()),
-                            ));
-                        }
-                    }
-                }
-            });
-        }
+        let active_sampler_runtimes = spawn_selected_sampler_runtimes(&cfg_clone, |display_id| {
+            let display_exists = spawn.generation.display_executors.contains_key(&display_id);
+            spawn_active_sampler_runtime(
+                Arc::new(cfg_clone.clone()),
+                display_id,
+                display_exists,
+                &root,
+                &self.state_dir,
+                &latest_grids,
+                &sampler_registry,
+                &sampler_statuses,
+                &web_sampling_tx,
+                &per_display_statuses_tx,
+                &front_ctl_tx,
+            )
+        })
+        .await;
 
         if cfg_clone.daemon.web_allow_nonloopback {
             tracing::warn!(
@@ -1561,17 +2316,36 @@ impl App {
         // both surfaces see the SAME instance — the singleflight
         // coalesce then dedupes a simultaneous CLI `dormantctl doctor`
         // and a browser click on "Run Doctor".
-        let doctor_service = DoctorService::new_with_sampler_status(
+        //
+        // Issue #185 cycle B — per-display sampler status watch. The
+        // daemon's sampler registry aggregates one redacted status per
+        let doctor_service = DoctorService::new_with_sampler_statuses(
             front_ctl_tx.clone(),
             config_rx.clone(),
             creds_rx.clone(),
             Some(web_sampling_rx.clone()),
+            #[cfg(target_os = "linux")]
+            Some(per_display_statuses_rx.clone()),
+            #[cfg(not(target_os = "linux"))]
+            None,
         );
 
         #[cfg(unix)]
         let ipc_handle = if self.disable_ipc {
             None
         } else {
+            // The IPC alias strategy: the unit wear-sampling variants
+            // resolve to the single configured display and error when
+            // >1 is selected, so the handler needs the current selection
+            // at request time. The config_rx is already kept up-to-date
+            // by reload; cloning a watch::Receiver and reading through
+            // the closure gives the IPC server a cheap snapshot view.
+            let selected_displays_closure = {
+                let config_rx = config_rx.clone();
+                std::sync::Arc::new(move || {
+                    config_rx.borrow().wear.active_sampling.selected_displays()
+                }) as std::sync::Arc<dyn Fn() -> Vec<String> + Send + Sync>
+            };
             Some(
                 crate::ipc::spawn(
                     &socket_path,
@@ -1579,8 +2353,9 @@ impl App {
                     reload_requester.clone(),
                     doctor_service.clone(),
                     direct_switch.clone(),
-                    active_sampler_handle.clone(),
+                    sampler_registry.clone(),
                     root.clone(),
+                    selected_displays_closure,
                 )
                 .context("spawn IPC server")?,
             )
@@ -1710,9 +2485,19 @@ impl App {
             operation_registry,
             wear_tracker_handle,
             #[cfg(target_os = "linux")]
-            active_sampler_handle,
+            active_sampler_runtimes,
             #[cfg(target_os = "linux")]
-            active_sampler_updates,
+            sampler_registry: sampler_registry.clone(),
+            #[cfg(target_os = "linux")]
+            latest_grids,
+            #[cfg(target_os = "linux")]
+            sampler_statuses,
+            #[cfg(target_os = "linux")]
+            per_display_statuses_tx,
+            #[cfg(target_os = "linux")]
+            web_sampling_tx,
+            #[cfg(target_os = "linux")]
+            sampler_event_tx: front_ctl_tx.clone(),
             started_web_port,
             started_web_bind,
             ctrl_ctx,
@@ -1722,7 +2507,7 @@ impl App {
             coordination: coordination.clone(),
             direct_switch: direct_switch.clone(),
             idle_obs_tx: Some(idle_obs_tx.clone()),
-            filtered_activity_tx,
+            filtered_activity_tx: filtered_activity_tx.clone(),
             sd: self.sd_notify,
             watchdog_interval,
             generation_barrier_ack_timeout,
@@ -1748,7 +2533,11 @@ impl App {
             force_generation_barrier_timeout: self.force_generation_barrier_timeout,
             #[cfg(any(test, feature = "test-util"))]
             reload_lifecycle_capture: self.reload_lifecycle_capture,
-            activity_follow_handle,
+            activity_follow_slot,
+            #[cfg(any(test, feature = "test-util"))]
+            activity_follow_pull_recorder: self.activity_follow_pull_recorder.clone(),
+            #[cfg(any(test, feature = "test-util"))]
+            activity_follow_terminated_sink: self.activity_follow_terminated_sink.clone(),
         };
 
         let join = tokio::spawn(run_loop(
@@ -1776,6 +2565,8 @@ impl App {
             _web_handle: web_handle,
             #[cfg(any(test, feature = "test-util"))]
             lkg_observed,
+            #[cfg(any(test, feature = "test-util"))]
+            filtered_activity_tx: filtered_activity_tx.clone(),
         };
 
         Ok((handle, join))
@@ -1836,6 +2627,11 @@ pub struct AppHandle {
     /// [`LkgCandidateObserved`].
     #[cfg(any(test, feature = "test-util"))]
     lkg_observed: Arc<Mutex<LkgCandidateObserved>>,
+    /// Test seam (issue #196): clone of the daemon-lifetime filtered-activity
+    /// fan-out, so a test can publish edges directly into the channel that
+    /// the activity-follow task is reading from.
+    #[cfg(any(test, feature = "test-util"))]
+    filtered_activity_tx: crate::filtered_activity::FilteredActivityTx,
 }
 
 impl AppHandle {
@@ -1972,6 +2768,17 @@ impl AppHandle {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
+
+    /// Test-util seam (issue #196): a clone of the daemon-lifetime
+    /// filtered-activity sender, so a test can publish activity edges
+    /// directly into the channel the activity-follow task is reading.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn filtered_activity_sender_for_test(
+        &self,
+    ) -> crate::filtered_activity::FilteredActivityTx {
+        self.filtered_activity_tx.clone()
+    }
 }
 
 // ── Runner (owns the run loop + reload) ────────────────────────────────────────
@@ -2015,13 +2822,29 @@ struct Runner {
     /// its cancellation-triggered final persist during shutdown, mirroring
     /// [`teardown`]'s bounded-join-then-abort pattern for the engine task.
     wear_tracker_handle: JoinHandle<()>,
-    /// Daemon-lifetime active sampler handle retained for future IPC routing.
+    /// Independently owned sampler lifecycles keyed by display id.
     #[cfg(target_os = "linux")]
-    #[allow(dead_code, reason = "Task 10 wires consent IPC commands")]
-    active_sampler_handle: Option<active_sampler::ActiveSamplerHandle>,
-    /// Sender retained across generation swaps so Task 9 can deliver reload plans.
+    active_sampler_runtimes: BTreeMap<DisplayId, ActiveSamplerRuntime>,
+    /// Dynamic command registry shared with IPC across reloads.
     #[cfg(target_os = "linux")]
-    active_sampler_updates: Option<mpsc::Sender<SamplerUpdate>>,
+    sampler_registry: SharedSamplerRegistry,
+    /// Keyed latest-grid handoff shared with the wear tracker.
+    #[cfg(target_os = "linux")]
+    latest_grids: LatestGrids,
+    /// Per-display lifecycle status shared with attribution and control surfaces.
+    #[cfg(target_os = "linux")]
+    sampler_statuses: SamplerStatuses,
+    /// Per-display redacted sampler status published from the status loop
+    /// for doctor and web per-display status polling.
+    #[cfg(target_os = "linux")]
+    per_display_statuses_tx:
+        watch::Sender<std::collections::BTreeMap<String, dormant_core::wear::WearSamplingStatus>>,
+    /// Legacy single-display status projection retained for cycle-B consumers.
+    #[cfg(target_os = "linux")]
+    web_sampling_tx: watch::Sender<Option<dormant_core::wear::WearSamplingStatus>>,
+    /// Stable front control channel used by newly added samplers after reload.
+    #[cfg(target_os = "linux")]
+    sampler_event_tx: mpsc::Sender<ControlMsg>,
     /// Port the web UI was started with (for reload change-detection).
     started_web_port: Option<u16>,
     /// Bind address the web UI was started with (for reload change-detection).
@@ -2141,9 +2964,39 @@ struct Runner {
     force_generation_barrier_timeout: bool,
     #[cfg(any(test, feature = "test-util"))]
     reload_lifecycle_capture: Option<ReloadLifecycleCapture>,
-    /// The activity-follow task spawned on boot and re-spawned on reload.
-    activity_follow_handle: Option<tokio::task::JoinHandle<()>>,
+    /// The active activity-follow generation — its `JoinHandle` and the
+    /// per-generation cancellation token, replaced as a paired unit on every
+    /// reload so the prior task is signalled to stop and bounded-awaited
+    /// before the replacement is spawned.
+    activity_follow_slot: Option<ActivityFollowSlot>,
+    /// Test seam (issue #196): unbounded sink that the activity-follow loop
+    /// records each pulled display into instead of calling
+    /// `DirectSwitchHandle::pull`. Production keeps this `None`; tests set
+    /// it via [`App::with_test_activity_follow_pull_recorder`].
+    #[cfg(any(test, feature = "test-util"))]
+    activity_follow_pull_recorder:
+        Option<tokio::sync::mpsc::UnboundedSender<dormant_core::types::DisplayId>>,
+    /// Test seam (issue #196): unbounded sink the activity-follow loop
+    /// fires once on every return path so a test can assert the OLD
+    /// task's handle actually terminated. Production keeps this `None`.
+    #[cfg(any(test, feature = "test-util"))]
+    activity_follow_terminated_sink: Option<tokio::sync::mpsc::UnboundedSender<()>>,
 }
+
+/// Per-generation activity-follow task handle + its cancellation token
+/// (issue #196). The pair is replaced together: cancelling the token
+/// signals the loop to stop, and awaiting the handle proves the task has
+/// returned before the next generation's task is spawned.
+struct ActivityFollowSlot {
+    handle: tokio::task::JoinHandle<()>,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+/// Bounded deadline for awaiting an activity-follow task's graceful
+/// shutdown during reload and final teardown. Mirrors the wear-tracker's
+/// 5 s teardown window — a stuck loop must never block a reload or
+/// daemon shutdown.
+const ACTIVITY_FOLLOW_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One LKG promotion candidate (spec §4 Mechanism): the config bytes
 /// captured when the generation this candidate tracks became live, and the
@@ -2259,38 +3112,87 @@ impl Runner {
     }
 
     #[cfg(target_os = "linux")]
-    fn publish_active_sampler_reload(&self, previous_cfg: &Config, new_generation: &Generation) {
-        let Some(updates) = &self.active_sampler_updates else {
-            return;
-        };
-        let display_exists = new_generation
+    async fn publish_active_sampler_reload(&mut self, previous_cfg: &Config) {
+        let selected: BTreeSet<DisplayId> = self
+            .generation
             .cfg
             .wear
             .active_sampling
-            .sampled_display
-            .as_ref()
-            .is_some_and(|display| {
-                new_generation
-                    .display_executors
-                    .contains_key(&DisplayId(display.clone()))
-            });
-        if let Err(error) = updates.try_send(SamplerUpdate::DisplayContext(
-            active_sampler_display_context(&new_generation.cfg, display_exists, Some("active")),
-        )) {
-            tracing::warn!(
-                event = "wear_sampling_update_dropped",
-                ?error,
-                "could not publish active-sampler display context"
-            );
+            .selected_displays()
+            .into_iter()
+            .map(DisplayId)
+            .collect();
+        let current: BTreeSet<DisplayId> = self.active_sampler_runtimes.keys().cloned().collect();
+        remove_unselected_active_samplers(
+            &mut self.active_sampler_runtimes,
+            &selected,
+            &self.latest_grids,
+            &self.sampler_registry,
+            &self.sampler_statuses,
+            &self.web_sampling_tx,
+            &self.per_display_statuses_tx,
+        )
+        .await;
+
+        let present: BTreeSet<DisplayId> =
+            self.generation.display_executors.keys().cloned().collect();
+        let added: Vec<DisplayId> = selected.difference(&current).cloned().collect();
+        for display_id in added {
+            if let Some(runtime) = spawn_active_sampler_runtime(
+                Arc::new(self.generation.cfg.clone()),
+                display_id.clone(),
+                present.contains(&display_id),
+                &self.root,
+                &self.state_dir,
+                &self.latest_grids,
+                &self.sampler_registry,
+                &self.sampler_statuses,
+                &self.web_sampling_tx,
+                &self.per_display_statuses_tx,
+                &self.sampler_event_tx,
+            )
+            .await
+            {
+                self.active_sampler_runtimes.insert(display_id, runtime);
+            }
         }
-        for plan in active_sampler_reconfigure_plans(previous_cfg, &new_generation.cfg) {
-            if let Err(error) = updates.try_send(SamplerUpdate::Reconfigure(plan)) {
+
+        let plans: Vec<ReconfigurePlan> =
+            active_sampler_reconfigure_plans(previous_cfg, &self.generation.cfg)
+                .into_iter()
+                .filter(|plan| plan.trigger != ConfigDelta::SampledDisplayChanged)
+                .collect();
+        for display_id in selected {
+            let Some(runtime) = self.active_sampler_runtimes.get(&display_id) else {
+                continue;
+            };
+            if let Err(error) = runtime.updates.try_send(SamplerUpdate::DisplayContext(
+                active_sampler_display_context(
+                    &display_id,
+                    present.contains(&display_id),
+                    Some("active"),
+                ),
+            )) {
                 tracing::warn!(
                     event = "wear_sampling_update_dropped",
+                    display = %display_id,
                     ?error,
-                    "could not publish active-sampler reload plan"
+                    "could not publish active-sampler display context"
                 );
-                break;
+            }
+            for plan in &plans {
+                if let Err(error) = runtime
+                    .updates
+                    .try_send(SamplerUpdate::Reconfigure(plan.clone()))
+                {
+                    tracing::warn!(
+                        event = "wear_sampling_update_dropped",
+                        display = %display_id,
+                        ?error,
+                        "could not publish active-sampler reload plan"
+                    );
+                    break;
+                }
             }
         }
     }
@@ -2319,7 +3221,7 @@ impl Runner {
         dormant_core::rules::KvmStatus {
             keymap: cfg.keymap.clone(),
             switch_capable_displays: switch_capable,
-            activity_following: self.activity_follow_handle.is_some(),
+            activity_following: self.activity_follow_slot.is_some(),
             push_capable_displays: push_capable,
         }
     }
@@ -2336,15 +3238,50 @@ impl Runner {
         }
     }
 
-    /// Spawn (or re-spawn) the activity-follow task from the current
-    /// generation's config and daemon-lifetime channels.
+    /// Reap the prior generation's activity-follow task (issue #196).
     ///
-    /// Drops any prior handle; re-spawns only when
-    /// `coordination.activity_follow` is true.
-    fn spawn_activity_follow(&mut self) {
-        if self.activity_follow_handle.is_some() {
-            self.activity_follow_handle = None;
+    /// Cancels its per-generation child token and bounded-awaits its
+    /// handle with an abort fallback. Called at the START of [`Self::reload`]
+    /// so an edge that fires during `install_generation` cannot be
+    /// processed by a task whose config is already stale. The OLD task
+    /// uses a child cancellation token of [`Runner::root`] so this
+    /// reap never cascades into the wear tracker, front routers, or
+    /// other consumers that share the root.
+    async fn reap_activity_follow(&mut self) {
+        if let Some(slot) = self.activity_follow_slot.take() {
+            slot.cancel.cancel();
+            let abort = slot.handle.abort_handle();
+            match tokio::time::timeout(ACTIVITY_FOLLOW_TEARDOWN_TIMEOUT, slot.handle).await {
+                Ok(Ok(())) => {}
+                Ok(Err(join_error)) => {
+                    tracing::warn!(
+                        event = "activity_follow_join_error",
+                        error = %join_error,
+                    );
+                }
+                Err(_) => {
+                    abort.abort();
+                    tracing::warn!(event = "activity_follow_abort_forced");
+                }
+            }
         }
+    }
+
+    /// Spawn the current generation's activity-follow task (issue #196).
+    ///
+    /// Called at the END of [`Self::reload`], after [`Self::reap_activity_follow`]
+    /// has already terminated the prior generation's task. The slot
+    /// must be `None` on entry — if it's `Some`, the OLD task would
+    /// race the NEW one on `filtered_rx` and `idle_rx`.
+    #[allow(
+        clippy::unused_async,
+        reason = "future-proofs the API; cancel+await may move here later"
+    )]
+    async fn spawn_activity_follow(&mut self) {
+        debug_assert!(
+            self.activity_follow_slot.is_none(),
+            "spawn_activity_follow called before reap_activity_follow — prior generation would race the new one on `filtered_rx`",
+        );
         if self.generation.cfg.coordination.activity_follow
             && let Some(idle_tx) = self.idle_obs_tx.as_ref()
         {
@@ -2363,17 +3300,31 @@ impl Runner {
                 .collect();
 
             if !shared.is_empty() {
+                let gen_cancel = self.root.child_token();
+                #[cfg(any(test, feature = "test-util"))]
+                let pull_recorder = self.activity_follow_pull_recorder.clone();
+                #[cfg(any(test, feature = "test-util"))]
+                let on_terminated = self.activity_follow_terminated_sink.clone();
+                #[cfg(not(any(test, feature = "test-util")))]
+                let pull_recorder: Option<
+                    tokio::sync::mpsc::UnboundedSender<dormant_core::types::DisplayId>,
+                > = None;
+                #[cfg(not(any(test, feature = "test-util")))]
+                let on_terminated: Option<tokio::sync::mpsc::UnboundedSender<()>> = None;
                 let deps = crate::activity_follow::ActivityFollowDeps {
                     idle_rx,
                     direct_switch: Some(self.direct_switch.clone()),
                     display_ids: shared.into(),
                     arm_after: self.generation.cfg.coordination.arm_after,
-                    cancel: self.root.clone(),
-                    pull_recorder: None,
+                    cancel: gen_cancel.clone(),
+                    pull_recorder,
+                    on_terminated,
                     clock: crate::activity_follow::production_clock,
                 };
-                self.activity_follow_handle =
-                    Some(crate::activity_follow::spawn(deps, filtered_rx));
+                self.activity_follow_slot = Some(ActivityFollowSlot {
+                    handle: crate::activity_follow::spawn(deps, filtered_rx),
+                    cancel: gen_cancel,
+                });
             }
         }
     }
@@ -2445,13 +3396,14 @@ impl Runner {
             coordination.reconcile_shared(new_shared);
         }
 
-        // Step-boundary ping 1/7 (spec §6.3): after `load_and_assemble`
-        // returns (probes done). The spec names this as a boundary DISTINCT
-        // from "after the quiesce loop" below — the serial controller
-        // probes inside `load_and_assemble` and the quiesce loop that
-        // follows are two independently-unbounded stretches of work, so
-        // each needs its own ping to keep either gap alone bounded.
-        self.ping("after_assemble");
+        // NOTE (issue #197): the `after_assemble` watchdog ping now lives
+        // in `execute_reload_batch`, bracketing the `assemble_loaded` call
+        // (probes) directly. The previous location here fired AFTER
+        // `request_snapshot` + validation + shared-displays check, which
+        // left the probe phase itself without a ping — a slow probe could
+        // starve the watchdog and let systemd kill a healthy daemon.
+        // The `after_quiesce` and `before_teardown` pings below remain
+        // in their spec §6.3 positions.
 
         // Build the set of rule-driven displays from the NEW config.
         // Rule-less (manual-only) displays are those in [displays] but NOT
@@ -2756,6 +3708,13 @@ impl Runner {
         };
         match spawn_result {
             Ok(spawn) => {
+                // Issue #196: reap the OLD activity-follow task BEFORE
+                // `install_generation` runs. The OLD task's config is
+                // about to become stale; an edge that fires during
+                // `install_generation`'s republish / quiesce would be
+                // processed by a task whose display list and arm_after
+                // are no longer the live generation's.
+                self.reap_activity_follow().await;
                 self.install_generation(spawn).await;
                 self.applied_revision = requested_revision.clone();
                 self.generation_id = next_generation;
@@ -2767,7 +3726,7 @@ impl Runner {
                 // Republish executor/config watches BEFORE activity-follow
                 // or any new edge can write — an edge that fires against a
                 // stale executor writes to the wrong panel.
-                self.spawn_activity_follow();
+                self.spawn_activity_follow().await;
                 self.publish_kvm_status().await;
 
                 // Rollback recovery (rollback-recovery plan, Task 2 §3): a
@@ -2865,7 +3824,8 @@ impl Runner {
                 }
                 self.defensive_wake(wake_list);
                 #[cfg(target_os = "linux")]
-                self.publish_active_sampler_reload(&previous_active_sampler_cfg, &self.generation);
+                self.publish_active_sampler_reload(&previous_active_sampler_cfg)
+                    .await;
                 self.config_tx.send_replace(Arc::new(new_cfg));
                 self.creds_tx.send_replace(Arc::new(new_creds));
                 tracing::info!(event = "config_reloaded");
@@ -3475,6 +4435,32 @@ async fn run_loop(
         }
     }
 
+    #[cfg(target_os = "linux")]
+    let sampler_teardown = {
+        let runtimes = std::mem::take(&mut runner.active_sampler_runtimes);
+        let latest_grids = runner.latest_grids.clone();
+        let registry = runner.sampler_registry.clone();
+        let statuses = runner.sampler_statuses.clone();
+        let web_status = runner.web_sampling_tx.clone();
+        let per_display_statuses_tx = runner.per_display_statuses_tx.clone();
+        async move {
+            for (display, runtime) in runtimes {
+                stop_active_sampler_runtime(
+                    &display,
+                    runtime,
+                    &latest_grids,
+                    &registry,
+                    &statuses,
+                    &web_status,
+                    &per_display_statuses_tx,
+                )
+                .await;
+            }
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let sampler_teardown = async {};
+
     // #47 fix (secondary hardening): the wear tracker's cancellation
     // branch (`deps.cancel.cancelled()`, `wear_tracker.rs`) does its own
     // final persist — but `root` was only just cancelled (either by the
@@ -3512,7 +4498,36 @@ async fn run_loop(
         quiesce_inputs(&mut runner.generation).await;
         teardown(&mut runner.generation).await;
     };
-    tokio::join!(generation_teardown, wear_teardown, front_teardown,);
+    // #196 (final teardown): the activity-follow task uses a per-
+    // generation child cancellation token of `root`, so reload teardown
+    // cancels the child WITHOUT cascading up to root consumers (the
+    // wear tracker / front routers sharing root must stay live across a
+    // reload). On shutdown, root.cancel() DOES reach the child token
+    // (tokio_util child semantics) — the explicit cancel below is for
+    // bounded reaping, not cancellation propagation: it proves the
+    // loop actually returned before `daemon_stopped` is logged, with
+    // abort as backstop. A stuck loop must never hang daemon shutdown.
+    let activity_follow_slot = runner.activity_follow_slot.take();
+    let activity_follow_teardown = async {
+        if let Some(slot) = activity_follow_slot {
+            slot.cancel.cancel();
+            let abort = slot.handle.abort_handle();
+            if tokio::time::timeout(ACTIVITY_FOLLOW_TEARDOWN_TIMEOUT, slot.handle)
+                .await
+                .is_err()
+            {
+                abort.abort();
+                tracing::warn!(event = "activity_follow_abort_forced");
+            }
+        }
+    };
+    tokio::join!(
+        generation_teardown,
+        wear_teardown,
+        front_teardown,
+        activity_follow_teardown,
+        sampler_teardown,
+    );
     tracing::info!(event = "daemon_stopped");
 }
 
@@ -3562,6 +4577,17 @@ async fn execute_reload_batch(
     requests: &mut mpsc::Receiver<ReloadRequest>,
     first: ReloadRequest,
 ) {
+    // Issue #196: reap the OLD activity-follow task at the very
+    // start of the reload batch — BEFORE the debounce window, the
+    // disk load, the controller probes, and the install_generation.
+    // The OLD task is subscribed to the daemon-lifetime
+    // filtered-activity channel and would otherwise commit a pull
+    // against the OLD config's display list during the entire reload
+    // window (debounce + load + assemble + install). The reap is a
+    // bounded-await on the OLD handle; it returns as soon as the
+    // task observes its per-generation child-token cancellation.
+    runner.reap_activity_follow().await;
+
     let mut batch = ReloadBatch::new(first);
     let window = runner.generation.cfg.daemon.reload_debounce;
     if !window.is_zero() {
@@ -3596,10 +4622,20 @@ async fn execute_reload_batch(
             true,
         )
     } else {
+        // Issue #197: bracket the assembly probe phase with watchdog pings.
+        // The probe phase inside `assemble_loaded` is the slowest part of
+        // the reload path and can run for an unbounded duration; a gap in
+        // pings here would let systemd kill a healthy daemon mid-reload.
+        // The `after_assemble` ping that used to live inside `Runner::reload`
+        // fired after `request_snapshot` + validation + shared-displays
+        // check, NOT right after the probes — moving the boundary to
+        // `execute_reload_batch` closes the gap.
+        runner.ping("before_assemble");
         let assembly = match loaded {
             Ok((cfg, creds)) => runner.assemble_loaded(cfg, creds).await,
             Err(detail) => Err(detail),
         };
+        runner.ping("after_assemble");
         runner
             .reload(
                 assembly,
@@ -3827,22 +4863,39 @@ impl GenerationRouter<ControlMsg> {
         state.paused = false;
     }
 
-    async fn route_control(&self, mut message: ControlMsg, root: &CancellationToken) -> bool {
-        let mut state = self.state.lock().await;
-        if state.paused {
-            state.queued.push_back(message);
-            return true;
-        }
-        if let (Some(registry), Some(generation)) = (&state.operation_registry, state.generation_id)
-        {
-            message = stamp_control_operation(message, registry, generation);
-        }
-        let Some(target) = state.target.clone() else {
-            return false;
+    async fn route_control(&self, message: ControlMsg, root: &CancellationToken) -> bool {
+        // Issue #209: pause-check, stamp, and target-clone must happen
+        // under the lock, but the actual `target.send(message).await` must
+        // run AFTER the guard drops. A full target channel would otherwise
+        // park the send while still holding the router mutex, deadlocking
+        // `pause()` (reload quiesce) and any other front-door consumer that
+        // needs the lock. The stamp is baked into the message under the
+        // lock (so it's bound to the current generation), and the target
+        // is a local clone of the `mpsc::Sender` — independent of any
+        // subsequent `install_generation` that swaps `state.target` — so
+        // the message is delivered to the generation-N channel stamped
+        // for generation N regardless of any concurrent install.
+        let (target, stamped) = {
+            let mut state = self.state.lock().await;
+            if state.paused {
+                state.queued.push_back(message);
+                return true;
+            }
+            let stamped = if let (Some(registry), Some(generation)) =
+                (&state.operation_registry, state.generation_id)
+            {
+                stamp_control_operation(message, registry, generation)
+            } else {
+                message
+            };
+            let Some(target) = state.target.clone() else {
+                return false;
+            };
+            (target, stamped)
         };
         tokio::select! {
             () = root.cancelled() => false,
-            result = target.send(message) => result.is_ok(),
+            result = target.send(stamped) => result.is_ok(),
         }
     }
 }
@@ -7020,6 +8073,75 @@ mod generation_router_tests {
         cancel.cancel();
         drop(front_tx);
         forwarder.await.unwrap();
+    }
+
+    // Issue #209: `route_control` must release the router mutex before
+    // `target.send(message).await` so a full target channel cannot block
+    // `pause()` (reload quiesce). With a cap-1 channel pre-filled, the
+    // in-flight send parks; the lock guard must already be dropped for
+    // `pause()` to acquire the mutex within a short bounded window.
+    #[tokio::test]
+    async fn route_control_releases_router_lock_before_send() {
+        // Cap-1 target pre-filled so the in-flight `target.send` parks.
+        let (target_tx, _target_rx) = mpsc::channel::<ControlMsg>(1);
+        target_tx
+            .send(ControlMsg::SetPendingReload(Some("pre-fill".into())))
+            .await
+            .expect("pre-fill the target channel");
+
+        let router = Arc::new(GenerationRouter::new_with_generation(
+            target_tx,
+            GenerationId(7),
+            Arc::new(OperationRegistry::default()),
+        ));
+        let cancel = CancellationToken::new();
+
+        // Drive `route_control` on a worker — the `.await` on `target.send`
+        // parks because the cap-1 channel is full. With the bug, the router
+        // mutex is held across that await; without it, the guard is already
+        // dropped and `pause()` returns promptly.
+        let router_for_route = router.clone();
+        let cancel_for_route = cancel.clone();
+        let route_task = tokio::spawn(async move {
+            router_for_route
+                .route_control(
+                    ControlMsg::ForceWake(DisplayId("blocked-send".into())),
+                    &cancel_for_route,
+                )
+                .await
+        });
+
+        // Give the worker a chance to enter the send-await before we assert
+        // on `pause()`. A single `yield_now` is sufficient: `mpsc::Sender::send`
+        // is an immediate await when the channel is full, so the router
+        // mutex is either held (bug) or already dropped (fix) by the time
+        // this task is scheduled.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // Bounded assertion: `pause()` must acquire the router mutex
+        // WITHOUT waiting for the in-flight send to drain. A 200ms ceiling
+        // is generous (the only work inside `pause()` is two field writes
+        // + a lock acquisition) but leaves headroom for scheduler jitter
+        // on loaded CI runners.
+        match tokio::time::timeout(Duration::from_millis(200), router.pause()).await {
+            Ok(()) => {}
+            Err(elapsed) => panic!(
+                "route_control held the router mutex across target.send — \
+                 pause() must acquire the mutex while the send is parked \
+                 (issue #209): {elapsed:?}"
+            ),
+        }
+
+        // Drain the parked send so the worker can complete.
+        cancel.cancel();
+        // Receive the queued message from the channel so the parked send
+        // can return. The cancel above will also unblock the
+        // `root.cancelled()` arm of the `tokio::select!`, so the worker
+        // exits either way — but draining keeps the assertion on the
+        // exact route semantics clean.
+        drop(router);
+        let _ = tokio::time::timeout(Duration::from_secs(1), route_task).await;
     }
 }
 

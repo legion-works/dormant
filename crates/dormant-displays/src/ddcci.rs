@@ -571,14 +571,32 @@ impl DisplayController for DdcciController {
                         .unwrap_or(u16::from(self.restore_brightness))
                 };
 
-                // If D6 is supported, try to power on first (ignore error
-                // — the brightness restore is the primary wake mechanism
-                // for a brightness-zero blanked display).
+                // If D6 is supported, power on FIRST and propagate any
+                // error. A failed D6-on must fail wake: a panel that was
+                // physically powered off still ACKs the brightness restore
+                // at the DDC level (the bus is alive, the monitor just
+                // won't apply it), so swallowing the D6-on error turns
+                // `wake()` into a false-success while the screen stays
+                // black — the project's worst failure mode.
+                //
+                // Propagating is also what makes this safe in the wider
+                // retry contract: `DisplayExecutor::wake`
+                // (crates/dormant-displays/src/executor.rs) consumes the
+                // per-controller `Err` as the trigger for its full safety
+                // net — the wake retry burst (rounds × `wake_retry_backoff`
+                // doubling per round), chain walk to the next fallback
+                // controller, and a post-burst `reprobe()` + final retry
+                // pass. A swallowed D6-on would short-circuit ALL of that
+                // with a single `Ok(())` and leave a still-dark panel
+                // behind it.
                 if d6_supported {
-                    let _ = self
-                        .ops
+                    self.ops
                         .set_vcp(&ident, VCP_POWER, D6_ON, &lock, VcpPriority::Command)
-                        .await;
+                        .await
+                        .map_err(|e| CmdFailure {
+                            controller: Self::NAME.to_string(),
+                            error: format!("{E_DISPLAY_IO}: failed to set power on: {e}"),
+                        })?;
                 }
 
                 // Restore brightness.
@@ -592,7 +610,12 @@ impl DisplayController for DdcciController {
 
                 // Clear saved_brightness so the NEXT blank cycle re-saves
                 // fresh. Without this, a user who manually raises
-                // brightness between cycles gets a stale restore.
+                // brightness between cycles gets a stale restore. Reached
+                // only on the fully-successful path above: a propagated
+                // D6-on or brightness error returns before this point, so
+                // a failed wake preserves the saved level for the next
+                // blank to re-capture — clearing on a false-success would
+                // leave an actually-dark panel with no recovery level.
                 let mut state = self.state.lock().unwrap();
                 state.saved_brightness = None;
 
@@ -1944,6 +1967,106 @@ mod tests {
             !log.iter()
                 .any(|l| l.contains("set_vcp") && l.contains("0x10")),
             "a failed D6-on write must not fall through to a brightness write: {log:?}"
+        );
+    }
+
+    /// RED-first regression for the `BrightnessZero` arm: a D6-on write
+    /// failure on wake must propagate as a `CmdFailure` carrying
+    /// `E_DISPLAY_IO` and the underlying write error — not be swallowed.
+    /// For a panel that was previously powered off, a failed D6-on leaves
+    /// the panel physically dark; the subsequent brightness restore
+    /// ACKs at the DDC level regardless (off-state panels still ack
+    /// writes), so a swallowed D6-on error turns `wake()` into a
+    /// false-success while the screen stays black — the project's worst
+    /// failure mode. The D6-on write must therefore fail wake BEFORE
+    /// the brightness restore is treated as success, and
+    /// `saved_brightness` must NOT be cleared (a future blank must
+    /// re-save the operator's current level — clearing on a
+    /// false-success would lock in stale state and force a manual
+    /// brightness retune).
+    #[tokio::test]
+    async fn brightness_zero_wake_propagates_d6_on_failure() {
+        let fake = Arc::new({
+            let f = single_display_vcp();
+            // probe: D6 is supported so the wake path takes the D6-on branch.
+            f.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, Ok(D6_ON));
+            f
+        });
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &PanelLocks::new(),
+        );
+        ctrl.probe().await.unwrap();
+
+        // Blank with BrightnessZero — saves 75, zeroes brightness.
+        fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(75));
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 0, Ok(()));
+        fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, Ok(0));
+        ctrl.blank(BlankMode::BrightnessZero).await.unwrap();
+        assert_eq!(
+            ctrl.state.lock().unwrap().saved_brightness,
+            Some(75),
+            "precondition: blank must save 75"
+        );
+
+        // Wake's D6-on write fails — must propagate, must NOT fall through
+        // to a brightness restore, must NOT clear saved_brightness.
+        fake.expect_set(
+            "i2c-dev:56 DEL DELL U2723QE",
+            VCP_POWER,
+            D6_ON,
+            Err("write failed".into()),
+        );
+        // Scripted brightness restore — its presence in the script lets
+        // the test also assert the call log never records a 75 set on
+        // the wake path.
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_BRIGHTNESS, 75, Ok(()));
+
+        let err = ctrl.wake().await.unwrap_err();
+        assert!(
+            err.error.contains("E_DISPLAY_IO"),
+            "wake failure must carry E_DISPLAY_IO: {err}"
+        );
+        assert!(
+            err.error.contains("failed to set power on"),
+            "wake failure must name the failed op: {err}"
+        );
+        assert!(
+            err.error.contains("write failed"),
+            "wake failure must surface the underlying write error: {err}"
+        );
+
+        let log = fake.take_call_log();
+        // D6-on attempted exactly once; if a D6-on failure is being
+        // propagated, no brightness restore should appear on the log.
+        assert_eq!(
+            log.iter()
+                .filter(|l| l.contains("set_vcp") && l.contains("0xD6") && l.contains('1'))
+                .count(),
+            1,
+            "wake should attempt the D6-on write exactly once: {log:?}"
+        );
+        // The blank already wrote a 0x10=0 set; filter on the saved
+        // value (75) to confirm the wake path did NOT also write it.
+        assert!(
+            !log.iter()
+                .any(|l| l.contains("set_vcp") && l.contains("0x10") && l.contains("75")),
+            "a failed D6-on write must not fall through to a 0x10=75 \
+             brightness restore: {log:?}"
+        );
+        // Plan trap: clearing saved_brightness on a false-success
+        // would leave the next blank with no recovery level if the
+        // panel is still dark. The state must remain so a future blank
+        // re-saves fresh.
+        assert_eq!(
+            ctrl.state.lock().unwrap().saved_brightness,
+            Some(75),
+            "saved_brightness must NOT be cleared on wake failure — \
+             clearing on a false-success leaves the next blank with \
+             no recovery level for an actually-dark panel"
         );
     }
 

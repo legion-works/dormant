@@ -52,9 +52,7 @@ use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
-#[cfg(feature = "render")]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use dormant_core::config::schema::{Config, WearConfig};
 use dormant_core::observation::{DaemonObservation, ObservationHub};
@@ -71,7 +69,7 @@ use dormant_core::wear::{
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
-use crate::active_sampler::{LatestGrid, SampledGrid};
+use crate::active_sampler::{LatestGrids, SampledGrid, SamplerStatuses};
 
 /// DDC/CI-shaped native brightness top-of-scale — the default for every
 /// display whose controller list does not include `samsung-tizen` (see
@@ -111,10 +109,10 @@ pub struct WearTrackerDeps {
     pub executors_rx: watch::Receiver<Arc<HashMap<DisplayId, Arc<dyn CommandSink>>>>,
     /// Shared ledger map for concurrent readers (IPC/WebUI).
     pub handle: WearHandle,
-    /// Latest privacy-preserving screen sample, owned by the sampler task.
-    pub latest_grid: LatestGrid,
-    /// Latest sampler lifecycle state, used to tag uniform fallback episodes.
-    pub sampler_status_rx: watch::Receiver<Option<crate::active_sampler::SamplerStatus>>,
+    /// Latest privacy-preserving screen samples, keyed by their sampler owner.
+    pub latest_grids: LatestGrids,
+    /// Latest per-display sampler lifecycle states for uniform fallback tags.
+    pub sampler_statuses: SamplerStatuses,
     /// Latest heat snapshots exposed to render sessions, when rendering is enabled.
     #[cfg(feature = "render")]
     pub heat_snapshots: dormant_render::HeatSnapshotHandle,
@@ -226,21 +224,48 @@ async fn run(mut deps: WearTrackerDeps) {
                 let now = now_epoch_s();
                 ensure_ledgers_loaded(&mut state, &cfg, &executors, &dir, now, &deps.observations);
 
+                // Compute the wall-clock-INDEPENDENT elapsed span since the
+                // previous attribution tick (issue #210 / sweep-2 Task 15).
+                // First call after a fresh `TrackerState` falls back to the
+                // configured sample interval; subsequent calls saturate the
+                // raw `Instant` delta at 2× sample interval so a
+                // suspend-resume cannot attribute hours of phantom on-time.
+                // The shell owns this because `tick` must stay pure.
+                let max_span = cfg.wear.sample_interval.saturating_mul(2);
+                let monotonic_span = state
+                    .last_tick_at
+                    .map_or(cfg.wear.sample_interval, |prev| {
+                        boundary.0.saturating_duration_since(prev).min(max_span)
+                    });
+                state.last_tick_at = Some(boundary.0);
+
                 let samples = collect_samples(&snapshot, &executors, &cfg.wear).await;
-                let latest_grid = deps
-                    .latest_grid
+                let latest_grids = deps
+                    .latest_grids
                     .read()
-                    .ok()
-                    .and_then(|slot| slot.clone());
-                let (injected_grid, sample_fallback) = filter_sample_for_tick(
-                    latest_grid.as_ref(),
-                    boundary,
-                    cfg.wear.sample_interval.saturating_mul(2),
-                );
-                let sample_fallback = sampler_status_fallback(
-                    deps.sampler_status_rx.borrow().as_ref(),
-                )
-                .or(sample_fallback);
+                    .map_or_else(|_| HashMap::new(), |grids| grids.clone());
+                let sampler_statuses = deps
+                    .sampler_statuses
+                    .read()
+                    .map_or_else(|_| std::collections::BTreeMap::new(), |statuses| statuses.clone());
+                let mut injected_grids = HashMap::new();
+                let mut sample_fallbacks = HashMap::new();
+                for display in cfg.wear.active_sampling.selected_displays() {
+                    let display = DisplayId(display);
+                    let (sample, fallback) = filter_sample_for_tick(
+                        latest_grids.get(&display),
+                        boundary,
+                        cfg.wear.sample_interval.saturating_mul(2),
+                    );
+                    if let Some(sample) = sample {
+                        injected_grids.insert(display.clone(), sample.clone());
+                    }
+                    if let Some(fallback) = sampler_status_fallback(sampler_statuses.get(&display))
+                        .or(fallback)
+                    {
+                        sample_fallbacks.insert(display, fallback);
+                    }
+                }
 
                 #[cfg(feature = "render")]
                 let exposures = collect_exposure_slices(
@@ -252,14 +277,15 @@ async fn run(mut deps: WearTrackerDeps) {
                 #[cfg(not(feature = "render"))]
                 let exposures = HashMap::new();
 
-                let actions = tick(
+                let actions = tick_with_grids(
                     &mut state,
                     &snapshot,
                     &samples,
                     &cfg.wear,
                     now,
-                    injected_grid,
-                    sample_fallback,
+                    monotonic_span,
+                    &injected_grids,
+                    &sample_fallbacks,
                     &exposures,
                 );
                 apply_actions(&mut state, actions, &executors, &deps.ctl_tx, &dir).await;
@@ -700,6 +726,12 @@ struct TrackerState {
     dwell_start: HashMap<DisplayId, Option<u64>>,
     /// Epoch-seconds of the last successful persist, per display.
     last_persist_epoch_s: HashMap<DisplayId, u64>,
+    /// Monotonic boundary of the previous attribution tick. Drives the
+    /// non-screensaver wear span so a backward wall-clock step (NTP
+    /// correction, suspend-resume) cannot zero or corrupt attributed
+    /// wear — `last_sample_at_epoch_s` is kept only for storage/persist
+    /// and advisory math, never as a span source.
+    last_tick_at: Option<Instant>,
     /// Resolved on-disk storage key per display (T7 review M1):
     /// `CommandSink::panel_identity()` when available, else the sanitized
     /// config key. Used consistently for the ledger filename,
@@ -916,15 +948,24 @@ fn sampled_uniform_fallback(
 /// Pure tracker tick: given the current snapshot/samples/config, mutate
 /// `state`'s ledgers and bookkeeping in place and return the actions the
 /// shell must execute. Zero I/O, zero tokio — see module docs.
+///
+/// `monotonic_span` is the wall-clock-INDEPENDENT elapsed time since the
+/// previous tick — the shell computes it from `state.last_tick_at` against
+/// a monotonic `Instant` (issue #210 / sweep-2 Task 15). Non-screensaver
+/// attribution rows use it as their span source; the screensaver path
+/// keeps its own per-item exposure slices which are already in the
+/// monotonic domain. `now_epoch_s` is retained solely for the persisted
+/// `last_sample_at_epoch_s` field, dwell tracking, and the advisory math.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn tick(
+fn tick_with_grids(
     state: &mut TrackerState,
     snapshot: &StateSnapshot,
     samples: &HashMap<DisplayId, Option<PanelState>>,
     cfg: &WearConfig,
     now_epoch_s: u64,
-    injected_grid: Option<&SampledGrid>,
-    fallback: Option<SampleFallbackTag>,
+    monotonic_span: Duration,
+    injected_grids: &HashMap<DisplayId, SampledGrid>,
+    fallbacks: &HashMap<DisplayId, SampleFallbackTag>,
     exposures: &HashMap<DisplayId, Vec<ScreensaverExposureSlice>>,
 ) -> Vec<TrackerAction> {
     let mut actions = Vec::new();
@@ -932,10 +973,15 @@ fn tick(
         return actions;
     }
 
-    let sample_interval_s = cfg.sample_interval.as_secs().max(1);
-    let max_span_s = sample_interval_s.saturating_mul(2);
+    let max_span = cfg.sample_interval.saturating_mul(2);
+    // Defensive clamp — the shell already bounds `monotonic_span` against
+    // 2× sample interval, but a stray caller (test, future scheduler
+    // change) must never be able to attribute hours of phantom on-time
+    // after a suspend-resume.
+    let monotonic_span = monotonic_span.min(max_span);
     let persist_interval_s = cfg.persist_interval.as_secs().max(1);
     let short_cycle_s = cfg.short_cycle_dwell.as_secs();
+    let sampled_displays = cfg.active_sampling.selected_displays();
 
     for (id_str, dsnap) in &snapshot.displays {
         let display_id = DisplayId(id_str.clone());
@@ -963,17 +1009,17 @@ fn tick(
         let mut attribution_mode = WearAttributionMode::Uniform;
 
         // ── Attribution ──────────────────────────────────────────────────
-        let elapsed_s = ledger
-            .last_sample_at_epoch_s
-            .map_or(sample_interval_s, |last| now_epoch_s.saturating_sub(last));
-        let span_s = elapsed_s.min(max_span_s);
-        let wall_span = Duration::from_secs(span_s);
+        // The screensaver path already lives in the monotonic domain
+        // (per-item `ScreensaverExposureSlice.span` sums). Every OTHER
+        // stage — active, grace, blanked, render_black — uses the
+        // shell-supplied `monotonic_span`, so a backward wall-clock step
+        // cannot zero or corrupt attributed wear (issue #210).
         let span = if stage_kind == "render_screensaver" {
-            exposures.get(&display_id).map_or(wall_span, |slices| {
+            exposures.get(&display_id).map_or(monotonic_span, |slices| {
                 slices.iter().map(|slice| slice.span).sum()
             })
         } else {
-            wall_span
+            monotonic_span
         };
 
         let norm = match stage_kind {
@@ -981,13 +1027,15 @@ fn tick(
             "render_black" | "blanked" => 0.0,
             "active" => {
                 if cfg.active_sampling.enabled
-                    && cfg.active_sampling.sampled_display.as_deref() == Some(display_id.0.as_str())
+                    && sampled_displays
+                        .iter()
+                        .any(|display| display == &display_id.0)
                 {
                     let selection = select_sample_for_attribution(
                         &dsnap.phase,
                         dsnap.stage.as_ref(),
-                        injected_grid,
-                        fallback,
+                        injected_grids.get(&display_id),
+                        fallbacks.get(&display_id).copied(),
                     );
                     match selection {
                         AttributionSelection::Sampled(sample) => {
@@ -1243,6 +1291,44 @@ fn tick(
     }
 
     actions
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn tick(
+    state: &mut TrackerState,
+    snapshot: &StateSnapshot,
+    samples: &HashMap<DisplayId, Option<PanelState>>,
+    cfg: &WearConfig,
+    now_epoch_s: u64,
+    monotonic_span: Duration,
+    injected_grid: Option<&SampledGrid>,
+    fallback: Option<SampleFallbackTag>,
+    exposures: &HashMap<DisplayId, Vec<ScreensaverExposureSlice>>,
+) -> Vec<TrackerAction> {
+    let display = cfg
+        .active_sampling
+        .first_sampled_display()
+        .map(|display| DisplayId(display.to_owned()));
+    let mut injected_grids = HashMap::new();
+    let mut fallbacks = HashMap::new();
+    if let (Some(display), Some(sample)) = (display.as_ref(), injected_grid) {
+        injected_grids.insert(display.clone(), sample.clone());
+    }
+    if let (Some(display), Some(fallback)) = (display, fallback) {
+        fallbacks.insert(display, fallback);
+    }
+    tick_with_grids(
+        state,
+        snapshot,
+        samples,
+        cfg,
+        now_epoch_s,
+        monotonic_span,
+        &injected_grids,
+        &fallbacks,
+        exposures,
+    )
 }
 
 // ── Impure ledger load/create/persist (file I/O — the shell's job) ─────────────
@@ -1538,6 +1624,20 @@ mod tests {
         }
     }
 
+    fn snapshot_with_two(
+        display_a: &DisplayId,
+        display_b: &DisplayId,
+        phase: &str,
+    ) -> StateSnapshot {
+        let mut snapshot = snapshot_with(display_a, phase, None);
+        let second = snapshot_with(display_b, phase, None)
+            .displays
+            .pop()
+            .expect("second display fixture");
+        snapshot.displays.push(second);
+        snapshot
+    }
+
     fn find_attribute(actions: &[TrackerAction], display: &DisplayId) -> Option<(Duration, f64)> {
         actions.iter().find_map(|a| match a {
             TrackerAction::Attribute {
@@ -1724,12 +1824,103 @@ mod tests {
             &samples,
             &cfg,
             1_000_060,
+            Duration::from_secs(60),
             None,
             None,
             &HashMap::new(),
         );
         let (_, norm) = find_attribute(&actions, &display).expect("Attribute action");
         assert!((norm - 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn plural_sample_for_a_applies_only_to_ledger_a() {
+        let display_a = DisplayId("oled-a".into());
+        let display_b = DisplayId("oled-b".into());
+        let mut state = TrackerState::default();
+        state
+            .ledgers
+            .insert(display_a.clone(), fresh_ledger(&display_a, 0));
+        state
+            .ledgers
+            .insert(display_b.clone(), fresh_ledger(&display_b, 0));
+        let mut cfg = WearConfig::default();
+        cfg.active_sampling.enabled = true;
+        cfg.active_sampling.sampled_displays = vec![display_a.0.clone(), display_b.0.clone()];
+        let sample_a = SampledGrid {
+            grid: LumaGrid::new(vec![0.2; usize::from(LUMA_GRID_ROWS * LUMA_GRID_COLS)])
+                .expect("sample A grid"),
+            captured_at: Tick::now(),
+            phase_at_capture: dormant_core::state_machine::Phase::Active,
+        };
+
+        let grids = HashMap::from([(display_a.clone(), sample_a.clone())]);
+        let actions = tick_with_grids(
+            &mut state,
+            &snapshot_with_two(&display_a, &display_b, "active"),
+            &HashMap::new(),
+            &cfg,
+            60,
+            Duration::from_secs(60),
+            &grids,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            TrackerAction::SampledSelection { display, sample }
+                if display == &display_a && sample == &sample_a
+        )));
+        assert!(!actions.iter().any(|action| matches!(
+            action,
+            TrackerAction::SampledSelection { display, .. } if display == &display_b
+        )));
+    }
+
+    #[test]
+    fn plural_sample_for_b_applies_only_to_ledger_b() {
+        let display_a = DisplayId("oled-a".into());
+        let display_b = DisplayId("oled-b".into());
+        let mut state = TrackerState::default();
+        state
+            .ledgers
+            .insert(display_a.clone(), fresh_ledger(&display_a, 0));
+        state
+            .ledgers
+            .insert(display_b.clone(), fresh_ledger(&display_b, 0));
+        let mut cfg = WearConfig::default();
+        cfg.active_sampling.enabled = true;
+        cfg.active_sampling.sampled_displays = vec![display_a.0.clone(), display_b.0.clone()];
+        let sample_b = SampledGrid {
+            grid: LumaGrid::new(vec![0.8; usize::from(LUMA_GRID_ROWS * LUMA_GRID_COLS)])
+                .expect("sample B grid"),
+            captured_at: Tick::now(),
+            phase_at_capture: dormant_core::state_machine::Phase::Active,
+        };
+
+        let grids = HashMap::from([(display_b.clone(), sample_b.clone())]);
+        let actions = tick_with_grids(
+            &mut state,
+            &snapshot_with_two(&display_a, &display_b, "active"),
+            &HashMap::new(),
+            &cfg,
+            60,
+            Duration::from_secs(60),
+            &grids,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            TrackerAction::SampledSelection { display, sample }
+                if display == &display_b && sample == &sample_b
+        )));
+        assert!(!actions.iter().any(|action| matches!(
+            action,
+            TrackerAction::SampledSelection { display, .. } if display == &display_a
+        )));
     }
 
     #[test]
@@ -1760,6 +1951,7 @@ mod tests {
                 &HashMap::new(),
                 &cfg,
                 u64::MAX,
+                Duration::from_secs(60),
                 fresh,
                 fallback,
                 &HashMap::new(),
@@ -1832,6 +2024,7 @@ mod tests {
             &brightness_samples,
             &cfg,
             60,
+            Duration::from_secs(60),
             Some(&sampled_grid),
             None,
             &HashMap::new(),
@@ -1880,6 +2073,7 @@ mod tests {
             &brightness_samples,
             &cfg,
             60,
+            Duration::from_secs(60),
             Some(&sampled_grid),
             None,
             &HashMap::new(),
@@ -1936,6 +2130,7 @@ mod tests {
                 &samples,
                 &cfg,
                 60,
+                Duration::from_secs(60),
                 None,
                 Some(fallback),
                 &HashMap::new(),
@@ -2026,6 +2221,7 @@ mod tests {
                 &brightness_samples,
                 &cfg,
                 60,
+                Duration::from_secs(60),
                 Some(&sampled_grid),
                 None,
                 &HashMap::new(),
@@ -2036,6 +2232,7 @@ mod tests {
                 &brightness_samples,
                 &cfg,
                 120,
+                Duration::from_secs(60),
                 Some(&sampled_grid),
                 None,
                 &HashMap::new(),
@@ -2104,6 +2301,7 @@ mod tests {
             &samples,
             &cfg,
             60,
+            Duration::from_secs(60),
             None,
             fallback,
             &HashMap::new(),
@@ -2148,6 +2346,7 @@ mod tests {
             &HashMap::new(),
             &cfg,
             60,
+            Duration::from_secs(60),
             Some(&sampled),
             None,
             &HashMap::new(),
@@ -2241,6 +2440,7 @@ mod tests {
             &HashMap::new(),
             &cfg,
             60,
+            Duration::from_secs(60),
             None,
             Some(SampleFallbackTag::Missing),
             &HashMap::new(),
@@ -2309,6 +2509,7 @@ mod tests {
             &samples,
             &cfg,
             1_000_060,
+            Duration::from_secs(60),
             None,
             None,
             &HashMap::new(),
@@ -2379,7 +2580,7 @@ mod tests {
             &ObservationHub::new(1),
         );
 
-        let latest = crate::active_sampler::new_latest_grid();
+        let latest = crate::active_sampler::new_latest_grids();
         let captured_at = Tick::now();
         let sample = SampledGrid {
             grid: LumaGrid::new(vec![0.5; usize::from(LUMA_GRID_ROWS * LUMA_GRID_COLS)])
@@ -2387,8 +2588,15 @@ mod tests {
             captured_at,
             phase_at_capture: dormant_core::state_machine::Phase::Active,
         };
-        *latest.write().expect("latest-grid lock") = Some(sample.clone());
-        let selected = latest.read().expect("latest-grid lock").clone();
+        latest
+            .write()
+            .expect("latest-grid lock")
+            .insert(display.clone(), sample.clone());
+        let selected = latest
+            .read()
+            .expect("latest-grid lock")
+            .get(&display)
+            .cloned();
         let (fresh, fallback) = filter_sample_for_tick(
             selected.as_ref(),
             captured_at,
@@ -2400,6 +2608,7 @@ mod tests {
             &HashMap::new(),
             &cfg.wear,
             60,
+            Duration::from_secs(60),
             fresh,
             fallback,
             &HashMap::new(),
@@ -2445,7 +2654,7 @@ mod tests {
         let executors = fake_executors(&[(&display, None)]);
         let (_executors_tx, executors_rx) = watch::channel(Arc::new(executors));
         let (ctl_tx, mut ctl_rx) = mpsc::channel(8);
-        let (_sampler_status_tx, sampler_status_rx) = watch::channel(None);
+        let sampler_statuses = crate::active_sampler::new_sampler_statuses();
         let wear_handle: WearHandle = Arc::new(std::sync::RwLock::new(HashMap::new()));
         let cancel = CancellationToken::new();
 
@@ -2466,8 +2675,8 @@ mod tests {
             ctl_tx,
             executors_rx,
             handle: wear_handle,
-            latest_grid: crate::active_sampler::new_latest_grid(),
-            sampler_status_rx,
+            latest_grids: crate::active_sampler::new_latest_grids(),
+            sampler_statuses,
             #[cfg(feature = "render")]
             heat_snapshots: Arc::new(std::sync::RwLock::new(HashMap::new())),
             cancel: cancel.clone(),
@@ -2661,7 +2870,15 @@ mod tests {
             }],
         )]);
         let actions = tick(
-            &mut state, &snapshot, &samples, &cfg, 1_000_060, None, None, &exposures,
+            &mut state,
+            &snapshot,
+            &samples,
+            &cfg,
+            1_000_060,
+            Duration::from_secs(60),
+            None,
+            None,
+            &exposures,
         );
         let (span, norm) = find_attribute(&actions, &display).expect("Attribute action");
         assert_eq!(span, Duration::from_secs(60));
@@ -2706,6 +2923,7 @@ mod tests {
             &HashMap::new(),
             &cfg,
             1_000_120,
+            Duration::from_secs(60),
             None,
             None,
             &exposures,
@@ -2761,6 +2979,7 @@ mod tests {
             &HashMap::new(),
             &cfg,
             1_000_060,
+            Duration::from_secs(60),
             None,
             None,
             &exposures,
@@ -2810,6 +3029,7 @@ mod tests {
             &HashMap::new(),
             &cfg,
             1_000_060,
+            Duration::from_secs(60),
             None,
             None,
             &exposures,
@@ -2852,6 +3072,7 @@ mod tests {
                 &HashMap::new(),
                 &cfg,
                 1_000_060,
+                Duration::from_secs(60),
                 None,
                 None,
                 &exposures,
@@ -2862,6 +3083,7 @@ mod tests {
                 &HashMap::new(),
                 &cfg,
                 1_000_120,
+                Duration::from_secs(60),
                 None,
                 None,
                 &exposures,
@@ -2913,6 +3135,7 @@ mod tests {
                 &HashMap::new(),
                 &cfg,
                 1_000_060,
+                Duration::from_secs(60),
                 None,
                 None,
                 &missing,
@@ -2923,6 +3146,7 @@ mod tests {
                 &HashMap::new(),
                 &cfg,
                 1_000_120,
+                Duration::from_secs(60),
                 None,
                 None,
                 &ready,
@@ -2933,6 +3157,7 @@ mod tests {
                 &HashMap::new(),
                 &cfg,
                 1_000_180,
+                Duration::from_secs(60),
                 None,
                 None,
                 &missing,
@@ -3047,6 +3272,7 @@ mod tests {
             &HashMap::new(),
             &cfg,
             60,
+            Duration::from_secs(60),
             None,
             None,
             &exposures,
@@ -3090,6 +3316,7 @@ mod tests {
             &HashMap::new(),
             &cfg,
             1_000_060,
+            Duration::from_secs(60),
             None,
             None,
             &exposures,
@@ -3109,6 +3336,7 @@ mod tests {
             &HashMap::new(),
             &cfg,
             1_000_060,
+            Duration::from_secs(60),
             None,
             None,
             &HashMap::new(),
@@ -3145,6 +3373,7 @@ mod tests {
             &HashMap::new(),
             &WearConfig::default(),
             1_000_060,
+            Duration::from_secs(60),
             None,
             None,
             &exposures,
@@ -3179,6 +3408,7 @@ mod tests {
                 &HashMap::new(),
                 &cfg,
                 1_000_060,
+                Duration::from_secs(60),
                 None,
                 None,
                 &HashMap::new(),
@@ -3189,6 +3419,7 @@ mod tests {
                 &HashMap::new(),
                 &cfg,
                 1_000_120,
+                Duration::from_secs(60),
                 None,
                 None,
                 &HashMap::new(),
@@ -3216,6 +3447,7 @@ mod tests {
                 &samples,
                 &cfg,
                 1_000_180,
+                Duration::from_secs(60),
                 None,
                 None,
                 &HashMap::new(),
@@ -3227,6 +3459,7 @@ mod tests {
                 &HashMap::new(),
                 &cfg,
                 1_000_240,
+                Duration::from_secs(60),
                 None,
                 None,
                 &HashMap::new(),
@@ -3261,6 +3494,7 @@ mod tests {
             &HashMap::new(),
             &cfg,
             1_000_060,
+            Duration::from_secs(60),
             None,
             None,
             &HashMap::new(),
@@ -3300,6 +3534,7 @@ mod tests {
             &samples,
             &cfg,
             1_000_060,
+            Duration::from_secs(60),
             None,
             None,
             &HashMap::new(),
@@ -3335,6 +3570,7 @@ mod tests {
             &samples,
             &cfg,
             now,
+            cfg.sample_interval.saturating_mul(10),
             None,
             None,
             &HashMap::new(),
@@ -3369,6 +3605,7 @@ mod tests {
             &samples,
             &cfg,
             now,
+            Duration::from_secs(60),
             None,
             None,
             &HashMap::new(),
@@ -3403,6 +3640,7 @@ mod tests {
             &samples,
             &cfg,
             now,
+            Duration::from_secs(60),
             None,
             None,
             &HashMap::new(),
@@ -3436,6 +3674,7 @@ mod tests {
             &samples,
             &cfg,
             now,
+            Duration::from_secs(60),
             None,
             None,
             &HashMap::new(),
@@ -3452,6 +3691,7 @@ mod tests {
             &samples,
             &cfg,
             now + 1,
+            Duration::from_secs(60),
             None,
             None,
             &HashMap::new(),
@@ -3481,6 +3721,7 @@ mod tests {
             &HashMap::new(),
             &cfg,
             1000,
+            Duration::from_secs(60),
             None,
             None,
             &HashMap::new(),
@@ -3515,6 +3756,7 @@ mod tests {
             &samples,
             &cfg,
             1_000_060,
+            Duration::from_secs(60),
             None,
             None,
             &HashMap::new(),
@@ -3941,5 +4183,65 @@ mod tests {
             &ObservationHub::new(1),
         );
         assert!(!again.needs_seed);
+    }
+
+    /// Issue #210 (sweep-2 Task 15): non-screensaver wear attribution must
+    /// source its span from a monotonic Instant, not the wall-clock epoch.
+    /// A backward wall-clock step (NTP correction, suspend-resume) must
+    /// never zero or corrupt the attributed span — the monotonic timer
+    /// advances regardless of what the OS clock does.
+    ///
+    /// RED: feed tick boundaries 60 MONOTONIC seconds apart while the wall
+    /// epoch moves BACKWARD 300s; assert 60s attribution AND that the
+    /// non-increasing wall timestamp does not erase wear.
+    #[test]
+    fn wear_tracker_backward_clock() {
+        let display = DisplayId("mon".into());
+        let cfg = WearConfig::default();
+        let mut ledger = fresh_ledger(&display, 1000);
+        // The wall-clock last-sample anchor is set to epoch 1000.
+        ledger.last_sample_at_epoch_s = Some(1000);
+        let mut state = TrackerState::default();
+        state.ledgers.insert(display.clone(), ledger);
+
+        // 60s of monotonic time has elapsed since the previous tick...
+        state.last_tick_at = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(60))
+                .expect("Instant::now() must be at least 60s past epoch"),
+        );
+        // ...while the wall epoch moved BACKWARD 300s (NTP step or
+        // suspend-resume) — `now_epoch_s = 700` is *before* the stored
+        // `last_sample_at_epoch_s = 1000`.
+        let now_epoch_s = 700_u64;
+
+        let snapshot = snapshot_with(&display, "active", None);
+        let mut samples = HashMap::new();
+        samples.insert(
+            display.clone(),
+            Some(PanelState {
+                power: None,
+                brightness: Some(100),
+            }),
+        );
+
+        let actions = tick(
+            &mut state,
+            &snapshot,
+            &samples,
+            &cfg,
+            now_epoch_s,
+            Duration::from_secs(60),
+            None,
+            None,
+            &HashMap::new(),
+        );
+        let (span, _) = find_attribute(&actions, &display).expect("Attribute action");
+        assert_eq!(
+            span,
+            Duration::from_secs(60),
+            "backward wall clock must not erase the monotonic wear span \
+             (issue #210: span was {span:?}, expected 60s)",
+        );
     }
 }

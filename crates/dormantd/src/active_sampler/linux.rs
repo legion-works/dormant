@@ -1,13 +1,16 @@
 //! Linux XDG `ScreenCast` portal and `PipeWire` capture implementation.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
+use std::thread_local;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use dormant_core::config::schema::{ActiveSamplingConfig, StreamMode};
+use dormant_core::types::DisplayId;
 use pipewire as pw;
 use pw::properties::properties;
 use pw::spa;
@@ -165,6 +168,7 @@ pub trait PortalTransport: Send + Sync + 'static {
 /// Linux `CaptureSource` backed by an XDG `ScreenCast` portal session.
 pub struct PortalPipeWireSource<T = ZbusPortalTransport> {
     transport: T,
+    display: DisplayId,
     session: Option<PortalSession>,
     stream: Option<ConnectedStream>,
     pipewire_fd: Option<OwnedFd>,
@@ -190,6 +194,7 @@ impl<T> PortalPipeWireSource<T> {
     pub fn from_transport(transport: T) -> Self {
         Self {
             transport,
+            display: DisplayId("unbound".to_owned()),
             session: None,
             stream: None,
             pipewire_fd: None,
@@ -198,6 +203,13 @@ impl<T> PortalPipeWireSource<T> {
             #[cfg(test)]
             scripted_frames: std::collections::VecDeque::new(),
         }
+    }
+
+    /// Binds diagnostic events to the independently sampled display.
+    #[must_use]
+    pub fn with_display(mut self, display: DisplayId) -> Self {
+        self.display = display;
+        self
     }
 
     /// Uses the configured deadline for warm-worker frame delivery.
@@ -226,15 +238,24 @@ impl<T: PortalTransport> PortalPipeWireSource<T> {
     ) -> Result<ConnectedStream, CaptureError> {
         self.close().await;
         let session = self.transport.create_session().await?;
-        tracing::info!(event = "wear_sampling_stage", stage = "session_created");
+        tracing::info!(
+            event = "wear_sampling_stage",
+            display = %self.display,
+            stage = "session_created"
+        );
         let opened = async {
             self.transport.select_sources(&session, options).await?;
-            tracing::info!(event = "wear_sampling_stage", stage = "sources_selected");
+            tracing::info!(
+                event = "wear_sampling_stage",
+                display = %self.display,
+                stage = "sources_selected"
+            );
             let started = self.transport.start(&session, start_response_timeout).await;
             let start = match started {
                 Ok(start) => {
                     tracing::info!(
                         event = "wear_sampling_stage",
+                        display = %self.display,
                         stage = "start_response_received",
                         granted = true
                     );
@@ -243,6 +264,7 @@ impl<T: PortalTransport> PortalPipeWireSource<T> {
                 Err(CaptureError::ConsentDenied) => {
                     tracing::info!(
                         event = "wear_sampling_stage",
+                        display = %self.display,
                         stage = "start_response_received",
                         granted = false
                     );
@@ -257,7 +279,11 @@ impl<T: PortalTransport> PortalPipeWireSource<T> {
             )
             .await
             .map_err(|_| CaptureError::Transport("open_pipewire_remote_timeout".to_owned()))??;
-            tracing::info!(event = "wear_sampling_stage", stage = "pipewire_fd_opened");
+            tracing::info!(
+                event = "wear_sampling_stage",
+                display = %self.display,
+                stage = "pipewire_fd_opened"
+            );
             Ok::<_, CaptureError>((stream, pipewire_fd))
         }
         .await;
@@ -268,6 +294,7 @@ impl<T: PortalTransport> PortalPipeWireSource<T> {
                 self.pipewire_fd = Some(pipewire_fd);
                 tracing::info!(
                     event = "wear_sampling_stage",
+                    display = %self.display,
                     stage = "portal_stream_ready",
                     node_id = stream.node_id
                 );
@@ -293,13 +320,14 @@ impl<T: PortalTransport> CaptureSource for PortalPipeWireSource<T> {
                 PORTAL_RESPONSE_TIMEOUT,
             )
             .await?;
-        if let Err(error) = reconcile_start_with_binding(&stream, binding) {
+        if let Err(error) = reconcile_start_with_binding(&stream, binding, &self.display) {
             self.close().await;
             return Err(error);
         }
         let frame = self.capture_one(StreamMode::Warm).await?;
         tracing::info!(
             event = "wear_sampling_stage",
+            display = %self.display,
             stage = "first_frame_received"
         );
         if let Err(error) = reconcile_reattached_frame(&frame, binding) {
@@ -314,7 +342,7 @@ impl<T: PortalTransport> CaptureSource for PortalPipeWireSource<T> {
 
     async fn request_consent(
         &mut self,
-        _display: &DisplayExpectation,
+        expected: &DisplayExpectation,
     ) -> Result<Grant, CaptureError> {
         self.open(
             SelectSourcesOptions::for_grant(),
@@ -324,6 +352,7 @@ impl<T: PortalTransport> CaptureSource for PortalPipeWireSource<T> {
         self.capture_one(StreamMode::Warm).await?;
         tracing::info!(
             event = "wear_sampling_stage",
+            display = %expected.display,
             stage = "first_frame_received"
         );
         Ok(Grant {
@@ -362,7 +391,8 @@ impl<T: PortalTransport> CaptureSource for PortalPipeWireSource<T> {
                 if let Some(mut worker) = self.warm_worker.take() {
                     worker.shutdown().await;
                 }
-                tokio::task::spawn_blocking(move || acquire_one_frame(fd, node_id))
+                let display_id = self.display.clone();
+                tokio::task::spawn_blocking(move || acquire_one_frame(fd, node_id, display_id))
                     .await
                     .map_err(|error| {
                         CaptureError::Transport(format!("PipeWire worker join: {error}"))
@@ -370,7 +400,10 @@ impl<T: PortalTransport> CaptureSource for PortalPipeWireSource<T> {
             }
             StreamMode::Warm => {
                 if self.warm_worker.is_none() {
-                    self.warm_worker = Some(WarmWorker::spawn(fd, node_id).await?);
+                    self.warm_worker = Some(
+                        WarmWorker::spawn(fd, node_id, self.capture_timeout, self.display.clone())
+                            .await?,
+                    );
                 }
                 let result = self
                     .warm_worker
@@ -409,6 +442,22 @@ impl<T: PortalTransport> CaptureSource for PortalPipeWireSource<T> {
             self.transport.close(session).await;
         }
     }
+
+    fn set_capture_timeout(&mut self, capture_timeout: Duration) {
+        self.capture_timeout = capture_timeout;
+    }
+
+    async fn invalidate_pending_capture(&mut self) {
+        // Drop any retained warm worker so a frame buffered in the cap-1
+        // channel by a cancelled capture cannot be served on the next
+        // attempt as if it were fresh. `Worker::Drop` sends the shutdown
+        // command and reaps the thread; the channel's `Sender` going away
+        // also forces any pending `try_send` from the process callback to
+        // become a no-op.
+        if let Some(mut worker) = self.warm_worker.take() {
+            worker.shutdown().await;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -424,28 +473,40 @@ struct WarmWorker {
 }
 
 impl WarmWorker {
-    async fn spawn(fd: OwnedFd, node_id: u32) -> Result<Self, CaptureError> {
-        tokio::task::spawn_blocking(move || Self::spawn_blocking(fd, node_id))
-            .await
-            .map_err(|error| {
-                CaptureError::Transport(format!("PipeWire warm worker join: {error}"))
-            })?
+    async fn spawn(
+        fd: OwnedFd,
+        node_id: u32,
+        init_timeout: Duration,
+        display_id: DisplayId,
+    ) -> Result<Self, CaptureError> {
+        tokio::task::spawn_blocking(move || {
+            Self::spawn_blocking(fd, node_id, init_timeout, display_id)
+        })
+        .await
+        .map_err(|error| CaptureError::Transport(format!("PipeWire warm worker join: {error}")))?
     }
 
-    fn spawn_blocking(fd: OwnedFd, node_id: u32) -> Result<Self, CaptureError> {
+    fn spawn_blocking(
+        fd: OwnedFd,
+        node_id: u32,
+        init_timeout: Duration,
+        display_id: DisplayId,
+    ) -> Result<Self, CaptureError> {
         let (frames_tx, frames) = tokio::sync::mpsc::channel(1);
         let (initialized_tx, initialized_rx) = std::sync::mpsc::sync_channel(1);
         let join = std::thread::Builder::new()
             .name("dormant-pipewire-warm".to_owned())
             .spawn(move || {
-                if let Err(error) = run_warm_stream(fd, node_id, frames_tx, &initialized_tx) {
+                if let Err(error) =
+                    run_warm_stream(fd, node_id, frames_tx, &initialized_tx, display_id)
+                {
                     let _ = initialized_tx.send(Err(error));
                 }
             })
             .map_err(|error| {
                 CaptureError::Transport(format!("spawn PipeWire warm worker: {error}"))
             })?;
-        match receive_warm_worker_initialization(initialized_rx, PORTAL_RESPONSE_TIMEOUT) {
+        match receive_warm_worker_initialization(initialized_rx, init_timeout) {
             Ok(commands) => Ok(Self {
                 commands,
                 frames,
@@ -554,6 +615,10 @@ struct WarmFrameState {
     frames: tokio::sync::mpsc::Sender<Result<RawFrame, CaptureError>>,
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the PipeWire listener callbacks must retain one shared main-loop lifetime and display-tagged diagnostic context"
+)]
 fn run_warm_stream(
     fd: OwnedFd,
     node_id: u32,
@@ -561,6 +626,7 @@ fn run_warm_stream(
     initialized: &std::sync::mpsc::SyncSender<
         Result<pw::channel::Sender<WarmCommand>, CaptureError>,
     >,
+    display_id: DisplayId,
 ) -> Result<(), CaptureError> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None)
@@ -587,10 +653,12 @@ fn run_warm_stream(
     }));
     let state_for_format = state.clone();
     let state_for_process = state.clone();
+    let display_for_state = display_id.clone();
+    let display_for_format = display_id;
     let stream_for_process = stream.clone();
     let _listener = stream
         .add_local_listener_with_user_data(())
-        .state_changed(|_, (), _, state| log_stream_state(&state))
+        .state_changed(move |_, (), _, state| log_stream_state(&state, &display_for_state))
         .param_changed(move |stream, (), id, param| {
             let Some(param) = param else { return };
             if id != pw::spa::param::ParamType::Format.as_raw() {
@@ -598,6 +666,7 @@ fn run_warm_stream(
             }
             tracing::info!(
                 event = "wear_sampling_stage",
+                display = %display_for_format,
                 stage = "pipewire_format_received"
             );
             let Ok((media_type, media_subtype)) = pw::spa::param::format_utils::parse_format(param)
@@ -608,7 +677,7 @@ fn run_warm_stream(
                 && media_subtype == pw::spa::param::format::MediaSubtype::Raw
             {
                 let _ = state_for_format.borrow_mut().format.parse(param);
-                update_shm_buffer_params(stream);
+                update_shm_buffer_params(stream, &display_for_format);
             }
         })
         .process(move |stream, ()| {
@@ -688,10 +757,12 @@ fn connected_stream(start: PortalStartResult) -> Result<ConnectedStream, Capture
 fn reconcile_start_with_binding(
     stream: &ConnectedStream,
     binding: &ConsentBinding<'_>,
+    display_id: &DisplayId,
 ) -> Result<(), CaptureError> {
     if !binding.portal_persistent_ids.is_empty() && stream.persistent_id.is_none() {
         tracing::info!(
             event = "wear_sampling_stage",
+            display = %display_id,
             stage = "persistent_id_unavailable_using_dimensions"
         );
     }
@@ -789,10 +860,11 @@ fn shm_buffer_param_object() -> spa::pod::Object {
     }
 }
 
-fn update_shm_buffer_params(stream: &pw::stream::Stream) {
+fn update_shm_buffer_params(stream: &pw::stream::Stream, display_id: &DisplayId) {
     let Ok(buffers) = shm_buffer_param_bytes() else {
         tracing::info!(
             event = "wear_sampling_stage",
+            display = %display_id,
             stage = "pipewire_buffer_params_failed"
         );
         return;
@@ -800,6 +872,7 @@ fn update_shm_buffer_params(stream: &pw::stream::Stream) {
     let Some(param) = spa::pod::Pod::from_bytes(&buffers) else {
         tracing::info!(
             event = "wear_sampling_stage",
+            display = %display_id,
             stage = "pipewire_buffer_params_failed"
         );
         return;
@@ -807,31 +880,81 @@ fn update_shm_buffer_params(stream: &pw::stream::Stream) {
     if let Err(error) = stream.update_params(&mut [param]) {
         tracing::info!(
             event = "wear_sampling_stage",
+            display = %display_id,
             stage = "pipewire_buffer_params_failed",
             error = %error
         );
     }
 }
 
-fn log_stream_state(state: &pw::stream::StreamState) {
+// Thread-local: tracks whether we have established a PipeWire streaming session.
+// The first `streaming` after initial connection is INFO (diagnostic signal).
+// All subsequent steady-state cadence transitions are DEBUG to eliminate the
+// ~3k lines/day noise from 60s sampling cycles.
+thread_local! {
+    static ESTABLISHED_STREAMING: RefCell<bool> = const { RefCell::new(false) };
+}
+
+fn log_stream_state(state: &pw::stream::StreamState, display_id: &DisplayId) {
     match state {
-        pw::stream::StreamState::Connecting => tracing::info!(
-            event = "wear_sampling_stage",
-            stage = "pipewire_state_changed",
-            state = "connecting"
-        ),
-        pw::stream::StreamState::Paused => tracing::info!(
-            event = "wear_sampling_stage",
-            stage = "pipewire_state_changed",
-            state = "paused"
-        ),
-        pw::stream::StreamState::Streaming => tracing::info!(
-            event = "wear_sampling_stage",
-            stage = "pipewire_state_changed",
-            state = "streaming"
-        ),
+        pw::stream::StreamState::Connecting => {
+            // Reset the established-stream tracker so the next streaming transition
+            // is logged at INFO again (the diagnostic signal after any reconnect).
+            // This is topology-independent: Warm workers are dedicated threads so
+            // the thread-local is naturally fresh per session; PerTick mode uses
+            // a reused spawn_blocking thread, so we must explicitly reset.
+            ESTABLISHED_STREAMING.with(|flag| *flag.borrow_mut() = false);
+            tracing::info!(
+                event = "wear_sampling_stage",
+                display = %display_id,
+                stage = "pipewire_state_changed",
+                state = "connecting"
+            );
+        }
+        pw::stream::StreamState::Paused => {
+            // `paused` is part of the steady-state cadence; after the first
+            // `streaming` is established it is demoted to DEBUG.
+            let established = ESTABLISHED_STREAMING.with(|flag| *flag.borrow());
+            if established {
+                tracing::debug!(
+                    event = "wear_sampling_stage",
+                    display = %display_id,
+                    stage = "pipewire_state_changed",
+                    state = "paused"
+                );
+            } else {
+                tracing::info!(
+                    event = "wear_sampling_stage",
+                    display = %display_id,
+                    stage = "pipewire_state_changed",
+                    state = "paused"
+                );
+            }
+        }
+        pw::stream::StreamState::Streaming => {
+            let established = ESTABLISHED_STREAMING.with(|flag| *flag.borrow());
+            if established {
+                // Subsequent steady-state streaming transitions are DEBUG noise.
+                tracing::debug!(
+                    event = "wear_sampling_stage",
+                    display = %display_id,
+                    stage = "pipewire_state_changed",
+                    state = "streaming"
+                );
+            } else {
+                // First streaming after (re)connect is the diagnostic signal.
+                ESTABLISHED_STREAMING.with(|flag| *flag.borrow_mut() = true);
+                tracing::info!(
+                    event = "wear_sampling_stage",
+                    display = %display_id,
+                    stage = "pipewire_state_changed",
+                    state = "streaming"
+                );
+            }
+        }
         pw::stream::StreamState::Error(error) => tracing::info!(
             event = "wear_sampling_stage",
+            display = %display_id,
             stage = "pipewire_state_changed",
             state = "error",
             error = %error
@@ -840,7 +963,11 @@ fn log_stream_state(state: &pw::stream::StreamState) {
     }
 }
 
-fn acquire_one_frame(fd: OwnedFd, node_id: u32) -> Result<RawFrame, CaptureError> {
+fn acquire_one_frame(
+    fd: OwnedFd,
+    node_id: u32,
+    display_id: DisplayId,
+) -> Result<RawFrame, CaptureError> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None)
         .map_err(|error| CaptureError::Transport(format!("PipeWire main loop: {error}")))?;
@@ -861,13 +988,17 @@ fn acquire_one_frame(fd: OwnedFd, node_id: u32) -> Result<RawFrame, CaptureError
     .map_err(|error| CaptureError::Transport(format!("PipeWire stream: {error}")))?;
     let (reply, frame) = std::sync::mpsc::channel();
     let loop_for_process = mainloop.clone();
+    let display_for_state = display_id.clone();
+    let display_for_format = display_id;
     let _listener = stream
         .add_local_listener_with_user_data(FrameState {
             format: spa::param::video::VideoInfoRaw::default(),
             reply,
         })
-        .state_changed(|_, _, _, stream_state| log_stream_state(&stream_state))
-        .param_changed(|stream, state, id, param| {
+        .state_changed(move |_, _, _, stream_state| {
+            log_stream_state(&stream_state, &display_for_state);
+        })
+        .param_changed(move |stream, state, id, param| {
             let Some(param) = param else {
                 return;
             };
@@ -876,6 +1007,7 @@ fn acquire_one_frame(fd: OwnedFd, node_id: u32) -> Result<RawFrame, CaptureError
             }
             tracing::info!(
                 event = "wear_sampling_stage",
+                display = %display_for_format,
                 stage = "pipewire_format_received"
             );
             let Ok((media_type, media_subtype)) = pw::spa::param::format_utils::parse_format(param)
@@ -886,7 +1018,7 @@ fn acquire_one_frame(fd: OwnedFd, node_id: u32) -> Result<RawFrame, CaptureError
                 && media_subtype == pw::spa::param::format::MediaSubtype::Raw
             {
                 let _ = state.format.parse(param);
-                update_shm_buffer_params(stream);
+                update_shm_buffer_params(stream, &display_for_format);
             }
         })
         .process(move |stream, state| {
@@ -1648,7 +1780,8 @@ mod tests {
                         height: 2160,
                         stride: 3840 * 4,
                     })],
-                );
+                )
+                .with_display(DisplayId("oled".to_owned()));
 
                 source
                     .request_consent(&DisplayExpectation {
@@ -1670,6 +1803,56 @@ mod tests {
             assert!(log.contains(stage), "missing {stage} stage: {log}");
         }
         assert!(log.contains("granted=true"), "missing grant result: {log}");
+        for line in log
+            .lines()
+            .filter(|line| line.contains("wear_sampling_stage"))
+        {
+            assert!(
+                line.contains("display=oled"),
+                "stage log is missing its display field: {line}"
+            );
+        }
+    }
+
+    /// RED test: after a reconnect (Connecting), the next streaming must be INFO again.
+    /// Intra-session cadence repeats (paused→streaming→paused→…) stay DEBUG.
+    ///
+    /// Sequence: session1: Connecting→Streaming→Paused→Streaming (2nd, DEBUG)
+    ///           session2: Connecting→Streaming (INFO again — reconnect resets)
+    #[test]
+    fn active_sampling_cadence_repeated_streaming_logged_at_info() {
+        let log = capture_tracing(|| {
+            let display_id = DisplayId("oled".to_owned());
+            // Session 1
+            log_stream_state(&pw::stream::StreamState::Connecting, &display_id);
+            log_stream_state(&pw::stream::StreamState::Streaming, &display_id); // 1st, INFO
+            // First cadence cycle
+            log_stream_state(&pw::stream::StreamState::Paused, &display_id);
+            log_stream_state(&pw::stream::StreamState::Streaming, &display_id); // 2nd, DEBUG
+            // Session 2 (reconnect resets so this streaming is INFO again)
+            log_stream_state(&pw::stream::StreamState::Connecting, &display_id); // reconnect
+            log_stream_state(&pw::stream::StreamState::Streaming, &display_id); // 3rd, INFO (first of session 2)
+        });
+
+        let streaming_at_info: usize = log
+            .lines()
+            .filter(|line| line.contains("pipewire_state_changed") && line.contains("streaming"))
+            .count();
+
+        // Two sessions → two first-streaming transitions are INFO; intra-session repeats are DEBUG.
+        assert_eq!(
+            streaming_at_info, 2,
+            "expected 2 INFO streaming (one per session), got {streaming_at_info}: {log}"
+        );
+        for line in log
+            .lines()
+            .filter(|line| line.contains("pipewire_state_changed"))
+        {
+            assert!(
+                line.contains("display=oled"),
+                "missing display field: {line}"
+            );
+        }
     }
 
     #[test]
@@ -1899,7 +2082,10 @@ mod tests {
             granted_height: 2160,
         };
 
-        assert_eq!(reconcile_start_with_binding(&stream, &binding), Ok(()));
+        assert_eq!(
+            reconcile_start_with_binding(&stream, &binding, &DisplayId("test".to_owned())),
+            Ok(())
+        );
     }
 
     #[test]
@@ -1925,7 +2111,7 @@ mod tests {
         };
 
         assert_eq!(
-            reconcile_start_with_binding(&stream, &binding),
+            reconcile_start_with_binding(&stream, &binding, &DisplayId("test".to_owned())),
             Err(CaptureError::Protocol(
                 WEAR_SAMPLING_WRONG_MONITOR.to_owned()
             ))
@@ -1977,5 +2163,79 @@ mod tests {
             Err(CaptureError::Timeout)
         );
         worker.shutdown().await;
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #211 — timeout ownership (defects B and C).
+    // ---------------------------------------------------------------------
+
+    /// Defect C: `WarmWorker::spawn`'s initialization must be bounded by the
+    /// caller-supplied timeout, not the hardcoded `PORTAL_RESPONSE_TIMEOUT`.
+    /// With a slow (non-signalling) init and a caller timeout of 50ms, the
+    /// spawn must return `Err` (specifically the
+    /// `pipewire_warm_worker_initialization_timeout` transport error) rather
+    /// than block for the full 30s.
+    #[tokio::test(start_paused = true)]
+    async fn warm_worker_spawn_initialization_is_bounded_by_caller_timeout() {
+        // We do not call `WarmWorker::spawn` directly because that path would
+        // exercise the real PipeWire init; instead we exercise the same
+        // bounded-receive primitive that `spawn_blocking` delegates to.
+        let (initialized_tx, initialized_rx) = std::sync::mpsc::sync_channel(1);
+        // Never send; init never completes.
+        let _hold_tx = initialized_tx;
+
+        let start = tokio::time::Instant::now();
+        let result = receive_warm_worker_initialization::<pw::channel::Sender<WarmCommand>>(
+            initialized_rx,
+            Duration::from_millis(50),
+        );
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(
+                &result,
+                Err(CaptureError::Transport(message))
+                    if message == "pipewire_warm_worker_initialization_timeout"
+            ),
+            "expected init timeout"
+        );
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "init should be bounded by the caller timeout, took {elapsed:?}"
+        );
+    }
+
+    /// Defect B (warm-worker side): the source's `invalidate_pending_capture`
+    /// must drop the warm worker so a stale frame buffered in the cap-1
+    /// channel cannot be served on the next capture.
+    #[tokio::test]
+    async fn portal_source_invalidate_pending_capture_drops_warm_worker() {
+        let transport = FakePortalTransport::grant_with(PortalStartResult::single(
+            73,
+            16,
+            9,
+            None,
+            "rotated-token",
+        ));
+        let mut source = PortalPipeWireSource::from_transport(transport);
+
+        // Inject a fake warm worker. The test module has access to the
+        // private field; the public constructor would require a real PipeWire
+        // fd.
+        let frame = RawFrame {
+            rgba: vec![1, 2, 3, 4],
+            width: 1,
+            height: 1,
+            stride: 4,
+        };
+        source.warm_worker = Some(WarmWorker::spawn_fake([Some(frame.clone())]));
+        assert!(source.warm_worker.is_some());
+
+        source.invalidate_pending_capture().await;
+
+        assert!(
+            source.warm_worker.is_none(),
+            "invalidate_pending_capture must drop the warm worker"
+        );
     }
 }

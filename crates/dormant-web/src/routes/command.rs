@@ -232,11 +232,18 @@ pub(crate) async fn post_emergency_wake(
         .map_err(|_| WebError::EmergencyWakeInProgress)?;
     let (reply_tx, reply_rx) = oneshot::channel();
 
+    // Publish the insert so a push-driven UI updates immediately. The
+    // detached monitor below owns the matching removal publish — the
+    // publish is the ownership boundary, not the request handler.
+    state.inner.publish_operations_changed().await;
+
     // Spawn before the channel send: if the HTTP task is cancelled while send
     // is pending, this detached monitor still owns the web single-flight guard.
+    let state_for_monitor = state.clone();
     let mut completion = tokio::spawn(async move {
         let result = reply_rx.await;
         drop(guard);
+        state_for_monitor.inner.publish_operations_changed().await;
         result
     });
     state
@@ -389,7 +396,7 @@ mod tests {
     use axum::http::{Method, Request, StatusCode};
     use axum::response::IntoResponse;
     use dormant_core::config::schema::{Config, Credentials, DaemonConfig};
-    use dormant_core::rules::{DisplaySnapshot, StateSnapshot};
+    use dormant_core::rules::{DaemonEvent, DisplaySnapshot, StateSnapshot};
     use indexmap::IndexMap;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
@@ -1081,10 +1088,15 @@ mod tests {
     async fn emergency_wake_dropped_reply_maps_to_500_json() {
         let (ctl_tx, mut ctl_rx) = mpsc::channel(8);
         tokio::spawn(async move {
-            let Some(ControlMsg::EmergencyWake { reply }) = ctl_rx.recv().await else {
-                panic!("expected EmergencyWake");
-            };
-            drop(reply);
+            // Drain PublishDaemonEvent frames sent before the EmergencyWake
+            // command (issue #184) so this test only cares about the
+            // command path, not the guard-push path.
+            while let Some(msg) = ctl_rx.recv().await {
+                if let ControlMsg::EmergencyWake { reply } = msg {
+                    drop(reply);
+                    return;
+                }
+            }
         });
         let response = command_test_router(ctl_tx)
             .oneshot(
@@ -1111,8 +1123,14 @@ mod tests {
         let state = test_web_state(ctl_tx);
         let first_state = state.clone();
         let first = tokio::spawn(async move { post_emergency_wake(State(first_state)).await });
-        let Some(ControlMsg::EmergencyWake { reply }) = ctl_rx.recv().await else {
-            panic!("expected first EmergencyWake");
+        // Drain PublishDaemonEvent frames (#184) so the test only sees the
+        // EmergencyWake control message.
+        let reply = loop {
+            match ctl_rx.recv().await.unwrap() {
+                ControlMsg::EmergencyWake { reply } => break reply,
+                ControlMsg::PublishDaemonEvent(_) => {}
+                other => panic!("expected first EmergencyWake, got {other:?}"),
+            }
         };
 
         let second = post_emergency_wake(State(state)).await.unwrap_err();
@@ -1132,9 +1150,14 @@ mod tests {
         let state = test_web_state(ctl_tx);
         let first_state = state.clone();
         let first = tokio::spawn(async move { post_emergency_wake(State(first_state)).await });
-        let reply = match ctl_rx.recv().await.unwrap() {
-            ControlMsg::EmergencyWake { reply } => reply,
-            other => panic!("expected EmergencyWake, got {other:?}"),
+        // Drain PublishDaemonEvent frames (#184) before reaching the
+        // EmergencyWake control message.
+        let reply = loop {
+            match ctl_rx.recv().await.unwrap() {
+                ControlMsg::EmergencyWake { reply } => break reply,
+                ControlMsg::PublishDaemonEvent(_) => {}
+                other => panic!("expected EmergencyWake, got {other:?}"),
+            }
         };
         tokio::time::advance(Duration::from_secs(2)).await;
         assert!(matches!(
@@ -1185,5 +1208,127 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
             serde_json::json!({"error": "emergency_wake_in_progress"})
         );
+    }
+
+    // ── #184 OperationsChanged publish tests ──────────────────────────────
+
+    /// Spawn a fake engine that records every `PublishDaemonEvent` and
+    /// drops the `EmergencyWake` reply so the route's detached completion
+    /// monitor (and its removal publish) runs immediately — exercising the
+    /// `Err(_)` reply path that drives the load-bearing 504-on-timeout
+    /// cleanup case the plan trap calls out.
+    fn spawn_publishing_engine() -> (
+        mpsc::Sender<ControlMsg>,
+        Arc<std::sync::Mutex<Vec<DaemonEvent>>>,
+    ) {
+        let (ctl_tx, mut ctl_rx) = mpsc::channel::<ControlMsg>(16);
+        let published: Arc<std::sync::Mutex<Vec<DaemonEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = published.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = ctl_rx.recv().await {
+                match msg {
+                    ControlMsg::Snapshot(reply) => {
+                        let _ = reply.send(StateSnapshot {
+                            sensors: vec![],
+                            zones: vec![],
+                            displays: vec![],
+                            pending_reload: None,
+                            rollback: None,
+                            kvm: None,
+                            wear_sampling_status: None,
+                        });
+                    }
+                    ControlMsg::PublishDaemonEvent(ev) => {
+                        recorded.lock().unwrap().push(ev);
+                    }
+                    ControlMsg::EmergencyWake { reply, .. } => {
+                        // Drop the reply without sending — the detached
+                        // monitor's `reply_rx.await` returns `Err` and the
+                        // monitor runs its removal-publish branch.
+                        drop(reply);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        (ctl_tx, published)
+    }
+
+    /// Wait for at least `count` `OperationsChanged` events to appear in the
+    /// published buffer. Yields repeatedly so the
+    /// route's spawned tasks make progress.
+    async fn wait_for_publishes(
+        recorded: &Arc<std::sync::Mutex<Vec<DaemonEvent>>>,
+        count: usize,
+    ) -> Vec<DaemonEvent> {
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            let snapshot = recorded.lock().unwrap().clone();
+            if snapshot
+                .iter()
+                .filter(|e| matches!(e, DaemonEvent::OperationsChanged { .. }))
+                .count()
+                >= count
+            {
+                return snapshot;
+            }
+        }
+        panic!(
+            "expected at least {count} OperationsChanged events, got: {:?}",
+            recorded.lock().unwrap().clone()
+        );
+    }
+
+    fn operations_snapshots(events: &[DaemonEvent]) -> Vec<(Vec<String>, bool)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                DaemonEvent::OperationsChanged {
+                    exercise_in_flight,
+                    emergency_wake_in_flight,
+                } => Some((exercise_in_flight.clone(), *emergency_wake_in_flight)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Route insertion publishes the exact post-insert guard snapshot.
+    #[tokio::test(start_paused = true)]
+    async fn emergency_wake_insert_publishes_operations_changed_with_in_flight_true() {
+        let (ctl_tx, published) = spawn_publishing_engine();
+        let state = test_web_state(ctl_tx);
+        let route = tokio::spawn(async move {
+            let _ = post_emergency_wake(State(state)).await;
+        });
+        let events = wait_for_publishes(&published, 2).await;
+        let ops = operations_snapshots(&events);
+        assert!(
+            ops.iter().any(|(ex, ew)| ex.is_empty() && *ew),
+            "expected insert publish with exercise_in_flight=[] and emergency_wake_in_flight=true, got {ops:?}",
+        );
+        route.abort();
+    }
+
+    /// Detached completion (after the HTTP timeout) publishes the
+    /// post-removal guard snapshot — the load-bearing case for an HTTP
+    /// timeout that the engine eventually replies to anyway.
+    #[tokio::test(start_paused = true)]
+    async fn emergency_wake_detached_completion_publishes_operations_changed_with_in_flight_false()
+    {
+        let (ctl_tx, published) = spawn_publishing_engine();
+        let state = test_web_state(ctl_tx);
+        // Drive the route to its 2s HTTP timeout; the engine drops the channel
+        // (Err branch) so the detached monitor still publishes the removal.
+        let route = tokio::spawn(async move {
+            let _ = post_emergency_wake(State(state)).await;
+        });
+        let events = wait_for_publishes(&published, 2).await;
+        let ops = operations_snapshots(&events);
+        assert!(
+            ops.iter().any(|(ex, ew)| ex.is_empty() && !ew),
+            "expected removal publish with emergency_wake_in_flight=false, got {ops:?}",
+        );
+        route.abort();
     }
 }

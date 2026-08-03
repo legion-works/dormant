@@ -9,9 +9,10 @@
  * - second pull never blocked by peer-owned verdict
  */
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, screen, fireEvent, waitFor, cleanup } from "@testing-library/react";
+import { useState } from "react";
+import { render, screen, fireEvent, waitFor, cleanup, act } from "@testing-library/react";
 import SwitchState from "../app/views/SwitchState";
-import { LiveStateContext, EventLogContext } from "../app/hooks/useLiveState";
+import { LiveStateContext, EventLogContext, type LiveState } from "../app/hooks/useLiveState";
 import { liveStateFixture, eventLogFixture } from "./fixtures/live-state";
 
 afterEach(() => cleanup());
@@ -183,5 +184,95 @@ describe("SwitchState", () => {
     await waitFor(() => {
       expect(screen.getByText(/✓ sent · unverified/)).toBeInTheDocument();
     });
+  });
+
+  it("#212 pull timer reads the latest snapshot — stale closure value must not mask ownership changes", async () => {
+    vi.useFakeTimers();
+
+    // Stateful harness: owns the snapshot in real React state so that calling
+    // harnessSetSnap(newSnapshot) triggers a genuine re-render.  This is
+    // required to distinguish the stale closure from the ref: the closure
+    // captures the OLD snapshot object at handlePull creation; after
+    // harnessSetSnap(newSnapshot) re-renders, the useEffect syncs the NEW
+    // snapshot into snapshotRef.current.
+    let harnessSetSnap: React.Dispatch<React.SetStateAction<LiveState["snapshot"]>> | null = null;
+
+    function Harness({ initial }: { initial: LiveState["snapshot"] }) {
+      const [snap, setSnap] = useState(initial);
+      harnessSetSnap = setSnap;
+      const live = liveStateFixture({ snapshot: snap });
+      return (
+        <LiveStateContext.Provider value={live}>
+          <EventLogContext.Provider value={eventLogFixture({ events: [], connected: true, lagged: false })}>
+            <SwitchState
+              displayId="test"
+              switchCapable={true}
+              pushCapable={false}
+              localWriteCode={0x15}
+              peerWriteCode={undefined}
+              owned={true}
+              observedInputCode={0x0f}
+            />
+          </EventLogContext.Provider>
+        </LiveStateContext.Provider>
+      );
+    }
+
+    const initialSnapshot: LiveState["snapshot"] = {
+      sensors: [],
+      zones: [],
+      displays: [["test", {
+        phase: "active",
+        inhibited: false,
+        paused: false,
+        cmd_gen: 1,
+        controllers: [],
+        scope: "shared",
+        owned: true,
+        observed_input_code: 0x0f,
+      }]],
+      pending_reload: null,
+    };
+
+    render(<Harness initial={initialSnapshot} />);
+
+    // Clicking pull schedules the reconciliation setTimeout AND calls
+    // setPullState, which schedules a re-render.
+    fireEvent.click(screen.getByText("◀ Pull here"));
+
+    // Simulate an ownership change arriving via the WS event stream:
+    // harnessSetSnap produces a genuinely NEW snapshot object (owned: false),
+    // triggering a re-render that causes the useEffect to sync
+    // snapshotRef.current = newSnapshot.
+    const newSnapshot: LiveState["snapshot"] = {
+      sensors: [],
+      zones: [],
+      displays: [["test", {
+        phase: "active",
+        inhibited: false,
+        paused: false,
+        cmd_gen: 1,
+        controllers: [],
+        scope: "shared",
+        owned: false,
+        observed_input_code: 0x0f,
+      }]],
+      pending_reload: null,
+    };
+
+    // Flush the state update first (inside act), then advance timers.
+    // React batches the setSnap update; act() flushes it before timers run.
+    await act(async () => {
+      harnessSetSnap!(newSnapshot);
+    });
+    await act(async () => {
+      await vi.runAllTimersAsync();
+    });
+
+    // With the fix (snapshotRef): callback reads the latest ref value
+    // (owned: false) → "unverified".
+    // With the bug (stale closure): callback reads owned:true → "verified".
+    expect(screen.getByRole("button").textContent).toMatch(/⚠ wrote, not confirmed/);
+    vi.useRealTimers();
   });
 });

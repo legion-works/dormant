@@ -20,6 +20,7 @@ import type {
   DisplayRuleInfo,
   DisplaySnapshot,
   OperationsStatus,
+  OperationsChangedEvent,
   WearDetail,
   WearListResponse,
   DoctorReport,
@@ -307,37 +308,26 @@ export function LiveStateProvider({ children }: { children: ReactNode }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps — history seed reads events for dedup
   }, [fetchAll, refreshWear]);
 
-  // Poll state and authoritative operation guards together at one-second
-  // cadence. `error` remains reserved for the fatal initial getState/getConfig
-  // load — a status-poll failure leaves the last snapshot and operation
-  // status usable and writes only `statePollWarning`.
+  // Reconciliation triggers (issue #184): driven by WS events + periodic
+  // + on reconnect. The 1 Hz paired poll is gone — operations state updates
+  // from OperationsChanged WS frames (exercise/emergency_wake insert/remove).
+  // Periodic + reconnect reconciliation still hits /api/state and /api/operations.
   useEffect(() => {
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
 
-    const poll = async () => {
-      const operationsPromise = refreshOperations();
-      const [snapshotResult, operationsResult] = await Promise.allSettled([
-        getState(),
-        operationsPromise,
-      ]);
+    const reconcile = () => {
       if (cancelled) return;
-      if (snapshotResult.status === "fulfilled") setSnapshot(snapshotResult.value);
-      const failures = [snapshotResult, operationsResult].filter(
-        (result): result is PromiseRejectedResult => result.status === "rejected",
-      );
-      setStatePollWarning(
-        failures.length > 0 ? failures.map(rejectionMessage).join("; ") : null,
-      );
-      timer = setTimeout(poll, 1000);
+      void refresh();
+      timer = setTimeout(reconcile, 30_000);
     };
 
-    timer = setTimeout(poll, 1000);
+    timer = setTimeout(reconcile, 30_000);
     return () => {
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, [refreshOperations]);
+  }, [refresh]);
 
   const onMessage = useCallback((data: unknown) => {
     const ev = data as
@@ -409,7 +399,13 @@ export function LiveStateProvider({ children }: { children: ReactNode }) {
                       {
                         ...d,
                         owned: oe.owned,
-                        observed_input_code: oe.observed_input_code ?? d.observed_input_code,
+                        // GOTCHA: undefined and explicit null BOTH mean "unreadable" on
+                        // the current wire; neither licenses retaining the prior owner's code.
+                        // Use the `in` operator to distinguish absent (keep existing) from
+                        // present-but-null (clear to null).
+                        observed_input_code: "observed_input_code" in oe
+                          ? oe.observed_input_code
+                          : d.observed_input_code,
                       },
                     ]
                   : [id, d],
@@ -455,11 +451,42 @@ export function LiveStateProvider({ children }: { children: ReactNode }) {
         void refresh();
         void refreshWear();
       }
+
+      // issue #184: push-driven operations state — replace the removed 1 Hz poll.
+      // Both WS frames and HTTP responses commit through the same seq counter.
+      // HTTP increments after response; WS increments at frame arrival. A WS frame
+      // always arrives after the HTTP request that was in flight when the operation
+      // started, so WS always has >= the in-flight HTTP seq → WS dominates HTTP.
+      if (tag === "operations_changed") {
+        const oe = ev as OperationsChangedEvent;
+        const requestId = ++operationsRequestSequence.current;
+        commitOperations(
+          {
+            exercise_in_flight: oe.exercise_in_flight,
+            emergency_wake_in_flight: oe.emergency_wake_in_flight,
+          },
+          requestId,
+        );
+      }
     }
-  }, [refresh, refreshWear]);
+  }, [refresh, refreshWear, commitOperations]);
 
   const onConnect = useCallback(() => {
     refresh();
+  }, [refresh]);
+
+  // issue #184: tab refocus / visibility change triggers reconciliation.
+  // Matches the named reconciliation policy in the issue.
+  useEffect(() => {
+    const handler = () => {
+      if (document.visibilityState === "visible") refresh();
+    };
+    window.addEventListener("visibilitychange", handler);
+    window.addEventListener("focus", handler);
+    return () => {
+      window.removeEventListener("visibilitychange", handler);
+      window.removeEventListener("focus", handler);
+    };
   }, [refresh]);
 
   const { connected } = useEvents({ onMessage, onConnect });

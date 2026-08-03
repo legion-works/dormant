@@ -89,11 +89,24 @@ struct SensorBinding {
 type TopicMap = HashMap<String, Vec<SensorBinding>>;
 
 /// Connection observations exposed only to external integration tests.
-#[cfg(feature = "test-util")]
+///
+/// All variants are constructed only inside `#[cfg(feature = "test-util")]` blocks,
+/// so the enum itself is safe to keep ungated (it is uninhabited in non-test-util
+/// builds, causing no dead-code warnings).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MqttLifecycle {
     /// The broker accepted the MQTT connection.
     Connected,
+    /// N topic subscriptions were queued to the client request channel.
+    ///
+    /// Emitted from inside `subscribe_topics` after each batch is queued, before
+    /// the broker has acknowledged or rejected any of them. Fires on every
+    /// `subscribe_topics` call regardless of caller, so it observes batches
+    /// issued both from `connect()` and from the [`ConnAck`](rumqttc::ConnAck) handler.
+    SubscribeQueued {
+        /// Number of topic subscriptions queued.
+        count: usize,
+    },
     /// Every queued topic subscription was acknowledged by the broker.
     Subscribed,
 }
@@ -222,13 +235,21 @@ impl MqttSource {
 
     /// Queue subscriptions for every topic and return the number accepted by
     /// the client request channel.
-    async fn subscribe_topics(client: &AsyncClient, topics: &[String]) -> usize {
+    async fn subscribe_topics(
+        client: &AsyncClient,
+        topics: &[String],
+        #[allow(unused_variables)] lifecycle_tx: Option<&mpsc::UnboundedSender<MqttLifecycle>>,
+    ) -> usize {
         let mut queued = 0;
         for topic in topics {
             match client.subscribe(topic, QoS::AtLeastOnce).await {
                 Ok(()) => queued += 1,
                 Err(e) => warn!("mqtt: initial subscribe failed for '{topic}': {e}"),
             }
+        }
+        #[cfg(feature = "test-util")]
+        if let Some(tx) = lifecycle_tx {
+            let _ = tx.send(MqttLifecycle::SubscribeQueued { count: queued });
         }
         queued
     }
@@ -239,27 +260,30 @@ impl MqttSource {
             .all(|code| matches!(code, SubscribeReasonCode::Success(_)))
     }
 
-    /// Create a fresh MQTT connection, queue subscriptions, and return the
-    /// client, event loop, and queued subscription count.
+    /// Create a fresh MQTT connection and return the client and event loop.
     ///
     /// `broker_url` is expected in the form `host:port` (e.g. `localhost:1883`)
-    /// or `tcp://host:port`.
-    async fn connect(
+    /// or `tcp://host:port`. A malformed URL surfaces as an `anyhow::Error`
+    /// so the caller can fail fast rather than connect to a garbage host.
+    /// Subscriptions are NOT issued here — [`ConnAck`](rumqttc::ConnAck) is
+    /// the sole subscription site so that first-session and reconnect sessions
+    /// behave identically.
+    fn connect(
         broker_url: &str,
         client_id: &str,
-        topics: &[String],
+        topic_count: usize,
         credential: Option<&MqttCredential>,
-    ) -> (AsyncClient, EventLoop, usize) {
-        let (host, port) = parse_broker_url(broker_url);
+    ) -> anyhow::Result<(AsyncClient, EventLoop)> {
+        let (host, port) = parse_broker_url(broker_url)
+            .map_err(|e| anyhow::anyhow!("invalid mqtt broker_url {broker_url:?}: {e}"))?;
         let mut mqttopts = MqttOptions::new(client_id, host, port);
         mqttopts.set_clean_session(true);
         if let Some(cred) = credential {
             mqttopts.set_credentials(cred.username.clone(), cred.password.clone());
         }
-        let cap = topics.len() + CAP_HEADROOM;
+        let cap = topic_count + CAP_HEADROOM;
         let (client, eventloop) = AsyncClient::new(mqttopts, cap);
-        let queued_subscriptions = Self::subscribe_topics(&client, topics).await;
-        (client, eventloop, queued_subscriptions)
+        Ok((client, eventloop))
     }
 
     /// Dispatch a publish on a sensor topic: parse each matching binding's
@@ -383,20 +407,19 @@ impl SensorSource for MqttSource {
         let mut warned_topics: HashSet<String> = HashSet::new();
         let mut warned_availability: HashSet<(String, String)> = HashSet::new();
         let mut outage_reported = false;
-        let mut initial_connack_seen = false;
 
         // We hold the current client+eventloop pair in these variables.
         // On reconnect we drop both and create a fresh pair.
-        let (mut client, mut eventloop, mut queued_subscriptions) = Self::connect(
+        let (mut client, mut eventloop) = Self::connect(
             &self.broker_url,
             &client_id,
-            &topics,
+            topics.len(),
             self.credential.as_ref(),
-        )
-        .await;
+        )?;
         let mut pending_subacks: HashMap<u16, String> = HashMap::new();
         let mut acknowledged_subscriptions = 0;
         let mut outgoing_subscriptions = 0;
+        let mut queued_subscriptions = 0;
 
         loop {
             tokio::select! {
@@ -440,15 +463,16 @@ impl SensorSource for MqttSource {
                             if let Some(lifecycle_tx) = &self.lifecycle_tx {
                                 let _ = lifecycle_tx.send(MqttLifecycle::Connected);
                             }
-                            if initial_connack_seen {
-                                // Reconnect after initial connection — re-subscribe
-                                // because clean_session = true.
-                                info!("mqtt: reconnected to '{}', re-subscribing", self.broker_url);
-                                queued_subscriptions = Self::subscribe_topics(&client, &topics).await;
-                            } else {
-                                initial_connack_seen = true;
-                                debug!("mqtt: initial connection established to '{}'", self.broker_url);
-                            }
+                            // Subscriptions are issued on every ConnAck (first and reconnect)
+                            // because clean_session = true — the broker stores no session state.
+                            // connect() only constructs the client/eventloop; it does NOT subscribe.
+                            info!("mqtt: connected to '{}', subscribing", self.broker_url);
+                            #[cfg(feature = "test-util")]
+                            let lifecycle = self.lifecycle_tx.as_ref();
+                            #[cfg(not(feature = "test-util"))]
+                            let lifecycle: Option<&mpsc::UnboundedSender<MqttLifecycle>> = None;
+                            queued_subscriptions =
+                                Self::subscribe_topics(&client, &topics, lifecycle).await;
                             backoff = BACKOFF_MIN;
                             outage_reported = false;
                         }
@@ -503,18 +527,18 @@ impl SensorSource for MqttSource {
                             }
                             backoff = backoff::next_backoff(backoff, BACKOFF_MIN, BACKOFF_MAX, JITTER_FRACTION);
                             // Reconnect: drop old pair, create new.
-                            let new_pair = Self::connect(
+                            let (new_client, new_eventloop) = Self::connect(
                                 &self.broker_url,
                                 &client_id,
-                                &topics,
+                                topics.len(),
                                 self.credential.as_ref(),
-                            ).await;
-                            client = new_pair.0;
-                            eventloop = new_pair.1;
-                            queued_subscriptions = new_pair.2;
+                            )?;
+                            client = new_client;
+                            eventloop = new_eventloop;
                             pending_subacks.clear();
                             acknowledged_subscriptions = 0;
                             outgoing_subscriptions = 0;
+                            queued_subscriptions = 0;
                         }
                     }
                 }

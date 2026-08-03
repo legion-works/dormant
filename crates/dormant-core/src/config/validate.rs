@@ -143,6 +143,7 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
         &[
             "enabled",
             "sampled_display",
+            "sampled_displays",
             "stream_mode",
             "capture_timeout",
             "failure_threshold",
@@ -1074,12 +1075,21 @@ fn validate_publish(cfg: &Config, creds: &Credentials, errors: &mut Vec<Validati
         return;
     }
 
-    let (host, _port) = parse_broker_url(url);
-    if host.is_empty() {
-        errors.push(ValidationError {
-            what: crate::error::E_CONFIG_INVALID.into(),
-            detail: format!("publish.broker_url {url:?} has no resolvable host"),
-        });
+    match parse_broker_url(url) {
+        Ok((host, _port)) => {
+            if host.is_empty() {
+                errors.push(ValidationError {
+                    what: crate::error::E_CONFIG_INVALID.into(),
+                    detail: format!("publish.broker_url {url:?} has no resolvable host"),
+                });
+            }
+        }
+        Err(err) => {
+            errors.push(ValidationError {
+                what: crate::error::E_CONFIG_INVALID.into(),
+                detail: format!("publish.broker_url {url:?} is invalid: {err}"),
+            });
+        }
     }
 
     if let Some(topic) = nonempty(&publish.base_topic) {
@@ -1201,22 +1211,29 @@ fn validate_wear(cfg: &Config, errors: &mut Vec<ValidationError>) {
                 detail: "sample_interval too short for active sampling (needs >= 2s)".into(),
             });
         }
-        match sampling.sampled_display.as_deref() {
-            None => errors.push(ValidationError {
+        let selected = sampling.selected_displays();
+        if selected.is_empty() {
+            errors.push(ValidationError {
                 what: "E_CONFIG_INVALID".into(),
                 detail: "wear.active_sampling.sampled_display is required when enabled".into(),
-            }),
-            Some(display_id) => match cfg.displays.get(display_id) {
+            });
+        }
+        for display_id in &selected {
+            match cfg.displays.get(display_id) {
                 None => errors.push(ValidationError {
                     what: "E_CONFIG_INVALID".into(),
-                    detail: format!("wear.active_sampling.sampled_display '{display_id}' is not configured"),
+                    detail: format!(
+                        "wear.active_sampling.sampled_display '{display_id}' is not configured"
+                    ),
                 }),
                 Some(display) if !display.is_render_eligible() => errors.push(ValidationError {
                     what: "E_CONFIG_INVALID".into(),
-                    detail: format!("wear.active_sampling.sampled_display '{display_id}' is not wear-tracked eligible"),
+                    detail: format!(
+                        "wear.active_sampling.sampled_display '{display_id}' is not wear-tracked eligible"
+                    ),
                 }),
                 Some(_) => {}
-            },
+            }
         }
         if sampling.capture_timeout < Duration::from_secs(1) {
             errors.push(ValidationError {
@@ -2831,8 +2848,10 @@ gracee_period = "60s"
 
     #[test]
     fn publish_config_enabled_with_garbage_broker_url_is_error() {
-        // parse_broker_url treats characters after the scheme as host:port.
-        // A bare "://" with no host is rejected.
+        // parse_broker_url surfaces a strict `EmptyHost` error for URLs
+        // with no resolvable host. The validator maps the `BrokerUrlError`
+        // into an `E_CONFIG_INVALID` validation error containing the
+        // grep-stable phrase "is invalid".
         let cfg: Config = toml::from_str(
             "config_version = 1\n[publish]\nenabled = true\nbroker_url = \"tcp://\"\n",
         )
@@ -2844,10 +2863,8 @@ gracee_period = "60s"
             &test_creds(),
         );
         assert!(
-            errors
-                .iter()
-                .any(|e| e.detail.contains("no resolvable host")),
-            "expected no-host error, got: {errors:?}"
+            errors.iter().any(|e| e.detail.contains("is invalid")),
+            "expected E_CONFIG_INVALID with 'is invalid' detail, got: {errors:?}"
         );
     }
 

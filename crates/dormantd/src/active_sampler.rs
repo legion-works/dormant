@@ -6,8 +6,9 @@ use dormant_core::ipc_proto::WearSamplingStatus;
 use dormant_core::rules::{ControlMsg, DaemonEvent};
 use dormant_core::spatial_grid::LumaGrid;
 use dormant_core::state_machine::Phase;
-use dormant_core::types::Tick;
+use dormant_core::types::{DisplayId, Tick};
 use dormant_core::wear::{WearSamplingState, WearSamplingStatus as RedactedWearSamplingStatus};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -51,8 +52,17 @@ pub struct SampledGrid {
     pub phase_at_capture: Phase,
 }
 
-/// Most recent privacy-preserving sample shared with the wear tracker.
-pub type LatestGrid = Arc<RwLock<Option<SampledGrid>>>;
+/// Most recent privacy-preserving sample for every configured sampling display.
+pub type LatestGrids = Arc<RwLock<HashMap<DisplayId, SampledGrid>>>;
+
+/// Sampler command handles keyed by configured display id.
+pub type SamplerRegistry = BTreeMap<DisplayId, ActiveSamplerHandle>;
+
+/// Shared sampler registry used by daemon control surfaces across reloads.
+pub type SharedSamplerRegistry = Arc<RwLock<SamplerRegistry>>;
+
+/// Latest lifecycle status for every independently owned sampler.
+pub type SamplerStatuses = Arc<RwLock<BTreeMap<DisplayId, SamplerStatus>>>;
 
 /// Public lifecycle snapshot for future IPC and status consumers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,7 +104,7 @@ impl SamplerStatus {
     }
 }
 
-/// Sender and status subscription for the daemon's single sampler service.
+/// Sender and status subscription for one display's sampler service.
 #[derive(Clone)]
 pub struct ActiveSamplerHandle {
     command_tx: mpsc::Sender<SamplerCommand>,
@@ -143,6 +153,10 @@ pub enum SamplerError {
     CommandChannelClosed,
     /// Persistent consent-record I/O failed.
     Store(crate::screencast_consent::ConsentError),
+    /// Sampling is administratively suspended (e.g. wear disabled, configured
+    /// display absent). Re-enable through configuration; the operator IPC
+    /// `Enable` cannot resume it.
+    AdministrativelySuspended,
 }
 
 /// Requests accepted by the daemon-lifetime sampler.
@@ -184,10 +198,12 @@ pub struct ReconfigurePlan {
 pub struct ActiveSamplerDeps {
     /// Initial daemon configuration used before reload updates arrive.
     pub initial_config: Arc<Config>,
+    /// Display permanently owned by this sampler instance.
+    pub display_id: DisplayId,
     /// Reload and generation-context updates.
     pub update_rx: mpsc::Receiver<SamplerUpdate>,
-    /// Daemon-lifetime latest-value handoff to the wear tracker.
-    pub latest_grid: LatestGrid,
+    /// Daemon-lifetime keyed latest-value handoff to the wear tracker.
+    pub latest_grids: LatestGrids,
     /// Platform capture implementation.
     pub source: Box<dyn CaptureSource + Send + Sync + 'static>,
     /// Secure persisted portal-consent record path.
@@ -215,15 +231,21 @@ pub struct DisplaySamplingContext {
     pub stage_active: bool,
 }
 
-/// Allocate the daemon-lifetime latest-sample slot.
+/// Allocate the daemon-lifetime latest-sample map.
 #[must_use]
-pub fn new_latest_grid() -> LatestGrid {
-    Arc::new(RwLock::new(None))
+pub fn new_latest_grids() -> LatestGrids {
+    Arc::new(RwLock::new(HashMap::new()))
 }
 
-fn replace_latest(latest: &LatestGrid, sample: SampledGrid) {
-    if let Ok(mut slot) = latest.write() {
-        *slot = Some(sample);
+/// Allocate the daemon-lifetime sampler-status map.
+#[must_use]
+pub fn new_sampler_statuses() -> SamplerStatuses {
+    Arc::new(RwLock::new(BTreeMap::new()))
+}
+
+fn replace_latest(latest: &LatestGrids, display: &DisplayId, sample: SampledGrid) {
+    if let Ok(mut grids) = latest.write() {
+        grids.insert(display.clone(), sample);
     }
 }
 
@@ -276,6 +298,9 @@ impl fmt::Display for SamplerError {
             Self::NoGraphicalSession => f.write_str("no graphical session is available"),
             Self::CommandChannelClosed => f.write_str("active sampling service is not running"),
             Self::Store(error) => error.fmt(f),
+            Self::AdministrativelySuspended => f.write_str(
+                "active sampling is administratively suspended; re-enable via configuration",
+            ),
         }
     }
 }
@@ -337,15 +362,16 @@ struct Runtime {
 }
 
 impl Runtime {
-    fn new(config: &Config, consent_path: &std::path::Path) -> Self {
+    fn new(config: &Config, consent_path: &std::path::Path, display_id: &DisplayId) -> Self {
         let display = DisplaySamplingContext {
             display: config
                 .wear
                 .active_sampling
-                .sampled_display
-                .as_ref()
-                .map(|display| DisplayExpectation {
-                    display: display.clone(),
+                .selected_displays()
+                .iter()
+                .any(|display| display == &display_id.0)
+                .then(|| DisplayExpectation {
+                    display: display_id.0.clone(),
                 }),
             phase: Phase::Active,
             stage_active: true,
@@ -398,6 +424,16 @@ enum CaptureOutcome {
     Failed(CaptureError, u32),
 }
 
+/// Pending outcome of a `Disable` command received mid-consent-flow.
+struct PendingDisable {
+    /// `true` if the operator asked the daemon to also drop the stored grant.
+    forget: bool,
+    /// Reply channel for the original `Disable` command.
+    reply: oneshot::Sender<Result<(), SamplerError>>,
+    /// Transition the sampler applied when it took the command.
+    transition: Transition,
+}
+
 async fn connect(
     source: &mut dyn CaptureSource,
     record: &crate::screencast_consent::BoundConsent,
@@ -415,11 +451,16 @@ async fn connect(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the capture boundary keeps the sampler key beside its independently owned source, cadence, and cancellation state"
+)]
 async fn capture_one(
     source: &mut dyn CaptureSource,
     active: &ActiveSamplingConfig,
     phase: Phase,
-    latest: &LatestGrid,
+    latest: &LatestGrids,
+    display: &DisplayId,
     cancel: &CancellationToken,
     cadence: &mut tokio::time::Interval,
     reset_stream: bool,
@@ -427,38 +468,54 @@ async fn capture_one(
     if reset_stream {
         source.reset_stream().await;
     }
-    let capture = tokio::time::timeout(
-        active.capture_timeout,
-        source.capture_one(active.stream_mode),
-    );
-    tokio::pin!(capture);
-    let mut overlapping = 0;
-    loop {
-        tokio::select! {
-            () = cancel.cancelled() => return CaptureOutcome::Cancelled,
-            result = &mut capture => match result {
-                Ok(Ok(frame)) => match dormant_core::spatial_grid::reduce_rgba8_to_luma_grid(
-                    &frame.rgba, frame.width, frame.height, frame.stride, 9, 16,
-                ) {
-                    Ok(grid) => {
-                        let captured_at = Tick::now();
-                        replace_latest(latest, SampledGrid {
-                            grid,
-                            captured_at,
-                            phase_at_capture: phase,
-                        });
-                        return CaptureOutcome::Ok(captured_at);
-                    }
-                    Err(_) => return CaptureOutcome::Failed(CaptureError::Protocol("grid reduction failed".to_owned()), overlapping),
+    let capture_outcome = {
+        let capture = tokio::time::timeout(
+            active.capture_timeout,
+            source.capture_one(active.stream_mode),
+        );
+        tokio::pin!(capture);
+        let mut overlapping = 0;
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => break CaptureOutcome::Cancelled,
+                result = &mut capture => match result {
+                    Ok(Ok(frame)) => match dormant_core::spatial_grid::reduce_rgba8_to_luma_grid(
+                        &frame.rgba, frame.width, frame.height, frame.stride, 9, 16,
+                    ) {
+                        Ok(grid) => {
+                            let captured_at = Tick::now();
+                            replace_latest(latest, display, SampledGrid {
+                                grid,
+                                captured_at,
+                                phase_at_capture: phase,
+                            });
+                            break CaptureOutcome::Ok(captured_at);
+                        }
+                        Err(_) => break CaptureOutcome::Failed(
+                            CaptureError::Protocol("grid reduction failed".to_owned()),
+                            overlapping,
+                        ),
+                    },
+                    Ok(Err(error)) => break CaptureOutcome::Failed(error, overlapping),
+                    Err(_) => break CaptureOutcome::Failed(
+                        CaptureError::Timeout,
+                        overlapping,
+                    ),
                 },
-                Ok(Err(error)) => return CaptureOutcome::Failed(error, overlapping),
-                Err(_) => return CaptureOutcome::Failed(CaptureError::Timeout, overlapping),
-            },
-            _ = cadence.tick() => {
-                overlapping = overlapping.saturating_add(1);
+                _ = cadence.tick() => {
+                    overlapping = overlapping.saturating_add(1);
+                }
             }
         }
+    };
+    // After the capture future is fully dropped, reclaim the borrow on
+    // `source` so the outer-timeout path can invalidate any warm-worker
+    // state that would otherwise be served stale on the next capture
+    // (issue #211 defect B).
+    if let CaptureOutcome::Failed(CaptureError::Timeout, _) = &capture_outcome {
+        source.invalidate_pending_capture().await;
     }
+    capture_outcome
 }
 
 fn persist_rotated_token(
@@ -476,21 +533,28 @@ fn persist_rotated_token(
     Ok(())
 }
 
-fn apply_capture_failure(
+async fn apply_capture_failure(
     runtime: &mut Runtime,
+    source: &mut dyn CaptureSource,
     error: CaptureError,
     status_tx: &watch::Sender<SamplerStatus>,
 ) -> Transition {
     match error {
-        CaptureError::Auth => apply_trigger(runtime, Trigger::AuthFailed, status_tx),
-        CaptureError::SessionClosed => apply_trigger(runtime, Trigger::SessionClosed, status_tx),
-        CaptureError::Protocol(reason) if reason == WEAR_SAMPLING_WRONG_MONITOR => {
-            apply_trigger(runtime, Trigger::WrongMonitor, status_tx)
+        CaptureError::Auth => {
+            apply_trigger_with_effects(runtime, source, Trigger::AuthFailed, status_tx).await
         }
-        CaptureError::Transport(_) => apply_trigger(runtime, Trigger::TransportFailed, status_tx),
+        CaptureError::SessionClosed => {
+            apply_trigger_with_effects(runtime, source, Trigger::SessionClosed, status_tx).await
+        }
+        CaptureError::Protocol(reason) if reason == WEAR_SAMPLING_WRONG_MONITOR => {
+            apply_trigger_with_effects(runtime, source, Trigger::WrongMonitor, status_tx).await
+        }
+        CaptureError::Transport(_) => {
+            apply_trigger_with_effects(runtime, source, Trigger::TransportFailed, status_tx).await
+        }
         CaptureError::ConsentDenied | CaptureError::Timeout | CaptureError::Protocol(_) => {
             if runtime.failures >= runtime.active.failure_threshold {
-                apply_trigger(runtime, Trigger::CaptureFailed, status_tx)
+                apply_trigger_with_effects(runtime, source, Trigger::CaptureFailed, status_tx).await
             } else {
                 // Below the breaker threshold the lifecycle remains Streaming;
                 // only its uniform fallback changes for this failed tick.
@@ -527,7 +591,18 @@ async fn handle_command(
                 ));
                 return false;
             }
-            if runtime.state == SamplingState::ConsentPending {
+            if runtime.state == SamplingState::Suspended {
+                // Suspended sampling cannot be resumed through the operator IPC
+                // enable path — only the wear/display configuration can lift it.
+                let _ = reply.send(ConsentFlowStatus::Error(
+                    SamplerError::AdministrativelySuspended.to_string(),
+                ));
+                return false;
+            }
+            if runtime.state != SamplingState::NeedsConsent {
+                // Reject before reaching the capture source: in Streaming / Connecting
+                // a subsequent cancellation of the new consent flow would call
+                // source.close() on a live portal session and tear it down.
                 let _ = reply.send(ConsentFlowStatus::Error(
                     SamplerError::FlowAlreadyActive.to_string(),
                 ));
@@ -548,14 +623,13 @@ async fn handle_command(
             let transition = apply_trigger(runtime, Trigger::GrantStarted, status_tx);
             debug_assert!(
                 transition.effects.contains(&Effect::OpenConsent),
-                "only GrantStarted may enter ConsentPending"
+                "Enable from NeedsConsent must request a portal consent flow"
             );
             // The portal has no config timeout; the five-minute interaction bound
             // prevents an abandoned dialog from retaining a daemon operation forever.
             let mut consent = Box::pin(source.request_consent(&expected));
             let mut deadline = Box::pin(tokio::time::sleep(CONSENT_INTERACTION_TIMEOUT));
-            let mut pending_disable: Option<(bool, oneshot::Sender<Result<(), SamplerError>>)> =
-                None;
+            let mut pending_disable: Option<PendingDisable> = None;
             let outcome = loop {
                 tokio::select! {
                     () = cancel.cancelled() => break None,
@@ -568,8 +642,20 @@ async fn handle_command(
                             ));
                         }
                         Some(SamplerCommand::Disable { forget, reply }) => {
-                            apply_trigger(runtime, Trigger::Forget, status_tx);
-                            pending_disable = Some((forget, reply));
+                            // Disable during a pending consent must transition
+                            // to Disabled (not NeedsConsent) so a later Enable
+                            // is rejected by the disabled-config path rather
+                            // than silently re-opening a fresh grant dialog.
+                            let transition = apply_trigger(
+                                runtime,
+                                Trigger::ConfigChanged(ConfigDelta::Enabled(false)),
+                                status_tx,
+                            );
+                            pending_disable = Some(PendingDisable {
+                                forget,
+                                reply,
+                                transition,
+                            });
                             break Some(Err(CaptureError::Protocol("wear_sampling_cancelled".to_owned())));
                         }
                         None => break None,
@@ -578,23 +664,29 @@ async fn handle_command(
             };
             drop(consent);
             drop(deadline);
-            if let Some((forget, reply)) = pending_disable {
-                source.close().await;
-                if forget {
+            if let Some(pending) = pending_disable {
+                if pending.transition.effects.contains(&Effect::CloseSession) {
+                    source.close().await;
+                }
+                if pending.forget {
                     if let Err(error) = crate::screencast_consent::forget(consent_path) {
-                        let _ = reply.send(Err(SamplerError::Store(error)));
+                        let _ = pending.reply.send(Err(SamplerError::Store(error)));
                     } else {
                         runtime.record = None;
-                        let _ = reply.send(Ok(()));
+                        let _ = pending.reply.send(Ok(()));
                     }
                 } else {
-                    let _ = reply.send(Ok(()));
+                    let _ = pending.reply.send(Ok(()));
                 }
             }
             match outcome {
                 None => return false,
                 Some(Err(CaptureError::Timeout)) => {
-                    tracing::warn!(event = "wear_sampling_consent_failed", reason = "timeout");
+                    tracing::warn!(
+                        event = "wear_sampling_consent_failed",
+                        display = %runtime.display_name(),
+                        reason = "timeout"
+                    );
                     apply_trigger(runtime, Trigger::ConsentTimedOut, status_tx);
                     let _ = reply.send(ConsentFlowStatus::TimedOut);
                 }
@@ -610,6 +702,7 @@ async fn handle_command(
                     }
                     tracing::warn!(
                         event = "wear_sampling_consent_failed",
+                        display = %runtime.display_name(),
                         reason = ?error
                     );
                     let trigger = if matches!(error, CaptureError::Protocol(ref text) if text == WEAR_SAMPLING_WRONG_MONITOR)
@@ -647,6 +740,7 @@ async fn handle_command(
                             .ok();
                             tracing::info!(
                                 event = "wear_sampling_stage",
+                                display = %record.sampled_display,
                                 stage = "token_persisted"
                             );
                             let transition = apply_trigger(runtime, Trigger::Granted, status_tx);
@@ -726,10 +820,34 @@ async fn apply_update_with_effects(
     status_tx: &watch::Sender<SamplerStatus>,
 ) -> Option<Transition> {
     let transition = apply_update(runtime, update, status_tx);
+    // Keep the platform source's inner per-capture bound in sync with the
+    // daemon's outer bound so a raised `capture_timeout` actually takes
+    // effect in warm mode (issue #211 defect A).
+    source.set_capture_timeout(runtime.active.capture_timeout);
     if transition
         .as_ref()
         .is_some_and(|transition| transition.effects.contains(&Effect::CloseSession))
     {
+        source.close().await;
+    }
+    transition
+}
+
+/// Apply a trigger and honor the lifecycle effects it emits.
+///
+/// The pure [`decide`] table only describes intent; the run loop is what
+/// releases a live portal session when a transition asks for `CloseSession`.
+/// Skipping this helper at any `AuthFailed` / `SessionClosed` / `WrongMonitor`
+/// site leaves the warm `PipeWire` worker and portal session parked after the
+/// lifecycle has moved on to `NeedsConsent` / `Disabled`.
+async fn apply_trigger_with_effects(
+    runtime: &mut Runtime,
+    source: &mut dyn CaptureSource,
+    trigger: Trigger,
+    status_tx: &watch::Sender<SamplerStatus>,
+) -> Transition {
+    let transition = apply_trigger(runtime, trigger, status_tx);
+    if transition.effects.contains(&Effect::CloseSession) {
         source.close().await;
     }
     transition
@@ -814,8 +932,13 @@ async fn run(
     mut command_rx: mpsc::Receiver<SamplerCommand>,
     status_tx: watch::Sender<SamplerStatus>,
 ) {
-    let mut runtime = Runtime::new(&deps.initial_config, &deps.consent_path);
+    let mut runtime = Runtime::new(&deps.initial_config, &deps.consent_path, &deps.display_id);
     runtime.event_tx = deps.event_tx.take();
+    // Push the configured per-capture deadline into the platform source at
+    // startup so the inner warm-mode bound is in lockstep with the daemon
+    // bound from the first tick (issue #211 defect A).
+    deps.source
+        .set_capture_timeout(runtime.active.capture_timeout);
     let initial_reason = match runtime.state {
         SamplingState::NeedsConsent => Some(WEAR_SAMPLING_NEEDS_CONSENT),
         SamplingState::Suspended => Some(WEAR_SAMPLING_SUSPENDED),
@@ -852,7 +975,13 @@ async fn run(
             }
             SamplingState::Connecting => {
                 let Some(record) = runtime.record.clone() else {
-                    apply_trigger(&mut runtime, Trigger::AuthFailed, &status_tx);
+                    apply_trigger_with_effects(
+                        &mut runtime,
+                        &mut *deps.source,
+                        Trigger::AuthFailed,
+                        &status_tx,
+                    )
+                    .await;
                     continue;
                 };
                 match connect(&mut *deps.source, &record, &deps.cancel).await {
@@ -864,7 +993,22 @@ async fn run(
                             && persist_rotated_token(&mut runtime, stream, &deps.consent_path)
                                 .is_err()
                         {
-                            apply_trigger(&mut runtime, Trigger::AuthFailed, &status_tx);
+                            // The rotated token could not be persisted, so the
+                            // portal session just opened by `connect()` must be
+                            // released. The pure table pins the effects vector
+                            // for `(Streaming, AuthFailed)` to
+                            // `[CloseSession, EnterUniform(WEAR_SAMPLING_TOKEN_INVALID)]`;
+                            // the helper is what honors the CloseSession at
+                            // runtime here. Without it, the warm PipeWire
+                            // worker and the portal session would leak in the
+                            // rare disk-full / permission-revoked path.
+                            apply_trigger_with_effects(
+                                &mut runtime,
+                                &mut *deps.source,
+                                Trigger::AuthFailed,
+                                &status_tx,
+                            )
+                            .await;
                             continue;
                         }
                         runtime.reconnect_backoff = Duration::from_secs(30);
@@ -876,7 +1020,13 @@ async fn run(
                         } else {
                             Trigger::AuthFailed
                         };
-                        apply_trigger(&mut runtime, trigger, &status_tx);
+                        apply_trigger_with_effects(
+                            &mut runtime,
+                            &mut *deps.source,
+                            trigger,
+                            &status_tx,
+                        )
+                        .await;
                     }
                     ConnectOutcome::Transport => {
                         apply_trigger(&mut runtime, Trigger::TransportFailed, &status_tx);
@@ -916,7 +1066,8 @@ async fn run(
                     &mut *deps.source,
                     &runtime.active,
                     runtime.display.phase.clone(),
-                    &deps.latest_grid,
+                    &deps.latest_grids,
+                    &deps.display_id,
                     &deps.cancel,
                     &mut cadence,
                     std::mem::take(&mut runtime.pending_stream_reset),
@@ -932,7 +1083,8 @@ async fn run(
                     }
                     CaptureOutcome::Failed(error, overlapping) => {
                         runtime.failures = runtime.failures.saturating_add(1 + overlapping);
-                        apply_capture_failure(&mut runtime, error, &status_tx);
+                        apply_capture_failure(&mut runtime, &mut *deps.source, error, &status_tx)
+                            .await;
                     }
                 }
             }
@@ -942,12 +1094,18 @@ async fn run(
                     () = tokio::time::sleep(runtime.active.circuit_reset_after) => {
                         let transition = apply_trigger(&mut runtime, Trigger::CooldownElapsed, &status_tx);
                         debug_assert!(transition.effects.contains(&Effect::Capture), "only CooldownElapsed may schedule a cooldown retry");
-                        let attempt = capture_one(&mut *deps.source, &runtime.active, runtime.display.phase.clone(), &deps.latest_grid, &deps.cancel, &mut cadence, std::mem::take(&mut runtime.pending_stream_reset)).await;
+                        let attempt = capture_one(&mut *deps.source, &runtime.active, runtime.display.phase.clone(), &deps.latest_grids, &deps.display_id, &deps.cancel, &mut cadence, std::mem::take(&mut runtime.pending_stream_reset)).await;
                         match attempt {
                             CaptureOutcome::Cancelled => break,
                             CaptureOutcome::Ok(captured_at) => { runtime.failures = 0; runtime.episode_warned.clear(); apply_trigger(&mut runtime, Trigger::CaptureOk, &status_tx); publish_status(&status_tx, &runtime, None, Some(captured_at)); }
                             CaptureOutcome::Failed(error, _) => {
-                                apply_capture_failure(&mut runtime, error, &status_tx);
+                                apply_capture_failure(
+                                    &mut runtime,
+                                    &mut *deps.source,
+                                    error,
+                                    &status_tx,
+                                )
+                                .await;
                             }
                         }
                     }
@@ -1210,6 +1368,17 @@ pub trait CaptureSource: Send + Sync + 'static {
 
     /// Release any live portal session.
     async fn close(&mut self);
+
+    /// Apply a new per-capture deadline. Sources with an inner timeout that
+    /// bounds a single frame must mirror the new value; sources without one
+    /// may accept and ignore the call.
+    fn set_capture_timeout(&mut self, _timeout: Duration) {}
+
+    /// Drop any state retained from a capture whose owning future was
+    /// cancelled. Called by the lifecycle when the outer capture timeout
+    /// fires before the inner bound, so a buffered frame cannot be served
+    /// on the next capture as if it were fresh.
+    async fn invalidate_pending_capture(&mut self) {}
 }
 
 /// Decide the next lifecycle state without performing portal I/O.
@@ -1325,6 +1494,15 @@ fn needs_consent(state: SamplingState, reason: &'static str) -> Transition {
     let mut effects = Vec::new();
     if state == SamplingState::ConsentPending {
         effects.push(Effect::CancelConsent);
+    }
+    // A live portal session must be released alongside the consent-record
+    // invalidation: the run loop parks in NeedsConsent indefinitely and would
+    // otherwise leak the warm PipeWire worker and portal session.
+    if matches!(
+        state,
+        SamplingState::Connecting | SamplingState::Streaming | SamplingState::Cooldown
+    ) {
+        effects.push(Effect::CloseSession);
     }
     effects.push(Effect::EnterUniform(reason));
     transition(SamplingState::NeedsConsent, effects)
@@ -1530,9 +1708,11 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn active_sampler_latest_replaces_capture_results() {
-        let latest = new_latest_grid();
+        let latest = new_latest_grids();
+        let display = DisplayId("oled".to_owned());
         replace_latest(
             &latest,
+            &display,
             SampledGrid {
                 grid: dormant_core::spatial_grid::LumaGrid::new(vec![0.1; 16 * 9]).unwrap(),
                 captured_at: dormant_core::types::Tick::now(),
@@ -1541,6 +1721,7 @@ mod tests {
         );
         replace_latest(
             &latest,
+            &display,
             SampledGrid {
                 grid: dormant_core::spatial_grid::LumaGrid::new(vec![0.9; 16 * 9]).unwrap(),
                 captured_at: dormant_core::types::Tick::now(),
@@ -1548,7 +1729,7 @@ mod tests {
             },
         );
 
-        let sample = latest.read().unwrap().clone().unwrap();
+        let sample = latest.read().unwrap().get(&display).cloned().unwrap();
         assert_eq!(sample.grid.cells, vec![0.9; 16 * 9]);
     }
 
@@ -1558,7 +1739,7 @@ mod tests {
         let consent_path = dir.path().join("consent.json");
         test_record(&consent_path);
         let config = active_config(Duration::from_secs(10));
-        let mut runtime = Runtime::new(&config, &consent_path);
+        let mut runtime = Runtime::new(&config, &consent_path, &DisplayId("oled".to_owned()));
         let (status_tx, _) = watch::channel(initial_status(&config));
 
         let transition = apply_update(
@@ -1601,6 +1782,7 @@ mod tests {
     #[derive(Clone)]
     enum TestCapture {
         Frame,
+        FrameValue(u8),
         Failure(CaptureError),
         Pending,
     }
@@ -1649,6 +1831,12 @@ mod tests {
                 .unwrap_or(TestCapture::Frame);
             match outcome {
                 TestCapture::Frame => Ok(test_frame()),
+                TestCapture::FrameValue(value) => Ok(RawFrame {
+                    rgba: vec![value; 16 * 9 * 4],
+                    width: 16,
+                    height: 9,
+                    stride: 16 * 4,
+                }),
                 TestCapture::Failure(error) => Err(error),
                 TestCapture::Pending => std::future::pending().await,
             }
@@ -1694,6 +1882,68 @@ mod tests {
         }
 
         async fn close(&mut self) {}
+    }
+
+    /// Capture source that records every `set_capture_timeout` and
+    /// `invalidate_pending_capture` call so reload-seam tests can assert the
+    /// lifecycle actually pushed configuration down to the platform boundary.
+    struct RecordingSource {
+        connects: Arc<AtomicUsize>,
+        capture_timeouts: Arc<Mutex<Vec<Duration>>>,
+        invalidations: Arc<AtomicUsize>,
+        captures: Mutex<VecDeque<TestCapture>>,
+        captures_seen: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl CaptureSource for RecordingSource {
+        async fn connect(
+            &mut self,
+            _binding: &ConsentBinding<'_>,
+        ) -> Result<ConnectedStream, CaptureError> {
+            self.connects.fetch_add(1, Ordering::SeqCst);
+            Ok(test_stream())
+        }
+
+        async fn request_consent(
+            &mut self,
+            _display: &DisplayExpectation,
+        ) -> Result<Grant, CaptureError> {
+            Err(CaptureError::Protocol(
+                "unexpected consent request".to_owned(),
+            ))
+        }
+
+        async fn capture_one(&mut self, _mode: StreamMode) -> Result<RawFrame, CaptureError> {
+            self.captures_seen.fetch_add(1, Ordering::SeqCst);
+            let outcome = self
+                .captures
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(TestCapture::Frame);
+            match outcome {
+                TestCapture::Frame => Ok(test_frame()),
+                TestCapture::FrameValue(value) => Ok(RawFrame {
+                    rgba: vec![value; 16 * 9 * 4],
+                    width: 16,
+                    height: 9,
+                    stride: 16 * 4,
+                }),
+                TestCapture::Failure(error) => Err(error),
+                TestCapture::Pending => std::future::pending().await,
+            }
+        }
+
+        async fn close(&mut self) {}
+
+        fn set_capture_timeout(&mut self, timeout: Duration) {
+            self.capture_timeouts.lock().unwrap().push(timeout);
+        }
+
+        async fn invalidate_pending_capture(&mut self) {
+            self.invalidations.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     fn test_stream() -> ConnectedStream {
@@ -1759,19 +2009,21 @@ mod tests {
         .unwrap();
     }
 
-    fn service_deps(
+    fn service_deps_for_with_grids(
+        display: &str,
         config: Arc<Config>,
         source: ServiceSource,
         consent_path: PathBuf,
         cancel: CancellationToken,
-    ) -> (ActiveSamplerDeps, mpsc::Sender<SamplerUpdate>, LatestGrid) {
-        let latest_grid = new_latest_grid();
+        latest_grids: LatestGrids,
+    ) -> (ActiveSamplerDeps, mpsc::Sender<SamplerUpdate>, LatestGrids) {
         let (update_tx, update_rx) = mpsc::channel(2);
         (
             ActiveSamplerDeps {
                 initial_config: config,
+                display_id: DisplayId(display.to_owned()),
                 update_rx,
-                latest_grid: latest_grid.clone(),
+                latest_grids: latest_grids.clone(),
                 source: Box::new(source),
                 consent_path,
                 cancel,
@@ -1779,8 +2031,284 @@ mod tests {
                 event_tx: None,
             },
             update_tx,
-            latest_grid,
+            latest_grids,
         )
+    }
+
+    fn service_deps_for(
+        display: &str,
+        config: Arc<Config>,
+        source: ServiceSource,
+        consent_path: PathBuf,
+        cancel: CancellationToken,
+    ) -> (ActiveSamplerDeps, mpsc::Sender<SamplerUpdate>, LatestGrids) {
+        service_deps_for_with_grids(
+            display,
+            config,
+            source,
+            consent_path,
+            cancel,
+            new_latest_grids(),
+        )
+    }
+
+    fn service_deps(
+        config: Arc<Config>,
+        source: ServiceSource,
+        consent_path: PathBuf,
+        cancel: CancellationToken,
+    ) -> (ActiveSamplerDeps, mpsc::Sender<SamplerUpdate>, LatestGrids) {
+        service_deps_for("oled", config, source, consent_path, cancel)
+    }
+
+    fn multi_active_config(interval: Duration) -> Arc<Config> {
+        let mut config = (*active_config(interval)).clone();
+        config.wear.active_sampling.sampled_display = None;
+        config.wear.active_sampling.sampled_displays =
+            vec!["oled-a".to_owned(), "oled-b".to_owned()];
+        Arc::new(config)
+    }
+
+    fn test_record_for(path: &std::path::Path, display: &str) {
+        crate::screencast_consent::store_atomic(
+            path,
+            &crate::screencast_consent::ConsentRecord {
+                token: format!("saved-{display}"),
+                sampled_display: display.to_owned(),
+                granted_at: OffsetDateTime::UNIX_EPOCH,
+                portal_persistent_ids: vec![format!("panel-{display}")],
+                granted_width: 16,
+                granted_height: 9,
+            },
+        )
+        .unwrap();
+    }
+
+    async fn wait_for_state(handle: &ActiveSamplerHandle, expected: SamplingState) {
+        let mut status = handle.status();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if status.borrow().state == expected {
+                    return;
+                }
+                status
+                    .changed()
+                    .await
+                    .expect("sampler status channel remains open");
+            }
+        })
+        .await
+        .expect("sampler reached expected state");
+    }
+
+    fn service_source(
+        captures: impl IntoIterator<Item = TestCapture>,
+    ) -> (
+        ServiceSource,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+    ) {
+        let captures_seen = Arc::new(AtomicUsize::new(0));
+        let closes_seen = Arc::new(AtomicUsize::new(0));
+        let grants_seen = Arc::new(AtomicUsize::new(0));
+        (
+            ServiceSource {
+                connects: Mutex::new(VecDeque::new()),
+                connects_seen: Arc::new(AtomicUsize::new(0)),
+                captures: Mutex::new(captures.into_iter().collect()),
+                captures_seen: captures_seen.clone(),
+                closes_seen: closes_seen.clone(),
+                grants_seen: grants_seen.clone(),
+            },
+            captures_seen,
+            closes_seen,
+            grants_seen,
+        )
+    }
+
+    #[tokio::test]
+    async fn two_selected_displays_open_independent_consent_flows_and_records() {
+        let dir = tempdir().unwrap();
+        let config = multi_active_config(Duration::from_secs(10));
+        let path_a = dir.path().join("consent-a.json");
+        let path_b = dir.path().join("consent-b.json");
+        let (source_a, _, _, grants_a) = service_source([TestCapture::Frame]);
+        let (source_b, _, _, grants_b) = service_source([TestCapture::Frame]);
+        let cancel_a = CancellationToken::new();
+        let cancel_b = CancellationToken::new();
+        let (deps_a, _, _) = service_deps_for(
+            "oled-a",
+            config.clone(),
+            source_a,
+            path_a.clone(),
+            cancel_a.clone(),
+        );
+        let (deps_b, _, _) =
+            service_deps_for("oled-b", config, source_b, path_b.clone(), cancel_b.clone());
+        let (handle_a, join_a) = spawn_with_handle(deps_a);
+        let (handle_b, join_b) = spawn_with_handle(deps_b);
+
+        let (reply_a_tx, reply_a_rx) = oneshot::channel();
+        handle_a
+            .send(SamplerCommand::Enable { reply: reply_a_tx })
+            .await
+            .unwrap();
+        let (reply_b_tx, reply_b_rx) = oneshot::channel();
+        handle_b
+            .send(SamplerCommand::Enable { reply: reply_b_tx })
+            .await
+            .unwrap();
+
+        assert_eq!(reply_a_rx.await.unwrap(), ConsentFlowStatus::Granted);
+        assert_eq!(reply_b_rx.await.unwrap(), ConsentFlowStatus::Granted);
+        assert_eq!(grants_a.load(Ordering::SeqCst), 1);
+        assert_eq!(grants_b.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            crate::screencast_consent::load(&path_a, "oled-a")
+                .unwrap()
+                .record()
+                .sampled_display,
+            "oled-a"
+        );
+        assert_eq!(
+            crate::screencast_consent::load(&path_b, "oled-b")
+                .unwrap()
+                .record()
+                .sampled_display,
+            "oled-b"
+        );
+
+        cancel_a.cancel();
+        cancel_b.cancel();
+        join_a.await.unwrap();
+        join_b.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn one_display_cooldown_does_not_move_the_other_sampler() {
+        let dir = tempdir().unwrap();
+        let config = multi_active_config(Duration::from_secs(10));
+        let path_a = dir.path().join("consent-a.json");
+        let path_b = dir.path().join("consent-b.json");
+        test_record_for(&path_a, "oled-a");
+        test_record_for(&path_b, "oled-b");
+        let (source_a, _, _, _) = service_source([TestCapture::Failure(CaptureError::Timeout)]);
+        let (source_b, _, _, _) = service_source([TestCapture::Frame]);
+        let cancel_a = CancellationToken::new();
+        let cancel_b = CancellationToken::new();
+        let (deps_a, _, _) =
+            service_deps_for("oled-a", config.clone(), source_a, path_a, cancel_a.clone());
+        let (deps_b, _, _) = service_deps_for("oled-b", config, source_b, path_b, cancel_b.clone());
+        let (handle_a, join_a) = spawn_with_handle(deps_a);
+        let (handle_b, join_b) = spawn_with_handle(deps_b);
+
+        wait_for_state(&handle_a, SamplingState::Cooldown).await;
+        wait_for_state(&handle_b, SamplingState::Streaming).await;
+        assert_eq!(handle_a.status().borrow().state, SamplingState::Cooldown);
+        assert_eq!(handle_b.status().borrow().state, SamplingState::Streaming);
+
+        cancel_a.cancel();
+        cancel_b.cancel();
+        join_a.await.unwrap();
+        join_b.await.unwrap();
+    }
+
+    /// Proves the production [`spawn_with_handle`] path gives each display an
+    /// independently owned cancellation token: cancelling sampler A must not
+    /// affect sampler B's liveliness.
+    #[tokio::test]
+    async fn sampler_runtime_lifecycles_are_independent() {
+        let dir = tempdir().unwrap();
+        let config = multi_active_config(Duration::from_secs(10));
+        let path_a = dir.path().join("consent-a.json");
+        let path_b = dir.path().join("consent-b.json");
+        test_record_for(&path_a, "oled-a");
+        test_record_for(&path_b, "oled-b");
+        let (source_a, _, _, _) = service_source([TestCapture::Frame]);
+        let (source_b, _, _, _) = service_source([TestCapture::Frame]);
+        let cancel_a = CancellationToken::new();
+        let cancel_b = CancellationToken::new();
+        let (deps_a, _, _) =
+            service_deps_for("oled-a", config.clone(), source_a, path_a, cancel_a.clone());
+        let (deps_b, _, _) = service_deps_for("oled-b", config, source_b, path_b, cancel_b.clone());
+        let (handle_a, join_a) = spawn_with_handle(deps_a);
+        let (handle_b, join_b) = spawn_with_handle(deps_b);
+
+        wait_for_state(&handle_a, SamplingState::Streaming).await;
+        wait_for_state(&handle_b, SamplingState::Streaming).await;
+
+        // Cancel A; B must remain live — its join handle must not be finished
+        // and its status must still show Streaming.
+        cancel_a.cancel();
+        let _ = tokio::time::timeout(Duration::from_millis(50), handle_a.status().changed())
+            .await
+            .expect("handle_a status should change after cancel");
+        assert_eq!(
+            handle_b.status().borrow().state,
+            SamplingState::Streaming,
+            "cancelling display A must not affect display B's sampler state"
+        );
+        assert!(
+            !join_b.is_finished(),
+            "display B's join must not finish when display A is cancelled"
+        );
+
+        cancel_b.cancel();
+        join_a.await.unwrap();
+        join_b.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn two_samplers_never_cross_deliver_latest_grids() {
+        let dir = tempdir().unwrap();
+        let config = multi_active_config(Duration::from_secs(10));
+        let path_a = dir.path().join("consent-a.json");
+        let path_b = dir.path().join("consent-b.json");
+        test_record_for(&path_a, "oled-a");
+        test_record_for(&path_b, "oled-b");
+        let (source_a, _, _, _) = service_source([TestCapture::FrameValue(32)]);
+        let (source_b, _, _, _) = service_source([TestCapture::FrameValue(224)]);
+        let cancel_a = CancellationToken::new();
+        let cancel_b = CancellationToken::new();
+        let latest_grids = new_latest_grids();
+        let (deps_a, _, _) = service_deps_for_with_grids(
+            "oled-a",
+            config.clone(),
+            source_a,
+            path_a,
+            cancel_a.clone(),
+            latest_grids.clone(),
+        );
+        let (deps_b, _, _) = service_deps_for_with_grids(
+            "oled-b",
+            config,
+            source_b,
+            path_b,
+            cancel_b.clone(),
+            latest_grids.clone(),
+        );
+        let (handle_a, join_a) = spawn_with_handle(deps_a);
+        let (handle_b, join_b) = spawn_with_handle(deps_b);
+
+        wait_for_state(&handle_a, SamplingState::Streaming).await;
+        wait_for_state(&handle_b, SamplingState::Streaming).await;
+        {
+            let grids = latest_grids.read().unwrap();
+            assert_eq!(grids.len(), 2);
+            let grid_a = grids
+                .get(&DisplayId("oled-a".to_owned()))
+                .expect("display A sample");
+            let grid_b = grids
+                .get(&DisplayId("oled-b".to_owned()))
+                .expect("display B sample");
+            assert_ne!(grid_a.grid, grid_b.grid);
+        }
+
+        cancel_a.cancel();
+        cancel_b.cancel();
+        join_a.await.unwrap();
+        join_b.await.unwrap();
     }
 
     #[test]
@@ -1788,7 +2316,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let config = active_config(Duration::from_secs(10));
         let (event_tx, mut event_rx) = mpsc::channel(4);
-        let mut runtime = Runtime::new(&config, &dir.path().join("consent.json"));
+        let mut runtime = Runtime::new(
+            &config,
+            &dir.path().join("consent.json"),
+            &DisplayId("oled".to_owned()),
+        );
         runtime.event_tx = Some(event_tx);
         let (status_tx, _) = watch::channel(initial_status(&config));
 
@@ -1809,7 +2341,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let config = active_config(Duration::from_secs(10));
         let (event_tx, mut event_rx) = mpsc::channel(4);
-        let mut runtime = Runtime::new(&config, &dir.path().join("consent.json"));
+        let mut runtime = Runtime::new(
+            &config,
+            &dir.path().join("consent.json"),
+            &DisplayId("oled".to_owned()),
+        );
         runtime.event_tx = Some(event_tx);
         let (status_tx, _) = watch::channel(SamplerStatus {
             state: SamplingState::Disabled,
@@ -1889,7 +2425,12 @@ mod tests {
         tokio::time::advance(Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
         assert_eq!(captures_seen.load(Ordering::SeqCst), 2);
-        assert!(latest.read().unwrap().is_some());
+        assert!(
+            latest
+                .read()
+                .unwrap()
+                .contains_key(&DisplayId("oled".to_owned()))
+        );
 
         cancel.cancel();
         join.await.unwrap();
@@ -1913,8 +2454,9 @@ mod tests {
         let (updates_tx, updates_rx) = mpsc::channel(2);
         let deps = ActiveSamplerDeps {
             initial_config: config.clone(),
+            display_id: DisplayId("oled".to_owned()),
             update_rx: updates_rx,
-            latest_grid: new_latest_grid(),
+            latest_grids: new_latest_grids(),
             source: Box::new(source),
             consent_path,
             cancel: cancel.clone(),
@@ -2294,7 +2836,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let consent_path = dir.path().join("consent.json");
         let config = active_config(Duration::from_secs(10));
-        let mut runtime = Runtime::new(&config, &consent_path);
+        let mut runtime = Runtime::new(&config, &consent_path, &DisplayId("oled".to_owned()));
         let (status_tx, _) = watch::channel(initial_status(&config));
         apply_trigger(&mut runtime, Trigger::GrantStarted, &status_tx);
         let mut source = ServiceSource {
@@ -2328,6 +2870,139 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn active_sampler_rejects_enable_while_active() {
+        let cases: &[(&str, &[Trigger])] = &[
+            ("connecting", &[Trigger::GrantStarted, Trigger::Granted]),
+            (
+                "streaming",
+                &[Trigger::GrantStarted, Trigger::Granted, Trigger::Connected],
+            ),
+            (
+                "cooldown",
+                &[
+                    Trigger::GrantStarted,
+                    Trigger::Granted,
+                    Trigger::Connected,
+                    Trigger::CaptureFailed,
+                ],
+            ),
+        ];
+        for (label, setup) in cases {
+            let dir = tempdir().unwrap();
+            let consent_path = dir.path().join("consent.json");
+            let config = active_config(Duration::from_secs(10));
+            let mut runtime = Runtime::new(&config, &consent_path, &DisplayId("oled".to_owned()));
+            let (status_tx, _) = watch::channel(initial_status(&config));
+            for trigger in *setup {
+                apply_trigger(&mut runtime, *trigger, &status_tx);
+            }
+            let expected_state = runtime.state;
+            let mut source = ServiceSource {
+                connects: Mutex::new(VecDeque::new()),
+                connects_seen: Arc::new(AtomicUsize::new(0)),
+                captures: Mutex::new(VecDeque::new()),
+                captures_seen: Arc::new(AtomicUsize::new(0)),
+                closes_seen: Arc::new(AtomicUsize::new(0)),
+                grants_seen: Arc::new(AtomicUsize::new(0)),
+            };
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let (_command_tx, mut command_rx) = mpsc::channel(1);
+
+            assert!(
+                !handle_command(
+                    &mut runtime,
+                    &mut source,
+                    &consent_path,
+                    SamplerCommand::Enable { reply: reply_tx },
+                    &mut command_rx,
+                    &status_tx,
+                    &CancellationToken::new(),
+                    test_env_reader,
+                )
+                .await,
+                "{label}: handle_command returned true (signalled connect)"
+            );
+            assert_eq!(
+                reply_rx.await.unwrap(),
+                ConsentFlowStatus::Error(SamplerError::FlowAlreadyActive.to_string()),
+                "{label}: reply mismatch"
+            );
+            assert_eq!(
+                runtime.state, expected_state,
+                "{label}: state mutated by rejected Enable"
+            );
+            assert_eq!(
+                source.grants_seen.load(Ordering::SeqCst),
+                0,
+                "{label}: request_consent was called"
+            );
+            assert_eq!(
+                source.closes_seen.load(Ordering::SeqCst),
+                0,
+                "{label}: close was called"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_sampler_rejects_enable_while_suspended() {
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        let config = active_config(Duration::from_secs(10));
+        let mut runtime = Runtime::new(&config, &consent_path, &DisplayId("oled".to_owned()));
+        let (status_tx, _) = watch::channel(initial_status(&config));
+        apply_trigger(
+            &mut runtime,
+            Trigger::ConfigChanged(ConfigDelta::WearEnabled(false)),
+            &status_tx,
+        );
+        let expected_state = runtime.state;
+        let mut source = ServiceSource {
+            connects: Mutex::new(VecDeque::new()),
+            connects_seen: Arc::new(AtomicUsize::new(0)),
+            captures: Mutex::new(VecDeque::new()),
+            captures_seen: Arc::new(AtomicUsize::new(0)),
+            closes_seen: Arc::new(AtomicUsize::new(0)),
+            grants_seen: Arc::new(AtomicUsize::new(0)),
+        };
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let (_command_tx, mut command_rx) = mpsc::channel(1);
+
+        assert!(
+            !handle_command(
+                &mut runtime,
+                &mut source,
+                &consent_path,
+                SamplerCommand::Enable { reply: reply_tx },
+                &mut command_rx,
+                &status_tx,
+                &CancellationToken::new(),
+                test_env_reader,
+            )
+            .await
+        );
+        assert_eq!(
+            reply_rx.await.unwrap(),
+            ConsentFlowStatus::Error(SamplerError::AdministrativelySuspended.to_string()),
+            "suspended: reply mismatch"
+        );
+        assert_eq!(
+            runtime.state, expected_state,
+            "suspended: state mutated by rejected Enable"
+        );
+        assert_eq!(
+            source.grants_seen.load(Ordering::SeqCst),
+            0,
+            "suspended: request_consent was called"
+        );
+        assert_eq!(
+            source.closes_seen.load(Ordering::SeqCst),
+            0,
+            "suspended: close was called"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn active_sampler_rejects_inline_second_enable_while_first_flow_waits() {
         let dir = tempdir().unwrap();
         let consent_path = dir.path().join("consent.json");
@@ -2337,8 +3012,9 @@ mod tests {
         let cancel = CancellationToken::new();
         let (handle, join) = spawn_with_handle(ActiveSamplerDeps {
             initial_config: config,
+            display_id: DisplayId("oled".to_owned()),
             update_rx,
-            latest_grid: new_latest_grid(),
+            latest_grids: new_latest_grids(),
             source: Box::new(ScriptedCaptureSource::with_pending_consent()),
             consent_path,
             cancel: cancel.clone(),
@@ -2372,7 +3048,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let consent_path = dir.path().join("consent.json");
         let config = active_config(Duration::from_secs(10));
-        let mut runtime = Runtime::new(&config, &consent_path);
+        let mut runtime = Runtime::new(&config, &consent_path, &DisplayId("oled".to_owned()));
         let initial_state = runtime.state;
         let (status_tx, _) = watch::channel(initial_status(&config));
         let mut source = ScriptedCaptureSource::with_pending_consent();
@@ -2406,7 +3082,7 @@ mod tests {
         let consent_path = dir.path().join("consent.json");
         let mut config = (*active_config(Duration::from_secs(10))).clone();
         config.wear.active_sampling.enabled = false;
-        let mut runtime = Runtime::new(&config, &consent_path);
+        let mut runtime = Runtime::new(&config, &consent_path, &DisplayId("oled".to_owned()));
         let (status_tx, _) = watch::channel(initial_status(&config));
         let mut source = ScriptedCaptureSource::default();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -2436,7 +3112,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let consent_path = dir.path().join("consent.json");
         let config = active_config(Duration::from_secs(10));
-        let mut runtime = Runtime::new(&config, &consent_path);
+        let mut runtime = Runtime::new(&config, &consent_path, &DisplayId("oled".to_owned()));
         let (status_tx, _) = watch::channel(initial_status(&config));
         let mut source = ScriptedCaptureSource::with_pending_consent();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -2460,8 +3136,12 @@ mod tests {
 
         assert_eq!(reply_rx.await.unwrap(), ConsentFlowStatus::TimedOut);
         let log = traced_output(&buffer);
-        assert!(log.contains("wear_sampling_consent_failed"), "{log}");
-        assert!(log.contains("reason=\"timeout\""), "{log}");
+        let failure = log
+            .lines()
+            .find(|line| line.contains("wear_sampling_consent_failed"))
+            .expect("timeout failure log");
+        assert!(failure.contains("reason=\"timeout\""), "{failure}");
+        assert!(failure.contains("display=oled"), "{failure}");
     }
 
     #[tokio::test]
@@ -2469,7 +3149,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let consent_path = dir.path().join("consent.json");
         let config = active_config(Duration::from_secs(10));
-        let mut runtime = Runtime::new(&config, &consent_path);
+        let mut runtime = Runtime::new(&config, &consent_path, &DisplayId("oled".to_owned()));
         let (status_tx, _) = watch::channel(initial_status(&config));
         let mut source = ScriptedCaptureSource {
             grants: VecDeque::from([ScriptedOutcome::Ready(Err(CaptureError::ConsentDenied))]),
@@ -2499,7 +3179,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let consent_path = dir.path().join("consent.json");
         let config = active_config(Duration::from_secs(10));
-        let mut runtime = Runtime::new(&config, &consent_path);
+        let mut runtime = Runtime::new(&config, &consent_path, &DisplayId("oled".to_owned()));
         let (status_tx, _) = watch::channel(initial_status(&config));
         let mut source = ScriptedCaptureSource {
             grants: VecDeque::from([ScriptedOutcome::Ready(Err(CaptureError::Transport(
@@ -2528,8 +3208,14 @@ mod tests {
             ConsentFlowStatus::Error(WEAR_SAMPLING_CONSENT_TIMEOUT.to_owned())
         );
         let log = traced_output(&buffer);
-        assert!(log.contains("wear_sampling_consent_failed"), "{log}");
-        assert!(log.contains("open_pipewire_remote_timeout"), "{log}");
+        let failure = log
+            .lines()
+            .find(|line| {
+                line.contains("wear_sampling_consent_failed")
+                    && line.contains("open_pipewire_remote_timeout")
+            })
+            .expect("transport failure log");
+        assert!(failure.contains("display=oled"), "{failure}");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2537,7 +3223,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let consent_path = dir.path().join("consent.json");
         let config = active_config(Duration::from_secs(10));
-        let mut runtime = Runtime::new(&config, &consent_path);
+        let mut runtime = Runtime::new(&config, &consent_path, &DisplayId("oled".to_owned()));
         let (status_tx, _) = watch::channel(initial_status(&config));
         let mut stream = test_stream();
         stream.restore_token = "unlogged-rotated-token".to_owned();
@@ -2569,6 +3255,7 @@ mod tests {
         for stage in ["wear_sampling_stage", "token_persisted"] {
             assert!(log.contains(stage), "missing {stage} stage: {log}");
         }
+        assert!(log.contains("display=oled"), "{log}");
         assert!(!log.contains("unlogged-rotated-token"), "{log}");
     }
 
@@ -2578,7 +3265,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let consent_path = dir.path().join("consent.json");
         let config = active_config(Duration::from_secs(10));
-        let mut runtime = Runtime::new(&config, &consent_path);
+        let mut runtime = Runtime::new(&config, &consent_path, &DisplayId("oled".to_owned()));
         let (status_tx, _) = watch::channel(initial_status(&config));
         let mut stream = test_stream();
         stream.width = 3072;
@@ -2635,7 +3322,7 @@ mod tests {
         let consent_path = dir.path().join("consent.json");
         test_record(&consent_path);
         let config = active_config(Duration::from_secs(10));
-        let mut runtime = Runtime::new(&config, &consent_path);
+        let mut runtime = Runtime::new(&config, &consent_path, &DisplayId("oled".to_owned()));
         let (status_tx, _) = watch::channel(initial_status(&config));
         let mut source = ScriptedCaptureSource::default();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -2669,11 +3356,17 @@ mod tests {
         let (update_tx, update_rx) = mpsc::channel(1);
         drop(update_tx);
         let cancel = CancellationToken::new();
+        let close_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let source = CloseTrackingScriptedSource {
+            inner: ScriptedCaptureSource::with_pending_consent(),
+            close_calls: close_calls.clone(),
+        };
         let (handle, join) = spawn_with_handle(ActiveSamplerDeps {
             initial_config: config,
+            display_id: DisplayId("oled".to_owned()),
             update_rx,
-            latest_grid: new_latest_grid(),
-            source: Box::new(ScriptedCaptureSource::with_pending_consent()),
+            latest_grids: new_latest_grids(),
+            source: Box::new(source),
             consent_path: consent_path.clone(),
             cancel: cancel.clone(),
             env_reader: test_env_reader,
@@ -2709,8 +3402,178 @@ mod tests {
             ConsentFlowStatus::Error("cancelled".to_owned())
         );
         assert!(!consent_path.exists());
+        // Disable during a pending consent must leave the sampler Disabled so a
+        // subsequent Enable is rejected by the disabled-config path instead of
+        // being accepted as a fresh consent flow.
+        let final_status = handle.status();
+        let snapshot = final_status.borrow().clone();
+        assert_eq!(snapshot.state, SamplingState::Disabled);
+        assert!(
+            close_calls.load(Ordering::SeqCst) >= 1,
+            "Disable during pending consent must close any live sampler session"
+        );
         cancel.cancel();
         join.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_sampler_streaming_capture_auth_failure_closes_source() {
+        // A live portal session invalidated by an Auth failure during
+        // Streaming must be released: the run loop parks in NeedsConsent
+        // indefinitely, so without honoring the CloseSession effect the
+        // warm PipeWire worker and the portal session would leak.
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        test_record(&consent_path);
+        let config = active_config(Duration::from_secs(10));
+        let closes_seen = Arc::new(AtomicUsize::new(0));
+        let captures_seen = Arc::new(AtomicUsize::new(0));
+        let source = ServiceSource {
+            connects: Mutex::new(VecDeque::new()),
+            connects_seen: Arc::new(AtomicUsize::new(0)),
+            captures: Mutex::new(VecDeque::from([
+                TestCapture::Frame,
+                TestCapture::Failure(CaptureError::Auth),
+            ])),
+            captures_seen: captures_seen.clone(),
+            closes_seen: closes_seen.clone(),
+            grants_seen: Arc::new(AtomicUsize::new(0)),
+        };
+        let cancel = CancellationToken::new();
+        let (deps, _updates, _latest) = service_deps(config, source, consent_path, cancel.clone());
+        let (handle, join) = spawn_with_handle(deps);
+
+        // First cadence tick: connect succeeds, first capture returns a frame.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(captures_seen.load(Ordering::SeqCst), 1);
+        assert_eq!(handle.status().borrow().state, SamplingState::Streaming);
+
+        // Advance past the sample interval to drive a second capture, which
+        // fails with Auth and routes through needs_consent -> NeedsConsent
+        // with a CloseSession effect.
+        for _ in 0..12 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(captures_seen.load(Ordering::SeqCst), 2);
+        assert_eq!(handle.status().borrow().state, SamplingState::NeedsConsent);
+        assert!(
+            closes_seen.load(Ordering::SeqCst) >= 1,
+            "Auth failure during Streaming must close the live portal session"
+        );
+
+        cancel.cancel();
+        join.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_sampler_disable_during_pending_consent_rejects_followup_enable() {
+        // A Disable received while a consent flow is still pending must
+        // leave the sampler Disabled: the in-flight Enable replies with
+        // "cancelled", the Disable itself replies Ok(()), and any later
+        // Enable is rejected (the sampler is no longer in NeedsConsent, so
+        // it cannot silently re-open a fresh grant dialog).
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        let config = active_config(Duration::from_secs(10));
+        let (update_tx, update_rx) = mpsc::channel(1);
+        drop(update_tx);
+        let cancel = CancellationToken::new();
+        let (handle, join) = spawn_with_handle(ActiveSamplerDeps {
+            initial_config: config,
+            display_id: DisplayId("oled".to_owned()),
+            update_rx,
+            latest_grids: new_latest_grids(),
+            source: Box::new(ScriptedCaptureSource::with_pending_consent()),
+            consent_path: consent_path.clone(),
+            cancel: cancel.clone(),
+            env_reader: test_env_reader,
+            event_tx: None,
+        });
+
+        let (enable_tx, enable_rx) = oneshot::channel();
+        handle
+            .send(SamplerCommand::Enable { reply: enable_tx })
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+
+        let (disable_tx, disable_rx) = oneshot::channel();
+        handle
+            .send(SamplerCommand::Disable {
+                forget: true,
+                reply: disable_tx,
+            })
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), disable_rx)
+                .await
+                .is_ok()
+        );
+        // The first Enable was cancelled by the Disable.
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), enable_rx)
+                .await
+                .unwrap()
+                .unwrap(),
+            ConsentFlowStatus::Error("cancelled".to_owned())
+        );
+        // Final state is Disabled — the operator's disable took effect.
+        assert_eq!(handle.status().borrow().state, SamplingState::Disabled);
+
+        // The follow-up Enable is rejected because the sampler is no
+        // longer in NeedsConsent: the Enable handler routes any other
+        // state through the FlowAlreadyActive rejection, which surfaces
+        // to the operator as the "consent flow is already active" error.
+        let (followup_tx, followup_rx) = oneshot::channel();
+        handle
+            .send(SamplerCommand::Enable { reply: followup_tx })
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), followup_rx)
+                .await
+                .unwrap()
+                .unwrap(),
+            ConsentFlowStatus::Error(SamplerError::FlowAlreadyActive.to_string())
+        );
+
+        cancel.cancel();
+        join.await.unwrap();
+    }
+
+    /// `ScriptedCaptureSource` wrapper that counts `close()` invocations via a
+    /// shared atomic so the test can observe the run loop honoring a
+    /// `CloseSession` effect across the `Box<dyn CaptureSource>` boundary.
+    struct CloseTrackingScriptedSource {
+        inner: ScriptedCaptureSource,
+        close_calls: std::sync::Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl CaptureSource for CloseTrackingScriptedSource {
+        async fn connect(
+            &mut self,
+            binding: &ConsentBinding<'_>,
+        ) -> Result<ConnectedStream, CaptureError> {
+            self.inner.connect(binding).await
+        }
+        async fn request_consent(
+            &mut self,
+            display: &DisplayExpectation,
+        ) -> Result<Grant, CaptureError> {
+            self.inner.request_consent(display).await
+        }
+        async fn capture_one(&mut self, mode: StreamMode) -> Result<RawFrame, CaptureError> {
+            self.inner.capture_one(mode).await
+        }
+        async fn close(&mut self) {
+            self.inner.close().await;
+            self.close_calls.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     #[tokio::test]
@@ -2718,7 +3581,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let consent_path = dir.path().join("consent.json");
         let config = active_config(Duration::from_secs(10));
-        let mut runtime = Runtime::new(&config, &consent_path);
+        let mut runtime = Runtime::new(&config, &consent_path, &DisplayId("oled".to_owned()));
         let (status_tx, _) = watch::channel(initial_status(&config));
         let mut source = ScriptedCaptureSource {
             grants: VecDeque::from([ScriptedOutcome::Ready(Err(CaptureError::Protocol(
@@ -2838,20 +3701,26 @@ mod tests {
                 effects: vec![Effect::EnterUniform("wear_sampling_portal_unreachable")],
             },
             TransitionCase {
-                name: "token rejection requires fresh consent",
+                name: "token rejection requires fresh consent and closes the live session",
                 state: SamplingState::Connecting,
                 trigger: Trigger::AuthFailed,
                 has_consent_record: true,
                 next: SamplingState::NeedsConsent,
-                effects: vec![Effect::EnterUniform("wear_sampling_token_invalid")],
+                effects: vec![
+                    Effect::CloseSession,
+                    Effect::EnterUniform("wear_sampling_token_invalid"),
+                ],
             },
             TransitionCase {
-                name: "wrong reattached monitor requires fresh consent with its distinct reason",
+                name: "wrong reattached monitor requires fresh consent with its distinct reason and closes the live session",
                 state: SamplingState::Connecting,
                 trigger: Trigger::WrongMonitor,
                 has_consent_record: true,
                 next: SamplingState::NeedsConsent,
-                effects: vec![Effect::EnterUniform("wear_sampling_wrong_monitor")],
+                effects: vec![
+                    Effect::CloseSession,
+                    Effect::EnterUniform("wear_sampling_wrong_monitor"),
+                ],
             },
             TransitionCase {
                 name: "stream capture failure opens the breaker",
@@ -2862,20 +3731,37 @@ mod tests {
                 effects: vec![Effect::EnterUniform("wear_sampling_capture_failed")],
             },
             TransitionCase {
-                name: "stream session closure invalidates consent",
+                name: "stream session closure invalidates consent and closes the live session",
                 state: SamplingState::Streaming,
                 trigger: Trigger::SessionClosed,
                 has_consent_record: true,
                 next: SamplingState::NeedsConsent,
-                effects: vec![Effect::EnterUniform("wear_sampling_token_invalid")],
+                effects: vec![
+                    Effect::CloseSession,
+                    Effect::EnterUniform("wear_sampling_token_invalid"),
+                ],
             },
             TransitionCase {
-                name: "wrong streaming monitor requires fresh consent with its distinct reason",
+                name: "wrong streaming monitor requires fresh consent with its distinct reason and closes the live session",
                 state: SamplingState::Streaming,
                 trigger: Trigger::WrongMonitor,
                 has_consent_record: true,
                 next: SamplingState::NeedsConsent,
-                effects: vec![Effect::EnterUniform("wear_sampling_wrong_monitor")],
+                effects: vec![
+                    Effect::CloseSession,
+                    Effect::EnterUniform("wear_sampling_wrong_monitor"),
+                ],
+            },
+            TransitionCase {
+                name: "stream auth rejection requires fresh consent and closes the live session",
+                state: SamplingState::Streaming,
+                trigger: Trigger::AuthFailed,
+                has_consent_record: true,
+                next: SamplingState::NeedsConsent,
+                effects: vec![
+                    Effect::CloseSession,
+                    Effect::EnterUniform("wear_sampling_token_invalid"),
+                ],
             },
             TransitionCase {
                 name: "stream transport failure reconnects without discarding consent",
@@ -2910,12 +3796,26 @@ mod tests {
                 effects: vec![Effect::EnterUniform("wear_sampling_portal_unreachable")],
             },
             TransitionCase {
-                name: "cooldown auth failure requires fresh consent",
+                name: "cooldown auth failure requires fresh consent and closes the live session",
                 state: SamplingState::Cooldown,
                 trigger: Trigger::AuthFailed,
                 has_consent_record: true,
                 next: SamplingState::NeedsConsent,
-                effects: vec![Effect::EnterUniform("wear_sampling_token_invalid")],
+                effects: vec![
+                    Effect::CloseSession,
+                    Effect::EnterUniform("wear_sampling_token_invalid"),
+                ],
+            },
+            TransitionCase {
+                name: "cooldown wrong monitor requires fresh consent and closes the live session",
+                state: SamplingState::Cooldown,
+                trigger: Trigger::WrongMonitor,
+                has_consent_record: true,
+                next: SamplingState::NeedsConsent,
+                effects: vec![
+                    Effect::CloseSession,
+                    Effect::EnterUniform("wear_sampling_wrong_monitor"),
+                ],
             },
             TransitionCase {
                 name: "renewed cooldown failure restarts the tagged cooldown",
@@ -3015,20 +3915,26 @@ mod tests {
                 effects: vec![],
             },
             TransitionCase {
-                name: "connecting session closure invalidates consent",
+                name: "connecting session closure invalidates consent and closes the live session",
                 state: SamplingState::Connecting,
                 trigger: Trigger::SessionClosed,
                 has_consent_record: true,
                 next: SamplingState::NeedsConsent,
-                effects: vec![Effect::EnterUniform("wear_sampling_token_invalid")],
+                effects: vec![
+                    Effect::CloseSession,
+                    Effect::EnterUniform("wear_sampling_token_invalid"),
+                ],
             },
             TransitionCase {
-                name: "cooldown session closure invalidates consent",
+                name: "cooldown session closure invalidates consent and closes the live session",
                 state: SamplingState::Cooldown,
                 trigger: Trigger::SessionClosed,
                 has_consent_record: true,
                 next: SamplingState::NeedsConsent,
-                effects: vec![Effect::EnterUniform("wear_sampling_token_invalid")],
+                effects: vec![
+                    Effect::CloseSession,
+                    Effect::EnterUniform("wear_sampling_token_invalid"),
+                ],
             },
             TransitionCase {
                 name: "disabling a pending flow cancels consent before closing the session",
@@ -3224,5 +4130,133 @@ mod tests {
 
         source.close().await;
         assert_eq!(source.close_calls(), 1);
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #211 — timeout ownership (defects A and B).
+    // ---------------------------------------------------------------------
+
+    /// Defect A: a `LimitsChanged` reconfigure must push the new
+    /// `capture_timeout` to the platform source so its inner warm-mode bound
+    /// stays in sync with the outer daemon bound.
+    #[tokio::test(start_paused = true)]
+    async fn active_sampler_limits_changed_reconfigure_pushes_capture_timeout_to_source() {
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        test_record(&consent_path);
+        let connects_seen = Arc::new(AtomicUsize::new(0));
+        let capture_timeouts = Arc::new(Mutex::new(Vec::<Duration>::new()));
+        let invalidations = Arc::new(AtomicUsize::new(0));
+        let captures_seen = Arc::new(AtomicUsize::new(0));
+        let source = RecordingSource {
+            connects: connects_seen.clone(),
+            capture_timeouts: capture_timeouts.clone(),
+            invalidations: invalidations.clone(),
+            captures: Mutex::new(VecDeque::new()),
+            captures_seen: captures_seen.clone(),
+        };
+        let cancel = CancellationToken::new();
+        let config = active_config(Duration::from_secs(10));
+        let (updates_tx, updates_rx) = mpsc::channel(2);
+        let deps = ActiveSamplerDeps {
+            initial_config: config.clone(),
+            display_id: DisplayId("oled".to_owned()),
+            update_rx: updates_rx,
+            latest_grids: new_latest_grids(),
+            source: Box::new(source),
+            consent_path,
+            cancel: cancel.clone(),
+            env_reader: test_env_reader,
+            event_tx: None,
+        };
+        let (_handle, join) = spawn_with_handle(deps);
+
+        tokio::task::yield_now().await;
+        let recorded = capture_timeouts.lock().unwrap().clone();
+        assert!(
+            recorded
+                .iter()
+                .any(|timeout| *timeout == Duration::from_secs(2)),
+            "initial capture_timeout must reach the source (got {recorded:?})"
+        );
+
+        let mut reconfigured = (*config).clone();
+        reconfigured.wear.active_sampling.capture_timeout = Duration::from_secs(7);
+        updates_tx
+            .send(SamplerUpdate::Reconfigure(ReconfigurePlan {
+                active_sampling: reconfigured.wear.active_sampling,
+                sample_interval: reconfigured.wear.sample_interval,
+                trigger: ConfigDelta::LimitsChanged,
+            }))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        let recorded = capture_timeouts.lock().unwrap().clone();
+        assert!(
+            recorded
+                .iter()
+                .any(|timeout| *timeout == Duration::from_secs(7)),
+            "LimitsChanged reconfigure must push the new capture_timeout to the source (got {recorded:?})"
+        );
+        let _ = invalidations.load(Ordering::SeqCst);
+        let _ = captures_seen.load(Ordering::SeqCst);
+
+        cancel.cancel();
+        join.await.unwrap();
+    }
+
+    /// Defect B: when the outer `tokio::time::timeout` elapses before the
+    /// inner bound, the lifecycle must call `invalidate_pending_capture` on
+    /// the source so a buffered frame cannot be served on the next capture.
+    #[tokio::test(start_paused = true)]
+    async fn active_sampler_outer_timeout_invalidates_pending_capture() {
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        test_record(&consent_path);
+        let invalidations = Arc::new(AtomicUsize::new(0));
+        let source: Box<dyn CaptureSource + Send + Sync + 'static> = Box::new(RecordingSource {
+            connects: Arc::new(AtomicUsize::new(0)),
+            capture_timeouts: Arc::new(Mutex::new(Vec::new())),
+            invalidations: invalidations.clone(),
+            captures: Mutex::new(VecDeque::from([TestCapture::Pending, TestCapture::Pending])),
+            captures_seen: Arc::new(AtomicUsize::new(0)),
+        });
+        let cancel = CancellationToken::new();
+        let mut config = active_config(Duration::from_secs(10));
+        Arc::get_mut(&mut config)
+            .unwrap()
+            .wear
+            .active_sampling
+            .capture_timeout = Duration::from_millis(50);
+        let latest_grids = new_latest_grids();
+        let (update_tx, update_rx) = mpsc::channel(2);
+        let deps = ActiveSamplerDeps {
+            initial_config: config,
+            display_id: DisplayId("oled".to_owned()),
+            update_rx,
+            latest_grids: latest_grids.clone(),
+            source,
+            consent_path,
+            cancel: cancel.clone(),
+            env_reader: test_env_reader,
+            event_tx: None,
+        };
+        let (handle, join) = spawn_with_handle(deps);
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(60)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            invalidations.load(Ordering::SeqCst),
+            1,
+            "outer capture timeout must invalidate the source's pending state"
+        );
+        let _ = handle.status();
+        cancel.cancel();
+        join.await.unwrap();
+        let _ = update_tx;
     }
 }

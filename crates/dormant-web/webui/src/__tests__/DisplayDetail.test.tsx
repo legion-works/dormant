@@ -100,6 +100,7 @@ describe("DisplayDetail", () => {
     // hid the fact that absolute on-hours are available, and would
     // have read as meaningless on a uniformly-worn panel.
     expect(screen.getByText("0 h")).toBeInTheDocument();
+    expect(screen.getByText("2 h mean")).toBeInTheDocument();
     expect(screen.getByText("3 h")).toBeInTheDocument();
 
     // Exposure summary rows (v3 restructure).

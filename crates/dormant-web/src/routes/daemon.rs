@@ -36,6 +36,24 @@ pub(crate) struct DaemonIdentity {
     /// an unknown/missing key as not-yet-dismissed.
     #[serde(default)]
     pub star_nudge_dismissed: bool,
+    /// Whether the daemon's active wear-sampling pipeline is **platform
+    /// capable** — i.e. the daemon actually owns a sampler lifecycle on
+    /// this host. Derived from `wear_sampling_rx.borrow().is_some()`:
+    /// non-Linux builds never spawn the active sampler (the module is
+    /// `#[cfg(target_os = "linux")]`), so the watch stays `None` and
+    /// this is `false`. Critically, this is independent of the user's
+    /// `wear.active_sampling.enabled` config flag — that is the user's
+    /// *intent*, this is the system's *capability*. The wear-card
+    /// onboarding nudge (#186) must read this field, not the config
+    /// flag, to decide whether to show the portal action.
+    #[serde(default)]
+    pub wear_sampling_supported: bool,
+    /// Whether the wear-card onboarding nudge has been dismissed.
+    /// Persisted as a flag file (`wear-sampling-nudge-dismissed`) in the
+    /// config directory. Defaults to `false` when absent — older clients
+    /// and first-load treat an unknown/missing key as not-yet-dismissed.
+    #[serde(default)]
+    pub wear_sampling_nudge_dismissed: bool,
 }
 
 /// `GET /api/daemon` — report the daemon's process identity.
@@ -51,6 +69,15 @@ pub(crate) async fn get_daemon(State(state): State<WebState>) -> impl IntoRespon
             version: env!("CARGO_PKG_VERSION"),
             socket: socket.display().to_string(),
             star_nudge_dismissed: state.inner.star_nudge_path.exists(),
+            // The daemon only writes to wear_sampling_rx on Linux (the
+            // active_sampler module is `#[cfg(target_os = "linux")]`); on
+            // any other host the watch stays `None` and the platform is
+            // incapable of running active sampling. The web UI uses this
+            // signal to gate the portal-consent affordance — the config
+            // `enabled` flag is the user's *intent*, not the system's
+            // *capability* (see #186).
+            wear_sampling_supported: state.inner.wear_sampling_rx.borrow().is_some(),
+            wear_sampling_nudge_dismissed: state.inner.wear_sampling_nudge_path.exists(),
         }),
     )
 }

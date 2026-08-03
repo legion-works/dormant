@@ -314,6 +314,71 @@ impl DisplayExecutor {
         self.blank_owners
             .owner(&self.display, &self.chain_fingerprint)
     }
+
+    /// One bounded re-probe pass over the chain — called by
+    /// [`CommandSink::blank`] after the main round fails (either zero
+    /// eligible controllers OR every eligible controller I/O-failed).
+    /// Issues `reprobe()` per controller, then re-evaluates
+    /// `is_available` + `supported_modes` and retries `blank(mode)`.
+    /// Returns `true` if any controller succeeded (caller short-circuits
+    /// to `Ok(())`), `false` if the chain is still dead (caller
+    /// surfaces the final `Err(CmdFailure)`).
+    ///
+    /// Bounded to ONE pass — issue #114's reprobe discipline; the
+    /// executor's wake-time retry/backoff is preserved for the
+    /// wake-side recovery. A successful `Ok` updates `health` and
+    /// records the blank owner; an `Err` updates `health` and
+    /// `last_controller` so the final error reflects the chain's
+    /// last-tried controller.
+    async fn reprobe_blank_pass(
+        &self,
+        mode: BlankMode,
+        health: &mut [ControllerHealth],
+        eligible_count: &mut usize,
+        last_controller: &mut String,
+    ) -> bool {
+        tracing::info!(
+            event = "executor_reprobe",
+            display = %self.display,
+            "blank main round failed; attempting on-demand reprobe",
+        );
+        for (i, controller) in self.chain.iter().enumerate() {
+            let _ = controller.reprobe().await;
+            if !controller.is_available().await {
+                continue;
+            }
+            if !controller.supported_modes().contains(&mode) {
+                continue;
+            }
+            *eligible_count += 1;
+            match controller.blank(mode).await {
+                Ok(()) => {
+                    health[i].healthy = true;
+                    health[i].detail = None;
+                    *self
+                        .health
+                        .lock()
+                        .expect("DisplayExecutor health lock poisoned") = health.to_vec();
+                    self.blank_owners
+                        .record(&self.display, &self.chain_fingerprint, i);
+                    return true;
+                }
+                Err(e) => {
+                    health[i].healthy = false;
+                    health[i].detail = Some(e.to_string());
+                    *last_controller = controller.name().to_string();
+                    tracing::warn!(
+                        event = "blank_controller_failed",
+                        display = %self.display,
+                        controller = controller.name(),
+                        error = %e,
+                        context = "reprobe",
+                    );
+                }
+            }
+        }
+        false
+    }
 }
 
 #[async_trait]
@@ -324,6 +389,12 @@ impl CommandSink for DisplayExecutor {
 
         let mut last_controller = String::from("none-eligible");
         let mut eligible_count: usize = 0;
+        // Task 21 / issue #182: explicit flag for the "every eligible
+        // controller I/O-failed" case. Without it we would have to
+        // derive the condition from `last_controller != "none-eligible"`,
+        // which is a stringly-typed proxy that breaks the moment any
+        // controller name happens to match the sentinel.
+        let mut any_eligible_failed = false;
         // One slot per chain position — updated in place so skipped
         // controllers are never masked (Must 2b).
         let mut health: Vec<ControllerHealth> = self
@@ -380,6 +451,7 @@ impl CommandSink for DisplayExecutor {
                         error = %e,
                     );
                     last_controller = controller.name().to_string();
+                    any_eligible_failed = true;
                 }
             }
         }
@@ -388,38 +460,20 @@ impl CommandSink for DisplayExecutor {
         // initially missed a controller (e.g. ddcci display was disconnected
         // at startup), the first command after reattach must re-probe the
         // chain instead of staying dead until restart (issue #114).
-        if eligible_count == 0 {
-            tracing::info!(
-                event = "executor_reprobe",
-                display = %self.display,
-                "zero available controllers for blank; attempting on-demand reprobe",
-            );
-            for (i, controller) in self.chain.iter().enumerate() {
-                let _ = controller.reprobe().await;
-                // Re-evaluate after reprbe — re-insert if now available.
-                if !controller.is_available().await {
-                    continue;
-                }
-                if !controller.supported_modes().contains(&mode) {
-                    continue;
-                }
-                eligible_count += 1;
-                match controller.blank(mode).await {
-                    Ok(()) => {
-                        health[i].healthy = true;
-                        health[i].detail = None;
-                        *self.health.lock().unwrap() = health;
-                        self.blank_owners
-                            .record(&self.display, &self.chain_fingerprint, i);
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        health[i].healthy = false;
-                        health[i].detail = Some(e.to_string());
-                        last_controller = controller.name().to_string();
-                    }
-                }
-            }
+        //
+        // Task 21 / issue #182: trigger the reprobe on either zero
+        // eligible controllers OR a fully failed eligible chain — a
+        // previously-OK controller whose I/O now fails (cable just
+        // reconnected, controller's cached state stale) is the
+        // canonical hotplug symptom. The reprobe is still bounded to a
+        // single pass; the retry/backoff of the executor's main wake
+        // path is preserved.
+        if (eligible_count == 0 || any_eligible_failed)
+            && self
+                .reprobe_blank_pass(mode, &mut health, &mut eligible_count, &mut last_controller)
+                .await
+        {
+            return Ok(());
         }
 
         tracing::error!(
@@ -507,6 +561,13 @@ impl CommandSink for DisplayExecutor {
                         controller: "superseded".to_string(),
                         error: format!("{E_WAKE_FAILED}: superseded by blank"),
                     });
+                }
+                // The owner's wake succeeded: clear it.  A non-owner fallback
+                // success (above, implicitly — `is_owner_attempt` is false there)
+                // leaves the owner in place, per invariant.
+                if is_owner_attempt {
+                    self.blank_owners
+                        .clear_if_owner(&self.display, &self.chain_fingerprint, i);
                 }
                 return Ok(());
             }
@@ -684,6 +745,13 @@ impl CommandSink for DisplayExecutor {
                         controller: "superseded".to_string(),
                         error: format!("{E_WAKE_FAILED}: superseded by blank"),
                     });
+                }
+                // The owner's wake succeeded: clear it.  A non-owner fallback
+                // success (above, implicitly — `is_owner_attempt` is false there)
+                // leaves the owner in place, per invariant.
+                if is_owner_attempt {
+                    self.blank_owners
+                        .clear_if_owner(&self.display, &self.chain_fingerprint, i);
                 }
                 return Ok(());
             }
@@ -1231,6 +1299,89 @@ mod tests {
         assert_eq!(a.count_op("blank"), 0, "no blank on a dead chain");
     }
 
+    /// Task 21 / issue #182: a re-attached display can come back with
+    /// previously-OK controllers whose current I/O fails (cable just
+    /// reconnected, controller's cached state stale). The reprobe must
+    /// trigger even when `eligible_count > 0` — i.e. when every
+    /// eligible controller I/O-failed — not only on `eligible_count == 0`.
+    /// Without this, the daemon stays in the "blank succeeded" state from
+    /// the previous lifecycle and the next presence flap hangs.
+    #[tokio::test]
+    async fn blank_reprobe_heals_when_eligible_controller_io_fails() {
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        // A is currently available (passed probe at startup), but its
+        // blank I/O fails — cable just reconnected, controller's cached
+        // state is stale.
+        a.push_blank_result(Err(err("A")));
+        // Reprobe heals A; A's blank then succeeds.
+        a.set_probe_result(Ok(()));
+        a.push_blank_result(Ok(()));
+        let (exec, _) = executor_with(vec![a.clone()], default_retry());
+
+        exec.blank(BlankMode::PowerOff)
+            .await
+            .expect("blank must heal when all eligible controllers I/O-failed");
+
+        assert_eq!(
+            a.count_op("reprobe"),
+            1,
+            "executor re-probed the chain after all eligible attempts failed"
+        );
+        assert_eq!(
+            a.count_op("blank"),
+            2,
+            "blank ran twice (initial fail + post-reprobe success)"
+        );
+
+        let health = exec.controller_health();
+        assert_eq!(health.len(), 1);
+        assert!(
+            health[0].healthy,
+            "health reflects the post-reprobe success"
+        );
+        assert!(health[0].detail.is_none());
+    }
+
+    /// Task 21: bounding the heal — when reprobe brings nothing back,
+    /// the command fails after exactly one reprobe pass even though
+    /// every eligible controller was attempted. Catches the "infinite
+    /// reprobe loop" failure mode.
+    #[tokio::test]
+    async fn blank_reprobe_is_bounded_when_eligible_chain_still_dead() {
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let b = FakeController::new("B", vec![BlankMode::PowerOff]);
+        // Main round: both I/O-fail.
+        a.push_blank_result(Err(err("A")));
+        b.push_blank_result(Err(err("B")));
+        // Reprobe: still fails for both (probe_result Err keeps the
+        // controller in `available`, but the blank I/O still errors).
+        a.push_blank_result(Err(err("A")));
+        b.push_blank_result(Err(err("B")));
+        a.set_probe_result(Err(DormantError::DisplayIo {
+            controller: "A".into(),
+            detail: "still detached".into(),
+        }));
+        b.set_probe_result(Err(DormantError::DisplayIo {
+            controller: "B".into(),
+            detail: "still detached".into(),
+        }));
+        let (exec, _) = executor_with(vec![a.clone(), b.clone()], default_retry());
+
+        let res = exec
+            .blank(BlankMode::PowerOff)
+            .await
+            .expect_err("still-dead chain must fail");
+
+        assert_eq!(res.controller, "B", "last attempted controller");
+        assert!(res.error.starts_with(E_BLANK_FAILED));
+        // Each controller re-probed exactly once across the whole chain.
+        assert_eq!(a.count_op("reprobe"), 1, "A re-probed exactly once");
+        assert_eq!(b.count_op("reprobe"), 1, "B re-probed exactly once");
+        // Main round + reprobe pass = 2 blanks per controller.
+        assert_eq!(a.count_op("blank"), 2, "A blanked twice (main + reprobe)");
+        assert_eq!(b.count_op("blank"), 2, "B blanked twice (main + reprobe)");
+    }
+
     #[tokio::test]
     async fn blank_skips_unavailable_and_mode_mismatch() {
         let a = FakeController::new("A", vec![BlankMode::PowerOff]);
@@ -1251,6 +1402,11 @@ mod tests {
     async fn blank_all_fail_returns_cmdfailure_with_last_controller() {
         let a = FakeController::new("A", vec![BlankMode::PowerOff]);
         let b = FakeController::new("B", vec![BlankMode::PowerOff]);
+        // Main round: both fail. Reprobe pass: both fail again (Task 21
+        // / issue #182 — the reprobe now triggers on a fully-failed
+        // eligible chain, not just on zero eligible).
+        a.push_blank_result(Err(err("A")));
+        b.push_blank_result(Err(err("B")));
         a.push_blank_result(Err(err("A")));
         b.push_blank_result(Err(err("B")));
         let (exec, _) = executor_with(vec![a.clone(), b.clone()], default_retry());
@@ -1258,8 +1414,9 @@ mod tests {
         let res = exec.blank(BlankMode::PowerOff).await.unwrap_err();
         assert_eq!(res.controller, "B", "last attempted controller");
         assert!(res.error.starts_with(E_BLANK_FAILED));
-        assert_eq!(a.count_op("blank"), 1);
-        assert_eq!(b.count_op("blank"), 1);
+        // Main round + reprobe pass = 2 blanks per controller.
+        assert_eq!(a.count_op("blank"), 2);
+        assert_eq!(b.count_op("blank"), 2);
     }
 
     // ── wake tests ────────────────────────────────────────────────────────
@@ -1901,6 +2058,11 @@ mod tests {
             "sole controller becomes owner after a successful blank"
         );
 
+        // Main round + reprobe pass = 2 failures (Task 21 / issue #182
+        // — the reprobe now triggers on a fully-failed eligible chain,
+        // not just on zero eligible, so both A's main attempt and its
+        // reprobe attempt must fail for the blank to bust).
+        a.push_blank_result(Err(err("A")));
         a.push_blank_result(Err(err("A")));
         let res = exec.blank(BlankMode::PowerOff).await;
         assert!(res.is_err(), "second blank fails (all controllers erred)");
@@ -2026,6 +2188,144 @@ mod tests {
         assert!(err.error.contains("superseded by blank"));
         assert_eq!(exec.blank_owner_for_test(), Some(1));
         assert_eq!(b.count_op("wake"), 0);
+    }
+
+    // ── Task 3 fix-round Must 1: owner cleared after reprobe-heal wake ───────
+
+    #[tokio::test]
+    async fn wake_reprobe_heal_clears_owner_when_owner_succeeds() {
+        // A (index 0) is owner (A blank succeeds; B blank fails).
+        // A.wake() fails in the main round; B.wake() fails.
+        // Reprobe heals A (set_probe_result Ok); A.wake() succeeds.
+        // Owner (A) must be cleared after this.
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let b = FakeController::new("B", vec![BlankMode::PowerOff]);
+        // B fails blank → owner stays A (index 0).
+        b.push_blank_result(Err(err("B")));
+        let (exec, _) = executor_with(vec![a.clone(), b.clone()], default_retry());
+
+        exec.blank(BlankMode::PowerOff).await.unwrap();
+        assert_eq!(
+            exec.blank_owner_for_test(),
+            Some(0),
+            "A (index 0) is owner after A succeeds blank"
+        );
+
+        // Main round: A fails wake, B fails wake.
+        a.push_wake_result(Err(err("A")));
+        b.push_wake_result(Err(err("B")));
+        // Reprobe: A heals (probe_result Ok); A.wake() succeeds.
+        a.set_probe_result(Ok(()));
+        a.push_wake_result(Ok(()));
+
+        exec.wake().await.unwrap();
+
+        assert_eq!(
+            exec.blank_owner_for_test(),
+            None,
+            "owner cleared after owner's wake succeeds in reprobe-heal"
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_once_reprobe_heal_clears_owner_when_owner_succeeds() {
+        // Same scenario through wake_once().
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let b = FakeController::new("B", vec![BlankMode::PowerOff]);
+        b.push_blank_result(Err(err("B")));
+        let (exec, _) = executor_with(vec![a.clone(), b.clone()], default_retry());
+
+        exec.blank(BlankMode::PowerOff).await.unwrap();
+        assert_eq!(exec.blank_owner_for_test(), Some(0));
+
+        a.push_wake_result(Err(err("A")));
+        b.push_wake_result(Err(err("B")));
+        a.set_probe_result(Ok(()));
+        a.push_wake_result(Ok(()));
+
+        exec.wake_once().await.unwrap();
+
+        assert_eq!(
+            exec.blank_owner_for_test(),
+            None,
+            "owner cleared after owner's wake_once succeeds in reprobe-heal"
+        );
+    }
+
+    // ── Task 3 fix-round Must 1 (negative): non-owner success INSIDE the
+    // reprobe-heal loop must not clear ownership. The main-loop equivalent is
+    // covered by `wake_retains_owner_when_owner_wake_fails_and_fallback_succeeds`;
+    // these two drive execution into the reprobe loop itself (every controller
+    // fails the main round) before the non-owner succeeds.
+
+    #[tokio::test]
+    async fn wake_reprobe_heal_keeps_owner_when_non_owner_succeeds() {
+        // A blanks successfully → owner = A (index 0). Wake: A (owner) fails
+        // the main round AND the reprobe attempt; B fails the main round,
+        // then succeeds inside the reprobe-heal loop (scripted Err consumed,
+        // default Ok). Owner must stay A.
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let b = FakeController::new("B", vec![BlankMode::PowerOff]);
+        let (exec, _) = executor_with(vec![a.clone(), b.clone()], default_retry());
+
+        exec.blank(BlankMode::PowerOff).await.unwrap();
+        assert_eq!(
+            exec.blank_owner_for_test(),
+            Some(0),
+            "A (index 0) is owner after A succeeds blank"
+        );
+
+        // default_retry has wake_retries: 0 → one main round. Script both
+        // controllers to fail it so the burst exhausts and the reprobe loop
+        // runs; A fails again there, B's queue is empty → default Ok.
+        a.push_wake_result(Err(err("A")));
+        a.push_wake_result(Err(err("A")));
+        b.push_wake_result(Err(err("B")));
+
+        exec.wake().await.unwrap();
+
+        assert_eq!(a.count_op("wake"), 2, "A tried in main round and reprobe");
+        assert_eq!(
+            b.count_op("wake"),
+            2,
+            "B failed the main round, succeeded in the reprobe loop"
+        );
+        assert_eq!(
+            exec.blank_owner_for_test(),
+            Some(0),
+            "non-owner success in the reprobe-heal loop must NOT clear ownership"
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_once_reprobe_heal_keeps_owner_when_non_owner_succeeds() {
+        // Same reprobe-path negative scenario through wake_once(): single
+        // main pass fails for both controllers, reprobe loop runs, A fails
+        // again, B succeeds there. Owner must stay A.
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let b = FakeController::new("B", vec![BlankMode::PowerOff]);
+        let (exec, _) = executor_with(vec![a.clone(), b.clone()], default_retry());
+
+        exec.blank(BlankMode::PowerOff).await.unwrap();
+        assert_eq!(exec.blank_owner_for_test(), Some(0));
+
+        a.push_wake_result(Err(err("A")));
+        a.push_wake_result(Err(err("A")));
+        b.push_wake_result(Err(err("B")));
+
+        exec.wake_once().await.unwrap();
+
+        assert_eq!(a.count_op("wake"), 2, "A tried in single pass and reprobe");
+        assert_eq!(
+            b.count_op("wake"),
+            2,
+            "B failed the single pass, succeeded in the reprobe loop"
+        );
+        assert_eq!(
+            exec.blank_owner_for_test(),
+            Some(0),
+            "non-owner success in the reprobe-heal loop must NOT clear ownership"
+        );
     }
 
     #[tokio::test]

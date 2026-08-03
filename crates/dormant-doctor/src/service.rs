@@ -15,6 +15,7 @@
 //! `Weak<Shared<…>>` so the slot self-cleans when the last caller drops
 //! its reference, and a fresh run starts on the next call after that.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
@@ -52,6 +53,14 @@ struct Inner {
     creds_rx: watch::Receiver<Arc<Credentials>>,
     /// Redacted sampler status published by the daemon's sole sampler owner.
     sampler_status_rx: Option<watch::Receiver<Option<WearSamplingStatus>>>,
+    /// Per-display redacted sampler statuses (issue #185 cycle B). The
+    /// daemon's registry of samplers writes one entry per active sampler;
+    /// the doctor emits ONE wear-sampling check PER configured display
+    /// from this map.  `None` when the daemon has no active sampler
+    /// registry (legacy single-display builds, tests) — the per-display
+    /// path then falls back to the singular probe so the existing
+    /// contract survives.
+    sampler_statuses_rx: Option<watch::Receiver<BTreeMap<String, WearSamplingStatus>>>,
     /// Coalesce slot: weak handle to the in-flight run, if any.
     inflight: Mutex<Option<Weak<SharedRun>>>,
 }
@@ -74,7 +83,7 @@ impl DoctorService {
         config_rx: watch::Receiver<Arc<Config>>,
         creds_rx: watch::Receiver<Arc<Credentials>>,
     ) -> Self {
-        Self::new_with_sampler_status(ctl_tx, config_rx, creds_rx, None)
+        Self::new_with_sampler_statuses(ctl_tx, config_rx, creds_rx, None, None)
     }
 
     /// Build a service with the daemon-owned, redacted sampler status watch.
@@ -85,12 +94,27 @@ impl DoctorService {
         creds_rx: watch::Receiver<Arc<Credentials>>,
         sampler_status_rx: Option<watch::Receiver<Option<WearSamplingStatus>>>,
     ) -> Self {
+        Self::new_with_sampler_statuses(ctl_tx, config_rx, creds_rx, sampler_status_rx, None)
+    }
+
+    /// Build a service with both the singular and per-display sampler
+    /// status watches (issue #185 cycle B).  Both are optional so
+    /// callers can pass either, neither, or both.
+    #[must_use]
+    pub fn new_with_sampler_statuses(
+        ctl_tx: mpsc::Sender<ControlMsg>,
+        config_rx: watch::Receiver<Arc<Config>>,
+        creds_rx: watch::Receiver<Arc<Credentials>>,
+        sampler_status_rx: Option<watch::Receiver<Option<WearSamplingStatus>>>,
+        sampler_statuses_rx: Option<watch::Receiver<BTreeMap<String, WearSamplingStatus>>>,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 ctl_tx,
                 config_rx,
                 creds_rx,
                 sampler_status_rx,
+                sampler_statuses_rx,
                 inflight: Mutex::new(None),
             }),
         }
@@ -130,8 +154,14 @@ impl DoctorService {
         let config_rx = self.inner.config_rx.clone();
         let creds_rx = self.inner.creds_rx.clone();
         let sampler_status_rx = self.inner.sampler_status_rx.clone();
-        let fut: Pin<Box<dyn Future<Output = DoctorReport> + Send>> =
-            Box::pin(run_inner(ctl_tx, config_rx, creds_rx, sampler_status_rx));
+        let sampler_statuses_rx = self.inner.sampler_statuses_rx.clone();
+        let fut: Pin<Box<dyn Future<Output = DoctorReport> + Send>> = Box::pin(run_inner(
+            ctl_tx,
+            config_rx,
+            creds_rx,
+            sampler_status_rx,
+            sampler_statuses_rx,
+        ));
         let shared: SharedRun = fut.shared();
         let arc = Arc::new(shared);
         *guard = Some(Arc::downgrade(&arc));
@@ -152,6 +182,7 @@ async fn run_inner(
     config_rx: watch::Receiver<Arc<Config>>,
     creds_rx: watch::Receiver<Arc<Credentials>>,
     sampler_status_rx: Option<watch::Receiver<Option<WearSamplingStatus>>>,
+    sampler_statuses_rx: Option<watch::Receiver<BTreeMap<String, WearSamplingStatus>>>,
 ) -> DoctorReport {
     let snapshot = fetch_snapshot(&ctl_tx).await;
     let cfg = config_rx.borrow().clone();
@@ -159,19 +190,39 @@ async fn run_inner(
 
     let mut checks: Vec<Check> = Vec::new();
 
-    let sampler_status = sampler_status_rx.as_ref().map(|rx| rx.borrow().clone());
-    let sampler_result = crate::probes::wear_sampling::probe_wear_sampling(
-        &cfg.wear,
-        cfg.wear
-            .active_sampling
-            .sampled_display
-            .as_ref()
-            .is_some_and(|display| cfg.displays.contains_key(display)),
-        sampler_status.as_ref().and_then(Option::as_ref),
-    );
-    let mut sampler_check = probe_result_to_check(&sampler_result);
-    sampler_check.category = Some("platform".into());
-    checks.push(sampler_check);
+    // Per-display wear-sampling probe (issue #185 cycle B). When the
+    // daemon supplies the per-display status map we emit one check
+    // per configured display so the operator sees each sampling
+    // display's health individually. When the daemon does NOT supply
+    // it (legacy / test / off-Linux) we fall back to the singular
+    // probe so the existing single-display contract survives.
+    if let Some(rx) = sampler_statuses_rx.as_ref() {
+        let statuses = rx.borrow().clone();
+        let configured = cfg.wear.active_sampling.selected_displays();
+        let live: Vec<String> = snapshot.displays.iter().map(|(id, _)| id.clone()).collect();
+        let per_display_results = crate::probes::wear_sampling::probe_wear_sampling_per_display(
+            &cfg.wear,
+            &configured,
+            &live,
+            &statuses,
+        );
+        for result in per_display_results {
+            checks.push(probe_result_to_check(&result));
+        }
+    } else {
+        let sampler_status = sampler_status_rx.as_ref().map(|rx| rx.borrow().clone());
+        let sampler_result = crate::probes::wear_sampling::probe_wear_sampling(
+            &cfg.wear,
+            cfg.wear
+                .active_sampling
+                .first_sampled_display()
+                .is_some_and(|display| cfg.displays.contains_key(display)),
+            sampler_status.as_ref().and_then(Option::as_ref),
+        );
+        let mut sampler_check = probe_result_to_check(&sampler_result);
+        sampler_check.category = Some("platform".into());
+        checks.push(sampler_check);
+    }
 
     // ── Owned sensors (USB) — report from snapshot, never re-open ──
     for sensor in &snapshot.sensors {
@@ -717,5 +768,241 @@ mod tests {
             .expect("doctor run should not hang");
         // No USB checks (snapshot was empty → no sensor rows).
         assert!(report.checks.iter().all(|c| !c.name.starts_with("usb ")));
+    }
+
+    // ── #185 Task 24b cycle B — per-display wear-sampling checks ─────────
+    //
+    // The doctor MUST emit ONE wear-sampling check PER configured
+    // sampling display, never collapsed to a single row.  The fixture
+    // here uses TWO displays with deliberately-different redacted
+    // states so a regression that emits two checks for the same
+    // subject (or one collapsed check) fails visibly.
+
+    fn two_display_snapshot() -> StateSnapshot {
+        StateSnapshot {
+            sensors: vec![],
+            zones: vec![],
+            displays: vec![
+                (
+                    "desk".into(),
+                    DisplaySnapshot {
+                        phase: "active".into(),
+                        inhibited: false,
+                        paused: false,
+                        cmd_gen: 1,
+                        scope: dormant_core::config::DisplayScope::Private,
+                        owned: true,
+                        observed_input_code: None,
+                        panel_state: None,
+                        controllers: vec![],
+                        wake_attempts: 0,
+                        last_blank_failed: false,
+                        stage: None,
+                    },
+                ),
+                (
+                    "tv".into(),
+                    DisplaySnapshot {
+                        phase: "active".into(),
+                        inhibited: false,
+                        paused: false,
+                        cmd_gen: 1,
+                        scope: dormant_core::config::DisplayScope::Private,
+                        owned: true,
+                        observed_input_code: None,
+                        panel_state: None,
+                        controllers: vec![],
+                        wake_attempts: 0,
+                        last_blank_failed: false,
+                        stage: None,
+                    },
+                ),
+            ],
+            pending_reload: None,
+            rollback: None,
+            kvm: None,
+            wear_sampling_status: None,
+        }
+    }
+
+    fn two_display_config() -> Arc<Config> {
+        let mut cfg = (*test_config()).clone();
+        cfg.wear.active_sampling.enabled = true;
+        cfg.wear.active_sampling.sampled_display = None;
+        cfg.wear.active_sampling.sampled_displays = vec!["desk".into(), "tv".into()];
+        Arc::new(cfg)
+    }
+
+    /// When the daemon supplies a per-display status map, the doctor
+    /// MUST emit one wear-sampling check PER configured display.
+    /// Pin both the count and the per-row subject so a single-row
+    /// implementation cannot pass.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn doctor_emits_one_wear_check_per_display_under_multi_selection() {
+        let cfg = two_display_config();
+        let creds = test_creds();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let ctl_tx = spawn_fake_engine(two_display_snapshot(), None, counter.clone());
+
+        let (config_tx, config_rx) = watch::channel(cfg.clone());
+        let (creds_tx, creds_rx) = watch::channel(creds.clone());
+        drop(config_tx);
+        drop(creds_tx);
+
+        let mut statuses: BTreeMap<String, WearSamplingStatus> = BTreeMap::new();
+        statuses.insert(
+            "desk".into(),
+            WearSamplingStatus {
+                state: dormant_core::wear::WearSamplingState::Streaming,
+                last_capture_age_s: Some(2),
+                uniform_reason: None,
+                bound_display: Some("desk".into()),
+                granted_at_epoch_s: None,
+            },
+        );
+        statuses.insert(
+            "tv".into(),
+            WearSamplingStatus {
+                state: dormant_core::wear::WearSamplingState::NeedsConsent,
+                last_capture_age_s: None,
+                uniform_reason: None,
+                bound_display: Some("tv".into()),
+                granted_at_epoch_s: None,
+            },
+        );
+        let (statuses_tx, statuses_rx) = watch::channel(statuses);
+        drop(statuses_tx);
+
+        let service = DoctorService::new_with_sampler_statuses(
+            ctl_tx,
+            config_rx,
+            creds_rx,
+            None,
+            Some(statuses_rx),
+        );
+        let report = service.run().await;
+
+        let wear_checks: Vec<&Check> = report
+            .checks
+            .iter()
+            .filter(|c| c.name == "wear-sampling")
+            .collect();
+        assert_eq!(
+            wear_checks.len(),
+            2,
+            "must emit one wear-sampling check per configured display, got {} (details: {:?})",
+            wear_checks.len(),
+            wear_checks
+                .iter()
+                .map(|c| (c.subject.clone(), c.status, c.detail.clone()))
+                .collect::<Vec<_>>()
+        );
+        let subjects: std::collections::BTreeSet<&str> = wear_checks
+            .iter()
+            .filter_map(|c| c.subject.as_deref())
+            .collect();
+        assert_eq!(
+            subjects,
+            ["desk", "tv"].into_iter().collect(),
+            "every wear-sampling check must carry its own subject"
+        );
+        // Both checks tagged as platform category (the singular probe
+        // would also tag — proves we are on the new path).
+        assert!(
+            wear_checks
+                .iter()
+                .all(|c| c.category.as_deref() == Some("platform"))
+        );
+    }
+
+    /// Redaction MUST hold at the doctor report layer too — even
+    /// though the probe is the source of truth, an extra
+    /// safety-net test here proves nothing in the Check
+    /// construction path leaks the secret fields.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn doctor_per_display_report_does_not_leak_consent_secrets() {
+        let cfg = two_display_config();
+        let creds = test_creds();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let ctl_tx = spawn_fake_engine(two_display_snapshot(), None, counter.clone());
+
+        let (config_tx, config_rx) = watch::channel(cfg.clone());
+        let (creds_tx, creds_rx) = watch::channel(creds.clone());
+        drop(config_tx);
+        drop(creds_tx);
+
+        let mut statuses: BTreeMap<String, WearSamplingStatus> = BTreeMap::new();
+        statuses.insert(
+            "desk".into(),
+            WearSamplingStatus {
+                state: dormant_core::wear::WearSamplingState::NeedsConsent,
+                last_capture_age_s: None,
+                uniform_reason: Some("token=persistent-id-should-not-leak".into()),
+                bound_display: Some("persistent-id-should-not-leak".into()),
+                granted_at_epoch_s: None,
+            },
+        );
+        statuses.insert(
+            "tv".into(),
+            WearSamplingStatus {
+                state: dormant_core::wear::WearSamplingState::NeedsConsent,
+                last_capture_age_s: None,
+                uniform_reason: Some("token=other-persistent-id".into()),
+                bound_display: Some("other-persistent-id".into()),
+                granted_at_epoch_s: None,
+            },
+        );
+        let (statuses_tx, statuses_rx) = watch::channel(statuses);
+        drop(statuses_tx);
+
+        let service = DoctorService::new_with_sampler_statuses(
+            ctl_tx,
+            config_rx,
+            creds_rx,
+            None,
+            Some(statuses_rx),
+        );
+        let report = service.run().await;
+        for check in &report.checks {
+            if let Some(detail) = &check.detail {
+                assert!(
+                    !detail.contains("token="),
+                    "check detail leaked a token assignment: {detail}"
+                );
+                assert!(
+                    !detail.contains("persistent-id"),
+                    "check detail leaked persistent-id: {detail}"
+                );
+            }
+        }
+    }
+
+    /// When the daemon does NOT supply the per-display map, the
+    /// doctor falls back to the singular probe — exactly one
+    /// wear-sampling check.  This is the legacy / off-Linux path.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn doctor_falls_back_to_singular_probe_without_per_display_map() {
+        let cfg = two_display_config();
+        let creds = test_creds();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let ctl_tx = spawn_fake_engine(two_display_snapshot(), None, counter.clone());
+
+        let (config_tx, config_rx) = watch::channel(cfg.clone());
+        let (creds_tx, creds_rx) = watch::channel(creds.clone());
+        drop(config_tx);
+        drop(creds_tx);
+
+        let service = DoctorService::new(ctl_tx, config_rx, creds_rx);
+        let report = service.run().await;
+        let wear_checks: Vec<&Check> = report
+            .checks
+            .iter()
+            .filter(|c| c.name == "wear-sampling")
+            .collect();
+        assert_eq!(
+            wear_checks.len(),
+            1,
+            "singular-probe fallback must emit exactly one check"
+        );
     }
 }

@@ -269,6 +269,10 @@ pub struct DisplayStateMachine {
     /// remaining.  Set when inhibitor or pause activates during a staged
     /// dwell; cleared when both are removed.  Mirrors `grace_frozen_remaining`.
     stage_dwell_frozen_remaining: Option<Duration>,
+    /// The absolute monotonic deadline of the currently scheduled stage tick.
+    /// Used to compute the remaining dwell at freeze time so the countdown is
+    /// preserved correctly across freeze/unfreeze cycles.
+    scheduled_stage_deadline: Option<Tick>,
     /// Whether the external ownership gate denies ownership.
     ///
     /// When `true`, the machine will not enter blank stages and will yield
@@ -335,6 +339,7 @@ impl DisplayStateMachine {
             zone_present: None,
             grace_frozen_remaining: None,
             input_wake_hold_active: false,
+            scheduled_stage_deadline: None,
         }
     }
 
@@ -376,6 +381,7 @@ impl DisplayStateMachine {
             zone_present: None,
             grace_frozen_remaining: None,
             input_wake_hold_active: false,
+            scheduled_stage_deadline: None,
         };
 
         let effects = match phase {
@@ -1073,11 +1079,14 @@ impl DisplayStateMachine {
                 self.overlays.inhibited = inhibited;
                 if inhibited {
                     // Freeze the dwell if there's a scheduled tick pending.
-                    // The tick itself carries the deadline; we don't have it
-                    // here, so we mark as frozen.  On next StageTick, the
-                    // freeze gate will drop it.  The caller must re-arm.
+                    // Capture the remaining time so it is preserved across
+                    // the freeze/unfreeze cycle.
+                    let remaining = self
+                        .scheduled_stage_deadline
+                        .map(|d| d.0.saturating_duration_since(now.0))
+                        .unwrap_or_default();
                     self.stage_dwell_frozen_remaining =
-                        self.stage_dwell_frozen_remaining.or(Some(Duration::ZERO));
+                        self.stage_dwell_frozen_remaining.or(Some(remaining));
                 } else {
                     // Inhibitor cleared — re-arm the stage tick.
                     return self.rearm_stage_tick(now);
@@ -1090,8 +1099,14 @@ impl DisplayStateMachine {
                 self.overlays.paused = Some(PauseState { until });
                 let mut effects = Vec::new();
                 if !was_paused {
+                    // Capture the remaining dwell time so the countdown is
+                    // preserved correctly when the stage is re-armed.
+                    let remaining = self
+                        .scheduled_stage_deadline
+                        .map(|d| d.0.saturating_duration_since(now.0))
+                        .unwrap_or_default();
                     self.stage_dwell_frozen_remaining =
-                        self.stage_dwell_frozen_remaining.or(Some(Duration::ZERO));
+                        self.stage_dwell_frozen_remaining.or(Some(remaining));
                 }
                 if let Some(deadline) = until {
                     effects.push(Effect::ScheduleTickAt(deadline));
@@ -1342,6 +1357,7 @@ impl DisplayStateMachine {
         // impossible to observe from any non-Grace phase).
         self.grace_frozen_remaining = None;
         self.stage_dwell_frozen_remaining = None;
+        self.scheduled_stage_deadline = None;
         self.current_stage = None;
         let from = self.phase_name();
         self.phase = Phase::Active;
@@ -1544,11 +1560,14 @@ impl DisplayStateMachine {
             return vec![];
         };
         let Some(dwell) = self.ladder.get(idx).and_then(|s| s.dwell) else {
+            // No dwell — no scheduled tick.
+            self.scheduled_stage_deadline = None;
             return vec![];
         };
         self.stage_gen = self.stage_gen.wrapping_add(1);
         let r#gen = self.stage_gen;
         let at = Tick(now.0 + dwell);
+        self.scheduled_stage_deadline = Some(at);
         vec![Effect::ScheduleStageTickAt { r#gen, at }]
     }
 
@@ -1566,12 +1585,15 @@ impl DisplayStateMachine {
             return vec![];
         };
         let Some(dwell) = self.ladder.get(idx).and_then(|s| s.dwell) else {
+            // Terminal stage — no tick needed, clear the deadline.
+            self.scheduled_stage_deadline = None;
             return vec![];
         };
         let effective = remaining.min(dwell);
         self.stage_gen = self.stage_gen.wrapping_add(1);
         let r#gen = self.stage_gen;
         let at = Tick(now.0 + effective);
+        self.scheduled_stage_deadline = Some(at);
         vec![Effect::ScheduleStageTickAt { r#gen, at }]
     }
 }
@@ -3364,6 +3386,17 @@ mod ladder_tests {
         DisplayStateMachine::new(timings(500), ladder, t(0))
     }
 
+    /// Return the scheduled stage tick from `ScheduleStageTickAt`, if present.
+    fn get_schedule_stage_tick(effects: &[Effect]) -> Option<Tick> {
+        effects.iter().find_map(|e| {
+            if let Effect::ScheduleStageTickAt { at, .. } = e {
+                Some(*at)
+            } else {
+                None
+            }
+        })
+    }
+
     /// Drive through Grace expiry and enter the first ladder stage.
     fn drive_to_entry(sm: &mut DisplayStateMachine) -> Vec<Effect> {
         let t0 = t(0);
@@ -3835,6 +3868,83 @@ mod ladder_tests {
 
         sm.step(Input::InhibitorChanged(false), t(800));
         assert!(!sm.stage_advance_frozen());
+    }
+
+    /// Regression test for issue #203: the inhibitor freeze site must capture
+    /// the remaining dwell at freeze time, not set it to zero.
+    ///
+    /// Bug: inhibitor freeze sets `stage_dwell_frozen_remaining = Some(Duration::ZERO)`.
+    /// Fix: capture `deadline.saturating_duration_since(now)` at freeze time.
+    #[test]
+    fn freeze_inhibitor_preserves_remaining_dwell() {
+        let mut sm = sm_with(vec![render_black_stage(60), off_stage()]);
+        drive_to_staged(&mut sm);
+
+        let freeze_tick = t(0);
+        let unfreeze_tick = t(10);
+
+        sm.step(Input::InhibitorChanged(true), freeze_tick);
+        assert!(
+            sm.stage_dwell_frozen_remaining.is_some(),
+            "freeze must set stage_dwell_frozen_remaining"
+        );
+
+        // With the bug: frozen_remaining = Some(Duration::ZERO).
+        // With the fix: frozen_remaining ≈ 60s.
+        let frozen_remaining = sm.stage_dwell_frozen_remaining;
+        assert!(
+            frozen_remaining.is_some_and(|r| r > Duration::from_secs(50)),
+            "frozen remaining must be > 50s (not 0), got {frozen_remaining:?} — \
+             BUG: freeze site captured remaining=0"
+        );
+
+        let fx = sm.step(Input::InhibitorChanged(false), unfreeze_tick);
+        assert!(!sm.stage_advance_frozen());
+
+        let rearm_tick =
+            get_schedule_stage_tick(&fx).expect("unfreeze must emit ScheduleStageTickAt");
+        let rearm_vs_unfreeze = rearm_tick.0.saturating_duration_since(unfreeze_tick.0);
+        assert!(
+            rearm_vs_unfreeze > Duration::from_secs(50),
+            "rearm must not fire immediately: rearm_vs_unfreeze={rearm_vs_unfreeze:?}, \
+             expected >50s — BUG: rearmed immediately"
+        );
+    }
+
+    /// Regression test for issue #203: the pause freeze site must also capture
+    /// the remaining dwell at freeze time.
+    #[test]
+    fn freeze_pause_preserves_remaining_dwell() {
+        let mut sm = sm_with(vec![render_black_stage(60), off_stage()]);
+        drive_to_staged(&mut sm);
+
+        let pause_tick = t(0);
+        let resume_tick = t(10);
+
+        sm.step(Input::Pause { until: None }, pause_tick);
+        assert!(
+            sm.stage_dwell_frozen_remaining.is_some(),
+            "pause must set stage_dwell_frozen_remaining"
+        );
+
+        let frozen_remaining = sm.stage_dwell_frozen_remaining;
+        assert!(
+            frozen_remaining.is_some_and(|r| r > Duration::from_secs(50)),
+            "frozen remaining must be > 50s (not 0), got {frozen_remaining:?} — \
+             BUG: freeze site captured remaining=0"
+        );
+
+        let fx = sm.step(Input::Resume, resume_tick);
+        assert!(!sm.stage_advance_frozen());
+
+        let rearm_tick =
+            get_schedule_stage_tick(&fx).expect("resume must emit ScheduleStageTickAt");
+        let rearm_vs_resume = rearm_tick.0.saturating_duration_since(resume_tick.0);
+        assert!(
+            rearm_vs_resume > Duration::from_secs(50),
+            "rearm must not fire immediately: rearm_vs_resume={rearm_vs_resume:?}, \
+             expected >50s — BUG: rearmed immediately"
+        );
     }
 
     #[test]

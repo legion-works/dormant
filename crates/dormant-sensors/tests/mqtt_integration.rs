@@ -75,6 +75,7 @@ async fn wait_for_subscribed(rx: &mut mpsc::UnboundedReceiver<MqttLifecycle>) {
         while let Some(lifecycle) = rx.recv().await {
             match lifecycle {
                 MqttLifecycle::Connected => connected = true,
+                MqttLifecycle::SubscribeQueued { .. } => {}
                 MqttLifecycle::Subscribed => {
                     assert!(connected, "Subscribed must follow ConnAck");
                     return;

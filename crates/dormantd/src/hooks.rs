@@ -956,12 +956,7 @@ async fn connect_with_backoff(
 /// Wrap [`dormant_core::mqtt::parse_broker_url`] into the
 /// `MqttPublishError::BrokerUrl` shape.
 fn parse_broker_url_or_err(url: &str) -> Result<(&str, u16), MqttPublishError> {
-    let (host, port) = parse_broker_url(url);
-    if host.is_empty() {
-        Err(MqttPublishError::BrokerUrl(url.to_string()))
-    } else {
-        Ok((host, port))
-    }
+    parse_broker_url(url).map_err(|e| MqttPublishError::BrokerUrl(format!("{url:?}: {e}")))
 }
 
 /// MQTT publish error surface — the runner converts to a `String`.

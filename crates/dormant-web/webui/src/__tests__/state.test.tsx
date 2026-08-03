@@ -87,9 +87,17 @@ vi.mock("../api/client", () => ({
   }),
 }));
 
-afterEach(() => {
+afterEach(async () => {
   cleanup();
   vi.clearAllMocks();
+  vi.restoreAllMocks();
+  // Reset getOperations so that mockReturnValue from an in-flight-HTTP test
+  // (which returns a never-resolving promise) does not bleed into the next test.
+  const { getOperations } = await import("../api/client");
+  vi.mocked(getOperations).mockResolvedValue({
+    exercise_in_flight: [],
+    emergency_wake_in_flight: false,
+  });
 });
 
 function SensorConsumer() {
@@ -269,8 +277,7 @@ describe("LiveStateProvider event-to-state patching", () => {
   });
 
   it("onConnect triggers state+config refetch", async () => {
-    const { getState } = await import("../api/client");
-    const { getConfig } = await import("../api/client");
+    const { getState, getConfig, getOperations } = await import("../api/client");
 
     render(
       <LiveStateProvider>
@@ -284,6 +291,7 @@ describe("LiveStateProvider event-to-state patching", () => {
 
     const stateCallsBefore = vi.mocked(getState).mock.calls.length;
     const configCallsBefore = vi.mocked(getConfig).mock.calls.length;
+    const opsCallsBefore = vi.mocked(getOperations).mock.calls.length;
 
     // Simulate a WS reconnect — should trigger a full refetch.
     act(() => {
@@ -294,6 +302,7 @@ describe("LiveStateProvider event-to-state patching", () => {
       expect(vi.mocked(getState).mock.calls.length).toBeGreaterThan(stateCallsBefore);
     });
     expect(vi.mocked(getConfig).mock.calls.length).toBeGreaterThan(configCallsBefore);
+    expect(vi.mocked(getOperations).mock.calls.length).toBeGreaterThan(opsCallsBefore);
   });
 });
 
@@ -656,4 +665,326 @@ describe("LiveStateProvider wake/blank failure events", () => {
     await new Promise((r) => setTimeout(r, 10));
     expect(screen.getByTestId("failure-d1")).toHaveTextContent("undef:undef");
   });
+});
+
+describe("LiveStateProvider ownership events", () => {
+  function ObservedInputConsumer() {
+    const { snapshot } = useLiveState();
+    if (!snapshot) return <span>loading</span>;
+    const code = snapshot.displays.find(([id]) => id === "d1")?.[1].observed_input_code;
+    return <span data-testid="observed-input">{String(code ?? "null")}</span>;
+  }
+
+  it("#200 explicit null observed_input_code clears the stored value (does not retain prior)", async () => {
+    const priorState: StateSnapshot = {
+      ...fixtures.state,
+      displays: [["d1", {
+        phase: "active",
+        inhibited: false,
+        paused: false,
+        cmd_gen: 1,
+        controllers: [],
+        owned: true,
+        observed_input_code: 0x10 as number | null,
+      }]] as StateSnapshot["displays"],
+    };
+    const { getState } = await import("../api/client");
+    vi.mocked(getState).mockResolvedValue(priorState);
+
+    render(
+      <LiveStateProvider>
+        <ObservedInputConsumer />
+      </LiveStateProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("observed-input")).toHaveTextContent("16");
+    });
+
+    // Send an ownership event where observed_input_code is explicitly null
+    // (input became unreadable) — the stored value MUST become null, NOT 0x10.
+    act(() => {
+      mocks.onMessage?.({
+        event: "ownership",
+        display: "d1",
+        owned: true,
+        observed_input_code: null,
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("observed-input")).toHaveTextContent("null");
+    });
+  });
+
+  it("#200 observed_input_code: undefined in event also clears (cannot occur on real wire — null is the wire unreadable value; this tests the defensive path)", async () => {
+    const priorState = {
+      ...fixtures.state,
+      displays: [["d1", {
+        phase: "active",
+        inhibited: false,
+        paused: false,
+        cmd_gen: 1,
+        controllers: [],
+        owned: true,
+        observed_input_code: 0x10 as number | null,
+      }]] as StateSnapshot["displays"],
+    };
+    const { getState } = await import("../api/client");
+    vi.mocked(getState).mockResolvedValue(priorState);
+
+    render(
+      <LiveStateProvider>
+        <ObservedInputConsumer />
+      </LiveStateProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("observed-input")).toHaveTextContent("16");
+    });
+
+    // Send observed_input_code: undefined (key IS present, value is undefined).
+    // This is distinct from absent (key not present) — the in check handles each correctly.
+    act(() => {
+      mocks.onMessage?.({
+        event: "ownership",
+        display: "d1",
+        owned: true,
+        observed_input_code: undefined,
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("observed-input")).toHaveTextContent("null");
+    });
+  });
+});
+
+// ── issue #184: operations_changed (push, not 1 Hz poll) ───────────────────
+
+describe("LiveStateProvider operations_changed event (issue #184)", () => {
+
+  it("operations_changed event drives operations state without polling", async () => {
+    function OperationsConsumer() {
+      const { operations } = useLiveState();
+      if (!operations) return <span>loading</span>;
+      return (
+        <div>
+          <span data-testid="ops-exercise">{operations.exercise_in_flight.join(",")}</span>
+          <span data-testid="ops-emergency">{String(operations.emergency_wake_in_flight)}</span>
+        </div>
+      );
+    }
+
+    render(
+      <LiveStateProvider>
+        <OperationsConsumer />
+      </LiveStateProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("ops-exercise")).toHaveTextContent("");
+    });
+    expect(screen.getByTestId("ops-emergency")).toHaveTextContent("false");
+
+    // Drive an exercise-in-flight event
+    act(() => {
+      mocks.onMessage?.({
+        event: "operations_changed",
+        exercise_in_flight: ["main"],
+        emergency_wake_in_flight: false,
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("ops-exercise")).toHaveTextContent("main");
+    });
+    expect(screen.getByTestId("ops-emergency")).toHaveTextContent("false");
+
+    // Drive an emergency-wake-in-flight event
+    act(() => {
+      mocks.onMessage?.({
+        event: "operations_changed",
+        exercise_in_flight: ["main"],
+        emergency_wake_in_flight: true,
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("ops-emergency")).toHaveTextContent("true");
+    });
+    expect(screen.getByTestId("ops-exercise")).toHaveTextContent("main");
+
+    // Drive completion (both cleared)
+    act(() => {
+      mocks.onMessage?.({
+        event: "operations_changed",
+        exercise_in_flight: [],
+        emergency_wake_in_flight: false,
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("ops-exercise")).toHaveTextContent("");
+    });
+    expect(screen.getByTestId("ops-emergency")).toHaveTextContent("false");
+  });
+
+  it("VACUITY GUARD: connected idle client makes zero 1s fetches over 5000ms of fake time", async () => {
+    // Uses fake timers so we can advance 5000ms without waiting real-time.
+    // FAILS on base (1Hz poll = 5 ticks in 5s) and PASSES on HEAD (no poll).
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { getState, getOperations } = await import("../api/client");
+      const getStateSpy = vi.mocked(getState);
+      const getOperationsSpy = vi.mocked(getOperations);
+
+      render(
+        <LiveStateProvider>
+          <SensorConsumer />
+        </LiveStateProvider>,
+      );
+
+      // Wait for initial load to complete
+      await waitFor(() => {
+        expect(screen.getByTestId("sensor-s1")).toHaveTextContent("absent");
+      });
+
+      const baselineStateCalls = getStateSpy.mock.calls.length;
+      const baselineOpsCalls = getOperationsSpy.mock.calls.length;
+
+      // Advance 5000ms of fake time — if the 1Hz poll is still active,
+      // that is 5 ticks and call counts grow. If gone (HEAD), they stay.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_000);
+      });
+
+      expect(getStateSpy.mock.calls.length).toBe(baselineStateCalls);
+      expect(getOperationsSpy.mock.calls.length).toBe(baselineOpsCalls);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("30s reconciliation timer fires and refetches state+operations", async () => {
+    // issue #184: replaces the removed 1Hz poll with a 30s reconciliation timer.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { getState, getOperations } = await import("../api/client");
+      const getStateSpy = vi.mocked(getState);
+      const getOperationsSpy = vi.mocked(getOperations);
+
+      render(
+        <LiveStateProvider>
+          <SensorConsumer />
+        </LiveStateProvider>,
+      );
+
+      await waitFor(() => {
+        expect(screen.getByTestId("sensor-s1")).toHaveTextContent("absent");
+      });
+
+      const preState = getStateSpy.mock.calls.length;
+      const preOps = getOperationsSpy.mock.calls.length;
+
+      // Advance past the 30s reconciliation tick and flush all pending async work.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_001);
+      });
+
+      // reconciliation fires refresh() which calls getState + getOperations
+      expect(getStateSpy.mock.calls.length).toBeGreaterThan(preState);
+      expect(getOperationsSpy.mock.calls.length).toBeGreaterThan(preOps);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("onConnect (reconnect) refetches state+operations", async () => {
+    // issue #184: onConnect drives reconciliation refresh which hits both endpoints.
+    const { getState, getOperations } = await import("../api/client");
+    const getStateSpy = vi.mocked(getState);
+    const getOperationsSpy = vi.mocked(getOperations);
+
+    render(
+      <LiveStateProvider>
+        <SensorConsumer />
+      </LiveStateProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("sensor-s1")).toHaveTextContent("absent");
+    });
+
+    const preState = getStateSpy.mock.calls.length;
+    const preOps = getOperationsSpy.mock.calls.length;
+
+    act(() => {
+      mocks.onConnect?.();
+    });
+
+    await waitFor(() => {
+      expect(getStateSpy.mock.calls.length).toBeGreaterThan(preState);
+    });
+    expect(getOperationsSpy.mock.calls.length).toBeGreaterThan(preOps);
+  });
+
+  it("operations_changed event applies even when operations HTTP request is in flight", async () => {
+    // issue #184: WS frame must win over an in-flight stale HTTP response.
+    // Uses a deferred promise to simulate an HTTP request that hasn't resolved yet.
+    let resolveOps: (v: { exercise_in_flight: string[]; emergency_wake_in_flight: boolean }) => void;
+    const pendingOps = new Promise<{ exercise_in_flight: string[]; emergency_wake_in_flight: boolean }>(
+      (r) => {
+        resolveOps = r;
+      },
+    );
+    const { getOperations } = await import("../api/client");
+    vi.mocked(getOperations).mockReturnValue(pendingOps);
+
+    function OperationsConsumer() {
+      const { operations } = useLiveState();
+      return (
+        <div>
+          <span data-testid="ops-ex">{operations?.exercise_in_flight.join(",") ?? "null"}</span>
+          <span data-testid="ops-em">{String(operations?.emergency_wake_in_flight ?? "null")}</span>
+        </div>
+      );
+    }
+
+    render(
+      <LiveStateProvider>
+        <OperationsConsumer />
+      </LiveStateProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("ops-ex")).toHaveTextContent("null");
+    });
+
+    // Deliver WS event while HTTP request is still pending — WS must win.
+    act(() => {
+      mocks.onMessage?.({
+        event: "operations_changed",
+        exercise_in_flight: ["studio"],
+        emergency_wake_in_flight: true,
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("ops-ex")).toHaveTextContent("studio");
+    });
+    expect(screen.getByTestId("ops-em")).toHaveTextContent("true");
+
+    // HTTP finally resolves with stale idle data — must NOT clobber the WS update.
+    // The shared seq counter ensures WS commit (seq=N+1) dominates HTTP (seq=N).
+    act(() => {
+      resolveOps!({ exercise_in_flight: [], emergency_wake_in_flight: false });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("ops-ex")).toHaveTextContent("studio");
+    });
+    expect(screen.getByTestId("ops-em")).toHaveTextContent("true");
+  });
+
 });

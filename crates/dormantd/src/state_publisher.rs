@@ -623,16 +623,28 @@ pub mod mqtt_transport {
         ///
         /// Public-only so a test can assert credential handling without
         /// having to wrestle a `Box<dyn PublisherTransport>` for the
-        /// answer.
-        #[must_use]
-        pub fn build_options(url: &str, creds: &Credentials, client_id: &str) -> MqttOptions {
-            let (host, port) = parse_broker_url(url);
+        /// answer. A malformed URL surfaces as `Err(String)` so the
+        /// transport can fail fast at startup instead of pointing the
+        /// client at a garbage host.
+        ///
+        /// # Errors
+        ///
+        /// Returns the parse error wrapped in a `String` when `url` is
+        /// not a valid MQTT broker URL (empty host or malformed port —
+        /// see [`dormant_core::mqtt::parse_broker_url`]).
+        pub fn build_options(
+            url: &str,
+            creds: &Credentials,
+            client_id: &str,
+        ) -> Result<MqttOptions, String> {
+            let (host, port) =
+                parse_broker_url(url).map_err(|e| format!("invalid broker_url {url:?}: {e}"))?;
             let mut opts = MqttOptions::new(client_id, host.to_string(), port);
             opts.set_clean_session(true);
             if let Some(cred) = creds.mqtt.get(url) {
                 opts.set_credentials(cred.username.clone(), cred.password.clone());
             }
-            opts
+            Ok(opts)
         }
 
         /// Apply the daemon's publish-credential conventions and return
@@ -647,13 +659,26 @@ pub mod mqtt_transport {
         /// Credentials are looked up by EXACT `broker_url` (the
         /// contract docs say "credential lookup is by exact
         /// `broker_url`").
-        #[must_use]
-        pub fn options_for_test(url: &str, creds: &Credentials, client_id: &str) -> String {
+        ///
+        /// Returns `Err(detail)` on a malformed broker URL — callers
+        /// should surface that as a test failure rather than mishandling
+        /// it silently.
+        ///
+        /// # Errors
+        ///
+        /// Returns the parse error wrapped in a `String` when `url` is
+        /// not a valid MQTT broker URL.
+        pub fn options_for_test(
+            url: &str,
+            creds: &Credentials,
+            client_id: &str,
+        ) -> Result<String, String> {
             let user = creds
                 .mqtt
                 .get(url)
                 .map_or("<none>", |c| c.username.as_str());
-            let (host, port) = parse_broker_url(url);
+            let (host, port) =
+                parse_broker_url(url).map_err(|e| format!("invalid broker_url {url:?}: {e}"))?;
             // `parse_broker_url` returns the host (possibly
             // userinfo-laden, e.g. `dormant:publish-secret-PWD@h`) or a
             // bracketed IPv6 literal — for any of those, only the bare
@@ -663,10 +688,10 @@ pub mod mqtt_transport {
                 Some((_, after)) => after,
                 None => host,
             };
-            format!(
+            Ok(format!(
                 "client_id={client_id:?} broker={broker_host}:{port} user={user:?} password_present={}",
                 creds.mqtt.get(url).is_some()
-            )
+            ))
         }
 
         /// Return the HA birth topic the transport subscribes to after
@@ -696,7 +721,12 @@ pub mod mqtt_transport {
             'connect_loop: loop {
                 // Build a fresh MqttOptions per attempt so the LWT
                 // stays bound; the LWT is held by the AsyncClient.
-                let (host, port) = parse_broker_url(&self.broker_url);
+                let (host, port) = match parse_broker_url(&self.broker_url) {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        return Err(format!("invalid broker_url {:?}: {e}", self.broker_url));
+                    }
+                };
                 let mut opts = MqttOptions::new(self.client_id.clone(), host.to_string(), port);
                 if let Some(cred) = self.credentials.mqtt.get(&self.broker_url) {
                     opts.set_credentials(cred.username.clone(), cred.password.clone());
@@ -1494,6 +1524,7 @@ pub fn event_records(cfg: &Config, event: &DaemonEvent, instance: &str) -> Vec<P
         // already have their own diagnostic surfaces.
         DaemonEvent::Subscribed
         | DaemonEvent::ConfigReloaded
+        | DaemonEvent::OperationsChanged { .. }
         | DaemonEvent::WakeRetry { .. }
         | DaemonEvent::WearSnapshot { .. }
         | DaemonEvent::WearSamplingStarted
@@ -3215,7 +3246,8 @@ mod async_tests {
             url,
             &creds,
             "dormant-publisher-office-pc-test",
-        );
+        )
+        .expect("valid URL must parse");
         // Sanity: client id is present in the redacted summary.
         assert!(
             opts.contains("dormant-publisher-office-pc-test"),
@@ -3251,7 +3283,8 @@ mod async_tests {
             userinfo_url,
             &creds_with_userinfo,
             "dormant-publisher-userinfo-test",
-        );
+        )
+        .expect("valid URL must parse");
         let userinfo_debug = format!("{userinfo_opts:?}");
         assert!(
             !userinfo_debug.contains("publish-secret-PWD"),

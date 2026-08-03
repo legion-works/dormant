@@ -51,6 +51,10 @@ pub struct ActivityFollowDeps {
     /// Test seam: when set, the loop sends each `DisplayId` here after the
     /// `arm_after` window instead of calling `DirectSwitchHandle::pull`.
     pub pull_recorder: Option<tokio::sync::mpsc::UnboundedSender<DisplayId>>,
+    /// Test seam (issue #196): when set, the loop sends `()` here when
+    /// it returns, so a test can assert the prior generation's task
+    /// has actually terminated (not merely "is currently idle").
+    pub on_terminated: Option<tokio::sync::mpsc::UnboundedSender<()>>,
     /// Replaceable monotonic clock — delegates to
     /// `tokio::time::Instant::now().into_std()` so paused-time tests can
     /// control the timeline via `advance()`.
@@ -129,6 +133,11 @@ async fn activity_follow_loop(deps: ActivityFollowDeps, mut filtered_rx: Filtere
     // has elapsed. The cooldown is enforced inside DirectSwitchHandle::pull
     // (SwitchReason::Activity path) — no private second clock.
     let mut edge_time: Option<Instant> = None;
+    // Drop guard: fires `on_terminated` (test seam, issue #196) on every
+    // exit path — top-of-loop cancel, channel close, biased commit-arm
+    // cancel. A single sink means a test can assert the OLD task's
+    // handle has actually terminated, not merely "is currently idle".
+    let _on_terminated_guard = on_terminated_guard(deps.on_terminated.clone());
 
     loop {
         let (observation, filtered, update) = tokio::select! {
@@ -154,6 +163,20 @@ async fn activity_follow_loop(deps: ActivityFollowDeps, mut filtered_rx: Filtere
             }
         };
 
+        // Pre-dispatch cancel check (issue #196): the top-of-loop
+        // `select!` is NOT biased, so when both `cancel` and
+        // `filtered_rx.changed()` are ready (e.g. a reload has just
+        // called `slot.cancel.cancel()` while the filtered source is
+        // emitting edges), it picks one at random. If it picked the
+        // `filtered_rx` branch, this check observes the already-set
+        // cancel and returns before `detect_activity_edge` /
+        // `recorder.send` can fire. The in-loop biased `select!`
+        // around the commit effect covers the complementary race
+        // (cancel that lands while the commit future is being polled).
+        if deps.cancel.is_cancelled() {
+            return;
+        }
+
         let edge = detect_activity_edge(
             update,
             &observation,
@@ -170,19 +193,56 @@ async fn activity_follow_loop(deps: ActivityFollowDeps, mut filtered_rx: Filtere
         if let Some(et) = edge_time
             && et + deps.arm_after <= (deps.clock)()
         {
-            if let Some(recorder) = &deps.pull_recorder {
-                for display_id in &*deps.display_ids {
-                    let _ = recorder.send(display_id.clone());
+            // Wrap the pull effect in a `tokio::select!` biased toward
+            // `deps.cancel` so a cancellation that lands while the
+            // current generation is being reaped (reload in progress,
+            // shutdown in progress) can short-circuit the commit before
+            // any recorder write or `DirectSwitchHandle::pull` `.await`.
+            // The top-of-loop `select!` only re-checks cancellation at
+            // the next wake — a mid-iteration pull would otherwise
+            // escape, producing the exact stale-pull leak this loop is
+            // here to prevent (issue #196).
+            let commit_arm = async {
+                if let Some(recorder) = &deps.pull_recorder {
+                    for display_id in &*deps.display_ids {
+                        let _ = recorder.send(display_id.clone());
+                    }
+                } else if let Some(ref direct_switch) = deps.direct_switch {
+                    for display_id in &*deps.display_ids {
+                        let _ = direct_switch
+                            .pull(display_id.clone(), SwitchReason::Activity)
+                            .await;
+                    }
                 }
-            } else if let Some(ref direct_switch) = deps.direct_switch {
-                for display_id in &*deps.display_ids {
-                    let _ = direct_switch
-                        .pull(display_id.clone(), SwitchReason::Activity)
-                        .await;
-                }
+            };
+            tokio::select! {
+                biased;
+                () = deps.cancel.cancelled() => return,
+                () = commit_arm => {}
+            }
+            if deps.cancel.is_cancelled() {
+                return;
             }
             edge_time = None;
         }
+    }
+}
+
+/// Drop guard that fires `on_terminated` (test seam, issue #196) exactly
+/// once when the loop returns — top-of-loop cancel, channel close, biased
+/// commit-arm cancel. Lets a test assert the OLD task's handle has
+/// actually terminated, not merely "is currently idle."
+fn on_terminated_guard(
+    tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+) -> Option<OnTerminatedGuard> {
+    tx.map(OnTerminatedGuard)
+}
+
+struct OnTerminatedGuard(tokio::sync::mpsc::UnboundedSender<()>);
+
+impl Drop for OnTerminatedGuard {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
     }
 }
 
@@ -459,6 +519,7 @@ mod tests {
             arm_after,
             cancel,
             pull_recorder: Some(pull_recorder),
+            on_terminated: None,
             clock: production_clock,
         };
         spawn(deps, filtered_rx)

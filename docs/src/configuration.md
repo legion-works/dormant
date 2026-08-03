@@ -497,16 +497,36 @@ See [Panel-wear tracking](./oled-health.md) for ledger location and limits.
 
 ### `[wear.active_sampling]` — compositor sampling
 
-Active sampling is opt-in (`enabled = false`) and applies to one configured
-display on Linux/KDE Wayland. It uses the `wear.sample_interval` cadence
-(default `60s`); there is no separate frame cadence. See [Active wear
+Active sampling is opt-in (`enabled = false`) and applies to one or more
+configured displays on Linux/KDE Wayland. It uses the `wear.sample_interval`
+cadence (default `60s`); there is no separate frame cadence. See [Active wear
 sampling](./active-wear-sampling.md) for consent, revocation, fallback, and
 single-frame semantics.
+
+`config_version = 1` accepts either `sampled_display` (legacy singular) or
+`sampled_displays` (canonical plural). Supplying both keys is a parse error
+so the operator's intent is unambiguous. Each id in the plural list must be
+distinct and must not collide after the on-disk name is sanitized
+(`[a-z0-9._-]`, 64 chars max) — the daemon writes per-display consent
+records to `screencast-consent-<sanitized>.json`.
+
+Each id in `sampled_displays` drives an independent sampler with its own
+ScreenCast consent record, PipeWire stream, and lifecycle status. Consent
+records are per-display files named `screencast-consent-<sanitized>.json`. On
+the first boot after upgrading from a singular `sampled_display` config, the
+legacy `screencast-consent.json` is copied to the per-display record for that
+display; after that one-way copy the per-display file is authoritative and the
+legacy file is never read again. `dormantctl wear enable-sampling` and
+`disable-sampling` take `--display <id>` to pick a sampler; the flag is
+required when more than one display is selected and optional when exactly one
+is. See [Active wear sampling](./active-wear-sampling.md) for the per-display
+CLI, HTTP, doctor, and web UI surface.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `enabled` | boolean | `false` | Enable the explicit ScreenCast consent flow |
-| `sampled_display` | string | unset | One configured wear-tracked display; required when enabled |
+| `sampled_display` | string | unset | Legacy singular form; one configured wear-tracked display, required when enabled and the plural list is absent |
+| `sampled_displays` | string list | unset | Canonical plural form; configured wear-tracked displays, required when enabled and the singular form is absent |
 | `stream_mode` | string | `"warm"` | Paused stream lifecycle: `"warm"` or `"per-tick"` |
 | `capture_timeout` | duration | `"2s"` | Capture budget; `1s`–`30s`, and at most half the sample interval |
 | `failure_threshold` | integer | `5` | Consecutive capture failures before circuit open |

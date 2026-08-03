@@ -219,6 +219,31 @@ export function postWearSamplingDisable(forget: boolean): Promise<WearSamplingSt
   return postWearSampling("/wear/sampling/disable", { forget });
 }
 
+// ── Issue #185 cycle B — per-display wear-sampling API ────────────────────────
+
+/** GET /api/wear/sampling?display=<id> — poll per-display daemon consent status. */
+export function getWearSamplingStatusFor(display: string): Promise<WearSamplingStatus> {
+  return request<WearSamplingStatus>(
+    `/wear/sampling?display=${encodeURIComponent(display)}`,
+  );
+}
+
+/** POST /api/wear/sampling/enable?display=<id> — start per-display portal flow. */
+export function postWearSamplingEnableFor(display: string): Promise<WearSamplingStatus> {
+  return postWearSampling(`/wear/sampling/enable?display=${encodeURIComponent(display)}`);
+}
+
+/** POST /api/wear/sampling/disable?display=<id> — close per-display sampling. */
+export function postWearSamplingDisableFor(
+  display: string,
+  forget: boolean,
+): Promise<WearSamplingStatus> {
+  return postWearSampling(
+    `/wear/sampling/disable?display=${encodeURIComponent(display)}`,
+    { forget },
+  );
+}
+
 async function postWearSampling(path: string, body?: unknown): Promise<WearSamplingStatus> {
   const res = await fetch(BASE + path, {
     method: "POST",
@@ -291,6 +316,16 @@ export function postStarNudgeStar(): Promise<{ starred: boolean }> {
 /** POST /api/star-nudge/dismiss — dismiss the "Star the repo" sidebar nudge permanently. */
 export function postStarNudgeDismiss(): Promise<void> {
   return request<void>("/star-nudge/dismiss", {
+    method: "POST",
+    headers: JSON_CT,
+  });
+}
+
+/** POST /api/wear/sampling/nudge/dismiss — dismiss the wear-card active-sampling
+ *  onboarding nudge permanently (issue #186). The flag file lives in the
+ *  config directory beside the star-nudge flag; persistence is symmetric. */
+export function postWearSamplingNudgeDismiss(): Promise<void> {
+  return request<void>("/wear/sampling/nudge/dismiss", {
     method: "POST",
     headers: JSON_CT,
   });

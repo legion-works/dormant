@@ -138,6 +138,28 @@ pub enum IpcRequest {
         /// Delete the stored consent record after closing the session.
         forget: bool,
     },
+    /// Start the explicit active-sampling consent flow for one display.
+    /// Additive tag, wire-compatible with the unit `WearSamplingEnable`.
+    WearSamplingEnableFor {
+        /// Configured display id; must match a `[displays.<id>]` key.
+        display: String,
+    },
+    /// Fetch the current active-sampling consent-flow status for one
+    /// display. Additive tag, wire-compatible with the unit
+    /// `WearSamplingStatus`.
+    WearSamplingStatusFor {
+        /// Configured display id; must match a `[displays.<id>]` key.
+        display: String,
+    },
+    /// Disable active sampling for one display, optionally forgetting its
+    /// consent record. Additive tag, wire-compatible with the unit
+    /// `WearSamplingDisable`.
+    WearSamplingDisableFor {
+        /// Configured display id; must match a `[displays.<id>]` key.
+        display: String,
+        /// Delete the stored consent record after closing the session.
+        forget: bool,
+    },
 }
 
 /// Structured status returned by active-sampling IPC requests.
@@ -155,6 +177,23 @@ pub enum WearSamplingStatus {
     /// The flow failed with a stable reason.
     Error(String),
 }
+
+/// Per-display redacted status entry for the multi-display aggregate.
+///
+/// Token-free by construction; the wire shape carries only the lifecycle
+/// state and a stable reason for uniform attribution while degraded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WearSamplingStatusMapEntry {
+    /// Current sampler lifecycle state for this display.
+    pub state: crate::wear::WearSamplingState,
+    /// Stable reason for uniform attribution while sampling is degraded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uniform_reason: Option<String>,
+}
+
+/// Per-display sampler status keyed by configured display id. Serialized
+/// in display-id order (`BTreeMap`) so consumers can iterate predictably.
+pub type WearSamplingStatusMap = std::collections::BTreeMap<String, WearSamplingStatusMapEntry>;
 
 // ── IpcResponse ───────────────────────────────────────────────────────────────
 
@@ -188,6 +227,11 @@ pub struct IpcResponse {
     /// Redacted lifecycle status for active wear sampling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wear_sampling_status: Option<WearSamplingLifecycleStatus>,
+    /// Per-display redacted status for the multi-display aggregate.
+    /// `BTreeMap<String, …>` keeps display ids sorted on the wire so
+    /// consumers can iterate without re-sorting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wear_sampling_statuses: Option<WearSamplingStatusMap>,
 }
 
 impl IpcResponse {
@@ -203,6 +247,7 @@ impl IpcResponse {
             exercise_report: None,
             wear_sampling: None,
             wear_sampling_status: None,
+            wear_sampling_statuses: None,
         }
     }
 
@@ -218,6 +263,7 @@ impl IpcResponse {
             exercise_report: None,
             wear_sampling: None,
             wear_sampling_status: None,
+            wear_sampling_statuses: None,
         }
     }
 
@@ -233,6 +279,7 @@ impl IpcResponse {
             exercise_report: None,
             wear_sampling: None,
             wear_sampling_status: None,
+            wear_sampling_statuses: None,
         }
     }
 
@@ -248,6 +295,7 @@ impl IpcResponse {
             exercise_report: None,
             wear_sampling: None,
             wear_sampling_status: None,
+            wear_sampling_statuses: None,
         }
     }
 
@@ -263,6 +311,7 @@ impl IpcResponse {
             exercise_report: Some(report),
             wear_sampling: None,
             wear_sampling_status: None,
+            wear_sampling_statuses: None,
         }
     }
 
@@ -278,6 +327,7 @@ impl IpcResponse {
             exercise_report: None,
             wear_sampling: Some(status),
             wear_sampling_status: None,
+            wear_sampling_statuses: None,
         }
     }
 }
@@ -288,6 +338,8 @@ impl IpcResponse {
 mod tests {
     use super::*;
     use crate::types::DisplayId;
+    use crate::wear::WearSamplingState;
+    use std::collections::BTreeMap;
 
     // ── IpcRequest serde round-trips ───────────────────────────────────────
 
@@ -786,6 +838,95 @@ mod tests {
                 serde_json::from_str(&serde_json::to_string(&response).unwrap()).unwrap();
             assert_eq!(back.wear_sampling, Some(status));
         }
+    }
+
+    #[test]
+    fn wear_sampling_per_display_requests_round_trip() {
+        // The per-display wire tags are additive. They must round-trip
+        // through JSON so old CLIs (unit variants) and new ones (For
+        // variants) are both valid on either side of the upgrade.
+        for request in [
+            IpcRequest::WearSamplingEnableFor {
+                display: "desk".to_owned(),
+            },
+            IpcRequest::WearSamplingStatusFor {
+                display: "desk".to_owned(),
+            },
+            IpcRequest::WearSamplingDisableFor {
+                display: "desk".to_owned(),
+                forget: false,
+            },
+            IpcRequest::WearSamplingDisableFor {
+                display: "tv".to_owned(),
+                forget: true,
+            },
+        ] {
+            let json = serde_json::to_string(&request).unwrap();
+            assert!(
+                json.contains("\"display\":\"desk\"") || json.contains("\"display\":\"tv\""),
+                "per-display wire must carry the display field, got: {json}"
+            );
+            let back: IpcRequest = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, request);
+        }
+    }
+
+    #[test]
+    fn wear_sampling_aggregate_status_keeps_display_keyed_order() {
+        // Aggregate status must serialize as a BTreeMap keyed by display
+        // id, so consumers can rely on a sorted iteration when the daemon
+        // reports multiple samplers.
+        let mut map = BTreeMap::new();
+        map.insert(
+            "tv".to_owned(),
+            WearSamplingStatusMapEntry {
+                state: WearSamplingState::Streaming,
+                uniform_reason: None,
+            },
+        );
+        map.insert(
+            "desk".to_owned(),
+            WearSamplingStatusMapEntry {
+                state: WearSamplingState::NeedsConsent,
+                uniform_reason: Some("wear_sampling_no_consent".to_owned()),
+            },
+        );
+        let json = serde_json::to_string(&map).unwrap();
+        let desk_pos = json.find("\"desk\"").unwrap();
+        let tv_pos = json.find("\"tv\"").unwrap();
+        assert!(
+            desk_pos < tv_pos,
+            "BTreeMap must serialize desk before tv, got: {json}"
+        );
+    }
+
+    #[test]
+    fn wear_sampling_old_unit_variants_still_deserialize() {
+        // The IPC alias strategy: the EXISTING unit variants keep their
+        // wire tags unchanged so old clients against new daemons (and
+        // vice versa for the new For variants) keep working with one
+        // selected display. The wire tag is `req` (lowercased variant),
+        // and the per-display additive For variants sit alongside them
+        // without disturbing the existing unit frame shape.
+        let old_enable = r#"{"req":"wear_sampling_enable"}"#;
+        let back: IpcRequest = serde_json::from_str(old_enable).unwrap();
+        assert!(matches!(back, IpcRequest::WearSamplingEnable));
+        let old_status = r#"{"req":"wear_sampling_status"}"#;
+        let back: IpcRequest = serde_json::from_str(old_status).unwrap();
+        assert!(matches!(back, IpcRequest::WearSamplingStatus));
+        let old_disable = r#"{"req":"wear_sampling_disable","forget":true}"#;
+        let back: IpcRequest = serde_json::from_str(old_disable).unwrap();
+        assert!(matches!(
+            back,
+            IpcRequest::WearSamplingDisable { forget: true }
+        ));
+        // The new per-display variants coexist on the same wire tag.
+        let new_enable = r#"{"req":"wear_sampling_enable_for","display":"desk"}"#;
+        let back: IpcRequest = serde_json::from_str(new_enable).unwrap();
+        assert!(matches!(
+            back,
+            IpcRequest::WearSamplingEnableFor { ref display } if display == "desk"
+        ));
     }
 
     #[test]

@@ -63,7 +63,7 @@ pub enum DoctorOutcome {
 // ── CLI ─────────────────────────────────────────────────────────────────────────
 
 /// Diagnose hardware and connectivity.
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 pub struct DoctorArgs {
     /// Path to the config file.
     #[arg(long)]
@@ -104,7 +104,7 @@ pub struct DoctorArgs {
     pub subcommand: Option<DoctorSubcommand>,
 }
 
-#[derive(clap::Subcommand, Debug)]
+#[derive(clap::Subcommand, Debug, Clone)]
 pub enum DoctorSubcommand {
     /// Probe DDC/CI displays.
     Ddcci,
@@ -203,6 +203,14 @@ async fn run_async(args: &DoctorArgs) -> Result<DoctorOutcome> {
         return run_draft(args).await;
     }
 
+    // Bare doctor (no subcommand, no draft flag) routes through the live
+    // daemon when reachable — see `run_bare_with_socket` for the contract.
+    // This branch is hit only for explicit subcommands; the dispatch in
+    // `main.rs` takes the bare path before reaching here.
+    if args.subcommand.is_none() && args.report_issue.is_none() && args.draft_feature.is_none() {
+        unreachable!("bare doctor is dispatched by main.rs with the resolved socket path")
+    }
+
     match &args.subcommand {
         Some(DoctorSubcommand::Ddcci) => {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -282,16 +290,163 @@ async fn run_async(args: &DoctorArgs) -> Result<DoctorOutcome> {
             unreachable!("doctor exercise is dispatched by main.rs with the resolved socket path")
         }
         None => {
-            // Bare doctor: delegate to the single-source orchestration.
-            let (cfg, creds, note) = load_config_and_creds(args)?;
+            // Bare doctor is dispatched by `main.rs` with the resolved
+            // socket path (see [`run_bare_with_socket`]). The bare
+            // route is structurally different from the explicit
+            // subcommands — it consults the live daemon's owned-state
+            // snapshot via IPC first and only opens the cold offline
+            // probe set on a connection failure — so it can't share
+            // the entry point. Any path that reaches here means the
+            // parser was wired up wrong.
+            unreachable!("bare doctor is dispatched by main.rs with the resolved socket path")
+        }
+    }
+}
+
+// ── Bare doctor (live daemon first, offline fallback) ────────────────────────────
+//
+// Issue #202: bare `dormantctl doctor` previously opened the configured USB
+// serial port directly, stealing frames from the live sensor that the daemon
+// already owns. The fix routes bare doctor through IPC (`IpcRequest::Doctor`)
+// and only opens the cold offline probe set when the daemon is unreachable.
+
+/// Test-only seam: incremented every time the bare doctor enters the offline
+/// fallback. Asserting `0` after a reachable-daemon test is the red-green
+/// evidence that the live path is actually being taken (not just the
+/// unreachable-daemon fallback). Mirrors the `probe_usb` contract spelled
+/// out in the Task 12 plan.
+#[cfg(test)]
+pub(crate) static BARE_DOCTOR_OFFLINE_INVOCATIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub fn run_bare_with_socket(args: &DoctorArgs, socket_path: &Path) -> Result<DoctorOutcome> {
+    // 1. Try the live daemon. A `Doctor` request goes to the
+    //    `DoctorService` which reports owned USB / DDC / etc from the
+    //    live `StateSnapshot` (never re-opens the port).
+    //
+    //    Issue #202 makes the connect/post-connect distinction
+    //    load-bearing: the cold offline probe set is only safe to run
+    //    on a CONNECT failure (the daemon is not up, the serial port
+    //    is not held by anyone). A post-connect failure means the
+    //    daemon IS up and likely owns the port — reopening for the
+    //    cold probe set re-introduces the #202 frame-steal.
+    match client::send_request_typed(socket_path, &IpcRequest::Doctor) {
+        client::IpcSendOutcome::Ok(resp) if resp.ok => match &resp.doctor_report {
+            Some(report) => {
+                let results = doctor_report_to_probe_results(report);
+                print_table(&results);
+                return Ok(outcome(&results));
+            }
+            None => {
+                // `ok: true` with no report is a wire-shape bug on the
+                // daemon side. Fall through to the offline fallback so
+                // the operator still gets a report rather than a hard
+                // failure.
+                eprintln!("note: daemon returned ok but no doctor_report; falling back to offline");
+            }
+        },
+        client::IpcSendOutcome::Ok(resp) => {
+            // Daemon reachable, but it rejected the request. Respect the
+            // verdict — do NOT reopen the port.
+            eprintln!(
+                "error: doctor failed: {}",
+                resp.error.as_deref().unwrap_or("unknown")
+            );
+            return Ok(DoctorOutcome::SomeFailed);
+        }
+        client::IpcSendOutcome::ConnectFailed(_) => {
+            // Only case the plan permits the cold probe set to run in.
+        }
+        client::IpcSendOutcome::PostConnectError(e) => {
+            // Daemon accepted the connection then dropped / garbled the
+            // response. The daemon is reachable (and likely owns the
+            // port); re-opening for the cold probe set would re-create
+            // #202. Respect the daemon's reachability.
+            eprintln!(
+                "error: doctor failed after connecting to daemon: {e:#} \
+                 (not falling back to offline — the daemon is reachable \
+                  and likely owns the sensor)"
+            );
+            return Ok(DoctorOutcome::SomeFailed);
+        }
+    }
+
+    run_bare_offline(args)
+}
+
+fn run_bare_offline(args: &DoctorArgs) -> Result<DoctorOutcome> {
+    #[cfg(test)]
+    {
+        BARE_DOCTOR_OFFLINE_INVOCATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    // Clone the args so the future owns its inputs (the future may be
+    // moved to a worker thread when the caller is inside an existing
+    // tokio runtime).
+    let args_owned: DoctorArgs = args.clone();
+    if tokio::runtime::Handle::try_current().is_ok() {
+        // Caller is in a runtime — offload to a dedicated `std::thread`
+        // with its own current-thread runtime to avoid re-entering the
+        // caller's runtime.  The closure captures only `args_owned`
+        // (Send + 'static); the non-Send `probe_all_offline` future
+        // is constructed inside `rt.block_on(...)` and never crosses
+        // the thread boundary, so safe `std::thread::Builder::spawn`
+        // is enough.
+        let join = std::thread::Builder::new()
+            .spawn(move || -> Result<DoctorOutcome> {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                rt.block_on(async move {
+                    let (cfg, creds, note) = load_config_and_creds(&args_owned)?;
+                    if let Some(n) = &note {
+                        println!("{n}");
+                    }
+                    let results = dormant_doctor::probe_all_offline(&cfg, &creds).await;
+                    print_table(&results);
+                    Ok(outcome(&results))
+                })
+            })
+            .map_err(|e| anyhow::anyhow!("spawn bare-offline worker: {e}"))?;
+        join.join()
+            .map_err(|e| anyhow::anyhow!("bare-offline worker thread panicked: {e:?}"))?
+    } else {
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(async move {
+            let (cfg, creds, note) = load_config_and_creds(&args_owned)?;
             if let Some(n) = &note {
                 println!("{n}");
             }
             let results = dormant_doctor::probe_all_offline(&cfg, &creds).await;
             print_table(&results);
             Ok(outcome(&results))
-        }
+        })
     }
+}
+
+/// Map a wire `DoctorReport` back to the same `ProbeResult` shape the offline
+/// path produces so `print_table` / `outcome` stay the single source of
+/// truth for rendering. The mapping is the inverse of
+/// `dormant_doctor::to_report`; the names + details + category + subject
+/// fields are preserved verbatim so the rendered table is byte-for-byte
+/// equivalent to the offline path's output (no divergent shape).
+fn doctor_report_to_probe_results(report: &dormant_core::doctor::DoctorReport) -> Vec<ProbeResult> {
+    use dormant_core::doctor::CheckStatus;
+    report
+        .checks
+        .iter()
+        .map(|c| ProbeResult {
+            name: c.name.clone(),
+            status: match c.status {
+                CheckStatus::Ok => ProbeStatus::Pass,
+                CheckStatus::Fail => ProbeStatus::Fail,
+                CheckStatus::Skip => ProbeStatus::Skip,
+                CheckStatus::NotSupported => ProbeStatus::NotSupported,
+            },
+            detail: c.detail.clone().unwrap_or_default(),
+            category: c.category.clone(),
+            subject: c.subject.clone(),
+        })
+        .collect()
 }
 
 // ── Doctor-assisted issue drafting ────────────────────────────────────────────────
@@ -1458,5 +1613,321 @@ mod tests {
             new_way,
             "new way: config passed, so config_ok must be true regardless of other probe failures"
         );
+    }
+
+    // ── #202: bare doctor routes through the live daemon when reachable ───
+
+    /// Captures the wire request seen by the fake daemon and replies
+    /// with a canned `Doctor` response. The daemon runs on a dedicated
+    /// `std::thread` whose wait loop is event-driven: each iteration
+    /// blocks on `recv_timeout` for the stop channel (kernel parks
+    /// the thread until the timeout elapses or a stop signal
+    /// arrives), then probes `accept` once on a non-blocking listener.
+    /// No sleep, no busy-wait.
+    ///
+    /// The test synchronises by calling `run_bare_with_socket` and
+    /// then reading the captured `Vec`: by the time the client has
+    /// read the daemon's reply, the request is already appended
+    /// (single-threaded push happens-before the daemon writes the
+    /// reply), so no separate "done" signal is needed.
+    ///
+    /// Returns `(captured, stop_tx, join)`. Send `stop_tx` to ask the
+    /// daemon to exit, then `join` to confirm clean shutdown.
+    fn spawn_one_shot_doctor_daemon(
+        socket_path: &Path,
+        reply_report: dormant_core::doctor::DoctorReport,
+    ) -> (
+        std::sync::Arc<std::sync::Mutex<Vec<IpcRequest>>>,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::io::{BufRead, Write};
+        use std::os::unix::net::UnixListener;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let _ = std::fs::remove_file(socket_path);
+        let listener = UnixListener::bind(socket_path).expect("bind fake socket");
+        // Non-blocking so `accept` returns WouldBlock when no client
+        // is waiting — combined with `recv_timeout` on the stop
+        // channel, this gives us an event-driven wait on both the
+        // listener fd and the stop signal with no sleep, no busy-wait.
+        listener
+            .set_nonblocking(true)
+            .expect("set listener non-blocking");
+        let captured: Arc<Mutex<Vec<IpcRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = Arc::clone(&captured);
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            // Event-driven wait: each iteration blocks on the stop
+            // channel (kernel parks the thread until a stop signal
+            // arrives or the 100ms tick elapses), then probes the
+            // listener once.  No sleep, no busy-wait.  Two distinct
+            // exit paths — a stop signal, or a client connection —
+            // are mapped to the `while let` predicate.
+            while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                stop_rx.recv_timeout(Duration::from_millis(100))
+            {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        // The accepted stream is blocking by default;
+                        // bound the read so a slow client can't wedge
+                        // the test (clean shutdown).
+                        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                        let mut buf = String::new();
+                        if reader.read_line(&mut buf).is_ok() {
+                            if let Ok(req) = serde_json::from_str::<IpcRequest>(buf.trim()) {
+                                captured_clone.lock().unwrap().push(req);
+                            }
+                            let resp =
+                                dormant_core::ipc_proto::IpcResponse::doctor(reply_report.clone());
+                            if let Ok(line) = serde_json::to_string(&resp) {
+                                let mut s = stream;
+                                let _ = s
+                                    .write_all(line.as_bytes())
+                                    .and_then(|()| s.write_all(b"\n"));
+                            }
+                        }
+                        // One-shot: reply and exit.  The push to
+                        // `captured` happened-before the write, so
+                        // when the client returns from its `read_line`
+                        // the test can safely read the captured Vec.
+                        return;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // No client yet; loop and re-check the stop
+                        // channel (the next `recv_timeout` will park
+                        // the thread until the next 100ms tick or a
+                        // stop signal — no busy-wait).
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        (captured, stop_tx, handle)
+    }
+
+    /// Build a `DoctorReport` containing a Skip check for the configured
+    /// USB port (mirrors the live `DoctorService` output: owned sensors
+    /// are reported from the snapshot, never re-probed).
+    fn fake_owned_usb_report() -> dormant_core::doctor::DoctorReport {
+        use dormant_core::doctor::{Check, CheckStatus, DoctorReport};
+        DoctorReport {
+            checks: vec![Check {
+                name: "usb /dev/ttyUSB0".into(),
+                status: CheckStatus::Skip,
+                detail: Some(
+                    "owned by daemon \u{2014} see live status (state: present, last seen: 3s ago)"
+                        .into(),
+                ),
+                category: Some("sensor".into()),
+                subject: Some("front_desk".into()),
+            }],
+        }
+    }
+
+    /// RED: a reachable fake daemon + bare `dormantctl doctor` → the
+    /// wire request is `IpcRequest::Doctor` and the cold offline path
+    /// (`probe_all_offline`, which calls `probe_usb`) is NOT entered.
+    /// The seam counter is the red-green evidence: with the old code it
+    /// would be `>= 1` because the bare path always ran offline.
+    #[test]
+    fn doctor_uses_live_daemon() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("dormant.sock");
+        let (captured, stop_tx, daemon_handle) =
+            spawn_one_shot_doctor_daemon(&socket, fake_owned_usb_report());
+
+        // Snapshot the seam counter before — every other test in this
+        // module that touches the bare path bumps it.
+        let before =
+            super::BARE_DOCTOR_OFFLINE_INVOCATIONS.load(std::sync::atomic::Ordering::SeqCst);
+
+        let args = super::DoctorArgs {
+            config: None,
+            credentials: None,
+            report_issue: None,
+            draft_feature: None,
+            subcommand: None,
+        };
+        let outcome = super::run_bare_with_socket(&args, &socket).expect("run_bare_with_socket ok");
+
+        // By the time the client has read the daemon's reply, the
+        // request is already appended to `captured` (the daemon
+        // pushes before it writes the reply — happens-before is
+        // guaranteed by the single-threaded sequence). No sleep, no
+        // busy-wait, no extra signal needed.
+        let requests = captured.lock().unwrap().clone();
+        assert_eq!(
+            requests.len(),
+            1,
+            "expected exactly one IPC request, got {requests:?}"
+        );
+        assert!(
+            matches!(requests[0], IpcRequest::Doctor),
+            "bare doctor must send IpcRequest::Doctor, got {:?}",
+            requests[0]
+        );
+
+        // Live path was taken: no fallback, so the seam counter is
+        // unchanged from the snapshot.
+        let after =
+            super::BARE_DOCTOR_OFFLINE_INVOCATIONS.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            after,
+            before,
+            "offline path was invoked {delta} times despite a reachable daemon",
+            delta = after.saturating_sub(before),
+        );
+
+        // The owned-USB report is rendered as a table; the live path
+        // produced AllOk (no Fail checks) — the operator sees the same
+        // shape regardless of which path the data came from.
+        assert_eq!(outcome, super::DoctorOutcome::AllOk);
+
+        // Ask the daemon thread to exit; join it to confirm clean
+        // shutdown before the test process reaps it.
+        let _ = stop_tx.send(());
+        let _ = daemon_handle.join();
+    }
+
+    /// RED: a bare doctor with NO daemon on the socket must run the
+    /// cold offline fallback. The seam counter is bumped exactly once
+    /// (one full bare-doctor invocation → one offline run).
+    ///
+    /// The offline path will attempt to load a real config; we point
+    /// `config` at a path that doesn't exist so the offline probe
+    /// emits a `Fail` row for `config` (matching what an operator sees
+    /// in the wild when they run `dormantctl doctor` on a host with no
+    /// config at all). The test only cares that the fallback was
+    /// ENTERED — not what the offline probes themselves return.
+    #[test]
+    fn doctor_falls_back_to_offline_when_daemon_unreachable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("does-not-exist.sock");
+        let missing_config = dir.path().join("definitely-missing.toml");
+
+        let before =
+            super::BARE_DOCTOR_OFFLINE_INVOCATIONS.load(std::sync::atomic::Ordering::SeqCst);
+
+        let args = super::DoctorArgs {
+            config: Some(missing_config),
+            credentials: None,
+            report_issue: None,
+            draft_feature: None,
+            subcommand: None,
+        };
+        // A missing config will cause the offline `load_config_and_creds`
+        // to error; that's the expected operator-facing outcome of
+        // running bare doctor on a host with no config. The point of
+        // this test is that the FALLBACK RAN — not the offline probe
+        // result.
+        let _ = super::run_bare_with_socket(&args, &socket);
+
+        let after =
+            super::BARE_DOCTOR_OFFLINE_INVOCATIONS.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            after.saturating_sub(before),
+            1,
+            "offline fallback must run exactly once when the daemon is unreachable"
+        );
+    }
+
+    /// RED: a bare doctor whose daemon ACCEPTS the connection then
+    /// drops the stream mid-response must NOT fall back to the cold
+    /// offline probe set. The daemon is reachable (and likely owns
+    /// the serial port); reopening the port for `probe_all_offline`
+    /// re-introduces the #202 frame-steal the fix targets. The
+    /// post-connect error is surfaced, the call returns
+    /// `SomeFailed`, and the seam counter is unchanged.
+    ///
+    /// The fake daemon accepts the connection, drains the request
+    /// line, then drops the stream (closes the `UnixStream`). The
+    /// client's `read_line` returns `Ok(0)` (EOF); the subsequent
+    /// `from_str("")` fails the parse — a textbook
+    /// `PostConnectError` on the client side.
+    fn spawn_doctor_daemon_that_drops(
+        socket_path: &Path,
+    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        use std::io::BufRead;
+        use std::os::unix::net::UnixListener;
+        use std::time::Duration;
+
+        let _ = std::fs::remove_file(socket_path);
+        let listener = UnixListener::bind(socket_path).expect("bind fake socket");
+        listener
+            .set_nonblocking(true)
+            .expect("set listener non-blocking");
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                stop_rx.recv_timeout(Duration::from_millis(100))
+            {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                        // Read the request line (so the client's write
+                        // is consumed and the client gets a real
+                        // post-connect EOF, not a write-side broken
+                        // pipe), then drop the stream without
+                        // replying.
+                        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                        let mut buf = String::new();
+                        let _ = reader.read_line(&mut buf);
+                        // Close the stream without sending a reply —
+                        // the client sees EOF on its read, which fails
+                        // the response parse and surfaces as a
+                        // post-connect error.
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        return;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(_) => return,
+                }
+            }
+        });
+        (stop_tx, handle)
+    }
+
+    #[test]
+    fn doctor_does_not_fall_back_on_post_connect_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("dormant.sock");
+        let (stop_tx, daemon_handle) = spawn_doctor_daemon_that_drops(&socket);
+
+        let before =
+            super::BARE_DOCTOR_OFFLINE_INVOCATIONS.load(std::sync::atomic::Ordering::SeqCst);
+
+        let args = super::DoctorArgs {
+            config: None,
+            credentials: None,
+            report_issue: None,
+            draft_feature: None,
+            subcommand: None,
+        };
+        let outcome = super::run_bare_with_socket(&args, &socket)
+            .expect("run_bare_with_socket returns Ok even on a daemon-side error");
+
+        // The offline fallback MUST NOT have been entered. A
+        // post-connect error means the daemon is reachable and
+        // likely owns the sensor; running the cold probe set
+        // would re-introduce the #202 frame-steal.
+        let after =
+            super::BARE_DOCTOR_OFFLINE_INVOCATIONS.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            after, before,
+            "post-connect error must not trigger the offline fallback (would reopen the daemon-owned port; issue #202)"
+        );
+
+        // The post-connect error is surfaced as SomeFailed — the
+        // operator gets a non-zero exit and the error on stderr
+        // (eprintln! at the call site), NOT a misleading "offline
+        // ran and reported fail" or worse a successful-looking
+        // probe table.
+        assert_eq!(outcome, super::DoctorOutcome::SomeFailed);
+
+        let _ = stop_tx.send(());
+        let _ = daemon_handle.join();
     }
 }

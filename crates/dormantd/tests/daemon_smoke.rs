@@ -22,6 +22,7 @@ use dormant_core::types::{DisplayId, PresenceEvent, SensorId, SensorState, Times
 use dormantd::app::{
     App, GenerationBarrierGate, ReloadLifecycleCapture, ReloadOutcome, validate_only,
 };
+use dormantd::filtered_activity::FilteredActivity;
 use tempfile::TempDir;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing_subscriber::fmt::MakeWriter;
@@ -5458,6 +5459,142 @@ async fn watchdog_ping_before_rebuild_old_on_spawn_generation_failure() {
     );
 }
 
+/// Issue #197: the `assemble_loaded` call inside `execute_reload_batch` runs
+/// controller probes (the slow part of the reload path) and must be bracketed
+/// by `before_assemble`/`after_assemble` watchdog pings. A slow probe would
+/// otherwise starve the watchdog and let systemd kill a healthy daemon.
+///
+/// The `source_builder` is the assembly seam — blocking it stalls the probe
+/// phase for an unbounded duration. The test holds the release gate,
+/// asserts `before_assemble` has already fired in the captured log (it
+/// must fire BEFORE `assemble_loaded` is called), then releases and
+/// asserts `after_assemble` fires once the probe unblocks and assembly
+/// completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "capture_count_lock() serializes every reload-driving test in this binary against \
+              this exact-count reader (see the lock's doc comment) and is always released \
+              promptly at test end"
+)]
+async fn watchdog_ping_brackets_reload_assembly_boundary() {
+    let _guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    install_capture_subscriber();
+
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &one_display_config(&marker, "0s"),
+    );
+    let creds_path = dir.path().join("credentials.toml");
+    let (_listener, sd) = fake_systemd_socket(dir.path());
+
+    // Gate the source_builder so the assembly probe phase parks on a
+    // `Condvar` until the test releases it. The first call (initial
+    // generation) must return immediately, so we pre-notify. `Mutex` +
+    // `Condvar` are both `Sync` and the source_builder closure requires
+    // `Send + Sync`.
+    let gate_pair: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)> =
+        std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    {
+        let (lock, cvar) = &*gate_pair;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+    }
+    let gate_pair_for_factory = gate_pair.clone();
+    let script = vec![(Duration::from_millis(100), ev("desk", SensorState::Absent))];
+    let template = dormant_core::fakes::FakeSensorSource {
+        id: "desk".to_string(),
+        script,
+    };
+    let app = App::build_with_sources(
+        cfg_path.clone(),
+        creds_path,
+        Strictness::Strict,
+        move |_cfg: &Config, _creds: &Credentials| -> anyhow::Result<Vec<Box<dyn SensorSource>>> {
+            // The source_builder is a sync `Fn` called from an async
+            // context. `block_in_place` moves the worker thread out of
+            // the runtime's worker pool, so the blocking `cvar.wait()`
+            // below does not starve other tasks — the `before_assemble`
+            // ping in `execute_reload_batch` fires BEFORE this closure
+            // is entered, so it's already in the capture by the time we
+            // park here.
+            tokio::task::block_in_place(|| {
+                let (lock, cvar) = &*gate_pair_for_factory;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = cvar.wait(released).unwrap();
+                }
+                // Consume the release so the next call blocks again.
+                *released = false;
+            });
+            Ok(vec![Box::new(template.clone()) as Box<dyn SensorSource>])
+        },
+    )
+    .expect("build app")
+    .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
+    .disable_ipc()
+    .with_sd_notify(sd)
+    .with_watchdog_interval(Duration::from_secs(120));
+    let (handle, join) = app.start().await.expect("start app");
+    let mut reloads = handle.subscribe_reload();
+
+    assert!(
+        wait_for(|| count(&marker, 'B') >= 1, Duration::from_secs(3)).await,
+        "display should blank before reload (initial generation assembly uses the same factory)"
+    );
+
+    drain_capture(); // discard startup noise (initial assembly pings, etc.)
+
+    // Trigger a reload via the file watcher. The reload's assembly phase
+    // will enter the factory and park on the condvar (the pre-armed
+    // release was consumed by the initial call).
+    fs::write(&cfg_path, one_display_config(&marker, "50ms")).unwrap();
+
+    // Wait for the reload to start AND for the assembly probe to be in
+    // flight (the factory is parked on the condvar). The `before_assemble`
+    // ping is emitted in `execute_reload_batch` BEFORE `assemble_loaded`
+    // is called, so it must already be in the capture by the time the
+    // assembly is parked.
+    let parked = wait_for(
+        || capture_contains("before_assemble"),
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        parked,
+        "before_assemble must fire before the assembly probe phase begins: \
+         current capture = {:?}",
+        drain_capture()
+    );
+
+    // Release the gate so assembly completes and `after_assemble` fires.
+    {
+        let (lock, cvar) = &*gate_pair;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+    }
+
+    let outcome = tokio::time::timeout(Duration::from_secs(5), reloads.recv())
+        .await
+        .expect("reload outcome in time")
+        .expect("reload bus open");
+    assert_eq!(outcome, ReloadOutcome::Reloaded);
+
+    let output = drain_capture();
+    shutdown(handle, join).await;
+
+    assert!(
+        output.contains("after_assemble"),
+        "after_assemble must fire once assembly completes: {output}"
+    );
+}
+
 /// A failed accepted-config spawn leaves both front-door routers paused while
 /// `rebuild_old` attempts to restore service. If that second spawn fails too,
 /// the daemon must exit rather than remain alive without an engine that can
@@ -6133,6 +6270,208 @@ async fn coordinator_config_watcher_suppression_is_effective() {
     assert!(
         !saw_reload,
         "real watcher fired a ReloadStarted — suppression is ineffective"
+    );
+
+    shutdown(handle, join).await;
+}
+// ── Issue #196 — activity-follow task must be replaced on reload ───────────────
+
+/// Build a coordinator config whose single shared display is named `name`
+/// (so a test can swap the name across a reload) and which has
+/// `coordination.activity_follow = true` with `arm_after = "0s"` and
+/// `cooldown = "0s"` so a single filtered-activity edge commits a pull in
+/// the same select iteration.
+#[allow(dead_code, reason = "shared with the reload test below")]
+fn activity_follow_config(name: &str, marker: &Path) -> String {
+    format!(
+        r#"config_version = 1
+[daemon]
+startup_holdoff = "0s"
+reload_debounce = "100ms"
+
+[sensors.desk]
+type = "mqtt"
+broker_url = "tcp://localhost:1883"
+topic = "x"
+
+[zones.office]
+mode = "any"
+members = ["desk"]
+
+[displays.{name}]
+controllers = ["command", "ddcci"]
+scope = "shared"
+shared_input_code = 0x0f
+blank_mode = "brightness_zero"
+blank_command = "printf B >> '{m}'"
+wake_command = "printf W >> '{m}'"
+modes = ["brightness_zero"]
+
+[coordination]
+activity_follow = true
+arm_after = "0s"
+cooldown = "0s"
+
+[rules.r]
+zone = "office"
+displays = ["{name}"]
+grace_period = "1s"
+min_wake_time = "0s"
+wake_retries = 0
+wake_retry_backoff = "10ms"
+wake_retry_interval = "1s"
+"#,
+        m = marker.display(),
+    )
+}
+
+/// Wait up to `timeout` for a pull recorder entry.
+async fn wait_for_pull(
+    pull_rx: &mut mpsc::UnboundedReceiver<DisplayId>,
+    timeout: Duration,
+) -> Option<DisplayId> {
+    match tokio::time::timeout(timeout, pull_rx.recv()).await {
+        Ok(Some(display)) => Some(display),
+        Ok(None) | Err(_) => None,
+    }
+}
+
+/// Activity-follow task must be replaced atomically on reload (issue
+/// #196). Two assertions, both required:
+///   1. The OLD generation's task handle has fired `on_terminated` (the
+///      loop's drop guard) — proves the bounded-await reaped it, not
+///      merely "is currently idle".
+///   2. The post-reload edge produces ONLY `beta` and no stale `alpha`
+///      within a 500 ms drain window — proves no in-flight pull from
+///      the prior generation escaped cancellation. The race window is
+///      widened by a side-task edge injector that fires every 1 ms
+///      across the reload: while `spawn_activity_follow`'s bounded-await
+///      is reaping the OLD task, `top-of-loop select` may pick
+///      `filtered_rx` over `cancel.cancelled()` (50/50), and the body
+///      runs — only the in-loop biased select! around the pull effect
+///      prevents a stale `recorder.send()` from escaping.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn activity_follow_replaces_task_on_reload_no_stale_generation() {
+    let paths = TestAppPaths::new();
+
+    // Generation 0: shared display "alpha", activity-follow on.
+    let config_path = write_file(
+        paths.root(),
+        "config.toml",
+        &activity_follow_config("alpha", &paths.marker),
+    );
+    let creds_path = write_credentials(paths.root(), "");
+
+    let (pull_tx, mut pull_rx) = mpsc::unbounded_channel::<DisplayId>();
+    let (term_tx, mut term_rx) = mpsc::unbounded_channel::<()>();
+
+    let (handle, join) = App::build_with_sources(
+        config_path.clone(),
+        creds_path,
+        Strictness::Strict,
+        fake_factory("desk", Vec::new()),
+    )
+    .expect("build app")
+    .with_notify_sink_builder(noop_factory)
+    .with_state_dir(paths.state.clone())
+    .disable_ipc()
+    .disable_config_watcher()
+    .with_test_activity_follow_pull_recorder(pull_tx)
+    .with_test_activity_follow_terminated_sink(term_tx)
+    .start()
+    .await
+    .expect("start app");
+
+    let filtered_tx = handle.filtered_activity_sender_for_test();
+
+    // Generation 0: ONE filtered-activity edge → expect a pull on `alpha`.
+    let t0 = Instant::now();
+    filtered_tx.send_replace(FilteredActivity {
+        last_activity: Some(t0),
+        observed_at: t0,
+        available: true,
+        edge_seq: 1,
+    });
+    let first = wait_for_pull(&mut pull_rx, Duration::from_secs(2)).await;
+    assert_eq!(
+        first,
+        Some(DisplayId("alpha".into())),
+        "generation-0 edge must pull `alpha`"
+    );
+
+    // Reload to a config whose only shared display is `beta`. While
+    // `reap_activity_follow` (called at the start of
+    // `execute_reload_batch`) reaps the OLD task via bounded-await,
+    // inject edges every 1 ms — the OLD task's top-of-loop select is
+    // racy on which ready branch to pick; with the pre-dispatch
+    // `is_cancelled()` check + in-loop biased select! absent, a
+    // `filtered_rx` win drives a stale `alpha` pull that escapes
+    // cancellation.
+    let injector_tx = filtered_tx.clone();
+    let injector = tokio::spawn(async move {
+        for seq in 2..200u64 {
+            let t = Instant::now();
+            injector_tx.send_replace(FilteredActivity {
+                last_activity: Some(t),
+                observed_at: t,
+                available: true,
+                edge_seq: seq,
+            });
+            tokio::task::yield_now().await;
+        }
+    });
+    fs::write(&config_path, activity_follow_config("beta", &paths.marker)).expect("rewrite config");
+    let receipt = reload_from_file(&handle).await;
+    injector.abort();
+    assert_eq!(receipt.outcome, ReloadOutcome::Reloaded);
+
+    // Assertion (1): the OLD task's drop guard fired — its handle
+    // returned and the on_terminated sink was sent `()` for the gen-0
+    // task. The reaper path is what proves termination, not "loop is
+    // currently idle". Bounded-await on this within 5 s.
+    let terminated = tokio::time::timeout(Duration::from_secs(5), term_rx.recv()).await;
+    assert!(
+        matches!(&terminated, Ok(Some(()))),
+        "OLD generation's activity-follow task did not signal termination after reload: {terminated:?}",
+    );
+
+    // From here, the OLD task's handle has resolved and only the NEW
+    // task is alive. Any subsequent pull must be `beta` — the OLD
+    // task's processing of `alpha` edges during the reload window
+    // (before `reap_activity_follow` ran) was legitimate processing
+    // under the OLD config and is drained below.
+    while let Ok(display) = pull_rx.try_recv() {
+        assert_eq!(
+            display,
+            DisplayId("alpha".into()),
+            "pre-reload drain saw a non-alpha pull — the OLD task was already terminated when this edge fired: {display:?}",
+        );
+    }
+
+    // Generation 1: ONE filtered-activity edge → MUST produce ONLY `beta`.
+    // The in-loop biased select! around the pull effect is what closes
+    // the original must-1 race: a cancellation that lands mid-iteration
+    // can no longer let a recorder.send escape.
+    let t1 = Instant::now();
+    filtered_tx.send_replace(FilteredActivity {
+        last_activity: Some(t1),
+        observed_at: t1,
+        available: true,
+        edge_seq: 1000,
+    });
+    let second = wait_for_pull(&mut pull_rx, Duration::from_secs(2)).await;
+    assert_eq!(
+        second,
+        Some(DisplayId("beta".into())),
+        "generation-1 edge must pull `beta` only; got {second:?}",
+    );
+
+    // Drain any further pulls within a short window. A stale `alpha`
+    // pull from a leaked OLD task would arrive here.
+    let stale = tokio::time::timeout(Duration::from_millis(500), pull_rx.recv()).await;
+    assert!(
+        matches!(&stale, Err(_) | Ok(None)),
+        "stale pull arrived from a leaked previous generation: {stale:?}",
     );
 
     shutdown(handle, join).await;

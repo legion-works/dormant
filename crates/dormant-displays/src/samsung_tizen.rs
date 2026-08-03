@@ -146,6 +146,15 @@ const REST_TIMEOUT: Duration = Duration::from_secs(3);
 /// Default seconds for a WebSocket connect timeout.
 const WS_CONNECT_TIMEOUT_SECS: u64 = 5;
 
+/// Maximum time to wait for a WebSocket frame after the wake key before
+/// concluding the key was lost on a stale socket. Samsung TVs drive the
+/// heartbeat by sending a frame roughly every ~10 s, so the bound must
+/// exceed that cadence to distinguish "waiting for the next heartbeat"
+/// (key delivered, panel waking) from "dead socket" (key lost). The wait
+/// is background confirmation — the engine spawns wakes, so the TV
+/// wakes at ~1 s while the daemon confirms at ~10 s.
+const WAKE_LIVENESS_WAIT: Duration = Duration::from_secs(12);
+
 /// Maximum time to wait since the TV last sent any frame before treating
 /// the cached WebSocket as stale and reconnecting. Samsung TVs drive the
 /// heartbeat — they send a WebSocket ping (or data frame) roughly every
@@ -177,6 +186,18 @@ pub trait TvTransport: Send + Sync {
 
     /// Check whether `host:port` accepts a TCP connection within `timeout`.
     async fn tcp_connect_ok(&self, host: &str, port: u16, connect_timeout: Duration) -> bool;
+
+    /// After a key send, wait for evidence that the socket that carried the
+    /// key is still alive — a fresh frame (heartbeat/pong) advancing the
+    /// reader's `last_seen` past its value at call time. Returns `true` if
+    /// a frame arrived before `deadline`, `false` if the socket stayed
+    /// silent (the key was likely lost on a stale socket the pre-send
+    /// freshness gate did not catch).
+    ///
+    /// The real implementation polls the shared `WsReaderState`; the fake
+    /// returns a pre-programmed result. The deadline rides the tokio
+    /// clock so paused-time tests can drive it via `tokio::time::advance`.
+    async fn socket_alive_after_send(&self, deadline: tokio::time::Instant) -> bool;
 }
 
 // ── Real transport ──────────────────────────────────────────────────────────────
@@ -581,6 +602,37 @@ impl TvTransport for RealTvTransport {
             .await
             .is_ok_and(|r| r.is_ok())
     }
+
+    async fn socket_alive_after_send(&self, deadline: tokio::time::Instant) -> bool {
+        let state = Arc::clone(&*self.reader_state.lock().expect("reader_state poisoned"));
+        // Snapshot the reader's `last_seen` at call time (right after the key
+        // send returned Ok). A frame arriving AFTER the send advances
+        // `last_seen` past this snapshot — proof the socket that carried the
+        // key is alive. A stale socket (silent drop within MAX_WS_SILENCE)
+        // sends no frames, so `last_seen` never advances.
+        let snapshot = state
+            .last_seen
+            .lock()
+            .map_or_else(|_| std::time::Instant::now(), |t| *t);
+        loop {
+            let advanced = state.last_seen.lock().is_ok_and(|t| *t > snapshot);
+            if advanced {
+                return true;
+            }
+            // The reader flips `dead` when the peer closes or sends an error
+            // frame — a fast loss signal when the RST has propagated. For a
+            // silent drop (no close, no RST yet) `dead` stays false and the
+            // deadline is the only bound; the freshness-check test confirms
+            // `dead` is NOT set in the silent-drop window.
+            if state.is_dead() {
+                return false;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
 }
 
 // ── NoVerify — TLS certificate verifier that accepts any cert ───────────────────
@@ -909,6 +961,105 @@ impl SamsungTizenController {
         Ok(())
     }
 
+    /// Bounded wait for the TV to become reachable after a `WoL` packet.
+    ///
+    /// A deep-standby TV that just received Wake-on-LAN needs seconds to
+    /// boot before port 8002 accepts connections. A single immediate
+    /// probe would see unreachable and (with
+    /// `treat_unreachable_as_blanked`) no-op — exactly the case `WoL`
+    /// exists to handle, leaving the panel dark. This retries the
+    /// reachability probe on a short interval until the TV responds or
+    /// the bound elapses.
+    ///
+    /// The bound and interval are hardware constants (the TV's boot
+    /// time is not operator-tunable), so they are fixed here rather than
+    /// exposed as config keys.
+    async fn wait_reachable_after_wol(&self) -> bool {
+        const PROBE_INTERVAL: Duration = Duration::from_secs(1);
+        const MAX_WAIT: Duration = Duration::from_secs(8);
+        // The deadline rides the tokio clock — the same clock `sleep` uses — so
+        // the bound is coherent with the probe interval. In production this is
+        // the real monotonic clock; in paused-time tests it advances with
+        // `tokio::time::advance`, keeping the wait deterministic.
+        let deadline = tokio::time::Instant::now() + MAX_WAIT;
+        loop {
+            if self.is_tv_reachable().await {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(PROBE_INTERVAL).await;
+        }
+    }
+
+    /// Confirm the wake key was delivered and the panel is awake.
+    ///
+    /// Two signals, in order:
+    ///
+    /// 1. **Socket liveness (primary delivery proof).** After `KEY_RETURN`
+    ///    returns `Ok`, wait for a fresh WebSocket frame (the TV's ~10 s
+    ///    heartbeat) to advance `last_seen` past its send-time snapshot. A
+    ///    frame arriving proves the socket that carried the key is alive —
+    ///    the key was delivered. A stale socket (silent drop within
+    ///    `MAX_WS_SILENCE` that the pre-send freshness gate missed because
+    ///    `last_seen` had not yet crossed the threshold) sends no frame, so
+    ///    `socket_alive_after_send` returns `false` → `Err`. This is the
+    ///    only signal that distinguishes delivered-vs-lost in picture-off:
+    ///    REST reports `"on"` for awake-picture-off (S90D spike,
+    ///    `docs/research/2026-07-05-s90d-verification.md` lines 45/65), so
+    ///    the REST oracle is blind in exactly the mode the stale-socket
+    ///    window inhabits.
+    ///
+    /// 2. **REST standby-catcher (supplementary).** Liveness confirms the
+    ///    key was delivered, but the TV may be in warm network-standby
+    ///    (socket alive, heartbeats flow) where `KEY_RETURN` does not wake
+    ///    — `KEY_POWER` does. `Some("standby")` is positive evidence the
+    ///    wake did not take → `Err`. `Some("on")` is consistent with awake
+    ///    (picture may be off, so this adds nothing over liveness). `None`
+    ///    means REST is flaky/down — it must not veto a wake the WS path
+    ///    delivered, or a TV with a working WS channel but a dead REST
+    ///    endpoint fails wake forever (the state machine re-issues
+    ///    `IssueWake` on `Err`) → `warn` + `Ok`.
+    async fn verify_awake_after_key(&self) -> Result<(), CmdFailure> {
+        let liveness_deadline = tokio::time::Instant::now() + WAKE_LIVENESS_WAIT;
+        if !self
+            .transport
+            .socket_alive_after_send(liveness_deadline)
+            .await
+        {
+            return Err(CmdFailure {
+                controller: Self::NAME.to_string(),
+                error: format!(
+                    "{E_DISPLAY_IO}: samsung-tizen wake verify failed — no WebSocket frame \
+                     received within {WAKE_LIVENESS_WAIT:?} after the wake key; the key was \
+                     likely lost on a stale socket (silent drop within MAX_WS_SILENCE)"
+                ),
+            });
+        }
+
+        match self.transport.get_power_state(&self.host).await.as_deref() {
+            Some("on") => Ok(()),
+            Some(state) => Err(CmdFailure {
+                controller: Self::NAME.to_string(),
+                error: format!(
+                    "{E_DISPLAY_IO}: samsung-tizen wake verify failed — power state is \
+                     \"{state}\" (expected \"on\") after the wake key; the key was delivered \
+                     but did not wake the panel"
+                ),
+            }),
+            None => {
+                tracing::warn!(
+                    controller = Self::NAME,
+                    host = %self.host,
+                    "REST power state unreachable after wake key — socket liveness confirmed \
+                     delivery; not vetoing the wake on REST health",
+                );
+                Ok(())
+            }
+        }
+    }
+
     /// Blank via Samsung IP Control G2 backlight.
     ///
     /// On the first blank: read the current backlight, save it, set to 0,
@@ -1182,9 +1333,19 @@ impl DisplayController for SamsungTizenController {
             );
         }
 
-        // If the TV is unreachable and the policy says to treat it as blanked,
-        // succeed silently after the WoL attempt.
-        if !self.is_tv_reachable().await && self.treat_unreachable_as_blanked {
+        // After WoL, a deep-standby TV needs seconds to boot before port 8002
+        // accepts connections — a single immediate probe would see unreachable
+        // and (with `treat_unreachable_as_blanked`) no-op, which is exactly the
+        // case WoL exists to handle, leaving the panel dark. Wait, bounded, for
+        // the TV to come back. Without a WoL MAC there is no boot-in-progress to
+        // wait for, so a single probe preserves the prior behaviour.
+        let reachable = if self.wol_mac.is_some() {
+            self.wait_reachable_after_wol().await
+        } else {
+            self.is_tv_reachable().await
+        };
+
+        if !reachable && self.treat_unreachable_as_blanked {
             return self.unreachable_noop("wake");
         }
 
@@ -1221,7 +1382,13 @@ impl DisplayController for SamsungTizenController {
             .map_err(|e| CmdFailure {
                 controller: Self::NAME.to_string(),
                 error: format!("{E_DISPLAY_IO}: {e}"),
-            })
+            })?;
+        // #208: a WS send that returns Ok at the TCP level can still lose the
+        // frame on a stale socket (the RST arrives later). Confirm via REST
+        // that the panel is actually on; a lost KEY_RETURN surfaces as a
+        // non-`on` power state → CmdFailure so the executor retries rather
+        // than declaring success on a dark panel.
+        self.verify_awake_after_key().await
     }
 
     /// Read the panel state — REST `PowerState` (on/standby) plus the
@@ -1482,6 +1649,21 @@ struct FakeTvTransport {
     wol_macs: StdMutex<Vec<String>>,
     /// Return values for `tcp_connect_ok` calls.
     connect_results: StdMutex<Vec<bool>>,
+    /// Value returned by `tcp_connect_ok` once `connect_results` is empty.
+    /// `None` (default) preserves the original "empty means reachable"
+    /// behaviour; `Some(false)` makes the TV stay unreachable forever
+    /// (used to exercise the bounded wait-then-noop path).
+    connect_default: StdMutex<Option<bool>>,
+    /// Ordered log of transport method calls — lets tests assert
+    /// cross-method call order (`WoL` before reachability before key before
+    /// the REST power-state verify).
+    call_log: StdMutex<Vec<&'static str>>,
+    /// Return values for successive `socket_alive_after_send` calls. Empty
+    /// (default) means `true` — a delivered key sees a heartbeat frame —
+    /// which preserves the success path for pre-existing tests. `false`
+    /// simulates a stale socket: the key send returned `Ok` at the TCP
+    /// level but no frame arrives afterward (the #208 silent-drop window).
+    liveness_results: StdMutex<Vec<bool>>,
 }
 
 #[allow(dead_code)]
@@ -1511,12 +1693,17 @@ impl FakeTvTransport {
     fn take_wol_macs(&self) -> Vec<String> {
         std::mem::take(&mut *self.wol_macs.lock().unwrap())
     }
+
+    fn take_call_log(&self) -> Vec<&'static str> {
+        std::mem::take(&mut *self.call_log.lock().unwrap())
+    }
 }
 
 #[async_trait]
 impl TvTransport for FakeTvTransport {
     async fn send_key(&self, _host: &str, _token: &str, key: &str) -> Result<(), String> {
         self.sent_keys.lock().unwrap().push(key.to_string());
+        self.call_log.lock().unwrap().push("key");
         let mut results = self.send_key_results.lock().unwrap();
         if results.is_empty() {
             Ok(())
@@ -1526,6 +1713,7 @@ impl TvTransport for FakeTvTransport {
     }
 
     async fn get_power_state(&self, _host: &str) -> Option<String> {
+        self.call_log.lock().unwrap().push("power_state");
         let mut results = self.power_state_results.lock().unwrap();
         if results.is_empty() {
             None
@@ -1536,6 +1724,7 @@ impl TvTransport for FakeTvTransport {
 
     async fn send_wol(&self, mac: &str) -> Result<(), String> {
         self.wol_macs.lock().unwrap().push(mac.to_string());
+        self.call_log.lock().unwrap().push("wol");
         let mut results = self.wol_results.lock().unwrap();
         if results.is_empty() {
             Ok(())
@@ -1545,7 +1734,18 @@ impl TvTransport for FakeTvTransport {
     }
 
     async fn tcp_connect_ok(&self, _host: &str, _port: u16, _connect_timeout: Duration) -> bool {
+        self.call_log.lock().unwrap().push("connect");
         let mut results = self.connect_results.lock().unwrap();
+        if !results.is_empty() {
+            return results.remove(0);
+        }
+        drop(results);
+        self.connect_default.lock().unwrap().unwrap_or(true)
+    }
+
+    async fn socket_alive_after_send(&self, _deadline: tokio::time::Instant) -> bool {
+        self.call_log.lock().unwrap().push("liveness");
+        let mut results = self.liveness_results.lock().unwrap();
         if results.is_empty() {
             true
         } else {
@@ -1769,6 +1969,11 @@ mod tests {
     #[tokio::test]
     async fn wake_sends_key_return() {
         let fake = Arc::new(FakeTvTransport::new());
+        // REST confirms the panel is on after the wake key (#208 verify).
+        fake.power_state_results
+            .lock()
+            .unwrap()
+            .push(Some("on".to_string()));
         let ctrl = test_controller(fake.clone());
         ctrl.wake().await.unwrap();
         let keys = fake.take_sent_keys();
@@ -1788,6 +1993,11 @@ mod tests {
     #[tokio::test]
     async fn wake_with_wol_mac_sends_wol_before_key() {
         let fake = Arc::new(FakeTvTransport::new());
+        // REST confirms the panel is on after the wake key (#208 verify).
+        fake.power_state_results
+            .lock()
+            .unwrap()
+            .push(Some("on".to_string()));
         let ctrl = SamsungTizenController::with_transport(
             "192.0.2.7".into(),
             "tok".into(),
@@ -2124,6 +2334,12 @@ mod tests {
     async fn wake_without_saved_backlight_sends_key_return() {
         let tv_fake = Arc::new(FakeTvTransport::new());
         let bl_fake = Arc::new(FakeBacklightTransport::new());
+        // REST confirms the panel is on after the wake key (#208 verify).
+        tv_fake
+            .power_state_results
+            .lock()
+            .unwrap()
+            .push(Some("on".to_string()));
 
         let ctrl = SamsungTizenController::with_transports(
             "192.0.2.7".into(),
@@ -2263,11 +2479,17 @@ mod tests {
         assert!(keys.is_empty(), "no keys should be sent when unreachable");
     }
 
-    #[tokio::test]
+    /// #193: with `WoL` configured, a TV that STAYS unreachable through the
+    /// whole bounded wait still no-ops — fail-safe: an off TV has no picture
+    /// to restore, and the daemon must not sit in a waking retry loop. The
+    /// bounded wait replaces the old single immediate probe; the no-op now
+    /// fires only after the TV has had its seconds to boot.
+    #[tokio::test(start_paused = true)]
     async fn wake_unreachable_still_sends_wol_then_noops() {
         let fake = Arc::new(FakeTvTransport {
-            connect_results: StdMutex::new(vec![false]),
-            ..FakeTvTransport::default()
+            // TV never comes back — every reachability probe fails.
+            connect_default: StdMutex::new(Some(false)),
+            ..Default::default()
         });
         let ctrl = SamsungTizenController::with_transport(
             "192.0.2.7".into(),
@@ -2276,11 +2498,181 @@ mod tests {
             true,
             fake.clone(),
         );
-        ctrl.wake().await.unwrap();
-        let macs = fake.take_wol_macs();
-        assert_eq!(macs, vec!["aa:bb:cc:dd:ee:ff"]);
-        let keys = fake.take_sent_keys();
-        assert!(keys.is_empty(), "no key sent after noop");
+
+        let join = tokio::spawn(async move { ctrl.wake().await });
+        tokio::task::yield_now().await;
+        for _ in 0..30 {
+            if join.is_finished() {
+                break;
+            }
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+        join.await.expect("wake task panicked").unwrap();
+
+        assert_eq!(fake.take_wol_macs(), vec!["aa:bb:cc:dd:ee:ff"]);
+        assert!(
+            fake.take_sent_keys().is_empty(),
+            "no key sent after a no-op"
+        );
+        // Bounded: the wait ran a finite number of probes, not an infinite
+        // loop. Completing at all proves the bound; the count pins it.
+        let connect_count = fake
+            .take_call_log()
+            .iter()
+            .filter(|tag| **tag == "connect")
+            .count();
+        assert!(
+            connect_count > 1,
+            "wait must retry the probe after WoL, got {connect_count}"
+        );
+        assert!(
+            connect_count <= 10,
+            "wait must be bounded (~8s/1s interval), got {connect_count} probes"
+        );
+    }
+
+    /// #193: a deep-standby TV that just got the `WoL` packet has not booted
+    /// yet, so a single immediate reachability probe sees unreachable and
+    /// (with `treat_unreachable_as_blanked`) no-ops — exactly the case `WoL`
+    /// exists to handle. `wake()` must instead wait, bounded, for the TV to
+    /// come back, then send the wake key and confirm via REST that the panel
+    /// is actually on. Call order: `WoL` → reachability probes → `KEY_RETURN` →
+    /// REST power-state.
+    #[tokio::test(start_paused = true)]
+    async fn wake_wol_waits_for_boot_then_confirms_on() {
+        let fake = Arc::new(FakeTvTransport {
+            // Two unreachable probes, then the TV finishes booting.
+            connect_results: StdMutex::new(vec![false, false, true]),
+            // REST confirms the panel is on after the wake key.
+            power_state_results: StdMutex::new(vec![Some("on".to_string())]),
+            ..Default::default()
+        });
+        let ctrl = SamsungTizenController::with_transport(
+            "192.0.2.7".into(),
+            "tok".into(),
+            Some("aa:bb:cc:dd:ee:ff".into()),
+            true,
+            fake.clone(),
+        );
+
+        let join = tokio::spawn(async move { ctrl.wake().await });
+        // First poll: WoL + first reachability probe (false) + schedule wait.
+        tokio::task::yield_now().await;
+        // Drive the paused clock one probe-interval at a time until wake
+        // completes — each advance fires the next probe's timer.
+        for _ in 0..30 {
+            if join.is_finished() {
+                break;
+            }
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+        join.await.expect("wake task panicked").unwrap();
+
+        assert_eq!(fake.take_wol_macs(), vec!["aa:bb:cc:dd:ee:ff"]);
+        // WoL → 3 reachability probes (false, false, true) → KEY_RETURN →
+        // liveness confirm → REST power-state.
+        assert_eq!(
+            fake.take_call_log(),
+            vec![
+                "wol",
+                "connect",
+                "connect",
+                "connect",
+                "key",
+                "liveness",
+                "power_state"
+            ]
+        );
+        assert_eq!(fake.take_sent_keys(), vec![KEY_RETURN]);
+    }
+
+    /// #208 (warm-standby catch): the WebSocket liveness gate is point-in-time
+    /// — the first write on a stale socket returns `Ok` at the TCP level while
+    /// the frame is lost. The primary delivery proof is socket liveness (a
+    /// fresh frame after the key); the REST standby-catcher is supplementary.
+    /// Here the socket is alive (warm standby keeps the WS open), so liveness
+    /// confirms delivery — but REST reports `"standby"`, positive evidence
+    /// that `KEY_RETURN` did not wake the panel (`KEY_POWER` is the warm-standby
+    /// wake key) → `CmdFailure` so the executor retries.
+    #[tokio::test]
+    async fn wake_key_send_ok_but_rest_still_standby_returns_err() {
+        let fake = Arc::new(FakeTvTransport {
+            // send_key returns Ok (WS frame "sent" at TCP level, but lost).
+            // REST power state is still standby — the key never landed.
+            power_state_results: StdMutex::new(vec![Some("standby".to_string())]),
+            ..Default::default()
+        });
+        let ctrl = SamsungTizenController::with_transport(
+            "192.0.2.7".into(),
+            "tok".into(),
+            None,
+            true,
+            fake.clone(),
+        );
+
+        let err = ctrl.wake().await.unwrap_err();
+        assert_eq!(err.controller, "samsung-tizen");
+        assert!(
+            err.error.starts_with(E_DISPLAY_IO),
+            "lost wake key must surface as E_DISPLAY_IO: {err}"
+        );
+        assert!(
+            err.error.contains("standby"),
+            "error must name the mismatched power state: {err}"
+        );
+        // The key was sent (WS path took the Ok), but REST verify caught the loss.
+        assert_eq!(fake.take_sent_keys(), vec![KEY_RETURN]);
+    }
+
+    /// #208 (picture-off — the real failure window): the stale-socket loss
+    /// happens during `ScreenOffAudioOn` (the TV silently drops the idle WS
+    /// during picture-off). REST reports `"on"` for awake-picture-off (S90D
+    /// spike, `docs/research/2026-07-05-s90d-verification.md` lines 45/65:
+    /// `"on"` means the panel is on, picture may be off), so the REST oracle
+    /// is blind here — `"on"` before AND after the lost key. The delivery
+    /// proof must come from the socket itself: after `KEY_RETURN`, a fresh
+    /// WebSocket frame (heartbeat) advancing `last_seen` proves the socket
+    /// that carried the key is alive. A stale socket sends no frame →
+    /// `socket_alive_after_send` returns `false` → `wake()` returns `Err`
+    /// so the executor retries rather than declaring success on a dark panel.
+    #[tokio::test(start_paused = true)]
+    async fn wake_picture_off_stale_socket_lost_key_returns_err() {
+        let fake = Arc::new(FakeTvTransport {
+            // REST reports "on" throughout — picture-off reads as "on"
+            // (S90D spike), so the REST oracle cannot distinguish a lost key.
+            power_state_results: StdMutex::new(vec![Some("on".to_string())]),
+            // Stale socket: send_key returns Ok (TCP buffered) but no frame
+            // arrives afterward — the key was lost on the silently-dropped
+            // socket within the MAX_WS_SILENCE window the pre-send gate missed.
+            liveness_results: StdMutex::new(vec![false]),
+            ..Default::default()
+        });
+        let ctrl = SamsungTizenController::with_transport(
+            "192.0.2.7".into(),
+            "tok".into(),
+            None,
+            true,
+            fake.clone(),
+        );
+        // Record a ScreenOffAudioOn blank so wake takes the KEY_RETURN path
+        // (the picture-off wake path, where the stale-socket window lives).
+        ctrl.blank(BlankMode::ScreenOffAudioOn).await.unwrap();
+
+        let err = ctrl.wake().await.unwrap_err();
+        assert_eq!(err.controller, "samsung-tizen");
+        assert!(
+            err.error.starts_with(E_DISPLAY_IO),
+            "lost wake key on a stale socket must surface as E_DISPLAY_IO: {err}"
+        );
+        assert!(
+            err.error.contains("stale socket") || err.error.contains("no WebSocket frame"),
+            "error must name the stale-socket loss: {err}"
+        );
+        // KEY_PICTURE_OFF (blank) then KEY_RETURN (wake) — the wake key was
+        // sent (TCP buffered, Ok) but lost.
+        assert_eq!(fake.take_sent_keys(), vec![KEY_PICTURE_OFF, KEY_RETURN]);
     }
 
     #[tokio::test]
@@ -3225,6 +3617,12 @@ mod tests {
     async fn screen_off_audio_on_wake_sends_key_return() {
         let tv_fake = Arc::new(FakeTvTransport::new());
         let bl_fake = Arc::new(FakeBacklightTransport::new());
+        // REST confirms the panel is on after the wake key (#208 verify).
+        tv_fake
+            .power_state_results
+            .lock()
+            .unwrap()
+            .push(Some("on".to_string()));
 
         // Registry wiring for `blank_mode = "screen_off_audio_on"`.
         let ctrl = SamsungTizenController::with_transports_mode(

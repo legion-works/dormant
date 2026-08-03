@@ -706,6 +706,21 @@ pub enum DaemonEvent {
     /// registered, so events emitted after this line will be delivered.
     /// Consumers may ignore it.
     Subscribed,
+    /// Web-scoped single-flight guard state changed — published by the
+    /// `dormant-web` HTTP layer after every `exercise_in_flight` /
+    /// `emergency_wake_lock` mutation (insert AND remove, including the
+    /// detached completion monitor that outlives an HTTP timeout). Lets the
+    /// webui replace a 1 Hz paired poll with event-driven UI, while still
+    /// hitting `GET /api/operations` on initial load and on reconnect/refocus.
+    /// `exercise_in_flight` is sorted ascending on the wire (grep-stable).
+    OperationsChanged {
+        /// Configured display ids with a web exercise currently awaiting
+        /// engine completion.
+        exercise_in_flight: Vec<String>,
+        /// Whether a global web emergency wake is currently awaiting engine
+        /// completion.
+        emergency_wake_in_flight: bool,
+    },
     /// Wire-tolerance catch-all: any event tag this build does not
     /// recognize deserializes to this variant instead of failing the whole
     /// stream.  The daemon never constructs this — see
@@ -1151,19 +1166,25 @@ pub struct RulesEngine {
     /// the tokio clock so paused tests can advance minutes in milliseconds.
     sensor_last_seen_virtual: HashMap<SensorId, tokio::time::Instant>,
     /// Sensors whose source has asserted `online = true` via a recent
-    /// availability (LWT) edge. The stale sweep consults this set to
-    /// decide whether a sensor's presence-topic silence may be treated as
-    /// "state unchanged" (in-set) or "device gone" (not in set → fire
-    /// `Unavailable`).  Source `Unavailable` events and broker failures
-    /// remove the entry; a fresh `online` assertion adds it back.
+    /// availability (LWT) edge, mapped to the virtual (tokio) instant
+    /// when that assertion was recorded. The stale sweep consults this
+    /// map to decide whether a sensor's presence-topic silence may be
+    /// treated as "state unchanged" (in-map and lease still valid) or
+    /// "device gone" (not in map, OR lease expired → fire
+    /// `Unavailable`). The lease is bounded by the sensor's configured
+    /// `stale_timeout` — a `retained online` that goes truly silent
+    /// past `stale_timeout` must still expire, otherwise a dead
+    /// connection whose last broker-side state was `online` could
+    /// preserve stale presence forever (issue #205).
     ///
     /// Clearing sites: [`RulesEngine::handle_presence_event`]
-    /// (`state == Unavailable` path) and
-    /// [`RulesEngine::handle_sensor_availability`] (offline LWT).
+    /// (`state == Unavailable` path),
+    /// [`RulesEngine::handle_sensor_availability`] (offline LWT), and
+    /// [`RulesEngine::sweep_stale_sensors`] (lease expired).
     /// Consumed by [`RulesEngine::sweep_stale_sensors`].
     /// See also [`RulesEngine::input_wake_holds`] for the analogous
     /// per-display hold expiry path.
-    availability_online: HashSet<SensorId>,
+    availability_online: HashMap<SensorId, tokio::time::Instant>,
     /// Timer wheel — min-heap on `(Tick, entry)`.
     timers: BinaryHeap<Reverse<(Tick, TimerEntry)>>,
     /// Internal results mpsc — spawned dispatch tasks write here.
@@ -1315,7 +1336,7 @@ impl RulesEngine {
             reported: HashSet::new(),
             last_blank_failed: HashSet::new(),
             sensor_last_seen_virtual: HashMap::new(),
-            availability_online: HashSet::new(),
+            availability_online: HashMap::new(),
             timers: BinaryHeap::new(),
             results_rx,
             results_tx,
@@ -1769,19 +1790,22 @@ impl RulesEngine {
 
     /// Record a source-asserted availability (LWT) edge.
     ///
-    /// `online = true` inserts the sensor into [`Self::availability_online`]
-    /// so the stale sweep leaves it alone on topic silence. Deliberately
-    /// does NOT touch `sensor_last_seen_virtual` — the trap from issue #136:
-    /// a heartbeat-style "online" frame would otherwise mask a real broker
-    /// disconnect from the next sweep's view of elapsed time.
+    /// `online = true` records the sensor in [`Self::availability_online`]
+    /// with the current virtual instant, so the stale sweep leaves it alone
+    /// on topic silence until that lease expires (bounded by the sensor's
+    /// `stale_timeout` — issue #205). Deliberately does NOT touch
+    /// `sensor_last_seen_virtual` — the trap from issue #136: a heartbeat-style
+    /// "online" frame would otherwise mask a real broker disconnect from the
+    /// next sweep's view of elapsed time.
     ///
-    /// `online = false` (LWT) removes the sensor from the set AND synthesises
+    /// `online = false` (LWT) removes the sensor from the map AND synthesises
     /// an `Unavailable` [`PresenceEvent`] so the fail-safe presence path
     /// takes over immediately, matching today's behavior for an `offline`
     /// payload.
     fn handle_sensor_availability(&mut self, ev: crate::types::SensorAvailabilityEvent) {
         if ev.online {
-            self.availability_online.insert(ev.sensor);
+            self.availability_online
+                .insert(ev.sensor, tokio::time::Instant::now());
         } else {
             self.availability_online.remove(&ev.sensor);
             self.handle_presence_event(PresenceEvent::new(
@@ -2634,13 +2658,21 @@ impl RulesEngine {
             if state == SensorState::Unavailable {
                 continue;
             }
-            // A source-asserted `online` availability edge means topic
-            // silence is "state unchanged", not "device gone" — skip the
-            // sweep for this sensor.  An Unavailable presence event below
-            // (broker failure, LWT offline) removes the entry, so a dead
-            // connection cannot preserve stale presence forever.
-            if self.availability_online.contains(&sensor_id) {
-                continue;
+            // A source-asserted `online` availability edge acts as a LEASE
+            // bounded by `stale_timeout`. Below the lease, topic silence is
+            // "state unchanged" (no sweep). When the lease expires, clear the
+            // marker and fall through to the normal stale path so the next
+            // sweep iteration fires `Unavailable`. Issue #205: an `online`
+            // retained sensor that then goes silent forever must still go
+            // Unavailable, otherwise a dead connection whose last broker-side
+            // state was `online` preserves stale presence forever.
+            if let Some(lease_start) = self.availability_online.get(&sensor_id).copied() {
+                if v_now.saturating_duration_since(lease_start) > stale_timeout {
+                    self.availability_online.remove(&sensor_id);
+                    // Fall through to the normal stale path.
+                } else {
+                    continue;
+                }
             }
             // Use virtual time for the elapsed comparison so paused tests
             // can drive minutes in milliseconds.
@@ -3902,6 +3934,42 @@ mod tests {
         ));
     }
 
+    /// `OperationsChanged` (issue #184) round-trips through the wire with
+    /// the expected tag and fields, and the `Unknown` catch-all still
+    /// traps unrecognized tags so older clients keep working.
+    #[test]
+    fn operations_changed_event_round_trips() {
+        let ev = DaemonEvent::OperationsChanged {
+            exercise_in_flight: vec!["studio".to_string(), "main".to_string()],
+            emergency_wake_in_flight: true,
+        };
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "event": "operations_changed",
+                "exercise_in_flight": ["studio", "main"],
+                "emergency_wake_in_flight": true,
+            })
+        );
+        let parsed: DaemonEvent = serde_json::from_value(json).unwrap();
+        match parsed {
+            DaemonEvent::OperationsChanged {
+                exercise_in_flight,
+                emergency_wake_in_flight,
+            } => {
+                assert_eq!(exercise_in_flight, vec!["studio", "main"]);
+                assert!(emergency_wake_in_flight);
+            }
+            other => panic!("expected OperationsChanged verbatim, got {other:?}"),
+        }
+        // The catch-all still routes unknown tags to Unknown — this is the
+        // forward-compat path a rolling daemon-upgrade relies on.
+        let unknown: DaemonEvent =
+            serde_json::from_str(r#"{"event":"from_the_future","x":1}"#).unwrap();
+        assert!(matches!(unknown, DaemonEvent::Unknown));
+    }
+
     #[test]
     fn wear_snapshot_preserves_additive_attribution_mode() {
         let wire = r#"{"event":"wear_snapshot","display":"m","total_on_hours":1.5,"sample_count":3,"wear_attribution_mode":"sampled"}"#;
@@ -4910,10 +4978,14 @@ mod tests {
         (s.state, s.last_seen_secs_ago)
     }
 
-    /// Issue #136: a healthy radar with a retained `online` availability
-    /// signal must not be marked `Unavailable` by the stale sweep just
-    /// because the state topic is silent (occupant seated, no motion).
-    /// The online assertion gates the sweep AND must NOT refresh the
+    /// Issue #136 + #205: a healthy radar with a retained `online`
+    /// availability signal must not be marked `Unavailable` by the stale
+    /// sweep just because the state topic is silent (occupant seated, no
+    /// motion) — AS LONG AS the silence is bounded by the sensor's
+    /// configured `stale_timeout`. The online assertion is a LEASE: it
+    /// gates the sweep for `stale_timeout` after the assertion, then
+    /// expires so a sensor that goes truly silent cannot preserve stale
+    /// presence forever. The online event also must NOT refresh the
     /// `last_seen` clock — silence still means "state unchanged", not
     /// "new data".
     #[tokio::test(start_paused = true)]
@@ -4939,29 +5011,80 @@ mod tests {
             SensorAvailabilityEvent::new(sensor.clone(), true, Timestamp::now()),
         ));
 
-        // 3. Advance virtual time well past stale_timeout, then run the
-        //    sweep explicitly (these tests drive `handle_*` directly; the
-        //    `run()` loop's timer-driven sweep is exercised by
-        //    `tests/rules_end_to_end.rs`).
-        tokio::time::sleep(Duration::from_millis(1200)).await;
+        // 3. Advance virtual time by LESS than `stale_timeout` (the lease
+        //    is still valid), then run the sweep explicitly (these tests
+        //    drive `handle_*` directly; the `run()` loop's timer-driven
+        //    sweep is exercised by `tests/rules_end_to_end.rs`).
+        tokio::time::sleep(Duration::from_millis(200)).await;
         engine.sweep_stale_sensors();
 
-        // The state must still be Present — the online assertion gates the
-        // sweep, so silence past stale_timeout is no longer a fault.
+        // The state must still be Present — the online lease is still
+        // valid, so silence is "state unchanged".
         let after = snapshot_of(&mut engine);
         let (state, last_seen_after) = sensor_view(&after, "desk");
         assert_eq!(
             state,
             SensorState::Present,
-            "online assertion must keep a present sensor present across silence (got {state:?})"
+            "online lease below stale_timeout must keep a present sensor present across silence (got {state:?})"
         );
         // CRUCIAL: last_seen must reflect elapsed time (not be reset by
-        // online). The 1200ms sleep elapses, so the unscaled
+        // online). The 200ms sleep elapses, so the unscaled
         // `last_seen_secs_ago` must be > the baseline — proving the online
         // event did not refresh the clock.
         assert!(
             last_seen_after >= last_seen_baseline,
             "last_seen_secs_ago must reflect elapsed time, not be reset by online"
+        );
+    }
+
+    /// Issue #205: the `availability_online` marker is a lease bounded by
+    /// `stale_timeout`. Once the lease expires, the next stale sweep must
+    /// demote the sensor to `Unavailable` so a dead connection whose last
+    /// broker-side state was `online` cannot preserve stale presence
+    /// forever. The zone's fail-safe-present policy keeps the display
+    /// awake — the sensor state still moves through `Unavailable`, never
+    /// to `Absent` (repo rule 6).
+    #[tokio::test(start_paused = true)]
+    async fn availability_online_lease_expires_after_stale_timeout() {
+        let sensor = SensorId("lease".into());
+        let mut engine = engine_with_short_stale("lease", Duration::from_millis(500));
+
+        // Present, then online assertion at t=0.
+        engine.handle_presence_event(PresenceEvent::new(
+            sensor.clone(),
+            SensorState::Present,
+            Timestamp::now(),
+        ));
+        engine.handle_control(ControlMsg::SensorAvailability(
+            SensorAvailabilityEvent::new(sensor.clone(), true, Timestamp::now()),
+        ));
+
+        // Below the lease: state stays Present.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        engine.sweep_stale_sensors();
+        let mid = snapshot_of(&mut engine);
+        assert_eq!(
+            sensor_view(&mid, "lease").0,
+            SensorState::Present,
+            "online lease must keep the sensor present below stale_timeout"
+        );
+
+        // Advance past stale_timeout. The lease expires; the next sweep
+        // demotes the sensor to Unavailable.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        engine.sweep_stale_sensors();
+        let after = snapshot_of(&mut engine);
+        let (state, _) = sensor_view(&after, "lease");
+        assert_eq!(
+            state,
+            SensorState::Unavailable,
+            "online lease must expire after stale_timeout and demote the sensor to Unavailable (got {state:?})"
+        );
+        // Crucially NOT Absent — repo rule 6 forbids data loss = absent.
+        assert_ne!(
+            state,
+            SensorState::Absent,
+            "silence must never be reported as Absent — only Unavailable (repo rule 6)"
         );
     }
 
@@ -5024,7 +5147,7 @@ mod tests {
     }
 
     /// Broker disconnect (a `PresenceEvent::Unavailable` from the source)
-    /// must clear the `availability_online` assertion so a dead connection
+    /// must clear the `availability_online` lease so a dead connection
     /// cannot preserve stale presence forever — the next sweep then
     /// correctly demotes a still-quiet sensor.
     #[tokio::test(start_paused = true)]
@@ -5041,13 +5164,14 @@ mod tests {
             SensorAvailabilityEvent::new(sensor.clone(), true, Timestamp::now()),
         ));
 
-        // Advance time under the online assertion: state stays Present.
-        tokio::time::sleep(Duration::from_millis(1100)).await;
+        // Advance time UNDER the online lease (stale_timeout = 500ms):
+        // state stays Present.
+        tokio::time::sleep(Duration::from_millis(200)).await;
         engine.sweep_stale_sensors();
         let still_present = snapshot_of(&mut engine);
         assert_eq!(sensor_view(&still_present, "disc").0, SensorState::Present);
 
-        // Broker drops: source emits Unavailable. The online assertion
+        // Broker drops: source emits Unavailable. The online lease
         // must clear so the next sweep re-engages the timeout.
         engine.handle_presence_event(PresenceEvent::new(
             sensor.clone(),
@@ -5131,7 +5255,7 @@ fn install_restored_machine_replaces_phase_and_queues_effects() {
         reported: HashSet::new(),
         last_blank_failed: HashSet::new(),
         sensor_last_seen_virtual: HashMap::new(),
-        availability_online: HashSet::new(),
+        availability_online: HashMap::new(),
         timers: BinaryHeap::new(),
         results_rx,
         results_tx,
@@ -5238,7 +5362,7 @@ fn install_restored_never_owned_refeed_not_dropped() {
         reported: HashSet::new(),
         last_blank_failed: HashSet::new(),
         sensor_last_seen_virtual: HashMap::new(),
-        availability_online: HashSet::new(),
+        availability_online: HashMap::new(),
         timers: BinaryHeap::new(),
         results_rx,
         results_tx,

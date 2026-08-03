@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use dormant_core::config::{Config, DisplayScope};
+use dormant_core::config::{Config, DisplayScope, defaults};
 use dormant_core::coordination::{
     COORD_POLL_FAILING_LOG_INTERVAL, CoordinationHandle, InputCodeAliases, InputSourceObservation,
 };
@@ -40,10 +40,16 @@ pub fn spawn(deps: CoordinationPollDeps) -> tokio::task::JoinHandle<()> {
     tokio::spawn(run(deps))
 }
 
+struct ReprobeState {
+    last_attempt: Instant,
+    next_interval: Duration,
+}
+
 async fn run(mut deps: CoordinationPollDeps) {
     let mut interval = new_interval(deps.config_rx.borrow().coordination.poll_interval);
     let mut last_failing_log = HashMap::new();
     let mut last_state_read: HashMap<DisplayId, Instant> = HashMap::new();
+    let mut reprobe_state: HashMap<DisplayId, ReprobeState> = HashMap::new();
     loop {
         tokio::select! {
             () = deps.cancel.cancelled() => break,
@@ -53,7 +59,7 @@ async fn run(mut deps: CoordinationPollDeps) {
                 }
                 interval = new_interval(deps.config_rx.borrow().coordination.poll_interval);
             }
-            _ = interval.tick() => poll_once(&deps, &mut last_failing_log, &mut last_state_read).await,
+            _ = interval.tick() => poll_once(&deps, &mut last_failing_log, &mut last_state_read, &mut reprobe_state).await,
         }
     }
 }
@@ -65,11 +71,67 @@ fn new_interval(period: Duration) -> tokio::time::Interval {
     interval
 }
 
+async fn maybe_reprobe(
+    display_id: &DisplayId,
+    executor: &dyn CommandSink,
+    config: &Config,
+    failures: u32,
+    reprobe_state: &mut HashMap<DisplayId, ReprobeState>,
+) {
+    let coordination = &config.coordination;
+    if failures < coordination.reprobe_failure_threshold {
+        return;
+    }
+    let now = Instant::now();
+    let floor = coordination.reprobe_interval;
+    let current_interval = reprobe_state
+        .get(display_id)
+        .map_or(floor, |state| state.next_interval.max(floor));
+    if reprobe_state
+        .get(display_id)
+        .is_some_and(|state| now.duration_since(state.last_attempt) < current_interval)
+    {
+        return;
+    }
+
+    tracing::warn!(
+        event = "coord_poll_reprobe_attempt",
+        display = %display_id,
+        consecutive_failures = failures,
+        interval = ?current_interval,
+    );
+    match executor.reprobe().await {
+        Ok(()) => tracing::info!(
+            event = "coord_poll_reprobe_ok",
+            display = %display_id,
+            interval = ?current_interval,
+        ),
+        Err(error) => tracing::warn!(
+            event = "coord_poll_reprobe_failed",
+            display = %display_id,
+            interval = ?current_interval,
+            error = %error,
+        ),
+    }
+    let next_interval = current_interval
+        .checked_mul(2)
+        .unwrap_or(defaults::COORDINATION_REPROBE_MAX_INTERVAL)
+        .min(defaults::COORDINATION_REPROBE_MAX_INTERVAL);
+    reprobe_state.insert(
+        display_id.clone(),
+        ReprobeState {
+            last_attempt: now,
+            next_interval,
+        },
+    );
+}
+
 #[allow(clippy::too_many_lines)]
 async fn poll_once(
     deps: &CoordinationPollDeps,
     last_failing_log: &mut HashMap<DisplayId, Instant>,
     last_state_read: &mut HashMap<DisplayId, Instant>,
+    reprobe_state: &mut HashMap<DisplayId, ReprobeState>,
 ) {
     let executors = deps.executors_rx.borrow().clone();
     // Reload intentionally publishes this sentinel while an old generation tears down.
@@ -127,9 +189,9 @@ async fn poll_once(
             // peer input code is not a meaningful observation — concurrent
             // DDC traffic garbles the byte stream, and the resulting code
             // cannot be distinguished from the operator selecting an OSD
-            // input.  Treat it as a transport failure: hold the last verdict
-            // rather than feeding it through the debounce where it could
-            // reset a pending transition or, improbably, commit a wrong one.
+            // input. Treat it as a failed observation for ownership only:
+            // hold the last verdict rather than feeding it through the
+            // debounce, but do not re-probe a controller that did respond.
             let classification = aliases.classify(observed);
             if matches!(classification, InputSourceObservation::Unknown(_)) {
                 deps.state.record_failure(&display_id);
@@ -151,6 +213,9 @@ async fn poll_once(
                 tracing::info!(event = "coord_poll_ok", display = %display_id);
             }
             last_failing_log.remove(&display_id);
+            if let Some(state) = reprobe_state.get_mut(&display_id) {
+                state.next_interval = config.coordination.reprobe_interval;
+            }
             // Observability for the issue #134 garbled-read path: a successful
             // but inconsistent `0x60` reading (cross-machine DDC traffic) sails
             // through the existing failure-counter path without a log line, so
@@ -224,6 +289,14 @@ async fn poll_once(
                 .snapshot()
                 .get(&display_id)
                 .map_or(0, |record| record.consecutive_failures);
+            maybe_reprobe(
+                &display_id,
+                executor.as_ref(),
+                &config,
+                failures,
+                reprobe_state,
+            )
+            .await;
             let now = Instant::now();
             if failures >= 2
                 && last_failing_log
@@ -275,6 +348,7 @@ mod tests {
         states: Mutex<VecDeque<Option<PanelState>>>,
         reads: Mutex<u32>,
         state_reads: Mutex<u32>,
+        reprobes: Mutex<u32>,
         cache_probe: Mutex<Option<CoordinationHandle>>,
     }
 
@@ -303,6 +377,10 @@ mod tests {
 
         fn state_reads(&self) -> u32 {
             *self.state_reads.lock().unwrap()
+        }
+
+        fn reprobes(&self) -> u32 {
+            *self.reprobes.lock().unwrap()
         }
 
         fn probe_cache(&self, state: CoordinationHandle) {
@@ -337,6 +415,11 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .unwrap_or(Ok(Some(0x11)))
+        }
+
+        async fn reprobe(&self) -> Result<(), String> {
+            *self.reprobes.lock().unwrap() += 1;
+            Ok(())
         }
 
         async fn read_state_sampled(&self) -> Option<PanelState> {
@@ -655,6 +738,119 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn sustained_failures_trigger_one_reprobe_then_recover() {
+        let capture = EventCapture::default();
+        let events = capture.0.clone();
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(capture));
+        let sink = Arc::new(ScriptedSink::with_inputs([
+            Err("hotplugged".to_string()),
+            Err("hotplugged".to_string()),
+            Err("hotplugged".to_string()),
+            Ok(Some(0x11)),
+        ]));
+        let (_config_tx, _executors_tx, _ctl_rx, state, cancel) = setup(sink.clone());
+        for _ in 0..4 {
+            tick().await;
+        }
+
+        assert_eq!(sink.reprobes(), 1);
+        assert_eq!(
+            state.snapshot()[&DisplayId("shared".to_string())].consecutive_failures,
+            0
+        );
+        assert_eq!(count_event(&events.lock().unwrap(), "coord_poll_ok"), 1);
+        cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reprobe_waits_for_configured_failure_threshold() {
+        let mut cfg = config();
+        cfg.coordination.reprobe_failure_threshold = 5;
+        let sink = Arc::new(ScriptedSink::with_inputs(
+            std::iter::repeat_with(|| Err("unreachable".to_string())).take(5),
+        ));
+        let (_config_tx, _executors_tx, _ctl_rx, state, cancel) =
+            setup_with_config(cfg, sink.clone());
+
+        for _ in 0..4 {
+            tick().await;
+        }
+        assert_eq!(sink.reprobes(), 0);
+        assert_eq!(
+            state.snapshot()[&DisplayId("shared".to_string())].consecutive_failures,
+            4
+        );
+
+        tick().await;
+        assert_eq!(sink.reprobes(), 1);
+        cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dead_panel_reprobe_uses_bounded_backoff() {
+        let sink = Arc::new(ScriptedSink::with_inputs(
+            std::iter::repeat_with(|| Err("unreachable".to_string())).take(40),
+        ));
+        let (_config_tx, _executors_tx, _ctl_rx, _state, cancel) = setup(sink.clone());
+        for _ in 0..40 {
+            tick().await;
+        }
+
+        // At 6s polls, attempts land at 18s, 78s, and 198s (30s → 60s →
+        // 120s), rather than every 30s forever.
+        assert_eq!(sink.reprobes(), 3);
+        cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn successful_read_resets_reprobe_backoff_to_floor() {
+        let sink = Arc::new(ScriptedSink::with_inputs([
+            Err("hotplugged".to_string()),
+            Err("hotplugged".to_string()),
+            Err("hotplugged".to_string()),
+            Ok(Some(0x11)),
+            Err("hotplugged".to_string()),
+            Err("hotplugged".to_string()),
+            Err("hotplugged".to_string()),
+            Ok(Some(0x11)),
+        ]));
+        let (_config_tx, _executors_tx, _ctl_rx, state, cancel) = setup(sink.clone());
+        for _ in 0..8 {
+            tick().await;
+        }
+
+        assert_eq!(sink.reprobes(), 1);
+        assert_eq!(
+            state.snapshot()[&DisplayId("shared".to_string())].consecutive_failures,
+            0
+        );
+        cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn flapping_panel_preserves_reprobe_interval_gate_across_recovery() {
+        let sink = Arc::new(ScriptedSink::with_inputs((0..48).map(|tick| {
+            if tick % 4 == 3 {
+                Ok(Some(0x11))
+            } else {
+                Err("hotplugged".to_string())
+            }
+        })));
+        let (_config_tx, _executors_tx, _ctl_rx, state, cancel) = setup(sink.clone());
+        let mut failures = Vec::new();
+        for _ in 0..48 {
+            tick().await;
+            failures.push(state.snapshot()[&DisplayId("shared".to_string())].consecutive_failures);
+        }
+
+        assert_eq!(sink.reads(), 48);
+        assert_eq!(sink.reprobes(), 6);
+        assert_eq!(&failures[..4], &[1, 2, 3, 0]);
+        assert!(failures.chunks_exact(4).all(|chunk| chunk == [1, 2, 3, 0]));
+        cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn repeated_failures_use_named_thirty_second_interval() {
         assert_eq!(COORD_POLL_FAILING_LOG_INTERVAL, Duration::from_secs(30));
         let failures = || std::iter::repeat_with(|| Err("transient".to_string()));
@@ -802,9 +998,16 @@ mod tests {
         };
         let mut last_failing_log = HashMap::new();
         let mut last_state_read = HashMap::new();
+        let mut reprobe_state = HashMap::new();
         for _ in 0..ticks {
             tokio::time::advance(Duration::from_secs(6)).await;
-            poll_once(&deps, &mut last_failing_log, &mut last_state_read).await;
+            poll_once(
+                &deps,
+                &mut last_failing_log,
+                &mut last_state_read,
+                &mut reprobe_state,
+            )
+            .await;
         }
         drop((config_tx, executors_tx));
         events.lock().unwrap().clone()
@@ -836,9 +1039,16 @@ mod tests {
         };
         let mut last_failing_log = HashMap::new();
         let mut last_state_read = HashMap::new();
+        let mut reprobe_state = HashMap::new();
         for _ in 0..ticks {
             tokio::time::advance(Duration::from_secs(6)).await;
-            poll_once(&deps, &mut last_failing_log, &mut last_state_read).await;
+            poll_once(
+                &deps,
+                &mut last_failing_log,
+                &mut last_state_read,
+                &mut reprobe_state,
+            )
+            .await;
         }
         drop((config_tx, executors_tx));
         events.lock().unwrap().clone()
@@ -972,6 +1182,26 @@ mod tests {
                 .any(|event| event == "coord_ownership_changed"),
             "unknown code must not trigger ownership change, got {captured:?}"
         );
+        cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn garbled_reads_hold_verdict_without_reprobe() {
+        let cfg = config_with_peer_read(0x12);
+        let sink = Arc::new(ScriptedSink::with_inputs(
+            std::iter::repeat_with(|| Ok(Some(0x99))).take(12),
+        ));
+        let (_config_tx, _executors_tx, _ctl_rx, state, cancel) =
+            setup_with_config(cfg, sink.clone());
+        for _ in 0..12 {
+            tick().await;
+        }
+
+        let record = state.snapshot()[&DisplayId("shared".to_string())].clone();
+        assert_eq!(sink.reads(), 12);
+        assert_eq!(sink.reprobes(), 0);
+        assert!(record.owned);
+        assert_eq!(record.consecutive_failures, 12);
         cancel.cancel();
     }
 

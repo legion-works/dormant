@@ -86,6 +86,8 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "poll_interval",
             "state_poll_interval",
             "loss_confirmations",
+            "reprobe_failure_threshold",
+            "reprobe_interval",
             "activity_follow",
             "arm_after",
             "cooldown",
@@ -1002,6 +1004,34 @@ fn validate_coordination(cfg: &Config, errors: &mut Vec<ValidationError>) {
         });
     }
     validate_loss_confirmations(&cfg.coordination, errors);
+    if !(1..=10).contains(&cfg.coordination.reprobe_failure_threshold) {
+        errors.push(ValidationError {
+            what: crate::error::E_CONFIG_INVALID.into(),
+            detail: format!(
+                "coordination reprobe_failure_threshold {} is outside the permitted 1..=10 range",
+                cfg.coordination.reprobe_failure_threshold
+            ),
+        });
+    }
+    if cfg.coordination.reprobe_interval < cfg.coordination.poll_interval {
+        errors.push(ValidationError {
+            what: crate::error::E_CONFIG_INVALID.into(),
+            detail: format!(
+                "coordination reprobe_interval {:?} must be >= poll_interval {:?}",
+                cfg.coordination.reprobe_interval, cfg.coordination.poll_interval
+            ),
+        });
+    }
+    if cfg.coordination.reprobe_interval > super::defaults::COORDINATION_REPROBE_MAX_INTERVAL {
+        errors.push(ValidationError {
+            what: crate::error::E_CONFIG_INVALID.into(),
+            detail: format!(
+                "coordination reprobe_interval {:?} exceeds the maximum of {:?}",
+                cfg.coordination.reprobe_interval,
+                super::defaults::COORDINATION_REPROBE_MAX_INTERVAL
+            ),
+        });
+    }
     if let Some(hotkey) = cfg.keymap.claim_hotkey.as_deref()
         && !is_conservative_accelerator(hotkey)
     {
@@ -7538,6 +7568,28 @@ availability_payload_offline = "down"
         }
     }
 
+    #[test]
+    fn coordination_reprobe_settings_enforce_bounds() {
+        let errors = validate_str(
+            "config_version = 1\n[coordination]\nreprobe_failure_threshold = 0\nreprobe_interval = \"1s\"\n",
+        );
+        assert!(errors.iter().any(|error| {
+            error.detail.contains("reprobe_failure_threshold") && error.detail.contains("1..=10")
+        }));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.detail.contains("reprobe_interval")
+                    && error.detail.contains("poll_interval"))
+        );
+
+        let errors =
+            validate_str("config_version = 1\n[coordination]\nreprobe_interval = \"121s\"\n");
+        assert!(errors.iter().any(|error| {
+            error.detail.contains("reprobe_interval") && error.detail.contains("maximum")
+        }));
+    }
+
     // (dead pairing/bind tests removed — the validated fields no longer exist)
 
     #[test]
@@ -7613,12 +7665,16 @@ availability_payload_offline = "down"
 
     #[test]
     fn kvm_direct_write_coordination_keys_accepted_in_strict_mode() {
-        // activity_follow, arm_after, cooldown must be known in [coordination].
-        let config = "config_version = 1\n[coordination]\nactivity_follow = true\narm_after = \"7s\"\ncooldown = \"3s\"\n";
+        // Every coordination key must be registered in the strict-mode tree.
+        let config = "config_version = 1\n[coordination]\nreprobe_failure_threshold = 3\nreprobe_interval = \"30s\"\nactivity_follow = true\narm_after = \"7s\"\ncooldown = \"3s\"\n";
         let value: toml::Value = toml::from_str(config).unwrap();
         assert!(
             collect_unknown_keys(&value).is_empty(),
             "new coordination keys must be known in strict mode"
+        );
+        assert!(
+            validate_str(config).is_empty(),
+            "new coordination keys must validate cleanly"
         );
     }
 

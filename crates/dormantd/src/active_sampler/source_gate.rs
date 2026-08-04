@@ -27,6 +27,28 @@ pub enum SourceGate {
     },
 }
 
+impl SourceGate {
+    /// Stable wire-friendly tag (`matched` | `mismatched` | `unknown`).
+    #[must_use]
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::Matched => "matched",
+            Self::Mismatched { .. } => "mismatched",
+            Self::Unknown { .. } => "unknown",
+        }
+    }
+
+    /// Observed source for `DaemonEvent`-class consumers; `Some` only for
+    /// mismatched polls. `None` for matched and unknown gates.
+    #[must_use]
+    pub fn observed(&self) -> Option<&str> {
+        match self {
+            Self::Mismatched { observed } => Some(observed.as_str()),
+            Self::Matched | Self::Unknown { .. } => None,
+        }
+    }
+}
+
 /// Samsung host, expected source, and polling cadence for one source gate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceGateExpectation {
@@ -100,7 +122,7 @@ impl<T: BacklightTransport> InputSourceReader for SamsungInputSourceReader<T> {
 pub struct SourceGatePoller {
     state_rx: watch::Receiver<SourceGate>,
     cancellation: CancellationToken,
-    join: JoinHandle<()>,
+    join: Option<JoinHandle<()>>,
 }
 
 impl SourceGatePoller {
@@ -127,6 +149,13 @@ impl SourceGatePoller {
                             &expectation.expected_source,
                             response.as_deref().map_err(|_| "poll_failed"),
                         );
+                        tracing::debug!(
+                            event = "wear_sampling_source_poll",
+                            expected = %expectation.expected_source,
+                            state = next.tag(),
+                            observed = next.observed().unwrap_or(""),
+                            "steady-state source poll observation"
+                        );
                         state_tx.send_if_modified(|state| {
                             if *state == next {
                                 false
@@ -143,7 +172,7 @@ impl SourceGatePoller {
         Self {
             state_rx,
             cancellation,
-            join,
+            join: Some(join),
         }
     }
 
@@ -154,9 +183,17 @@ impl SourceGatePoller {
     }
 
     /// Cancel the poller and wait for its task to terminate.
-    pub async fn cancel(self) {
+    pub async fn cancel(mut self) {
         self.cancellation.cancel();
-        let _ = self.join.await;
+        if let Some(join) = self.join.take() {
+            let _ = join.await;
+        }
+    }
+}
+
+impl Drop for SourceGatePoller {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
     }
 }
 

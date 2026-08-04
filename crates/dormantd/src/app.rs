@@ -52,7 +52,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use dormant_core::config::schema::{Config, Credentials, DisplayScope, RuleConfig};
+use dormant_core::config::schema::{Config, Credentials, DisplayConfig, DisplayScope, RuleConfig};
 use dormant_core::config::{
     Strictness, ValidationError, Warning, load_config, load_config_from_bytes, load_credentials,
     load_credentials_from_bytes, validate_with_input_source_readers,
@@ -155,9 +155,9 @@ fn active_sampler_reconfigure_plans(old: &Config, new: &Config) -> Vec<Reconfigu
 #[cfg(target_os = "linux")]
 fn active_sampler_display_context(
     display: &DisplayId,
+    display_config: &DisplayConfig,
     display_exists: bool,
     phase: Option<&str>,
-    compositor_output: Option<String>,
 ) -> DisplaySamplingContext {
     let phase = match phase {
         Some("grace") => Phase::Grace { until: Tick::now() },
@@ -167,6 +167,12 @@ fn active_sampler_display_context(
         _ => Phase::Active,
     };
     let stage_active = display_exists && matches!(phase, Phase::Active | Phase::Grace { .. });
+    let compositor_output = display_config.compositor_output.clone();
+    let source_gate_expectation = build_active_sampler_gate_expectation(display_config);
+    let stream_mode = display_config
+        .sampling
+        .as_ref()
+        .and_then(|sampling| sampling.stream_mode);
     DisplaySamplingContext {
         display: display_exists.then(|| DisplayExpectation {
             display: display.0.clone(),
@@ -174,7 +180,28 @@ fn active_sampler_display_context(
         }),
         phase,
         stage_active,
+        source_gate_expectation,
+        stream_mode,
     }
+}
+
+/// Build a source-gate expectation from the selected display's
+/// `[displays.<id>.sampling]` table — only when an `expected_source` is
+/// configured together with the display's network `host` (the poller
+/// target). Returns `None` for render-only displays; the runtime then
+/// treats the gate as permanently matched.
+#[cfg(target_os = "linux")]
+fn build_active_sampler_gate_expectation(
+    display_config: &DisplayConfig,
+) -> Option<crate::active_sampler::source_gate::SourceGateExpectation> {
+    let sampling = display_config.sampling.as_ref()?;
+    let expected_source = sampling.expected_source.as_ref()?;
+    let host = display_config.host.as_ref()?;
+    Some(crate::active_sampler::source_gate::SourceGateExpectation {
+        host: host.clone(),
+        expected_source: expected_source.clone(),
+        poll_interval: sampling.source_poll_interval,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -365,6 +392,21 @@ async fn spawn_active_sampler_runtime(
             return None;
         }
     };
+    // Construct the source-gate reader for displays that declare a TV
+    // `host` plus an `expected_source` — the runtime spawns a
+    // `SourceGatePoller` from this reader when the lifecycle is
+    // `Streaming`. Render-only monitors get `None` here.
+    let source_reader = cfg
+        .displays
+        .get(&display_id.0)
+        .and_then(|display| display.host.as_ref())
+        .map(|_host| {
+            let transport =
+                std::sync::Arc::new(dormant_displays::samsung_ip::RealBacklightTransport::new());
+            std::sync::Arc::new(active_sampler::source_gate::SamsungInputSourceReader::new(
+                transport,
+            )) as std::sync::Arc<dyn active_sampler::source_gate::InputSourceReader>
+        });
     let consent_path = migrate_legacy_consent(state_dir, &cfg, &display_id);
     let (updates, update_rx) = mpsc::channel::<SamplerUpdate>(16);
     let cancel = sampler_cancellation_token(root);
@@ -374,19 +416,23 @@ async fn spawn_active_sampler_runtime(
         update_rx,
         latest_grids: latest_grids.clone(),
         source: Box::new(source),
+        source_reader,
         consent_path,
         cancel: cancel.clone(),
         env_reader: crate::active_sampler::production_env_reader,
         event_tx: Some(event_tx.clone()),
     });
+    let display_config = cfg
+        .displays
+        .get(&display_id.0)
+        .expect("display config present for selected sampler")
+        .clone();
     if let Err(error) = updates.try_send(SamplerUpdate::DisplayContext(
         active_sampler_display_context(
             &display_id,
+            &display_config,
             display_exists,
             Some("active"),
-            cfg.displays
-                .get(&display_id.0)
-                .and_then(|display| display.compositor_output.clone()),
         ),
     )) {
         tracing::warn!(
@@ -530,6 +576,44 @@ mod active_sampler_reload_tests {
         }
     }
 
+    /// Minimal `DisplayConfig` for tests that only exercise the active-sampler
+    /// context helper.
+    fn sample_display_config() -> DisplayConfig {
+        DisplayConfig {
+            controllers: Vec::new(),
+            scope: DisplayScope::default(),
+            shared_input_code: None,
+            shared_input_write_code: None,
+            shared_peer_input_write_code: None,
+            shared_peer_input_code: None,
+            hooks: dormant_core::config::schema::HookSlots::default(),
+            blank_mode: None,
+            degraded_mode: None,
+            ladder: Vec::new(),
+            screensaver: None,
+            output: None,
+            ddc_display: None,
+            host: None,
+            wol_mac: None,
+            blank_command: None,
+            wake_command: None,
+            modes: None,
+            ha_url: None,
+            blank_service: None,
+            blank_data: None,
+            wake_service: None,
+            wake_data: None,
+            command_timeout: Duration::from_secs(5),
+            restore_brightness: 100,
+            samsung_restore_backlight: dormant_core::config::defaults::SAMSUNG_RESTORE_BACKLIGHT,
+            treat_unreachable_as_blanked: true,
+            panel_type: dormant_core::wear::PanelType::default(),
+            power_off_opt_in: false,
+            compositor_output: None,
+            sampling: None,
+        }
+    }
+
     #[test]
     #[allow(
         clippy::too_many_lines,
@@ -657,15 +741,22 @@ mod active_sampler_reload_tests {
         cfg.wear.active_sampling.sampled_display = Some("oled".to_owned());
 
         let display = DisplayId("oled".to_owned());
-        let missing = active_sampler_display_context(&display, false, Some("active"), None);
+        let display_config = DisplayConfig {
+            compositor_output: None,
+            ..sample_display_config()
+        };
+        let missing =
+            active_sampler_display_context(&display, &display_config, false, Some("active"));
         assert_eq!(missing.display, None);
         assert!(!missing.stage_active);
 
-        let restored = active_sampler_display_context(&display, true, Some("grace"), None);
+        let restored =
+            active_sampler_display_context(&display, &display_config, true, Some("grace"));
         assert_eq!(restored.display.unwrap().display, "oled");
         assert!(restored.stage_active);
 
-        let blanked = active_sampler_display_context(&display, true, Some("blanked"), None);
+        let blanked =
+            active_sampler_display_context(&display, &display_config, true, Some("blanked"));
         assert!(!blanked.stage_active);
     }
 
@@ -675,9 +766,13 @@ mod active_sampler_reload_tests {
     fn plural_selection_context_reflects_per_display_identity() {
         let display_a = DisplayId("oled-a".to_owned());
         let display_b = DisplayId("oled-b".to_owned());
+        let display_config_a = sample_display_config();
+        let display_config_b = sample_display_config();
 
-        let ctx_a = active_sampler_display_context(&display_a, true, Some("active"), None);
-        let ctx_b = active_sampler_display_context(&display_b, true, Some("active"), None);
+        let ctx_a =
+            active_sampler_display_context(&display_a, &display_config_a, true, Some("active"));
+        let ctx_b =
+            active_sampler_display_context(&display_b, &display_config_b, true, Some("active"));
 
         assert_eq!(
             ctx_a
@@ -721,11 +816,12 @@ mod active_sampler_reload_tests {
         let mut cfg = config();
         cfg.wear.active_sampling.sampled_displays = vec!["oled-a".to_owned(), "oled-b".to_owned()];
 
+        let display_config = sample_display_config();
         let context = active_sampler_display_context(
             &DisplayId("oled-a".to_owned()),
+            &display_config,
             true,
             Some("active"),
-            None,
         );
         assert_eq!(
             context.display.expect("selected display context").display,
@@ -736,12 +832,12 @@ mod active_sampler_reload_tests {
     #[test]
     fn display_context_publishes_configured_compositor_output() {
         let display = DisplayId("oled".to_owned());
-        let context = active_sampler_display_context(
-            &display,
-            true,
-            Some("active"),
-            Some("HDMI-A-1".to_owned()),
-        );
+        let display_config = DisplayConfig {
+            compositor_output: Some("HDMI-A-1".to_owned()),
+            ..sample_display_config()
+        };
+        let context =
+            active_sampler_display_context(&display, &display_config, true, Some("active"));
         assert_eq!(
             context
                 .display
@@ -919,6 +1015,7 @@ mod active_sampler_reload_tests {
             uniform_reason: None,
             bound_display: Some(display.to_owned()),
             granted_at: None,
+            source_gate: None,
         }
     }
 
@@ -3200,16 +3297,16 @@ impl Runner {
             let Some(runtime) = self.active_sampler_runtimes.get(&display_id) else {
                 continue;
             };
+            let display_config = match self.generation.cfg.displays.get(&display_id.0) {
+                Some(display_config) => display_config.clone(),
+                None => continue,
+            };
             if let Err(error) = runtime.updates.try_send(SamplerUpdate::DisplayContext(
                 active_sampler_display_context(
                     &display_id,
+                    &display_config,
                     present.contains(&display_id),
                     Some("active"),
-                    self.generation
-                        .cfg
-                        .displays
-                        .get(&display_id.0)
-                        .and_then(|display| display.compositor_output.clone()),
                 ),
             )) {
                 tracing::warn!(

@@ -921,6 +921,7 @@ mod tests {
                     uniform_reason: None,
                     bound_display: Some("oled-a".to_owned()),
                     granted_at: None,
+                    source_gate: None,
                 },
             ),
             (
@@ -931,6 +932,7 @@ mod tests {
                     uniform_reason: Some(crate::active_sampler::WEAR_SAMPLING_CAPTURE_FAILED),
                     bound_display: Some("oled-b".to_owned()),
                     granted_at: None,
+                    source_gate: None,
                 },
             ),
         ];

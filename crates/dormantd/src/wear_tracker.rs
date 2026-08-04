@@ -2286,6 +2286,7 @@ mod tests {
             uniform_reason: Some(crate::active_sampler::WEAR_SAMPLING_SUSPENDED),
             bound_display: Some(display.0.clone()),
             granted_at: None,
+            source_gate: None,
         }));
         let fallback = sampler_status_fallback(status_rx.borrow().as_ref());
         let mut samples = HashMap::new();

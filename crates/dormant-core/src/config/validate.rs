@@ -1262,12 +1262,30 @@ fn validate_wear(cfg: &Config, errors: &mut Vec<ValidationError>) {
                         "wear.active_sampling.sampled_display '{display_id}' is not configured"
                     ),
                 }),
-                Some(display) if !display.is_render_eligible() => errors.push(ValidationError {
-                    what: "E_CONFIG_INVALID".into(),
-                    detail: format!(
-                        "wear.active_sampling.sampled_display '{display_id}' is not wear-tracked eligible"
-                    ),
-                }),
+                Some(display)
+                    if !display.is_sampling_eligible()
+                        || (display.compositor_output.is_some()
+                            && display
+                                .sampling
+                                .as_ref()
+                                .and_then(|s| s.expected_source.as_ref())
+                                .is_none_or(String::is_empty)) =>
+                {
+                    let remote_without_source = display.compositor_output.is_some();
+                    let detail = if remote_without_source {
+                        format!(
+                            "sampled display '{display_id}' is remote-controlled: sampling requires [displays.{display_id}.sampling] expected_source"
+                        )
+                    } else {
+                        format!(
+                            "wear.active_sampling.sampled_display '{display_id}' is not wear-tracked eligible"
+                        )
+                    };
+                    errors.push(ValidationError {
+                        what: "E_CONFIG_INVALID".into(),
+                        detail,
+                    });
+                }
                 Some(_) => {}
             }
         }
@@ -6453,6 +6471,56 @@ stream_mode = "warm"
                     .iter()
                     .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("sampled_display"))
             );
+        }
+    }
+
+    /// A remote-only display that opts into active sampling via
+    /// `compositor_output` must also pin `sampling.expected_source` so the
+    /// source-gate poller can decide whether the TV's current input is the
+    /// one we want to capture from. A local display without any `sampling`
+    /// subtable is still valid: the gate is configured per display, and a
+    /// digital-pedestal AOC has no remote source exposure to gate on.
+    #[test]
+    fn active_sampling_remote_display_without_expected_source_is_rejected() {
+        let cases: &[(&str, &str, &str, Option<&str>)] = &[
+            (
+                "remote-no-expected-source",
+                "sampled_display = \"tv\"\n[displays.tv.sampling]\nsource_poll_interval = \"5s\"\n",
+                "[displays.tv]\ncontrollers = [\"samsung-tizen\"]\nblank_mode = \"brightness_zero\"\nhost = \"tv.local\"\ncompositor_output = \"HDMI-A-1\"\n[displays.aoc]\ncontrollers = [\"ddcci\"]\nblank_mode = \"brightness_zero\"\n",
+                Some(
+                    "sampled display 'tv' is remote-controlled: sampling requires [displays.tv.sampling] expected_source",
+                ),
+            ),
+            (
+                "remote-with-expected-source",
+                "sampled_display = \"tv\"\n[displays.tv.sampling]\nexpected_source = \"HDMI4\"\n",
+                "[displays.tv]\ncontrollers = [\"samsung-tizen\"]\nblank_mode = \"brightness_zero\"\nhost = \"tv.local\"\ncompositor_output = \"HDMI-A-1\"\n",
+                None,
+            ),
+            (
+                "local-no-sampling-table",
+                "sampled_display = \"aoc\"\n",
+                "[displays.aoc]\ncontrollers = [\"ddcci\"]\nblank_mode = \"brightness_zero\"\n",
+                None,
+            ),
+        ];
+        for (label, body, displays, expected_detail) in cases {
+            let errors = active_sampling_validation_errors(body, displays);
+            match expected_detail {
+                Some(detail) => assert!(
+                    errors
+                        .iter()
+                        .any(|e| e.what == "E_CONFIG_INVALID" && e.detail == *detail),
+                    "{label}: missing expected detail {detail:?}, got: {errors:?}"
+                ),
+                None => {
+                    assert!(
+                        !errors.iter().any(|e| e.what == "E_CONFIG_INVALID"
+                            && e.detail.contains("remote-controlled")),
+                        "{label}: unexpected remote-controlled error: {errors:?}"
+                    );
+                }
+            }
         }
     }
 

@@ -1529,6 +1529,7 @@ pub fn event_records(cfg: &Config, event: &DaemonEvent, instance: &str) -> Vec<P
         | DaemonEvent::WearSnapshot { .. }
         | DaemonEvent::WearSamplingStarted
         | DaemonEvent::WearSamplingDegraded { .. }
+        | DaemonEvent::WearSamplingSourceGate { .. }
         | DaemonEvent::CompensationAdvisory { .. }
         | DaemonEvent::BlankFailure { .. }
         | DaemonEvent::BlankRecovered { .. }

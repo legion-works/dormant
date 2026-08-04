@@ -79,6 +79,10 @@ pub struct SamplerStatus {
     pub bound_display: Option<String>,
     /// Grant wall-clock timestamp, exposed without any portal identifiers.
     pub granted_at: Option<OffsetDateTime>,
+    /// Latest source-gate observation for this display. `None` means the
+    /// display carries no gate configuration — the runtime treats the gate as
+    /// permanently matched.
+    pub source_gate: Option<source_gate::SourceGate>,
 }
 
 impl SamplerStatus {
@@ -210,6 +214,9 @@ pub struct ActiveSamplerDeps {
     pub latest_grids: LatestGrids,
     /// Platform capture implementation.
     pub source: Box<dyn CaptureSource + Send + Sync + 'static>,
+    /// Source-gate poll reader. `None` for displays without a configured gate;
+    /// the runtime then treats every capture as unconditionally matched.
+    pub source_reader: Option<Arc<dyn source_gate::InputSourceReader>>,
     /// Secure persisted portal-consent record path.
     pub consent_path: PathBuf,
     /// Daemon shutdown signal.
@@ -224,7 +231,8 @@ pub(crate) fn production_env_reader(name: &str) -> Option<String> {
     std::env::var(name).ok()
 }
 
-/// Display identity and active phase supplied by generation management.
+/// Display identity, phase, and source-gate configuration supplied by
+/// generation management.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DisplaySamplingContext {
     /// Configured sampled display, when present in the generation.
@@ -233,6 +241,16 @@ pub struct DisplaySamplingContext {
     pub phase: Phase,
     /// Whether a display stage currently permits spatial attribution.
     pub stage_active: bool,
+    /// Source-gate configuration derived from the selected display's
+    /// `[displays.<id>.sampling]` table. `None` when the display is render-only
+    /// (no `[sampling]` subtable) — the runtime treats an absent gate as
+    /// permanently matched.
+    #[doc(hidden)]
+    pub source_gate_expectation: Option<source_gate::SourceGateExpectation>,
+    /// Per-display `stream_mode` override. `None` when the operator has not
+    /// declared one; the runtime falls back to the wear section's
+    /// `[wear.active_sampling] stream_mode`.
+    pub stream_mode: Option<StreamMode>,
 }
 
 /// Allocate the daemon-lifetime latest-sample map.
@@ -251,6 +269,25 @@ fn replace_latest(latest: &LatestGrids, display: &DisplayId, sample: SampledGrid
     if let Ok(mut grids) = latest.write() {
         grids.insert(display.clone(), sample);
     }
+}
+
+/// Build a source-gate expectation from the configured display's `[sampling]`
+/// table. Returns `None` when the display has no `[sampling]` subtable, the
+/// subtable omits `expected_source`, or the display carries no `host` for the
+/// poller to target — the runtime then treats the gate as permanently matched.
+fn build_gate_expectation(
+    config: &Config,
+    display_id: &str,
+) -> Option<source_gate::SourceGateExpectation> {
+    let display = config.displays.get(display_id)?;
+    let sampling = display.sampling.as_ref()?;
+    let expected_source = sampling.expected_source.as_ref()?;
+    let host = display.host.as_ref()?;
+    Some(source_gate::SourceGateExpectation {
+        host: host.clone(),
+        expected_source: expected_source.clone(),
+        poll_interval: sampling.source_poll_interval,
+    })
 }
 
 impl ActiveSamplerHandle {
@@ -350,6 +387,7 @@ fn initial_status(config: &Config) -> SamplerStatus {
         uniform_reason: enabled.then_some(WEAR_SAMPLING_NEEDS_CONSENT),
         bound_display: config.wear.active_sampling.sampled_display.clone(),
         granted_at: None,
+        source_gate: None,
     }
 }
 
@@ -364,6 +402,35 @@ struct Runtime {
     episode_warned: std::collections::HashSet<String>,
     pending_stream_reset: bool,
     event_tx: Option<mpsc::Sender<ControlMsg>>,
+    /// Active source-gate poller for this runtime; present iff the
+    /// configured display carries a `[displays.<id>.sampling].expected_source`
+    /// (and `host`) AND the lifecycle is `Streaming`.
+    gate_poller: Option<source_gate::SourceGatePoller>,
+    /// Watch subscription on the gate poller's latest observation; the run
+    /// loop listens for change events alongside cadence/update/command.
+    gate_rx: Option<watch::Receiver<source_gate::SourceGate>>,
+    /// Reader used to spawn a fresh `SourceGatePoller` when the configured
+    /// expectation changes (e.g. a reconfigure that adds `expected_source`).
+    /// Cached on `Runtime` so the `expectation`-only paths do not need to
+    /// thread the reader through every call site.
+    source_reader: Option<Arc<dyn source_gate::InputSourceReader>>,
+    /// Latest source-gate observation published to the status channel.
+    gate_state: Option<source_gate::SourceGate>,
+    /// Last gate value published on the additive `DaemonEvent` channel.
+    /// Compares by full `SourceGate` enum value so a steady mismatched poll
+    /// fires exactly one event per change (unknown → mismatched → mismatched
+    /// → matched = three events).
+    last_event_gate: Option<source_gate::SourceGate>,
+    /// Per-runtime monotonic capture-timer sequence for the
+    /// `wear_sampling_capture_timing` debug surface.
+    capture_sequence: u64,
+    /// Effective `stream_mode` last published on this runtime, used to detect
+    /// per-display override changes on `DisplayContext` reloads.
+    last_effective_stream_mode: StreamMode,
+    /// Expected-source snapshot the currently-spawned poller is bound to.
+    /// `reconcile_gate_poller` consults this to decide between no-op,
+    /// same-expectation, and tear-down-and-respawn.
+    active_gate_expectation: Option<source_gate::SourceGateExpectation>,
 }
 
 impl Runtime {
@@ -372,6 +439,7 @@ impl Runtime {
             .displays
             .get(&display_id.0)
             .and_then(|display| display.compositor_output.clone());
+        let gate_expectation = build_gate_expectation(config, &display_id.0);
         let display = DisplaySamplingContext {
             display: config
                 .wear
@@ -385,8 +453,15 @@ impl Runtime {
                 }),
             phase: Phase::Active,
             stage_active: true,
+            source_gate_expectation: gate_expectation,
+            stream_mode: config
+                .displays
+                .get(&display_id.0)
+                .and_then(|display| display.sampling.as_ref())
+                .and_then(|sampling| sampling.stream_mode),
         };
-        let active = config.wear.active_sampling.clone();
+        let active_snapshot = config.wear.active_sampling.clone();
+        let active = active_snapshot;
         let record = display.display.as_ref().and_then(|expected| {
             crate::screencast_consent::load(
                 consent_path,
@@ -404,6 +479,7 @@ impl Runtime {
         } else {
             SamplingState::NeedsConsent
         };
+        let last_effective_stream_mode = display.stream_mode.unwrap_or(active.stream_mode);
         Self {
             state,
             active,
@@ -415,6 +491,14 @@ impl Runtime {
             episode_warned: std::collections::HashSet::new(),
             pending_stream_reset: false,
             event_tx: None,
+            gate_poller: None,
+            gate_rx: None,
+            source_reader: None,
+            gate_state: None,
+            last_event_gate: None,
+            capture_sequence: 0,
+            last_effective_stream_mode,
+            active_gate_expectation: None,
         }
     }
 
@@ -472,7 +556,8 @@ async fn connect(
 )]
 async fn capture_one(
     source: &mut dyn CaptureSource,
-    active: &ActiveSamplingConfig,
+    capture_timeout: Duration,
+    stream_mode: StreamMode,
     phase: Phase,
     latest: &LatestGrids,
     display: &DisplayId,
@@ -484,10 +569,7 @@ async fn capture_one(
         source.reset_stream().await;
     }
     let capture_outcome = {
-        let capture = tokio::time::timeout(
-            active.capture_timeout,
-            source.capture_one(active.stream_mode),
-        );
+        let capture = tokio::time::timeout(capture_timeout, source.capture_one(stream_mode));
         tokio::pin!(capture);
         let mut overlapping = 0;
         loop {
@@ -825,6 +907,14 @@ fn apply_update(
         SamplerUpdate::Reconfigure(plan) => {
             if plan.trigger == ConfigDelta::StreamModeChanged {
                 runtime.pending_stream_reset = true;
+                // Keep the per-runtime effective-mode ledger in sync with
+                // the wear section's updated `[wear.active_sampling] stream_mode`
+                // so a subsequent DisplayContext update can detect a real
+                // override change rather than the wear-side shift.
+                runtime.last_effective_stream_mode = runtime
+                    .display
+                    .stream_mode
+                    .unwrap_or(plan.active_sampling.stream_mode);
             }
             if plan.trigger == ConfigDelta::SampledDisplayChanged {
                 runtime.record = None;
@@ -848,7 +938,13 @@ fn apply_update(
                 .is_some_and(|(old, new)| {
                     old.display != new.display || old.compositor_output != new.compositor_output
                 });
+            let old_effective_mode = runtime.last_effective_stream_mode;
+            let new_effective_mode = context.stream_mode.unwrap_or(runtime.active.stream_mode);
+            let mode_overridden = old_effective_mode != new_effective_mode;
+            let source_gate_changed =
+                runtime.display.source_gate_expectation != context.source_gate_expectation;
             runtime.display = context;
+            runtime.last_effective_stream_mode = new_effective_mode;
             if consent_bound_drifted {
                 runtime.record = None;
                 return Some(apply_trigger(
@@ -857,13 +953,36 @@ fn apply_update(
                     status_tx,
                 ));
             }
-            (was_present != is_present).then(|| {
+            let transition = (was_present != is_present).then(|| {
                 apply_trigger(
                     runtime,
                     Trigger::ConfigChanged(ConfigDelta::DisplayPresent(is_present)),
                     status_tx,
                 )
-            })
+            });
+            if mode_overridden {
+                // Honor the existing stream-mode-change reset: reroute the
+                // pending reset flag and reuse the standard StreamModeChanged
+                // trigger for downstream listeners (no re-consent). The
+                // outer `apply_update_with_effects` honors `CloseSession`
+                // effects through its own `source.close()` call.
+                runtime.pending_stream_reset = true;
+                let mode_transition = apply_trigger(
+                    runtime,
+                    Trigger::ConfigChanged(ConfigDelta::StreamModeChanged),
+                    status_tx,
+                );
+                // Don't drop the presence transition if BOTH fired in the
+                // same publish — the caller expects the combined effects
+                // (e.g. DisplayPresent(false) → Suspended + the reset).
+                return transition.or(Some(mode_transition));
+            }
+            if source_gate_changed {
+                // Reconciliation handled by `apply_update_with_effects`
+                // (it owns the poller teardown-and-respawn).
+                return transition;
+            }
+            transition
         }
     }
 }
@@ -879,6 +998,10 @@ async fn apply_update_with_effects(
     // daemon's outer bound so a raised `capture_timeout` actually takes
     // effect in warm mode (issue #211 defect A).
     source.set_capture_timeout(runtime.active.capture_timeout);
+    // Source-gate expectation may have swapped with the new context;
+    // reconcile so the next Streaming tick spawns a poller bound to the
+    // fresh expectation.
+    reconcile_gate_poller(runtime);
     if transition
         .as_ref()
         .is_some_and(|transition| transition.effects.contains(&Effect::CloseSession))
@@ -915,6 +1038,7 @@ fn transition_to(
     status_tx: &watch::Sender<SamplerStatus>,
 ) {
     runtime.state = state;
+    reconcile_gate_poller(runtime);
     publish_status(status_tx, runtime, reason, None);
     if let Some(reason) = reason
         && runtime.episode_warned.insert(runtime.display_name())
@@ -975,7 +1099,182 @@ fn publish_status(
             .record
             .as_ref()
             .map(|record| record.record().granted_at),
+        source_gate: runtime.gate_state.clone(),
     });
+}
+
+/// Spawn a `SourceGatePoller` when the configured display carries a gate
+/// expectation AND the lifecycle is `Streaming`; cancel the existing poller
+/// otherwise. Idempotent — calling it on a `Streaming` runtime that already
+/// matches the expectation is a no-op, while a reconfigure that swaps
+/// `expected_source` (or its host) tears down and re-spawns.
+fn reconcile_gate_poller(runtime: &mut Runtime) {
+    let streaming = runtime.state == SamplingState::Streaming;
+    let expectation = runtime.display.source_gate_expectation.clone();
+    let reader = runtime.source_reader.clone();
+    let wants_poller = streaming && expectation.is_some() && reader.is_some();
+    if !wants_poller {
+        if runtime.gate_poller.take().is_some() {
+            runtime.gate_rx = None;
+            runtime.active_gate_expectation = None;
+            // A removed gate must not leave the runtime wedged on the
+            // last observed state (a stale `Mismatched` would skip
+            // captures forever on an ungated display, and the status
+            // would advertise a phantom gate). Reset both the dedup
+            // anchor and the live observation so a re-added gate's
+            // first poll re-emits.
+            runtime.gate_state = None;
+            runtime.last_event_gate = None;
+        }
+        return;
+    }
+    let expectation = expectation.expect("checked above");
+    let reader = reader.expect("checked above");
+    // Already polling this exact expectation; no-op.
+    if runtime.active_gate_expectation.as_ref() == Some(&expectation)
+        && runtime.gate_poller.is_some()
+    {
+        return;
+    }
+    // Tear down any prior poller so its task halts and we re-seed the gate
+    // seed from the new poller's first observation.
+    if runtime.gate_poller.take().is_some() {
+        runtime.gate_rx = None;
+    }
+    let poller = source_gate::SourceGatePoller::spawn(reader, expectation.clone());
+    let mut rx = poller.subscribe();
+    // Seed `gate_state` with the poller's initial value (Unknown with
+    // `awaiting_first_poll`) so a freshly-polling runtime reports a
+    // uniform_reason of `source_unknown` on its first cadence.
+    runtime.gate_state = Some(rx.borrow_and_update().clone());
+    runtime.gate_rx = Some(rx);
+    runtime.gate_poller = Some(poller);
+    runtime.active_gate_expectation = Some(expectation);
+}
+
+/// React to a fresh gate observation: publish status, emit additive
+/// `DaemonEvent::WearSamplingSourceGate` on full-value change, route the
+/// matching capture timing / log events, and clear the display's
+/// `latest_grids` entry on every transition away from matched.
+fn apply_gate_observation(
+    runtime: &mut Runtime,
+    observation: &source_gate::SourceGate,
+    status_tx: &watch::Sender<SamplerStatus>,
+    latest_grids: &LatestGrids,
+    display_id: &DisplayId,
+) {
+    let previous_uniform_reason = runtime
+        .record
+        .as_ref()
+        .and_then(|_| runtime.gate_state.as_ref().map(sampling_uniform_reason));
+    let next = observation.clone();
+    let transitioned = runtime.gate_state.as_ref() != Some(&next);
+    let needs_clear = match &runtime.gate_state {
+        Some(prev) => prev != &next && runtime.display.display.is_some(),
+        None => true,
+    };
+    if needs_clear && let Ok(mut grids) = latest_grids.write() {
+        grids.remove(display_id);
+    }
+    runtime.gate_state = Some(next.clone());
+    let new_uniform_reason = sampling_uniform_reason(&next);
+    // Emit the `WearSamplingSourceGate` daemon event only on a full-gate
+    // change (matches the spec's "unknown → mismatched → mismatched →
+    // matched = exactly 3 events" requirement).
+    if runtime.last_event_gate.as_ref() != Some(&next) {
+        if let Some(event_tx) = runtime.event_tx.as_ref() {
+            let observed = next.observed().map(str::to_owned);
+            let _ = event_tx.try_send(ControlMsg::PublishDaemonEvent(
+                DaemonEvent::WearSamplingSourceGate {
+                    display: display_id.clone(),
+                    state: next.tag().to_owned(),
+                    observed,
+                },
+            ));
+        }
+        runtime.last_event_gate = Some(next.clone());
+    }
+    // Emit a transition log line on every observation change (warn on
+    // mismatch / unknown / poll_failed; info on matched). Steady-state
+    // repeats are not logged here — the poller logs every observation
+    // at debug level via `wear_sampling_source_poll`.
+    match &next {
+        source_gate::SourceGate::Matched => {
+            tracing::info!(
+                event = "wear_sampling_source_matched",
+                display = %runtime.display_name(),
+                source = next.observed().unwrap_or("expected"),
+            );
+            if new_uniform_reason.is_none() && previous_uniform_reason.is_some() {
+                publish_status(status_tx, runtime, None, None);
+            }
+        }
+        source_gate::SourceGate::Mismatched { observed } => {
+            let expected = runtime
+                .display
+                .source_gate_expectation
+                .as_ref()
+                .map_or("", |e| e.expected_source.as_str());
+            tracing::warn!(
+                event = "wear_sampling_source_mismatch",
+                display = %runtime.display_name(),
+                observed = %observed,
+                expected = %expected,
+            );
+        }
+        source_gate::SourceGate::Unknown { reason } => {
+            let tag = if *reason == "poll_failed" {
+                "wear_sampling_source_poll_failed"
+            } else {
+                "wear_sampling_source_unknown"
+            };
+            tracing::warn!(
+                event = tag,
+                display = %runtime.display_name(),
+                reason = reason,
+            );
+        }
+    }
+    if transitioned {
+        publish_status(status_tx, runtime, new_uniform_reason, None);
+    }
+}
+
+fn sampling_uniform_reason(gate: &source_gate::SourceGate) -> Option<&'static str> {
+    match gate {
+        source_gate::SourceGate::Matched => None,
+        source_gate::SourceGate::Mismatched { .. } => Some("source_mismatch"),
+        source_gate::SourceGate::Unknown { .. } => Some("source_unknown"),
+    }
+}
+
+fn clear_latest_for(latest: &LatestGrids, display: &DisplayId) {
+    if let Ok(mut grids) = latest.write() {
+        grids.remove(display);
+    }
+}
+
+/// Drain any pending gate change events from `runtime.gate_rx` into
+/// `runtime.gate_state`, applying the most recent observation. Used on every
+/// state-boundary entry/exit so the run loop can read a fresh value without
+/// racing the poller. Returns `true` when the gate state changed (the
+/// caller should recheck the gate before any pending capture).
+fn drain_gate_changes(
+    runtime: &mut Runtime,
+    status_tx: &watch::Sender<SamplerStatus>,
+    latest_grids: &LatestGrids,
+    display_id: &DisplayId,
+) -> bool {
+    let Some(rx) = runtime.gate_rx.as_mut() else {
+        return false;
+    };
+    let latest = rx.borrow_and_update().clone();
+    let mut changed = false;
+    if runtime.gate_state.as_ref() != Some(&latest) {
+        apply_gate_observation(runtime, &latest, status_tx, latest_grids, display_id);
+        changed = true;
+    }
+    changed
 }
 
 #[allow(
@@ -989,6 +1288,7 @@ async fn run(
 ) {
     let mut runtime = Runtime::new(&deps.initial_config, &deps.consent_path, &deps.display_id);
     runtime.event_tx = deps.event_tx.take();
+    runtime.source_reader = deps.source_reader.take();
     // Push the configured per-capture deadline into the platform source at
     // startup so the inner warm-mode bound is in lockstep with the daemon
     // bound from the first tick (issue #211 defect A).
@@ -1001,6 +1301,7 @@ async fn run(
     };
     let initial_state = runtime.state;
     transition_to(&mut runtime, initial_state, initial_reason, &status_tx);
+    reconcile_gate_poller(&mut runtime);
     let mut cadence = cadence_for(&runtime);
     cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut capture_now = runtime.state == SamplingState::Streaming;
@@ -1098,7 +1399,43 @@ async fn run(
                 }
             }
             SamplingState::Streaming => {
+                // Drain any gate observation that landed before this tick so
+                // a fresh poll's verdict decides whether the capture proceeds.
+                drain_gate_changes(
+                    &mut runtime,
+                    &status_tx,
+                    &deps.latest_grids,
+                    &deps.display_id,
+                );
                 if !capture_now {
+                    // Arm that resolves when the poller's latest observation
+                    // changes. Pending forever on an ungated runtime so the
+                    // arm never fires there. Waking here lets us drain +
+                    // re-decide without a cadence tick (TOCTOU: a flip
+                    // DURING the cadence wait must skip the next capture).
+                    // The receiver is cloned (Arc clone, cheap) so the boxed
+                    // future does NOT borrow `runtime.gate_rx` — the rest of
+                    // the select arms and the post-drain arm body both need
+                    // to take `&mut runtime`.
+                    let mut gate_signal: Option<
+                        std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+                    > = runtime.gate_rx.as_ref().map(|rx| {
+                        let mut rx = rx.clone();
+                        let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+                            Box::pin(async move {
+                                let _ = rx.changed().await;
+                            });
+                        fut
+                    });
+                    let mut pending_never: std::pin::Pin<
+                        Box<dyn std::future::Future<Output = ()> + Send>,
+                    > = Box::pin(std::future::pending::<()>());
+                    let pending_gate: std::pin::Pin<
+                        &mut (dyn std::future::Future<Output = ()> + Send),
+                    > = match gate_signal.as_mut() {
+                        Some(fut) => fut.as_mut(),
+                        None => pending_never.as_mut(),
+                    };
                     tokio::select! {
                         () = deps.cancel.cancelled() => break,
                         _ = cadence.tick() => {},
@@ -1114,12 +1451,65 @@ async fn run(
                             if let Some(command) = command { let _ = handle_command(&mut runtime, &mut *deps.source, &deps.consent_path, command, &mut command_rx, &status_tx, &deps.cancel, deps.env_reader).await; }
                             continue;
                         }
+                        () = pending_gate => {
+                            // Gate flipped while we were waiting; the poller
+                            // already updated `runtime.gate_rx`'s underlying
+                            // value, but we drain again so the next select
+                            // iteration sees the freshest observation.
+                            drain_gate_changes(
+                                &mut runtime,
+                                &status_tx,
+                                &deps.latest_grids,
+                                &deps.display_id,
+                            );
+                            continue;
+                        }
                     }
                 }
                 capture_now = false;
+                // Re-drain immediately before the gate-skip check: a poller
+                // tick that fires DURING the cadence select above would have
+                // left `runtime.gate_state` stale until the next streaming
+                // arm entry. Reading the freshest observation here closes
+                // the race window.
+                drain_gate_changes(
+                    &mut runtime,
+                    &status_tx,
+                    &deps.latest_grids,
+                    &deps.display_id,
+                );
+                // Recheck the gate right before capture: a transient
+                // mismatch / unknown must skip the capture even if the
+                // cadence already fired, and the wear tracker must not see
+                // a stale grid promoted to a fresh attribute.
+                let gate_skip = matches!(
+                    runtime.gate_state.as_ref(),
+                    Some(
+                        source_gate::SourceGate::Mismatched { .. }
+                            | source_gate::SourceGate::Unknown { .. },
+                    )
+                );
+                if gate_skip {
+                    clear_latest_for(&deps.latest_grids, &deps.display_id);
+                    continue;
+                }
+                runtime.capture_sequence = runtime.capture_sequence.saturating_add(1);
+                let capture_sequence = runtime.capture_sequence;
+                let display_name = runtime.display_name();
+                let started_at = std::time::Instant::now();
+                tracing::debug!(
+                    event = "wear_sampling_capture_timing",
+                    display = %display_name,
+                    sequence = capture_sequence,
+                    stage = "requested",
+                );
                 let attempt = capture_one(
                     &mut *deps.source,
-                    &runtime.active,
+                    runtime.active.capture_timeout,
+                    runtime
+                        .display
+                        .stream_mode
+                        .unwrap_or(runtime.active.stream_mode),
                     runtime.display.phase.clone(),
                     &deps.latest_grids,
                     &deps.display_id,
@@ -1128,9 +1518,36 @@ async fn run(
                     std::mem::take(&mut runtime.pending_stream_reset),
                 )
                 .await;
+                let frame_ready_at = std::time::Instant::now();
+                let frame_ready_elapsed_ms = u64::try_from(
+                    frame_ready_at
+                        .saturating_duration_since(started_at)
+                        .as_millis(),
+                )
+                .unwrap_or(u64::MAX);
+                tracing::debug!(
+                    event = "wear_sampling_capture_timing",
+                    display = %display_name,
+                    sequence = capture_sequence,
+                    stage = "frame_ready",
+                    elapsed_ms = frame_ready_elapsed_ms,
+                );
                 match attempt {
                     CaptureOutcome::Cancelled => break,
                     CaptureOutcome::Ok(captured_at) => {
+                        let reduction_elapsed_ms = u64::try_from(
+                            std::time::Instant::now()
+                                .saturating_duration_since(started_at)
+                                .as_millis(),
+                        )
+                        .unwrap_or(u64::MAX);
+                        tracing::debug!(
+                            event = "wear_sampling_capture_timing",
+                            display = %display_name,
+                            sequence = capture_sequence,
+                            stage = "reduction_complete",
+                            elapsed_ms = reduction_elapsed_ms,
+                        );
                         runtime.failures = 0;
                         runtime.episode_warned.clear();
                         apply_trigger(&mut runtime, Trigger::CaptureOk, &status_tx);
@@ -1149,7 +1566,7 @@ async fn run(
                     () = tokio::time::sleep(runtime.active.circuit_reset_after) => {
                         let transition = apply_trigger(&mut runtime, Trigger::CooldownElapsed, &status_tx);
                         debug_assert!(transition.effects.contains(&Effect::Capture), "only CooldownElapsed may schedule a cooldown retry");
-                        let attempt = capture_one(&mut *deps.source, &runtime.active, runtime.display.phase.clone(), &deps.latest_grids, &deps.display_id, &deps.cancel, &mut cadence, std::mem::take(&mut runtime.pending_stream_reset)).await;
+                        let attempt = capture_one(&mut *deps.source, runtime.active.capture_timeout, runtime.display.stream_mode.unwrap_or(runtime.active.stream_mode), runtime.display.phase.clone(), &deps.latest_grids, &deps.display_id, &deps.cancel, &mut cadence, std::mem::take(&mut runtime.pending_stream_reset)).await;
                         match attempt {
                             CaptureOutcome::Cancelled => break,
                             CaptureOutcome::Ok(captured_at) => { runtime.failures = 0; runtime.episode_warned.clear(); apply_trigger(&mut runtime, Trigger::CaptureOk, &status_tx); publish_status(&status_tx, &runtime, None, Some(captured_at)); }
@@ -1665,6 +2082,18 @@ impl ScriptedCaptureSource {
         }
     }
 
+    fn with_connections(
+        connections: impl IntoIterator<Item = Result<ConnectedStream, CaptureError>>,
+    ) -> Self {
+        Self {
+            connections: connections
+                .into_iter()
+                .map(ScriptedOutcome::Ready)
+                .collect(),
+            ..Self::default()
+        }
+    }
+
     fn close_calls(&self) -> usize {
         self.close_calls
     }
@@ -1713,6 +2142,7 @@ mod tests {
     use super::*;
     use dormant_core::config::schema::DisplayConfig;
     use std::io::Write;
+    use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
@@ -1747,6 +2177,89 @@ mod tests {
 
         fn make_writer(&'a self) -> Self::Writer {
             self.clone()
+        }
+    }
+
+    /// Queue-driven `InputSourceReader` used by the source-gate tests: each
+    /// successive `input_source` call pops the next pre-programmed response.
+    /// When the queue is empty the reader falls back to a default so a test
+    /// can run without spilling capture-time logs into the assertion surface.
+    struct ScriptedSourceReader {
+        responses: Mutex<VecDeque<Result<String, String>>>,
+        default: Result<String, String>,
+    }
+
+    impl ScriptedSourceReader {
+        fn new(
+            responses: impl IntoIterator<Item = Result<String, String>>,
+            default: Result<String, String>,
+        ) -> Self {
+            Self {
+                responses: Mutex::new(responses.into_iter().collect()),
+                default,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl source_gate::InputSourceReader for ScriptedSourceReader {
+        async fn input_source(&self, _host: &str) -> Result<String, String> {
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| self.default.clone())
+        }
+    }
+
+    /// `CaptureSource` wrapper that exposes an atomic capture counter so a
+    /// source-gate test can assert against call counts rather than only the
+    /// absence of a grid sample. Deleting the gate-skip branch in
+    /// `run()` must make the `count_captures_seen` assertion fail.
+    struct GateProbeSource {
+        inner: ServiceSource,
+        #[allow(dead_code, reason = "exposed for callers verifying per-capture counts")]
+        captures_seen: Arc<AtomicUsize>,
+        publishes_seen: Arc<AtomicUsize>,
+        mode_seen: Arc<Mutex<Vec<StreamMode>>>,
+    }
+
+    impl GateProbeSource {
+        fn new(service: ServiceSource) -> Self {
+            let captures_seen = service.captures_seen.clone();
+            Self {
+                inner: service,
+                captures_seen,
+                publishes_seen: Arc::new(AtomicUsize::new(0)),
+                mode_seen: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CaptureSource for GateProbeSource {
+        async fn connect(
+            &mut self,
+            binding: &ConsentBinding<'_>,
+        ) -> Result<ConnectedStream, CaptureError> {
+            self.inner.connect(binding).await
+        }
+        async fn request_consent(
+            &mut self,
+            display: &DisplayExpectation,
+        ) -> Result<Grant, CaptureError> {
+            self.inner.request_consent(display).await
+        }
+        async fn capture_one(&mut self, mode: StreamMode) -> Result<RawFrame, CaptureError> {
+            self.mode_seen.lock().unwrap().push(mode);
+            self.publishes_seen.fetch_add(1, Ordering::SeqCst);
+            self.inner.capture_one(mode).await
+        }
+        async fn reset_stream(&mut self) {
+            self.inner.reset_stream().await;
+        }
+        async fn close(&mut self) {
+            self.inner.close().await;
         }
     }
 
@@ -1818,6 +2331,8 @@ mod tests {
                 display: None,
                 phase: Phase::Active,
                 stage_active: false,
+                source_gate_expectation: None,
+                stream_mode: None,
             }),
             &status_tx,
         );
@@ -1842,6 +2357,8 @@ mod tests {
                 }),
                 phase: Phase::Active,
                 stage_active: true,
+                source_gate_expectation: None,
+                stream_mode: None,
             }),
             &status_tx,
         )
@@ -1883,6 +2400,8 @@ mod tests {
                 }),
                 phase: Phase::Active,
                 stage_active: true,
+                source_gate_expectation: None,
+                stream_mode: None,
             }),
             &status_tx,
         )
@@ -1920,6 +2439,8 @@ mod tests {
                 }),
                 phase: Phase::Active,
                 stage_active: true,
+                source_gate_expectation: None,
+                stream_mode: None,
             }),
             &status_tx,
         )
@@ -1957,6 +2478,8 @@ mod tests {
                 }),
                 phase: Phase::Active,
                 stage_active: true,
+                source_gate_expectation: None,
+                stream_mode: None,
             }),
             &status_tx,
         );
@@ -2048,6 +2571,8 @@ mod tests {
                 }),
                 phase: Phase::Active,
                 stage_active: true,
+                source_gate_expectation: None,
+                stream_mode: None,
             }),
             &status_tx,
         );
@@ -2311,6 +2836,7 @@ mod tests {
                 update_rx,
                 latest_grids: latest_grids.clone(),
                 source: Box::new(source),
+                source_reader: None,
                 consent_path,
                 cancel,
                 env_reader: test_env_reader,
@@ -2367,6 +2893,31 @@ mod tests {
                 granted_height: 9,
                 stream_position: None,
                 compositor_output: None,
+            },
+        )
+        .unwrap();
+    }
+
+    /// Consent record for the gated TV fixture: pins both the display id
+    /// and the configured `compositor_output` so the runtime's `Runtime::new`
+    /// drift check does not wipe it on first launch.
+    fn test_tv_consent(path: &std::path::Path, compositor_output: &str) {
+        let compositor_output = if compositor_output.is_empty() {
+            None
+        } else {
+            Some(compositor_output.to_owned())
+        };
+        crate::screencast_consent::store_atomic(
+            path,
+            &crate::screencast_consent::ConsentRecord {
+                token: "saved-tv".to_string(),
+                sampled_display: "tv".to_owned(),
+                granted_at: OffsetDateTime::UNIX_EPOCH,
+                portal_persistent_ids: vec!["panel-tv".to_owned()],
+                granted_width: 16,
+                granted_height: 9,
+                stream_position: None,
+                compositor_output,
             },
         )
         .unwrap();
@@ -2641,6 +3192,7 @@ mod tests {
             uniform_reason: None,
             bound_display: None,
             granted_at: None,
+            source_gate: None,
         });
 
         transition_to(
@@ -2746,6 +3298,7 @@ mod tests {
             update_rx: updates_rx,
             latest_grids: new_latest_grids(),
             source: Box::new(source),
+            source_reader: None,
             consent_path,
             cancel: cancel.clone(),
             env_reader: test_env_reader,
@@ -2786,6 +3339,8 @@ mod tests {
                 }),
                 phase: Phase::Active,
                 stage_active: true,
+                source_gate_expectation: None,
+                stream_mode: None,
             }))
             .await
             .unwrap();
@@ -3372,6 +3927,7 @@ mod tests {
             update_rx,
             latest_grids: new_latest_grids(),
             source: Box::new(ScriptedCaptureSource::with_pending_consent()),
+            source_reader: None,
             consent_path,
             cancel: cancel.clone(),
             env_reader: test_env_reader,
@@ -3781,6 +4337,8 @@ mod tests {
         let source = CloseTrackingScriptedSource {
             inner: ScriptedCaptureSource::with_pending_consent(),
             close_calls: close_calls.clone(),
+            captures_seen: std::sync::Arc::new(AtomicUsize::new(0)),
+            connect_calls: std::sync::Arc::new(AtomicUsize::new(0)),
         };
         let (handle, join) = spawn_with_handle(ActiveSamplerDeps {
             initial_config: config,
@@ -3788,6 +4346,7 @@ mod tests {
             update_rx,
             latest_grids: new_latest_grids(),
             source: Box::new(source),
+            source_reader: None,
             consent_path: consent_path.clone(),
             cancel: cancel.clone(),
             env_reader: test_env_reader,
@@ -3908,6 +4467,7 @@ mod tests {
             update_rx,
             latest_grids: new_latest_grids(),
             source: Box::new(ScriptedCaptureSource::with_pending_consent()),
+            source_reader: None,
             consent_path: consent_path.clone(),
             cancel: cancel.clone(),
             env_reader: test_env_reader,
@@ -3970,6 +4530,22 @@ mod tests {
     struct CloseTrackingScriptedSource {
         inner: ScriptedCaptureSource,
         close_calls: std::sync::Arc<AtomicUsize>,
+        captures_seen: std::sync::Arc<AtomicUsize>,
+        connect_calls: std::sync::Arc<AtomicUsize>,
+    }
+
+    impl CloseTrackingScriptedSource {
+        fn new(inner: ScriptedCaptureSource) -> Self {
+            let captures_seen = std::sync::Arc::new(AtomicUsize::new(0));
+            let close_calls = std::sync::Arc::new(AtomicUsize::new(0));
+            let connect_calls = std::sync::Arc::new(AtomicUsize::new(0));
+            Self {
+                inner,
+                close_calls,
+                captures_seen,
+                connect_calls,
+            }
+        }
     }
 
     #[async_trait]
@@ -3978,6 +4554,7 @@ mod tests {
             &mut self,
             binding: &ConsentBinding<'_>,
         ) -> Result<ConnectedStream, CaptureError> {
+            self.connect_calls.fetch_add(1, Ordering::SeqCst);
             self.inner.connect(binding).await
         }
         async fn request_consent(
@@ -3987,6 +4564,7 @@ mod tests {
             self.inner.request_consent(display).await
         }
         async fn capture_one(&mut self, mode: StreamMode) -> Result<RawFrame, CaptureError> {
+            self.captures_seen.fetch_add(1, Ordering::SeqCst);
             self.inner.capture_one(mode).await
         }
         async fn close(&mut self) {
@@ -4586,6 +5164,7 @@ mod tests {
             update_rx: updates_rx,
             latest_grids: new_latest_grids(),
             source: Box::new(source),
+            source_reader: None,
             consent_path,
             cancel: cancel.clone(),
             env_reader: test_env_reader,
@@ -4660,6 +5239,7 @@ mod tests {
             update_rx,
             latest_grids: latest_grids.clone(),
             source,
+            source_reader: None,
             consent_path,
             cancel: cancel.clone(),
             env_reader: test_env_reader,
@@ -4680,5 +5260,1282 @@ mod tests {
         cancel.cancel();
         join.await.unwrap();
         let _ = update_tx;
+    }
+
+    // ── Source-gate lifecycle (Task 8) ─────────────────────────────────
+
+    /// TV config that wires the gate-expectation into the active sampler:
+    /// a Samsung-tizen display with a `host` plus a `sampling.expected_source`
+    /// declared on the display config, and a TV-side configured
+    /// `sampled_display`. Used as the `initial_config` of every
+    /// source-gate integration test below.
+    fn gated_tv_config(interval: Duration) -> Arc<Config> {
+        use dormant_core::config::schema::{DisplaySamplingConfig, DisplayScope, HookSlots};
+        use dormant_core::types::{BlankMode, LadderStage, StageKind};
+        let mut config = (*active_config(interval)).clone();
+        config.wear.active_sampling.sampled_display = Some("tv".to_owned());
+        config.displays.insert(
+            "tv".to_owned(),
+            DisplayConfig {
+                controllers: vec!["samsung-tizen".to_owned()],
+                scope: DisplayScope::default(),
+                shared_input_code: None,
+                shared_input_write_code: None,
+                shared_peer_input_write_code: None,
+                shared_peer_input_code: None,
+                hooks: HookSlots::default(),
+                blank_mode: Some(BlankMode::BrightnessZero),
+                degraded_mode: None,
+                ladder: vec![LadderStage {
+                    kind: StageKind::Controller(BlankMode::BrightnessZero),
+                    dwell: None,
+                }],
+                screensaver: None,
+                output: None,
+                ddc_display: None,
+                host: Some("tv.local".to_owned()),
+                wol_mac: None,
+                blank_command: None,
+                wake_command: None,
+                modes: None,
+                ha_url: None,
+                blank_service: None,
+                blank_data: None,
+                wake_service: None,
+                wake_data: None,
+                command_timeout: Duration::from_secs(5),
+                restore_brightness: 100,
+                samsung_restore_backlight:
+                    dormant_core::config::defaults::SAMSUNG_RESTORE_BACKLIGHT,
+                treat_unreachable_as_blanked: true,
+                panel_type: dormant_core::wear::PanelType::default(),
+                power_off_opt_in: false,
+                compositor_output: Some("HDMI-A-1".to_owned()),
+                sampling: Some(DisplaySamplingConfig {
+                    expected_source: Some("HDMI4".to_owned()),
+                    source_poll_interval: Duration::from_secs(2),
+                    stream_mode: None,
+                }),
+            },
+        );
+        Arc::new(config)
+    }
+
+    /// Step 1 (RED): the source gate must gate `capture_one` per cadence
+    /// tick. Matched → 1 capture. Mismatched / Unknown → 0 captures, no
+    /// grid, lifecycle still `Streaming`. The assertion is on the source's
+    /// atomic capture counter (not just the absent grid), so deleting the
+    /// skip branch turns the `mismatched` / `unknown` rows red.
+    #[tokio::test(start_paused = true)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the match-three RED table covers all three gate states inline"
+    )]
+    async fn source_gate_skips_capture_when_mismatched_or_unknown() {
+        let dir = tempdir().unwrap();
+
+        // Matched gate: exactly one capture succeeds and the grid is published.
+        let matched_path = dir.path().join("matched-consent.json");
+        test_tv_consent(&matched_path, "HDMI-A-1");
+        let (captures_seen, _latest, _handle, _join, _cancel) =
+            drive_default(Ok("HDMI4"), &matched_path, Duration::from_secs(10));
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(10)).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            captures_seen.load(Ordering::SeqCst),
+            1,
+            "Matched gate must allow exactly one capture on the first cadence tick"
+        );
+    }
+
+    /// Step 2 (RED): a runtime whose poller reports `Mismatched` from
+    /// the first poll onwards must skip EVERY capture. The runtime's
+    /// gate-skip match arm must fire on the Mismatched row (not only
+    /// on the Unknown initial-state path). Disabling the Mismatched
+    /// arm of `gate_skip` must make `captures_seen == 0` fail. The
+    /// reader returns Ok("HDMI2") which `classify` resolves to
+    /// Mismatched against the configured `expected_source` `"HDMI4"`.
+    #[tokio::test(start_paused = true)]
+    async fn source_gate_skips_capture_on_persistent_mismatch() {
+        let dir = tempdir().unwrap();
+        let tv_path = dir.path().join("tv-consent.json");
+        test_tv_consent(&tv_path, "HDMI-A-1");
+        // drive_default builds a single static response. The Error
+        // variant maps to `Ok("")`-style Unknown — we need an `Ok("HDMI2")`
+        // response to drive Mismatched, so build the deps inline.
+        let config = gated_tv_config(Duration::from_secs(10));
+        let (source_service, _, _, _) = service_source([TestCapture::Frame, TestCapture::Frame]);
+        let captures_seen = source_service.captures_seen.clone();
+        let source: Box<dyn CaptureSource + Send + Sync + 'static> =
+            Box::new(GateProbeSource::new(source_service));
+        let reader: Arc<dyn source_gate::InputSourceReader> = Arc::new(ScriptedSourceReader::new(
+            [Ok("HDMI2".to_owned())],
+            Ok("HDMI2".to_owned()),
+        ));
+        let cancel = CancellationToken::new();
+        let (updates_tx, updates_rx) = mpsc::channel(4);
+        let deps = ActiveSamplerDeps {
+            initial_config: config,
+            display_id: DisplayId("tv".to_owned()),
+            update_rx: updates_rx,
+            latest_grids: new_latest_grids(),
+            source,
+            source_reader: Some(reader),
+            consent_path: tv_path,
+            cancel: cancel.clone(),
+            env_reader: test_env_reader,
+            event_tx: None,
+        };
+        drop(updates_tx);
+        let (_handle, join) = spawn_with_handle(deps);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(10)).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            captures_seen.load(Ordering::SeqCst),
+            0,
+            "Mismatched gate must skip every capture (the Mismatched skip arm of `gate_skip` is what this row pins; disabling it makes the counter increment on every cadence tick)"
+        );
+        cancel.cancel();
+        let _ = join.await;
+    }
+
+    /// Step 2 (RED): the `latest_grids` entry for a display must be
+    /// cleared when the gate transitions away from Matched, so the
+    /// wear tracker cannot see a stale grid promoted to a fresh
+    /// attribute. The runtime's `apply_gate_observation` removes the
+    /// grid entry inside its `needs_clear` branch on every transition
+    /// away from the previous observation. Driving the test through
+    /// the runtime requires a hot-spin capture; we instead drive it
+    /// directly: seed `latest` with a grid for the TV display, run the
+    /// runtime's own `apply_gate_observation` on a Mismatched
+    /// observation (simulating the poller's first observation that
+    /// differs from Matched), and assert the grid entry is gone.
+    /// This proves the `needs_clear` branch; the runtime's
+    /// `drain_gate_changes` calls this on every poll flip, so an
+    /// in-flight transition-away-from-Matched is what removes the
+    /// grid. Disabling `needs_clear` makes the assertion fail.
+    #[test]
+    fn source_gate_clears_latest_grids_on_transition_away_from_matched() {
+        let dir = tempdir().unwrap();
+        let tv_path = dir.path().join("tv-consent.json");
+        test_tv_consent(&tv_path, "HDMI-A-1");
+        let config = gated_tv_config(Duration::from_secs(10));
+        let mut runtime = Runtime::new(&config, &tv_path, &DisplayId("tv".to_owned()));
+        let latest = new_latest_grids();
+        let display_id = DisplayId("tv".to_owned());
+        // Seed the grid entry the way the capture path would.
+        let (status_tx, _) = watch::channel(initial_status(&config));
+        // Seed runtime.gate_state to Matched so the first
+        // apply_gate_observation call below transitions
+        // Matched -> Mismatched (the bug-under-test path).
+        runtime.gate_state = Some(source_gate::SourceGate::Matched);
+        latest.write().unwrap().insert(
+            display_id.clone(),
+            SampledGrid {
+                grid: dormant_core::spatial_grid::LumaGrid::new(vec![0.0; 16 * 9]).unwrap(),
+                captured_at: Tick::now(),
+                phase_at_capture: Phase::Active,
+            },
+        );
+        assert!(
+            latest.read().unwrap().contains_key(&display_id),
+            "seed must populate the grid entry"
+        );
+        // Feed the same Matched observation — must NOT clear the grid.
+        apply_gate_observation(
+            &mut runtime,
+            &source_gate::SourceGate::Matched,
+            &status_tx,
+            &latest,
+            &display_id,
+        );
+        assert!(
+            latest.read().unwrap().contains_key(&display_id),
+            "Matched observation must NOT clear the grid"
+        );
+        apply_gate_observation(
+            &mut runtime,
+            &source_gate::SourceGate::Mismatched {
+                observed: "HDMI2".to_owned(),
+            },
+            &status_tx,
+            &latest,
+            &display_id,
+        );
+        assert!(
+            !latest.read().unwrap().contains_key(&display_id),
+            "transitioning from Matched to Mismatched must clear the grid entry"
+        );
+        // And the inverse: re-seeding a grid and feeding the same
+        // observation must NOT clear it (no transition).
+        latest.write().unwrap().insert(
+            display_id.clone(),
+            SampledGrid {
+                grid: dormant_core::spatial_grid::LumaGrid::new(vec![0.5; 16 * 9]).unwrap(),
+                captured_at: Tick::now(),
+                phase_at_capture: Phase::Active,
+            },
+        );
+        apply_gate_observation(
+            &mut runtime,
+            &source_gate::SourceGate::Mismatched {
+                observed: "HDMI2".to_owned(),
+            },
+            &status_tx,
+            &latest,
+            &display_id,
+        );
+        assert!(
+            latest.read().unwrap().contains_key(&display_id),
+            "feeding the SAME observation (no transition) must not clear the grid"
+        );
+    }
+
+    /// Step 2 (RED): the `WearSamplingSourceGate` event must fire
+    /// EXACTLY ONCE per full-gate-value change — not per poll. The
+    /// spec calls out `unknown -> mismatched -> mismatched -> matched`
+    /// as a three-event sequence even though the poller observed four
+    /// values (the second mismatched poll is a steady-state repeat).
+    /// The runtime enforces this with `last_event_gate` deduplication
+    /// inside `apply_gate_observation`. The test wires a real
+    /// `event_tx` (all prior gate tests passed `None` and so could
+    /// not observe the event at all) and feeds the four observations
+    /// through `apply_gate_observation`, then drains the channel and
+    /// asserts the exact 3-event sequence + observed-source mapping.
+    #[test]
+    fn source_gate_event_dedup_exactly_three_for_umm_match() {
+        let dir = tempdir().unwrap();
+        let tv_path = dir.path().join("tv-consent.json");
+        test_tv_consent(&tv_path, "HDMI-A-1");
+        let config = gated_tv_config(Duration::from_secs(10));
+        let mut runtime = Runtime::new(&config, &tv_path, &DisplayId("tv".to_owned()));
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        runtime.event_tx = Some(event_tx);
+        let display_id = DisplayId("tv".to_owned());
+        let (status_tx, _) = watch::channel(initial_status(&config));
+
+        // Drain the WearSamplingStarted event the runtime emits on
+        // entry to Streaming (publish_status fires it before our test
+        // reaches the gate observation feed).
+        let _ = event_rx.try_recv();
+
+        // u -> m -> m -> m. Three transitions in the gate-state
+        // value space; the two steady-state Mismatched polls must
+        // produce ONE event, not two.
+        apply_gate_observation(
+            &mut runtime,
+            &source_gate::SourceGate::Unknown {
+                reason: "awaiting_first_poll",
+            },
+            &status_tx,
+            &new_latest_grids(),
+            &display_id,
+        );
+        apply_gate_observation(
+            &mut runtime,
+            &source_gate::SourceGate::Mismatched {
+                observed: "HDMI2".to_owned(),
+            },
+            &status_tx,
+            &new_latest_grids(),
+            &display_id,
+        );
+        apply_gate_observation(
+            &mut runtime,
+            &source_gate::SourceGate::Mismatched {
+                observed: "HDMI2".to_owned(),
+            },
+            &status_tx,
+            &new_latest_grids(),
+            &display_id,
+        );
+        apply_gate_observation(
+            &mut runtime,
+            &source_gate::SourceGate::Matched,
+            &status_tx,
+            &new_latest_grids(),
+            &display_id,
+        );
+
+        let mut events: Vec<(String, Option<String>)> = Vec::new();
+        while let Ok(msg) = event_rx.try_recv() {
+            if let ControlMsg::PublishDaemonEvent(DaemonEvent::WearSamplingSourceGate {
+                state,
+                observed,
+                ..
+            }) = msg
+            {
+                events.push((state, observed));
+            }
+        }
+        assert_eq!(
+            events,
+            vec![
+                ("unknown".to_owned(), None),
+                ("mismatched".to_owned(), Some("HDMI2".to_owned())),
+                ("matched".to_owned(), None),
+            ],
+            "u -> m -> m -> matched must emit exactly 3 WearSamplingSourceGate events; got {events:?}"
+        );
+    }
+
+    /// Step 2 (RED): the source-gate poller must only run for displays
+    /// that declare a gate expectation AND only while the lifecycle
+    /// is `Streaming`. Outside of Streaming — for example, in
+    /// `NeedsConsent` after the operator revokes the portal grant —
+    /// the runtime must report `source_gate = None` (permanently
+    /// matched, no phantom observation) and the poller must not run
+    /// at all. The probe drives `Runtime::new` with a gate-equipped
+    /// config and no consent record, then asserts the initial state
+    /// is `NeedsConsent` AND the status publishes with `source_gate =
+    /// None`. With the runtime in `NeedsConsent` the poller must NOT
+    /// spawn (lifecycle-gated), so the test does not need to wait for
+    /// a poll observation to settle.
+    #[tokio::test]
+    async fn source_gate_poller_does_not_run_outside_streaming() {
+        let dir = tempdir().unwrap();
+        let tv_path = dir.path().join("tv-consent.json");
+        // No consent record — runtime starts in NeedsConsent despite
+        // the gate expectation in the config.
+        let config = gated_tv_config(Duration::from_secs(10));
+        let runtime = Runtime::new(&config, &tv_path, &DisplayId("tv".to_owned()));
+        let (status_tx, _) = watch::channel(initial_status(&config));
+        let status = SamplerStatus {
+            state: runtime.state,
+            last_capture: None,
+            uniform_reason: None,
+            bound_display: runtime
+                .record
+                .as_ref()
+                .map(|record| record.record().sampled_display.clone()),
+            granted_at: runtime
+                .record
+                .as_ref()
+                .map(|record| record.record().granted_at),
+            source_gate: runtime.gate_state.clone(),
+        };
+        publish_status(&status_tx, &runtime, None, None);
+        assert_eq!(
+            runtime.state,
+            SamplingState::NeedsConsent,
+            "a gated display with no consent record must start in NeedsConsent"
+        );
+        assert_eq!(
+            status.source_gate, None,
+            "outside Streaming the status must not advertise a source_gate observation"
+        );
+        // reconcile_gate_poller must also have refused to spawn. We
+        // pre-wire `source_reader` (the same way the run() helper does
+        // when it takes `deps.source_reader`) so the `reader.is_some()`
+        // arm of `wants_poller` is exercised — without a reader the
+        // streaming-only check is irrelevant.
+        let mut runtime = runtime;
+        runtime.source_reader = Some(Arc::new(ScriptedSourceReader::new(
+            [Ok("HDMI4".to_owned())],
+            Ok("HDMI4".to_owned()),
+        )));
+        reconcile_gate_poller(&mut runtime);
+        assert!(
+            runtime.gate_poller.is_none(),
+            "poller must NOT spawn in NeedsConsent lifecycle (streaming=false short-circuits the gate)"
+        );
+        assert!(
+            runtime.gate_rx.is_none(),
+            "gate_rx must NOT be wired in NeedsConsent lifecycle"
+        );
+        // And the inverse: rewire the lifecycle to Streaming (without
+        // actually changing anything else) and confirm the poller NOW
+        // spawns — the streaming-only gate is the only thing that
+        // changes between the two reconcile calls.
+        runtime.state = SamplingState::Streaming;
+        reconcile_gate_poller(&mut runtime);
+        assert!(
+            runtime.gate_poller.is_some(),
+            "poller MUST spawn once the lifecycle reaches Streaming"
+        );
+    }
+
+    /// Step 2 (RED): a gate flip DURING the cadence wait must skip the
+    /// capture that wakes up at the next tick. The runtime re-reads the
+    /// poller's latest observation between select-return and the
+    /// `gate_skip` check so a stale `gate_state` from before the wait
+    /// cannot authorize a capture the operator's TV has just invalidated.
+    ///
+    /// The probe flips Matched -> Mismatched at +2s on a 10s cadence;
+    /// without the fix, `captures_seen` grows by one more capture than
+    /// the matched-window baseline (the post-wait capture proceeds
+    /// against the stale Matched). With the fix it stays at the
+    /// baseline.
+    ///
+    /// The pre-wait state MUST be `Matched` (not the seeded
+    /// `Unknown{awaiting_first_poll}`, which is itself a skip value and
+    /// would mask the bug). Force the drain by advancing past the
+    /// poller's first poll and sending an identity `DisplayContext` so
+    /// the runtime wakes from select and the NEXT iteration's top
+    /// drain reads the `Matched` observation. Without the fix the
+    /// runtime then sits in select with `state=Match`; the poller
+    /// flips to `Mismatch` at +2s; the cadence fires at +10s and the
+    /// stale `gate_skip` reads `Matched` → capture. With the fix the
+    /// post-select re-drain reads `Mismatch` → skip.
+    ///
+    /// Must NOT use `drive()`: that helper drops `updates_tx`, which
+    /// makes `update_rx.recv()` return instantly and the loop
+    /// hot-spins `drain → select → continue` without ever actually
+    /// waiting for the cadence (the bug's hiding spot).
+    #[tokio::test(start_paused = true)]
+    async fn source_gate_flip_during_cadence_wait_skips_the_wake_capture() {
+        let dir = tempdir().unwrap();
+        let tv_path = dir.path().join("tv-consent.json");
+        test_tv_consent(&tv_path, "HDMI-A-1");
+        let config = gated_tv_config(Duration::from_secs(10));
+        let (source_service, _, _, _) =
+            service_source([TestCapture::Frame, TestCapture::Frame, TestCapture::Frame]);
+        let captures_seen = source_service.captures_seen.clone();
+        let source: Box<dyn CaptureSource + Send + Sync + 'static> =
+            Box::new(GateProbeSource::new(source_service));
+        let reader: Arc<dyn source_gate::InputSourceReader> = Arc::new(ScriptedSourceReader::new(
+            [Ok("HDMI4".to_owned()), Ok("HDMI2".to_owned())],
+            Ok("HDMI2".to_owned()),
+        ));
+        let cancel = CancellationToken::new();
+        // KEEP updates_tx alive — closing it makes the runtime's
+        // `update_rx.recv()` arm resolve instantly and hides the race.
+        let (updates_tx, updates_rx) = mpsc::channel(4);
+        let deps = ActiveSamplerDeps {
+            initial_config: config,
+            display_id: DisplayId("tv".to_owned()),
+            update_rx: updates_rx,
+            latest_grids: new_latest_grids(),
+            source,
+            source_reader: Some(reader),
+            consent_path: tv_path,
+            cancel: cancel.clone(),
+            env_reader: test_env_reader,
+            event_tx: None,
+        };
+        let (handle, join) = spawn_with_handle(deps);
+        // Phase 1: let the runtime reach Streaming, then advance past
+        // the poller's first poll (at +2s, fires Matched) and pump the
+        // runtime so the NEXT streaming-arm iteration's top drain
+        // catches Matched into gate_state. The runtime is otherwise
+        // parked in select (live updates_tx, no other arms firing).
+        tokio::time::advance(Duration::from_secs(3)).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        // Force the runtime to wake from select with the identity
+        // DisplayContext. The arm body calls apply_update (which does
+        // not drain by itself) and `continue`s; the next streaming
+        // arm iteration drains at its top — by now the poller's first
+        // poll at +2s has fired, so the drain reads Matched.
+        updates_tx
+            .send(SamplerUpdate::DisplayContext(DisplaySamplingContext {
+                display: Some(DisplayExpectation {
+                    display: "tv".to_owned(),
+                    compositor_output: Some("HDMI-A-1".to_owned()),
+                }),
+                phase: Phase::Active,
+                stage_active: true,
+                source_gate_expectation: Some(source_gate::SourceGateExpectation {
+                    host: "tv.local".to_owned(),
+                    expected_source: "HDMI4".to_owned(),
+                    poll_interval: Duration::from_secs(2),
+                }),
+                stream_mode: None,
+            }))
+            .await
+            .unwrap();
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        let baseline_captures = captures_seen.load(Ordering::SeqCst);
+        assert_eq!(
+            handle.status().borrow().state,
+            SamplingState::Streaming,
+            "runtime must have reached Streaming before the flip"
+        );
+        assert_eq!(
+            handle.status().borrow().source_gate,
+            Some(source_gate::SourceGate::Matched),
+            "pre-wait drain must settle gate_state to Matched (got {:?}); \
+             the test cannot discriminate the TOCTOU fix if the pre-wait \
+             state is Unknown{{awaiting_first_poll}}, which is itself a \
+             skip value",
+            handle.status().borrow().source_gate
+        );
+        // Phase 2: advance past several poller ticks (the poller is on a
+        // +2s cadence from the +2s first poll, so the writes at +4s,
+        // +6s, +8s, +10s all observe HDMI2 → Mismatched) AND the
+        // first cadence tick at +10s. The runtime sits in select
+        // with `state=Match`; without the TOCTOU fix the `gate_skip`
+        // check reads the stale Matched and authorizes a capture;
+        // with the fix the runtime re-drains the flip before
+        // `gate_skip` and skips. The advance + 200 yields are sized
+        // so the runtime is reliably polled through the post-cadence
+        // drain (small advances race the executor's poll cadence
+        // and leave `source_gate` reporting Matched instead).
+        tokio::time::advance(Duration::from_secs(15)).await;
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            handle.status().borrow().source_gate,
+            Some(source_gate::SourceGate::Mismatched {
+                observed: "HDMI2".to_owned()
+            }),
+            "runtime must reflect the post-flip Mismatched observation"
+        );
+        let final_captures = captures_seen.load(Ordering::SeqCst);
+        assert_eq!(
+            final_captures, baseline_captures,
+            "a Matched -> Mismatched flip during the cadence wait must skip the wake capture (baseline={baseline_captures}, final={final_captures})"
+        );
+        cancel.cancel();
+        let _ = join.await;
+    }
+
+    /// Step 2 (RED): removing the configured gate expectation must
+    /// reset the live `gate_state`, not leave the runtime wedged on the
+    /// last observation. A `Mismatched` gate followed by gate removal
+    /// would otherwise skip captures forever on an ungated display —
+    /// the contract "no gate = permanently matched" the production
+    /// status surface advertises. The probe: Mismatched gate -> 0
+    /// captures (gate skips), then remove the expectation, advance a
+    /// full cadence, and assert at least one capture landed. Without
+    /// the fix `captures_seen` stays at 0.
+    #[tokio::test(start_paused = true)]
+    async fn source_gate_removal_resets_state_and_resumes_capture() {
+        let dir = tempdir().unwrap();
+        let tv_path = dir.path().join("tv-consent.json");
+        test_tv_consent(&tv_path, "HDMI-A-1");
+        let config = gated_tv_config(Duration::from_secs(10));
+        let (source_service, _, _, _) = service_source([
+            TestCapture::Frame,
+            TestCapture::Frame,
+            TestCapture::Frame,
+            TestCapture::Frame,
+        ]);
+        let captures_seen = source_service.captures_seen.clone();
+        let source: Box<dyn CaptureSource + Send + Sync + 'static> =
+            Box::new(GateProbeSource::new(source_service));
+        // Reader keeps returning the wrong source so the gate stays
+        // Mismatched until the expectation is removed.
+        let reader: Arc<dyn source_gate::InputSourceReader> = Arc::new(ScriptedSourceReader::new(
+            [Ok("HDMI2".to_owned())],
+            Ok("HDMI2".to_owned()),
+        ));
+        let cancel = CancellationToken::new();
+        let (updates_tx, updates_rx) = mpsc::channel(4);
+        let deps = ActiveSamplerDeps {
+            initial_config: config,
+            display_id: DisplayId("tv".to_owned()),
+            update_rx: updates_rx,
+            latest_grids: new_latest_grids(),
+            source,
+            source_reader: Some(reader),
+            consent_path: tv_path,
+            cancel: cancel.clone(),
+            env_reader: test_env_reader,
+            event_tx: None,
+        };
+        let (handle, join) = spawn_with_handle(deps);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        // Phase 1: Mismatched gate -> zero captures through one cadence.
+        tokio::time::advance(Duration::from_secs(11)).await;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            handle.status().borrow().source_gate,
+            Some(source_gate::SourceGate::Mismatched {
+                observed: "HDMI2".to_owned()
+            }),
+            "runtime must report the wrong-source Mismatched observation"
+        );
+        assert_eq!(
+            captures_seen.load(Ordering::SeqCst),
+            0,
+            "Mismatched gate must skip every capture"
+        );
+        // Phase 2: remove the expectation. After one cadence, the
+        // ungated display must capture — no stale gate_state.
+        updates_tx
+            .send(SamplerUpdate::DisplayContext(DisplaySamplingContext {
+                display: Some(DisplayExpectation {
+                    display: "tv".to_owned(),
+                    compositor_output: Some("HDMI-A-1".to_owned()),
+                }),
+                phase: Phase::Active,
+                stage_active: true,
+                source_gate_expectation: None,
+                stream_mode: None,
+            }))
+            .await
+            .unwrap();
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(11)).await;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            handle.status().borrow().source_gate,
+            None,
+            "runtime must clear source_gate on gate removal (permanently matched, no phantom status)"
+        );
+        assert!(
+            captures_seen.load(Ordering::SeqCst) >= 1,
+            "removing the gate must allow captures again after one cadence; got {}",
+            captures_seen.load(Ordering::SeqCst)
+        );
+        cancel.cancel();
+        let _ = join.await;
+    }
+
+    /// Drive a fresh `ActiveSampler` configured for a single gate
+    /// response. Used by the source-gate × tick test and the reload
+    /// lifecycle test below; exists as a separate function so the
+    /// assertion blocks stay within each test's `too_many_lines`
+    /// allowance. The caller selects the per-call capture source via
+    /// the `source_factory` closure so the reload test can swap in a
+    /// `CloseTrackingScriptedSource` without giving up the helper's
+    /// shared finalize-and-spawn body. The factory returns the boxed
+    /// source plus the atomic `captures_seen` counter the runtime's
+    /// capture pipeline increments for each `capture_one` call.
+    fn drive<F>(
+        gate_response: Result<&'static str, &'static str>,
+        consent_path: &std::path::Path,
+        interval: Duration,
+        source_factory: F,
+    ) -> (
+        Arc<AtomicUsize>,
+        LatestGrids,
+        ActiveSamplerHandle,
+        JoinHandle<()>,
+        CancellationToken,
+    )
+    where
+        F: FnOnce() -> (
+            Box<dyn CaptureSource + Send + Sync + 'static>,
+            Arc<AtomicUsize>,
+        ),
+    {
+        let config = gated_tv_config(interval);
+        let (source, captures_seen) = source_factory();
+        let latest = new_latest_grids();
+        let cancel = CancellationToken::new();
+        let responses: Vec<Result<String, String>> = match gate_response {
+            Ok(s) => vec![Ok((*s).to_owned())],
+            Err(s) => vec![Err((*s).to_owned())],
+        };
+        let default: Result<String, String> = match gate_response {
+            Ok(s) => Ok((*s).to_owned()),
+            Err(s) => Err((*s).to_owned()),
+        };
+        let reader: Arc<dyn source_gate::InputSourceReader> =
+            Arc::new(ScriptedSourceReader::new(responses, default));
+        let (updates_tx, updates_rx) = mpsc::channel(2);
+        let deps = ActiveSamplerDeps {
+            initial_config: config,
+            display_id: DisplayId("tv".to_owned()),
+            update_rx: updates_rx,
+            latest_grids: latest.clone(),
+            source,
+            source_reader: Some(reader),
+            consent_path: consent_path.to_path_buf(),
+            cancel: cancel.clone(),
+            env_reader: test_env_reader,
+            event_tx: None,
+        };
+        drop(updates_tx);
+        let (handle, join) = spawn_with_handle(deps);
+        (captures_seen, latest, handle, join, cancel)
+    }
+
+    fn drive_default(
+        gate_response: Result<&'static str, &'static str>,
+        consent_path: &std::path::Path,
+        interval: Duration,
+    ) -> (
+        Arc<AtomicUsize>,
+        LatestGrids,
+        ActiveSamplerHandle,
+        JoinHandle<()>,
+        CancellationToken,
+    ) {
+        drive(gate_response, consent_path, interval, || {
+            let (source, _, _, _) = service_source([TestCapture::Frame, TestCapture::Frame]);
+            let captures_seen = source.captures_seen.clone();
+            (Box::new(GateProbeSource::new(source)), captures_seen)
+        })
+    }
+
+    /// Step 2 (RED): the source-gate poller must only be active for
+    /// displays that declare a `[displays.<id>.sampling]` table AND only
+    /// while the runtime is `Streaming`. Adding, removing, or changing
+    /// `expected_source` via a `DisplayContext` update must restart the
+    /// poller without ever touching the source's `close()` or
+    /// `connect()` (gated capture != gated portal session). The
+    /// `close_calls == 0` and `connect_calls` invariant is THE pin: if
+    /// source-setting reloads ever called `close()` the operator would
+    /// silently burn the saved portal grant on every TV config edit.
+    #[tokio::test(start_paused = true)]
+    // Five linear scenarios (a-e) live in one body so the portal-session pin
+    // stays co-located with the counter deltas it certifies.
+    #[allow(clippy::too_many_lines)]
+    async fn source_gate_poller_lifecycle_respects_portal_session() {
+        // (a) unconfigured AOC: no poller, no source_gate status.
+        let dir = tempdir().unwrap();
+        let aoc_path = dir.path().join("aoc-consent.json");
+        test_record(&aoc_path);
+        let aoc_config = active_config(Duration::from_secs(60));
+        let aoc_inner = CloseTrackingScriptedSource::new(ScriptedCaptureSource::with_connections(
+            [Ok(test_stream())],
+        ));
+        let mut aoc_inner = aoc_inner;
+        aoc_inner.inner.frames = VecDeque::from([
+            ScriptedOutcome::Ready(Ok(test_frame())),
+            ScriptedOutcome::Ready(Ok(test_frame())),
+        ]);
+        let aoc_close_calls = aoc_inner.close_calls.clone();
+        let aoc_connect_calls = aoc_inner.connect_calls.clone();
+        let aoc_captures = aoc_inner.captures_seen.clone();
+        let cancel = CancellationToken::new();
+        let (updates_tx, updates_rx) = mpsc::channel(4);
+        let deps_aoc = ActiveSamplerDeps {
+            initial_config: aoc_config,
+            display_id: DisplayId("oled".to_owned()),
+            update_rx: updates_rx,
+            latest_grids: new_latest_grids(),
+            source: Box::new(aoc_inner),
+            source_reader: None,
+            consent_path: aoc_path,
+            cancel: cancel.clone(),
+            env_reader: test_env_reader,
+            event_tx: None,
+        };
+        drop(updates_tx);
+        let (aoc_handle, aoc_join) = spawn_with_handle(deps_aoc);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            aoc_handle.status().borrow().source_gate,
+            None,
+            "unconfigured AOC must have no source_gate status (permanently matched)"
+        );
+        let aoc_captures_after_spawn = aoc_captures.load(Ordering::SeqCst);
+        let aoc_connects_after_spawn = aoc_connect_calls.load(Ordering::SeqCst);
+        let aoc_closes_after_spawn = aoc_close_calls.load(Ordering::SeqCst);
+        assert_eq!(
+            aoc_closes_after_spawn, 0,
+            "AOC must not have called close() before shutdown (pre-pin baseline)"
+        );
+        cancel.cancel();
+        let _ = aoc_join.await;
+
+        // (b) configured TV: poller spawns in Streaming, then we drive
+        // a sequence of source-setting reloads via the same
+        // `DisplayContext` channel the production reload path uses.
+        // Through ALL of those the `close_calls` and `connect_calls`
+        // counters on the source must stay flat — the pin: source
+        // reloads must never close the portal session.
+        let dir = tempdir().unwrap();
+        let tv_path = dir.path().join("tv-consent.json");
+        test_tv_consent(&tv_path, "HDMI-A-1");
+        let inner =
+            CloseTrackingScriptedSource::new(ScriptedCaptureSource::with_connections([Ok(
+                test_stream(),
+            )]));
+        let mut inner = inner;
+        inner.inner.frames = VecDeque::from([
+            ScriptedOutcome::Ready(Ok(test_frame())),
+            ScriptedOutcome::Ready(Ok(test_frame())),
+            ScriptedOutcome::Ready(Ok(test_frame())),
+        ]);
+        let close_calls = inner.close_calls.clone();
+        let connect_calls = inner.connect_calls.clone();
+        let captures_seen = inner.captures_seen.clone();
+        let cancel = CancellationToken::new();
+        let (updates_tx, updates_rx) = mpsc::channel(4);
+        let deps = ActiveSamplerDeps {
+            initial_config: gated_tv_config(Duration::from_secs(60)),
+            display_id: DisplayId("tv".to_owned()),
+            update_rx: updates_rx,
+            latest_grids: new_latest_grids(),
+            source: Box::new(inner),
+            source_reader: Some(Arc::new(ScriptedSourceReader::new(
+                [Ok("HDMI4".to_owned())],
+                Ok("HDMI4".to_owned()),
+            ))),
+            consent_path: tv_path,
+            cancel: cancel.clone(),
+            env_reader: test_env_reader,
+            event_tx: None,
+        };
+        let (handle, join) = spawn_with_handle(deps);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        let initial_close_calls = close_calls.load(Ordering::SeqCst);
+        let initial_connect_calls = connect_calls.load(Ordering::SeqCst);
+        let initial_captures = captures_seen.load(Ordering::SeqCst);
+        assert_eq!(
+            initial_close_calls, 0,
+            "TV with configured gate must never call close() on initial connect"
+        );
+        assert_eq!(
+            initial_connect_calls, 1,
+            "TV runtime must have called connect() exactly once during initial Streaming entry"
+        );
+
+        // (c) change `expected_source` via a DisplayContext update.
+        updates_tx
+            .send(SamplerUpdate::DisplayContext(DisplaySamplingContext {
+                display: Some(DisplayExpectation {
+                    display: "tv".to_owned(),
+                    compositor_output: Some("HDMI-A-1".to_owned()),
+                }),
+                phase: Phase::Active,
+                stage_active: true,
+                source_gate_expectation: Some(source_gate::SourceGateExpectation {
+                    host: "tv.local".to_owned(),
+                    expected_source: "HDMI2".to_owned(),
+                    poll_interval: Duration::from_secs(2),
+                }),
+                stream_mode: None,
+            }))
+            .await
+            .unwrap();
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        // (d) remove the gate by sending a DisplayContext with no
+        // `source_gate_expectation`.
+        updates_tx
+            .send(SamplerUpdate::DisplayContext(DisplaySamplingContext {
+                display: Some(DisplayExpectation {
+                    display: "tv".to_owned(),
+                    compositor_output: Some("HDMI-A-1".to_owned()),
+                }),
+                phase: Phase::Active,
+                stage_active: true,
+                source_gate_expectation: None,
+                stream_mode: None,
+            }))
+            .await
+            .unwrap();
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            close_calls.load(Ordering::SeqCst),
+            initial_close_calls,
+            "source-setting reloads (expect change, expect removal) must not call close()"
+        );
+        assert_eq!(
+            connect_calls.load(Ordering::SeqCst),
+            initial_connect_calls,
+            "source-setting reloads must not re-open the portal session"
+        );
+        assert_eq!(
+            captures_seen.load(Ordering::SeqCst),
+            initial_captures,
+            "no extra captures must run while the runtime was reloading the gate"
+        );
+        // AOC was cancelled before the TV reloads; the AOC's
+        // `close_calls` increments once on shutdown (the runtime's
+        // `run()` calls `source.close()` at the end of the loop).
+        // The pin we actually want is that the TV's gate reloads do
+        // not re-open the AOC's portal session — i.e. the AOC's
+        // `connect_calls` and `captures_seen` stay flat.
+        assert_eq!(
+            aoc_close_calls.load(Ordering::SeqCst),
+            aoc_closes_after_spawn + 1,
+            "AOC must close exactly once (the shutdown close), nothing more"
+        );
+        assert_eq!(
+            aoc_connect_calls.load(Ordering::SeqCst),
+            aoc_connects_after_spawn,
+            "AOC's connect_calls must remain flat across the TV's gate reloads"
+        );
+        assert_eq!(
+            aoc_captures.load(Ordering::SeqCst),
+            aoc_captures_after_spawn,
+            "AOC's capture counter must remain flat across the TV's gate reloads"
+        );
+
+        cancel.cancel();
+        let _ = handle;
+        let _ = join.await;
+    }
+
+    /// Big config builder for the two-runtime mode-resolution test.
+    /// Two displays: a TV with an explicit per-display `stream_mode`
+    /// override, and a render-only monitor with no override. The wear
+    /// section's `[wear.active_sampling] stream_mode` is the global
+    /// fallback (`Warm`).
+    fn two_runtime_mode_resolution_config() -> Arc<Config> {
+        use dormant_core::config::schema::{DisplaySamplingConfig, DisplayScope, HookSlots};
+        use dormant_core::types::{BlankMode, LadderStage, StageKind};
+        let mut config = (*active_config(Duration::from_secs(60))).clone();
+        config.wear.active_sampling.sampled_display = None;
+        config.wear.active_sampling.sampled_displays = vec!["tv".to_owned(), "monitor".to_owned()];
+        config.wear.active_sampling.stream_mode = StreamMode::Warm;
+        config.displays.insert(
+            "monitor".to_owned(),
+            DisplayConfig {
+                controllers: vec!["ddcci".to_owned()],
+                scope: DisplayScope::default(),
+                shared_input_code: None,
+                shared_input_write_code: None,
+                shared_peer_input_write_code: None,
+                shared_peer_input_code: None,
+                hooks: HookSlots::default(),
+                blank_mode: Some(BlankMode::BrightnessZero),
+                degraded_mode: None,
+                ladder: vec![LadderStage {
+                    kind: StageKind::Controller(BlankMode::BrightnessZero),
+                    dwell: None,
+                }],
+                screensaver: None,
+                output: None,
+                ddc_display: None,
+                host: None,
+                wol_mac: None,
+                blank_command: None,
+                wake_command: None,
+                modes: None,
+                ha_url: None,
+                blank_service: None,
+                blank_data: None,
+                wake_service: None,
+                wake_data: None,
+                command_timeout: Duration::from_secs(5),
+                restore_brightness: 100,
+                samsung_restore_backlight:
+                    dormant_core::config::defaults::SAMSUNG_RESTORE_BACKLIGHT,
+                treat_unreachable_as_blanked: true,
+                panel_type: dormant_core::wear::PanelType::default(),
+                power_off_opt_in: false,
+                compositor_output: None,
+                sampling: None,
+            },
+        );
+        config.displays.insert(
+            "tv".to_owned(),
+            DisplayConfig {
+                controllers: vec!["samsung-tizen".to_owned()],
+                scope: DisplayScope::default(),
+                shared_input_code: None,
+                shared_input_write_code: None,
+                shared_peer_input_write_code: None,
+                shared_peer_input_code: None,
+                hooks: HookSlots::default(),
+                blank_mode: Some(BlankMode::BrightnessZero),
+                degraded_mode: None,
+                ladder: vec![LadderStage {
+                    kind: StageKind::Controller(BlankMode::BrightnessZero),
+                    dwell: None,
+                }],
+                screensaver: None,
+                output: None,
+                ddc_display: None,
+                host: Some("tv.local".to_owned()),
+                wol_mac: None,
+                blank_command: None,
+                wake_command: None,
+                modes: None,
+                ha_url: None,
+                blank_service: None,
+                blank_data: None,
+                wake_service: None,
+                wake_data: None,
+                command_timeout: Duration::from_secs(5),
+                restore_brightness: 100,
+                samsung_restore_backlight:
+                    dormant_core::config::defaults::SAMSUNG_RESTORE_BACKLIGHT,
+                treat_unreachable_as_blanked: true,
+                panel_type: dormant_core::wear::PanelType::default(),
+                power_off_opt_in: false,
+                compositor_output: Some("HDMI-A-1".to_owned()),
+                sampling: Some(DisplaySamplingConfig {
+                    expected_source: Some("HDMI4".to_owned()),
+                    source_poll_interval: Duration::from_secs(2),
+                    stream_mode: Some(StreamMode::PerTick),
+                }),
+            },
+        );
+        Arc::new(config)
+    }
+
+    /// Capture-source wrapper that records every `capture_one` mode
+    /// argument and every `reset_stream` call so the two-runtime
+    /// mode-resolution test can read out the effective `StreamMode`
+    /// each runtime observed AND prove the per-display effective-mode
+    /// change fires `StreamModeChanged` only on the runtime that
+    /// flipped mode.
+    struct ModeRecordingSource {
+        inner: ServiceSource,
+        modes: Arc<Mutex<Vec<StreamMode>>>,
+        resets: Arc<AtomicUsize>,
+    }
+
+    impl ModeRecordingSource {
+        fn new(inner: ServiceSource) -> (Self, Arc<AtomicUsize>, Arc<Mutex<Vec<StreamMode>>>) {
+            let modes = Arc::new(Mutex::new(Vec::new()));
+            let resets = Arc::new(AtomicUsize::new(0));
+            let recorded_modes = modes.clone();
+            let recorded_resets = resets.clone();
+            (
+                Self {
+                    inner,
+                    modes: modes.clone(),
+                    resets,
+                },
+                recorded_resets,
+                recorded_modes,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl CaptureSource for ModeRecordingSource {
+        async fn connect(
+            &mut self,
+            binding: &ConsentBinding<'_>,
+        ) -> Result<ConnectedStream, CaptureError> {
+            self.inner.connect(binding).await
+        }
+        async fn request_consent(
+            &mut self,
+            display: &DisplayExpectation,
+        ) -> Result<Grant, CaptureError> {
+            self.inner.request_consent(display).await
+        }
+        async fn capture_one(&mut self, mode: StreamMode) -> Result<RawFrame, CaptureError> {
+            self.modes.lock().unwrap().push(mode);
+            self.inner.capture_one(mode).await
+        }
+        async fn reset_stream(&mut self) {
+            self.resets.fetch_add(1, Ordering::SeqCst);
+            self.inner.reset_stream().await;
+        }
+        async fn close(&mut self) {
+            self.inner.close().await;
+        }
+    }
+
+    /// Step 2 (RED): two-runtime mode-resolution. Global = `Warm`.
+    /// Monitor runtime carries no `[sampling]` override and must
+    /// resolve `Warm`. TV runtime carries `Some(PerTick)` and must
+    /// resolve `PerTick`. Reloading the TV's `DisplayContext` to
+    /// `stream_mode == None` must switch the TV's effective mode to
+    /// `Warm` through the existing `StreamModeChanged` reset path
+    /// WITHOUT re-consent (no `consent_path` rebuild, no `request_consent`
+    /// call). The monitor runtime must record no mode change.
+    #[tokio::test(start_paused = true)]
+    // Two runtimes + a DisplayContext reload + reset-path + consent-binding
+    // assertions read more clearly as one chronological flow than as helpers.
+    #[allow(clippy::too_many_lines)]
+    async fn source_gate_per_display_stream_mode_resolution_two_runtimes() {
+        let dir = tempdir().unwrap();
+        let monitor_path = dir.path().join("monitor-consent.json");
+        let tv_path = dir.path().join("tv-consent.json");
+        test_record_for(&monitor_path, "monitor");
+        test_tv_consent(&tv_path, "HDMI-A-1");
+        let config = two_runtime_mode_resolution_config();
+
+        let (monitor_source, monitor_resets, monitor_modes) =
+            ModeRecordingSource::new(service_source([TestCapture::Frame, TestCapture::Frame]).0);
+        let (tv_source, tv_resets, tv_modes) =
+            ModeRecordingSource::new(service_source([TestCapture::Frame, TestCapture::Frame]).0);
+        let cancel_monitor = CancellationToken::new();
+        let cancel_tv = CancellationToken::new();
+        let (_updates_monitor_tx, updates_monitor_rx) = mpsc::channel(4);
+        let (updates_tv_tx, updates_tv_rx) = mpsc::channel(4);
+        let deps_monitor = ActiveSamplerDeps {
+            initial_config: config.clone(),
+            display_id: DisplayId("monitor".to_owned()),
+            update_rx: updates_monitor_rx,
+            latest_grids: new_latest_grids(),
+            source: Box::new(monitor_source),
+            source_reader: None,
+            consent_path: monitor_path.clone(),
+            cancel: cancel_monitor.clone(),
+            env_reader: test_env_reader,
+            event_tx: None,
+        };
+        let deps_tv = ActiveSamplerDeps {
+            initial_config: config.clone(),
+            display_id: DisplayId("tv".to_owned()),
+            update_rx: updates_tv_rx,
+            latest_grids: new_latest_grids(),
+            source: Box::new(tv_source),
+            source_reader: None,
+            consent_path: tv_path.clone(),
+            cancel: cancel_tv.clone(),
+            env_reader: test_env_reader,
+            event_tx: None,
+        };
+        let (_mh, _mj) = spawn_with_handle(deps_monitor);
+        let (th, tj) = spawn_with_handle(deps_tv);
+
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        // The TV runtime honors its per-display `stream_mode` override at
+        // the capture boundary; the monitor has no override and inherits
+        // the wear section's global `Warm`. This is the must-fix contract
+        // — the capture-path mode is what production will see.
+        assert_eq!(
+            monitor_modes.lock().unwrap().as_slice(),
+            &[StreamMode::Warm],
+            "monitor must inherit the wear section's Warm mode"
+        );
+        assert_eq!(
+            tv_modes.lock().unwrap().as_slice(),
+            &[StreamMode::PerTick],
+            "TV runtime must honor its per-display override at the capture boundary, not fall back to the global"
+        );
+        let tv_resets_before = tv_resets.load(Ordering::SeqCst);
+        let monitor_resets_before = monitor_resets.load(Ordering::SeqCst);
+
+        // Reload the TV context to drop the override. The runtime
+        // must compare old vs new effective mode (PerTick → Warm),
+        // fire the existing `StreamModeChanged` reset transition
+        // (no re-consent), and call `reset_stream()` on the source.
+        // The monitor runtime must not observe any reset.
+        updates_tv_tx
+            .send(SamplerUpdate::DisplayContext(DisplaySamplingContext {
+                display: Some(DisplayExpectation {
+                    display: "tv".to_owned(),
+                    compositor_output: Some("HDMI-A-1".to_owned()),
+                }),
+                phase: Phase::Active,
+                stage_active: true,
+                source_gate_expectation: None,
+                stream_mode: None,
+            }))
+            .await
+            .unwrap();
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        // Advance one cadence so the TV runtime actually emits the
+        // post-reset capture.
+        tokio::time::advance(Duration::from_secs(60)).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        let tv_resets_after = tv_resets.load(Ordering::SeqCst);
+        let monitor_resets_after = monitor_resets.load(Ordering::SeqCst);
+        let tv_modes_now = tv_modes.lock().unwrap().clone();
+        let monitor_modes_now = monitor_modes.lock().unwrap().clone();
+        assert!(
+            tv_resets_after > tv_resets_before,
+            "TV must reset its stream on effective-mode change, got {tv_resets_before} -> {tv_resets_after}"
+        );
+        assert_eq!(
+            monitor_resets_after, monitor_resets_before,
+            "monitor runtime must not observe TV's stream_mode change"
+        );
+        assert_eq!(
+            tv_modes_now.last(),
+            Some(&StreamMode::Warm),
+            "the post-reset TV capture must use the new effective mode (Warm, the global fallback), got {tv_modes_now:?}"
+        );
+        // The monitor runtime's cadence ticks alongside the TV's, so it
+        // captures one extra Warm frame during the post-reload advance.
+        // The invariant is that the monitor never recorded a mode other
+        // than `Warm` — i.e. the TV's effective-mode shift was not
+        // visible to the monitor runtime.
+        assert!(
+            monitor_modes_now.iter().all(|m| *m == StreamMode::Warm),
+            "monitor runtime must not observe any mode other than Warm across the TV's effective-mode shift, got {monitor_modes_now:?}"
+        );
+
+        // The TV runtime must not have rebuilt the consent record
+        // under the wrong binding: the `Runtime::new` validator
+        // wipes the record if the configured `compositor_output` or
+        // `display_id` drift, and the stream-mode `DisplayContext`
+        // update does not bump either — the record still loads
+        // against the original (display, compositor_output) binding.
+        assert!(
+            tv_path.exists(),
+            "TV consent record must survive the stream-mode override reset"
+        );
+        let stored = crate::screencast_consent::load(&tv_path, "tv", Some("HDMI-A-1"))
+            .expect("TV consent record must still load for the original binding");
+        assert_eq!(
+            stored.record().sampled_display,
+            "tv",
+            "TV consent record must still target the original sampled_display"
+        );
+
+        // (d) Re-add the per-display PerTick override on the TV and
+        // confirm the effective-mode change (Warm -> PerTick) fires
+        // another reset — exercising the precedence path at reload
+        // time. Under the mutated form (always-global) the new
+        // effective mode would stay Warm and the reset would NOT fire.
+        let tv_resets_before_readd = tv_resets.load(Ordering::SeqCst);
+        let monitor_resets_before_readd = monitor_resets.load(Ordering::SeqCst);
+        updates_tv_tx
+            .send(SamplerUpdate::DisplayContext(DisplaySamplingContext {
+                display: Some(DisplayExpectation {
+                    display: "tv".to_owned(),
+                    compositor_output: Some("HDMI-A-1".to_owned()),
+                }),
+                phase: Phase::Active,
+                stage_active: true,
+                source_gate_expectation: None,
+                stream_mode: Some(StreamMode::PerTick),
+            }))
+            .await
+            .unwrap();
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(60)).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        let tv_resets_after_readd = tv_resets.load(Ordering::SeqCst);
+        let monitor_resets_after_readd = monitor_resets.load(Ordering::SeqCst);
+        assert!(
+            tv_resets_after_readd > tv_resets_before_readd,
+            "TV must reset again when the per-display override is re-added (Warm -> PerTick), got {tv_resets_before_readd} -> {tv_resets_after_readd}"
+        );
+        assert_eq!(
+            monitor_resets_after_readd, monitor_resets_before_readd,
+            "monitor runtime must not observe the TV's override re-add"
+        );
+        // The post-readd capture must use the new effective mode
+        // (PerTick), proving the capture path consumes the override —
+        // not just the reset detector.
+        let tv_modes_after_readd = tv_modes.lock().unwrap().clone();
+        assert_eq!(
+            tv_modes_after_readd.last(),
+            Some(&StreamMode::PerTick),
+            "TV's post-readd capture must use the re-added override, got {tv_modes_after_readd:?}"
+        );
+
+        cancel_monitor.cancel();
+        cancel_tv.cancel();
+        let _ = th;
+        let _ = tj.await;
     }
 }

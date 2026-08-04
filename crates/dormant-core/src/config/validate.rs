@@ -257,6 +257,8 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "treat_unreachable_as_blanked",
             "panel_type",
             "power_off_opt_in",
+            "compositor_output",
+            "sampling",
             "hooks",
         ],
     ),
@@ -317,6 +319,10 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
     (
         "displays..hooks.on_observed_loss.mqtt",
         &["topic", "payload"],
+    ),
+    (
+        "displays..sampling",
+        &["expected_source", "source_poll_interval", "stream_mode"],
     ),
     // ── displays.<id>.screensaver ─────────────────────────────────────────
     (
@@ -1545,6 +1551,54 @@ fn validate_display_with_input_source_readers(
     has_mqtt_broker: bool,
     errors: &mut Vec<ValidationError>,
 ) {
+    if dc
+        .compositor_output
+        .as_ref()
+        .is_some_and(|output| output.trim().is_empty())
+    {
+        errors.push(ValidationError {
+            what: crate::error::E_CONFIG_INVALID.into(),
+            detail: format!("display '{display_id}' compositor_output must not be empty"),
+        });
+    }
+
+    if let Some(sampling) = &dc.sampling {
+        if sampling
+            .expected_source
+            .as_ref()
+            .is_some_and(|source| source.trim().is_empty())
+        {
+            errors.push(ValidationError {
+                what: crate::error::E_CONFIG_INVALID.into(),
+                detail: format!(
+                    "display '{display_id}' sampling.expected_source must not be empty"
+                ),
+            });
+        }
+        if sampling.expected_source.is_some()
+            && !dc
+                .controllers
+                .iter()
+                .any(|controller| controller == "samsung-tizen")
+        {
+            errors.push(ValidationError {
+                what: crate::error::E_CONFIG_INVALID.into(),
+                detail: "expected_source requires a samsung-tizen controller".into(),
+            });
+        }
+        if !(Duration::from_secs(5)..=Duration::from_secs(300))
+            .contains(&sampling.source_poll_interval)
+        {
+            errors.push(ValidationError {
+                what: crate::error::E_CONFIG_INVALID.into(),
+                detail: format!(
+                    "display '{display_id}' sampling.source_poll_interval {:?} is out of range — allowed: 5s..=300s",
+                    sampling.source_poll_interval
+                ),
+            });
+        }
+    }
+
     // controllers must be non-empty.
     if dc.controllers.is_empty() {
         errors.push(ValidationError {
@@ -6237,6 +6291,146 @@ kind = "power_off"
                 .to_string()
                 .contains("wear.active_sampling.unknown")
         );
+    }
+
+    #[test]
+    fn display_sampling_source_validation_is_strict() {
+        let validate_case = |controller: &str,
+                             compositor_output: &str,
+                             expected_source: &str,
+                             source_poll_interval: &str| {
+            validate_str(&format!(
+                r#"
+config_version = 1
+
+[displays.sampled]
+controllers = ["{controller}"]
+blank_mode = "brightness_zero"
+host = "192.168.1.50"
+compositor_output = "{compositor_output}"
+
+[displays.sampled.sampling]
+expected_source = "{expected_source}"
+source_poll_interval = "{source_poll_interval}"
+stream_mode = "warm"
+"#,
+            ))
+        };
+
+        for (name, controller, compositor_output, expected_source, interval, detail) in [
+            (
+                "empty compositor output",
+                "samsung-tizen",
+                "   ",
+                "HDMI 1",
+                "15s",
+                "compositor_output",
+            ),
+            (
+                "empty expected source",
+                "samsung-tizen",
+                "DP-1",
+                " \\t ",
+                "15s",
+                "sampling.expected_source",
+            ),
+            (
+                "expected source without samsung-tizen",
+                "ddcci",
+                "DP-1",
+                "HDMI 1",
+                "15s",
+                "expected_source requires a samsung-tizen controller",
+            ),
+            (
+                "source poll below floor",
+                "samsung-tizen",
+                "DP-1",
+                "HDMI 1",
+                "4s",
+                "sampling.source_poll_interval",
+            ),
+            (
+                "source poll above ceiling",
+                "samsung-tizen",
+                "DP-1",
+                "HDMI 1",
+                "301s",
+                "sampling.source_poll_interval",
+            ),
+        ] {
+            let errors = validate_case(controller, compositor_output, expected_source, interval);
+            assert_eq!(errors.len(), 1, "{name}: unexpected findings: {errors:?}");
+            assert_eq!(errors[0].what, crate::error::E_CONFIG_INVALID, "{name}");
+            assert!(
+                errors[0].detail.contains(detail),
+                "{name}: expected detail containing {detail:?}, got {:?}",
+                errors[0].detail
+            );
+            if name == "expected source without samsung-tizen" {
+                assert_eq!(errors[0].detail, detail);
+            }
+        }
+
+        for interval in ["5s", "300s"] {
+            let errors = validate_case("samsung-tizen", "DP-1", "HDMI 1", interval);
+            assert!(
+                errors.is_empty(),
+                "inclusive bound {interval} must pass, got {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn known_keys_accept_display_sampling_subtable_and_reject_typo() {
+        let typo_key = format!("source_poll_interval{}", 'l');
+        for (name, toml_str, expected_unknown) in [
+            (
+                "declared sampling keys",
+                r#"
+config_version = 1
+
+[displays.tv]
+controllers = ["samsung-tizen"]
+blank_mode = "brightness_zero"
+compositor_output = "DP-1"
+
+[displays.tv.sampling]
+expected_source = "HDMI 1"
+source_poll_interval = "15s"
+stream_mode = "warm"
+"#
+                .to_string(),
+                Vec::<String>::new(),
+            ),
+            (
+                "sampling key typo",
+                format!(
+                    r#"
+config_version = 1
+
+[displays.tv]
+controllers = ["samsung-tizen"]
+blank_mode = "brightness_zero"
+compositor_output = "DP-1"
+
+[displays.tv.sampling]
+expected_source = "HDMI 1"
+{typo_key} = "15s"
+stream_mode = "warm"
+"#
+                ),
+                vec![format!("displays.tv.sampling.{typo_key}")],
+            ),
+        ] {
+            let value: toml::Value = toml::from_str(&toml_str).unwrap();
+            let unknown = collect_unknown_keys(&value);
+            let paths = unknown
+                .iter()
+                .map(|finding| finding.key_path.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(paths, expected_unknown, "{name}");
+        }
     }
 
     fn active_sampling_validation_errors(body: &str, displays: &str) -> Vec<ValidationError> {

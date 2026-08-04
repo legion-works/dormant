@@ -45,6 +45,13 @@ github-build-setup = "../dist-build-setup.yml"
 [dist.github-custom-runners]
 aarch64-apple-darwin = "macos-latest"
 x86_64-apple-darwin = "macos-15-intel"
+# The Linux targets need PipeWire >= 1.0 headers: libspa 0.10 indexes fields
+# (`spa_video_info_raw.flags`) that do not exist in the 0.3.48 pre-1.0 headers
+# shipped by ubuntu-22.04, so a 22.04 build fails inside libspa itself. 24.04
+# ships 1.0.5. This raises the prebuilt-binary glibc floor to 2.39 — documented
+# in docs/src/installation.md.
+aarch64-unknown-linux-gnu = "ubuntu-24.04"
+x86_64-unknown-linux-gnu = "ubuntu-24.04"
 
 # Release builds need system libraries. Apt itself only runs on the Linux
 # runners, but `targets` is kept explicit below anyway so the Linux-only

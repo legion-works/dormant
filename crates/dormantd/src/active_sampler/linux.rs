@@ -108,6 +108,10 @@ pub struct PortalStream {
     pub width: u32,
     /// Compositor-coordinate height reported by the portal.
     pub height: u32,
+    /// Logical top-left `(x, y)` in compositor coordinates; the identity signal
+    /// that keeps two same-resolution outputs distinguishable. `None` when the
+    /// compositor omits the field (older versions).
+    pub position: Option<(i32, i32)>,
     /// Stable compositor identity when the portal provides one.
     pub persistent_id: Option<String>,
 }
@@ -129,12 +133,14 @@ impl PortalStartResult {
         height: u32,
         persistent_id: Option<&str>,
         restore_token: &str,
+        position: Option<(i32, i32)>,
     ) -> Self {
         Self {
             streams: vec![PortalStream {
                 node_id,
                 width,
                 height,
+                position,
                 persistent_id: persistent_id.map(str::to_owned),
             }],
             restore_token: restore_token.to_owned(),
@@ -755,6 +761,7 @@ fn connected_stream(start: PortalStartResult) -> Result<ConnectedStream, Capture
         persistent_id: stream.persistent_id.clone(),
         width: stream.width,
         height: stream.height,
+        position: stream.position,
         frame_width: 0,
         frame_height: 0,
     })
@@ -1398,6 +1405,15 @@ fn parse_start_result(
                 height: u32::try_from(height).map_err(|_| {
                     CaptureError::Protocol("portal stream height is negative".to_owned())
                 })?,
+                position: properties
+                    .remove("position")
+                    .map(|value| {
+                        let (x, y): (i32, i32) = value.try_into().map_err(|error| {
+                            CaptureError::Protocol(format!("portal stream position: {error}"))
+                        })?;
+                        Ok::<_, CaptureError>((x, y))
+                    })
+                    .transpose()?,
                 persistent_id: properties
                     .remove("id")
                     .map(|value| {
@@ -1615,6 +1631,7 @@ mod tests {
                 1728,
                 Some("persistent-output"),
                 "rotated-token",
+                None,
             ))
         }
 
@@ -1699,6 +1716,7 @@ mod tests {
             1728,
             Some("persistent-output"),
             "rotated-token",
+            None,
         ));
         let mut source = PortalPipeWireSource::from_transport_with_frames(
             transport.clone(),
@@ -1751,7 +1769,14 @@ mod tests {
     async fn active_sampling_protocol_allows_start_response_during_consent_window() {
         let transport = FakePortalTransport::grant_after(
             Duration::from_secs(200),
-            PortalStartResult::single(73, 3072, 1728, Some("persistent-output"), "rotated-token"),
+            PortalStartResult::single(
+                73,
+                3072,
+                1728,
+                Some("persistent-output"),
+                "rotated-token",
+                None,
+            ),
         );
         let mut source = PortalPipeWireSource::from_transport_with_frames(
             transport.clone(),
@@ -1792,6 +1817,7 @@ mod tests {
                     1728,
                     Some("persistent-output"),
                     "rotated-token",
+                    None,
                 ));
                 let mut source = PortalPipeWireSource::from_transport_with_frames(
                     transport,
@@ -1929,6 +1955,7 @@ mod tests {
             1728,
             Some("persistent-output"),
             "rotated-token",
+            None,
         ));
         let frame = RawFrame {
             rgba: vec![0; 4],
@@ -1970,6 +1997,7 @@ mod tests {
             1728,
             Some("persistent-output"),
             "rotated-token",
+            None,
         ));
         let mut source = PortalPipeWireSource::from_transport_with_frames(
             transport.clone(),
@@ -2009,6 +2037,7 @@ mod tests {
             1728,
             None,
             "rotated-token",
+            None,
         ));
         let mut source = PortalPipeWireSource::from_transport_with_frames(
             transport,
@@ -2044,6 +2073,7 @@ mod tests {
             1728,
             None,
             "rotated-token",
+            None,
         ));
         let mut source = PortalPipeWireSource::from_transport_with_frames(
             transport.clone(),
@@ -2103,6 +2133,7 @@ mod tests {
             1728,
             Some("persistent-output"),
             "token",
+            None,
         ))
         .expect("start metadata is valid");
         let persistent_ids = vec!["persistent-output".to_owned()];
@@ -2131,6 +2162,7 @@ mod tests {
             1728,
             Some("other-output"),
             "token",
+            None,
         ))
         .expect("start metadata is valid");
         let persistent_ids = vec!["persistent-output".to_owned()];
@@ -2248,6 +2280,7 @@ mod tests {
             9,
             None,
             "rotated-token",
+            None,
         ));
         let mut source = PortalPipeWireSource::from_transport(transport);
 
@@ -2269,5 +2302,105 @@ mod tests {
             source.warm_worker.is_none(),
             "invalidate_pending_capture must drop the warm worker"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // ScreenCast `Start` `position` parsing — the identity signal that lets
+    // two same-resolution 4K outputs stay distinguishable. The field is a
+    // SIBLING of `size` inside each stream vardict; missing means older
+    // compositor, malformed means protocol violation.
+    // ---------------------------------------------------------------------
+
+    fn owned_value<T: Into<Value<'static>>>(value: T) -> OwnedValue {
+        OwnedValue::try_from(value.into()).expect("test value is a valid OwnedValue")
+    }
+
+    fn start_results_with_position(position: Option<(i32, i32)>) -> HashMap<String, OwnedValue> {
+        let mut stream_props = HashMap::new();
+        stream_props.insert("size".to_owned(), owned_value((3072_i32, 1728_i32)));
+        if let Some(coord) = position {
+            stream_props.insert("position".to_owned(), owned_value(coord));
+        }
+        let mut results = HashMap::new();
+        results.insert(
+            "streams".to_owned(),
+            owned_value(vec![(73_u32, stream_props)]),
+        );
+        results.insert("restore_token".to_owned(), owned_value("rotated-token"));
+        results
+    }
+
+    fn start_results_with_position_value(
+        position_value: OwnedValue,
+    ) -> HashMap<String, OwnedValue> {
+        let mut stream_props = HashMap::new();
+        stream_props.insert("size".to_owned(), owned_value((3072_i32, 1728_i32)));
+        stream_props.insert("position".to_owned(), position_value);
+        let mut results = HashMap::new();
+        results.insert(
+            "streams".to_owned(),
+            owned_value(vec![(73_u32, stream_props)]),
+        );
+        results.insert("restore_token".to_owned(), owned_value("rotated-token"));
+        results
+    }
+
+    #[test]
+    fn portal_start_position_parses_zero_coordinates() {
+        let parsed = parse_start_result(start_results_with_position(Some((0, 0))))
+            .expect("zero coordinates parse as a valid position");
+        assert_eq!(parsed.streams[0].position, Some((0, 0)));
+    }
+
+    #[test]
+    fn portal_start_position_parses_positive_offsets() {
+        let parsed = parse_start_result(start_results_with_position(Some((3072, 813))))
+            .expect("positive compositor offsets parse");
+        assert_eq!(parsed.streams[0].position, Some((3072, 813)));
+    }
+
+    #[test]
+    fn portal_start_position_parses_negative_coordinates() {
+        let parsed = parse_start_result(start_results_with_position(Some((-1920, 1080))))
+            .expect("negative compositor coordinates parse");
+        assert_eq!(parsed.streams[0].position, Some((-1920, 1080)));
+    }
+
+    #[test]
+    fn portal_start_position_omission_yields_none() {
+        let parsed = parse_start_result(start_results_with_position(None))
+            .expect("older compositors omit position");
+        assert_eq!(parsed.streams[0].position, None);
+    }
+
+    #[test]
+    fn portal_start_position_malformed_is_protocol_error() {
+        let results = start_results_with_position_value(owned_value(0_u32));
+        match parse_start_result(results) {
+            Err(CaptureError::Protocol(message)) => {
+                assert!(
+                    message.starts_with("portal stream position: "),
+                    "unexpected protocol message: {message}"
+                );
+            }
+            other => panic!("expected Protocol error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn portal_start_position_arrives_on_connected_stream() {
+        // Boundary pin: the field must survive `connected_stream()`. A bug
+        // that parses but then drops position at the boundary would silently
+        // collapse two same-resolution outputs — this test is the canary.
+        let stream = connected_stream(PortalStartResult::single(
+            7,
+            3072,
+            1728,
+            Some("persistent-output"),
+            "token",
+            Some((1920, -540)),
+        ))
+        .expect("start metadata is valid");
+        assert_eq!(stream.position, Some((1920, -540)));
     }
 }

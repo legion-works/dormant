@@ -1288,6 +1288,10 @@ pub struct ConnectedStream {
     pub width: u32,
     /// Stream height reported by the portal.
     pub height: u32,
+    /// Logical top-left `(x, y)` in compositor coordinates when the portal
+    /// reports one; the identity signal that keeps two same-resolution outputs
+    /// distinguishable. `None` when the compositor omits the field.
+    pub position: Option<(i32, i32)>,
     /// Native width observed in the first delivered `PipeWire` frame.
     pub frame_width: u32,
     /// Native height observed in the first delivered `PipeWire` frame.
@@ -1971,6 +1975,7 @@ mod tests {
             persistent_id: Some("test-panel".to_owned()),
             width: 16,
             height: 9,
+            position: None,
             frame_width: 16,
             frame_height: 9,
         }
@@ -4234,6 +4239,7 @@ mod tests {
             persistent_id: Some("panel-7".to_owned()),
             width: 1920,
             height: 1080,
+            position: None,
             frame_width: 1920,
             frame_height: 1080,
         };

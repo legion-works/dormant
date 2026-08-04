@@ -39,6 +39,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - MQTT subscriptions are issued once per broker connection acknowledgement, so a reconnect no longer accumulates duplicate subscription batches.
 - Malformed MQTT broker URLs — empty host, a non-numeric port such as `host:1883x`, an unclosed bracket — are rejected instead of silently connecting somewhere unintended. Bare and bracketed IPv6 forms both resolve correctly.
 - A retained `online` availability signal is bounded by the sensor's `stale_timeout`. A sensor that publishes `online` and then goes silent is demoted to unavailable, so a dead broker cannot hold stale presence open forever. Zone policy still treats unavailable as present.
+- Linux release binaries are built on Ubuntu 24.04 rather than 22.04, because active wear sampling links against PipeWire 1.0 headers that 22.04 does not ship. Prebuilt Linux binaries now require glibc 2.39 or newer; on an older distribution, build from source or install from the AUR, which compile against your own system libraries.
 - `upsert_samsung_token` serializes its read, edit, write and rename through a per-path lock, creates its temporary file with `create_new(true)` and `O_NOFOLLOW` on Unix, and uses a unique sibling name, so two concurrent calls cannot clobber each other.
 
 ## [0.10.0] - 2026-07-31

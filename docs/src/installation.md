@@ -73,6 +73,10 @@ See [Tray autostart](#tray-autostart) below to run it on every login.
 
 The cargo-dist pipeline publishes shell installers and tarballs for every binary. These URLs always resolve to the newest release; substitute `download/vX.Y.Z` for a specific one. Install on Linux x86_64 or aarch64:
 
+> **Linux prebuilt binaries need glibc 2.39 or newer** (Ubuntu 24.04, Debian 13, Fedora 40 and later). They are built on Ubuntu 24.04 because active wear sampling links against PipeWire 1.0 headers, which Ubuntu 22.04 does not ship.
+>
+> On an older distribution, [build from source](#from-source) or install [from the AUR](#arch-linux-aur) — both compile against your own system libraries. Check yours with `ldd --version`.
+
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/latest/download/dormantd-installer.sh | sh
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/latest/download/dormantctl-installer.sh | sh

@@ -75,7 +75,9 @@ The cargo-dist pipeline publishes shell installers and tarballs for every binary
 
 > **Linux prebuilt binaries need glibc 2.39 or newer** (Ubuntu 24.04, Debian 13, Fedora 40 and later). They are built on Ubuntu 24.04 because active wear sampling links against PipeWire 1.0 headers, which Ubuntu 22.04 does not ship.
 >
-> On an older distribution, [build from source](#from-source) or install [from the AUR](#arch-linux-aur) — both compile against your own system libraries. Check yours with `ldd --version`.
+> They also need PipeWire's client library present at runtime — `sudo apt install libpipewire-0.3-0` on Debian and Ubuntu, or `pipewire` on Fedora and Arch. Without it the daemon exits immediately with `error while loading shared libraries: libpipewire-0.3.so.0`.
+>
+> On an older distribution, [build from source](#from-source) or install [from the AUR](#arch-linux-aur) — both compile against your own system libraries. Check your glibc with `ldd --version`.
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/latest/download/dormantd-installer.sh | sh

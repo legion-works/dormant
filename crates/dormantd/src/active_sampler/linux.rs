@@ -787,6 +787,24 @@ fn reconcile_start_with_binding(
             WEAR_SAMPLING_WRONG_MONITOR.to_owned(),
         ));
     }
+    // Two same-resolution 4K monitors share a persistent id and
+    // dimensions; the compositor-reported position is the only signal
+    // left to keep them apart. The check is skipped when either side is
+    // absent: older records and older compositors must continue to bind.
+    if let (Some(recorded), Some(observed)) = (binding.stream_position, stream.position)
+        && recorded != observed
+    {
+        tracing::warn!(
+            event = "wear_sampling_position_drift",
+            display = %display_id,
+            recorded = ?recorded,
+            observed = ?observed,
+            "reattach stream position does not match the recorded grant"
+        );
+        return Err(CaptureError::Protocol(
+            WEAR_SAMPLING_WRONG_MONITOR.to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -1731,6 +1749,7 @@ mod tests {
         let grant = source
             .request_consent(&DisplayExpectation {
                 display: "oled".to_owned(),
+                compositor_output: None,
             })
             .await
             .expect("scripted portal grant succeeds");
@@ -1791,6 +1810,7 @@ mod tests {
         let grant = source
             .request_consent(&DisplayExpectation {
                 display: "oled".to_owned(),
+                compositor_output: None,
             })
             .await
             .expect("a Start response before the consent deadline succeeds");
@@ -1833,6 +1853,7 @@ mod tests {
                 source
                     .request_consent(&DisplayExpectation {
                         display: "oled".to_owned(),
+                        compositor_output: None,
                     })
                     .await
                     .expect("scripted portal grant succeeds");
@@ -1934,6 +1955,7 @@ mod tests {
             PORTAL_RESPONSE_TIMEOUT + Duration::from_secs(1),
             source.request_consent(&DisplayExpectation {
                 display: "oled".to_owned(),
+                compositor_output: None,
             }),
         )
         .await;
@@ -1970,6 +1992,7 @@ mod tests {
         source
             .request_consent(&DisplayExpectation {
                 display: "oled".to_owned(),
+                compositor_output: None,
             })
             .await
             .expect("scripted portal grant succeeds");
@@ -2015,6 +2038,7 @@ mod tests {
             portal_persistent_ids: &ids,
             granted_width: 3840,
             granted_height: 2160,
+            stream_position: None,
         };
 
         let stream = source.connect(&binding).await.expect("reattach succeeds");
@@ -2055,6 +2079,7 @@ mod tests {
             portal_persistent_ids: &ids,
             granted_width: 3840,
             granted_height: 2160,
+            stream_position: None,
         };
 
         let stream = source
@@ -2090,6 +2115,7 @@ mod tests {
             portal_persistent_ids: &[],
             granted_width: 3840,
             granted_height: 2160,
+            stream_position: None,
         };
 
         assert_eq!(
@@ -2115,6 +2141,7 @@ mod tests {
             portal_persistent_ids: &[],
             granted_width: 3072,
             granted_height: 1728,
+            stream_position: None,
         };
 
         assert_eq!(
@@ -2143,6 +2170,7 @@ mod tests {
             portal_persistent_ids: &persistent_ids,
             granted_width: 3840,
             granted_height: 2160,
+            stream_position: None,
         };
 
         assert_eq!(
@@ -2172,6 +2200,7 @@ mod tests {
             portal_persistent_ids: &persistent_ids,
             granted_width: 3840,
             granted_height: 2160,
+            stream_position: None,
         };
 
         assert_eq!(
@@ -2179,6 +2208,157 @@ mod tests {
             Err(CaptureError::Protocol(
                 WEAR_SAMPLING_WRONG_MONITOR.to_owned()
             ))
+        );
+    }
+
+    #[test]
+    fn reattach_same_dimensions_different_position() {
+        // Two 4K monitors with identical native dimensions but different
+        // compositor positions must remain distinguishable: the recorded
+        // position drives the binding together with the persistent id.
+        // Without this check, a mirrored reattach could silently swap
+        // which monitor the consent grant was issued for.
+        let stream = connected_stream(PortalStartResult::single(
+            7,
+            3840,
+            2160,
+            Some("persistent-output"),
+            "token",
+            Some((3072, 813)),
+        ))
+        .expect("start metadata is valid");
+        let persistent_ids = vec!["persistent-output".to_owned()];
+        let binding = ConsentBinding {
+            token: "saved",
+            sampled_display: "oled",
+            portal_persistent_ids: &persistent_ids,
+            granted_width: 3840,
+            granted_height: 2160,
+            stream_position: Some((0, 0)),
+        };
+
+        assert_eq!(
+            reconcile_start_with_binding(&stream, &binding, &DisplayId("test".to_owned())),
+            Err(CaptureError::Protocol(
+                WEAR_SAMPLING_WRONG_MONITOR.to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn reattach_absent_position_is_accepted() {
+        // Older compositors omit the `position` field entirely. When the
+        // recorded position is also absent, the dimension check is the
+        // only binding signal we have — that must remain sufficient.
+        let stream = connected_stream(PortalStartResult::single(
+            7,
+            3072,
+            1728,
+            Some("persistent-output"),
+            "token",
+            None,
+        ))
+        .expect("start metadata is valid");
+        let persistent_ids = vec!["persistent-output".to_owned()];
+        let binding = ConsentBinding {
+            token: "saved",
+            sampled_display: "oled",
+            portal_persistent_ids: &persistent_ids,
+            granted_width: 3840,
+            granted_height: 2160,
+            stream_position: None,
+        };
+
+        assert_eq!(
+            reconcile_start_with_binding(&stream, &binding, &DisplayId("test".to_owned())),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn reattach_matching_position_is_accepted() {
+        let stream = connected_stream(PortalStartResult::single(
+            7,
+            3072,
+            1728,
+            Some("persistent-output"),
+            "token",
+            Some((0, 0)),
+        ))
+        .expect("start metadata is valid");
+        let persistent_ids = vec!["persistent-output".to_owned()];
+        let binding = ConsentBinding {
+            token: "saved",
+            sampled_display: "oled",
+            portal_persistent_ids: &persistent_ids,
+            granted_width: 3840,
+            granted_height: 2160,
+            stream_position: Some((0, 0)),
+        };
+
+        assert_eq!(
+            reconcile_start_with_binding(&stream, &binding, &DisplayId("test".to_owned())),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn reattach_recorded_none_observed_some_is_accepted() {
+        // Older record (no recorded position) but the portal streams one
+        // anyway. The position check must skip only the position gate
+        // and let the dimension check still do its work.
+        let stream = connected_stream(PortalStartResult::single(
+            7,
+            3072,
+            1728,
+            Some("persistent-output"),
+            "token",
+            Some((0, 0)),
+        ))
+        .expect("start metadata is valid");
+        let persistent_ids = vec!["persistent-output".to_owned()];
+        let binding = ConsentBinding {
+            token: "saved",
+            sampled_display: "oled",
+            portal_persistent_ids: &persistent_ids,
+            granted_width: 3840,
+            granted_height: 2160,
+            stream_position: None,
+        };
+
+        assert_eq!(
+            reconcile_start_with_binding(&stream, &binding, &DisplayId("test".to_owned())),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn reattach_recorded_some_observed_none_is_accepted() {
+        // Newer record (recorded position) meets an older compositor
+        // that omits the field. The position check must skip only the
+        // position gate and let the dimension check still do its work.
+        let stream = connected_stream(PortalStartResult::single(
+            7,
+            3072,
+            1728,
+            Some("persistent-output"),
+            "token",
+            None,
+        ))
+        .expect("start metadata is valid");
+        let persistent_ids = vec!["persistent-output".to_owned()];
+        let binding = ConsentBinding {
+            token: "saved",
+            sampled_display: "oled",
+            portal_persistent_ids: &persistent_ids,
+            granted_width: 3840,
+            granted_height: 2160,
+            stream_position: Some((0, 0)),
+        };
+
+        assert_eq!(
+            reconcile_start_with_binding(&stream, &binding, &DisplayId("test".to_owned())),
+            Ok(())
         );
     }
 

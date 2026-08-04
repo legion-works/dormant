@@ -157,6 +157,7 @@ fn active_sampler_display_context(
     display: &DisplayId,
     display_exists: bool,
     phase: Option<&str>,
+    compositor_output: Option<String>,
 ) -> DisplaySamplingContext {
     let phase = match phase {
         Some("grace") => Phase::Grace { until: Tick::now() },
@@ -169,6 +170,7 @@ fn active_sampler_display_context(
     DisplaySamplingContext {
         display: display_exists.then(|| DisplayExpectation {
             display: display.0.clone(),
+            compositor_output,
         }),
         phase,
         stage_active,
@@ -220,7 +222,7 @@ fn migrate_legacy_consent(state_dir: &Path, cfg: &Config, display_id: &DisplayId
         return target;
     }
     let legacy = screencast_consent::legacy_consent_path(state_dir);
-    match screencast_consent::load(&legacy, &display_id.0) {
+    match screencast_consent::load(&legacy, &display_id.0, None) {
         Ok(record) => {
             if let Err(error) = screencast_consent::store_atomic(&target, record.record()) {
                 tracing::warn!(
@@ -367,7 +369,7 @@ async fn spawn_active_sampler_runtime(
     let (updates, update_rx) = mpsc::channel::<SamplerUpdate>(16);
     let cancel = sampler_cancellation_token(root);
     let (handle, join) = active_sampler::spawn_with_handle(ActiveSamplerDeps {
-        initial_config: cfg,
+        initial_config: cfg.clone(),
         display_id: display_id.clone(),
         update_rx,
         latest_grids: latest_grids.clone(),
@@ -378,7 +380,14 @@ async fn spawn_active_sampler_runtime(
         event_tx: Some(event_tx.clone()),
     });
     if let Err(error) = updates.try_send(SamplerUpdate::DisplayContext(
-        active_sampler_display_context(&display_id, display_exists, Some("active")),
+        active_sampler_display_context(
+            &display_id,
+            display_exists,
+            Some("active"),
+            cfg.displays
+                .get(&display_id.0)
+                .and_then(|display| display.compositor_output.clone()),
+        ),
     )) {
         tracing::warn!(
             event = "wear_sampling_update_dropped",
@@ -648,15 +657,15 @@ mod active_sampler_reload_tests {
         cfg.wear.active_sampling.sampled_display = Some("oled".to_owned());
 
         let display = DisplayId("oled".to_owned());
-        let missing = active_sampler_display_context(&display, false, Some("active"));
+        let missing = active_sampler_display_context(&display, false, Some("active"), None);
         assert_eq!(missing.display, None);
         assert!(!missing.stage_active);
 
-        let restored = active_sampler_display_context(&display, true, Some("grace"));
+        let restored = active_sampler_display_context(&display, true, Some("grace"), None);
         assert_eq!(restored.display.unwrap().display, "oled");
         assert!(restored.stage_active);
 
-        let blanked = active_sampler_display_context(&display, true, Some("blanked"));
+        let blanked = active_sampler_display_context(&display, true, Some("blanked"), None);
         assert!(!blanked.stage_active);
     }
 
@@ -667,8 +676,8 @@ mod active_sampler_reload_tests {
         let display_a = DisplayId("oled-a".to_owned());
         let display_b = DisplayId("oled-b".to_owned());
 
-        let ctx_a = active_sampler_display_context(&display_a, true, Some("active"));
-        let ctx_b = active_sampler_display_context(&display_b, true, Some("active"));
+        let ctx_a = active_sampler_display_context(&display_a, true, Some("active"), None);
+        let ctx_b = active_sampler_display_context(&display_b, true, Some("active"), None);
 
         assert_eq!(
             ctx_a
@@ -712,11 +721,34 @@ mod active_sampler_reload_tests {
         let mut cfg = config();
         cfg.wear.active_sampling.sampled_displays = vec!["oled-a".to_owned(), "oled-b".to_owned()];
 
-        let context =
-            active_sampler_display_context(&DisplayId("oled-a".to_owned()), true, Some("active"));
+        let context = active_sampler_display_context(
+            &DisplayId("oled-a".to_owned()),
+            true,
+            Some("active"),
+            None,
+        );
         assert_eq!(
             context.display.expect("selected display context").display,
             "oled-a"
+        );
+    }
+
+    #[test]
+    fn display_context_publishes_configured_compositor_output() {
+        let display = DisplayId("oled".to_owned());
+        let context = active_sampler_display_context(
+            &display,
+            true,
+            Some("active"),
+            Some("HDMI-A-1".to_owned()),
+        );
+        assert_eq!(
+            context
+                .display
+                .expect("present display")
+                .compositor_output
+                .as_deref(),
+            Some("HDMI-A-1"),
         );
     }
 
@@ -755,6 +787,8 @@ mod active_sampler_reload_tests {
                 portal_persistent_ids: vec!["panel-oled".to_owned()],
                 granted_width: 1920,
                 granted_height: 1080,
+                stream_position: None,
+                compositor_output: None,
             },
         )
         .unwrap();
@@ -767,7 +801,7 @@ mod active_sampler_reload_tests {
         );
         assert_ne!(migrated, legacy);
         assert_eq!(
-            screencast_consent::load(&migrated, &display_id.0)
+            screencast_consent::load(&migrated, &display_id.0, None)
                 .unwrap()
                 .record()
                 .token,
@@ -3171,6 +3205,11 @@ impl Runner {
                     &display_id,
                     present.contains(&display_id),
                     Some("active"),
+                    self.generation
+                        .cfg
+                        .displays
+                        .get(&display_id.0)
+                        .and_then(|display| display.compositor_output.clone()),
                 ),
             )) {
                 tracing::warn!(

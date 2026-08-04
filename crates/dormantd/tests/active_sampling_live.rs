@@ -17,6 +17,7 @@ async fn portal_pipewire_live_reduces_one_transient_frame() {
     source
         .request_consent(&DisplayExpectation {
             display: "operator-selected".to_owned(),
+            compositor_output: None,
         })
         .await
         .expect("grant monitor consent");

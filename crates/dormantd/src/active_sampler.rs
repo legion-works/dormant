@@ -366,6 +366,10 @@ struct Runtime {
 
 impl Runtime {
     fn new(config: &Config, consent_path: &std::path::Path, display_id: &DisplayId) -> Self {
+        let configured_compositor_output = config
+            .displays
+            .get(&display_id.0)
+            .and_then(|display| display.compositor_output.clone());
         let display = DisplaySamplingContext {
             display: config
                 .wear
@@ -375,13 +379,19 @@ impl Runtime {
                 .any(|display| display == &display_id.0)
                 .then(|| DisplayExpectation {
                     display: display_id.0.clone(),
+                    compositor_output: configured_compositor_output.clone(),
                 }),
             phase: Phase::Active,
             stage_active: true,
         };
         let active = config.wear.active_sampling.clone();
         let record = display.display.as_ref().and_then(|expected| {
-            crate::screencast_consent::load(consent_path, &expected.display).ok()
+            crate::screencast_consent::load(
+                consent_path,
+                &expected.display,
+                expected.compositor_output.as_deref(),
+            )
+            .ok()
         });
         let state = if !active.enabled {
             SamplingState::Disabled
@@ -532,7 +542,13 @@ fn persist_rotated_token(
     let mut rotated = record.record().clone();
     rotated.token = stream.restore_token;
     crate::screencast_consent::store_atomic(path, &rotated)?;
-    runtime.record = crate::screencast_consent::load(path, &rotated.sampled_display).ok();
+    let configured_output = runtime
+        .display
+        .display
+        .as_ref()
+        .and_then(|expected| expected.compositor_output.as_deref());
+    runtime.record =
+        crate::screencast_consent::load(path, &rotated.sampled_display, configured_output).ok();
     Ok(())
 }
 
@@ -748,12 +764,15 @@ async fn handle_command(
                         portal_persistent_ids: grant.stream.persistent_id.into_iter().collect(),
                         granted_width: grant.stream.frame_width,
                         granted_height: grant.stream.frame_height,
+                        stream_position: grant.stream.position,
+                        compositor_output: expected.compositor_output.clone(),
                     };
                     match crate::screencast_consent::store_atomic(consent_path, &record) {
                         Ok(()) => {
                             runtime.record = crate::screencast_consent::load(
                                 consent_path,
                                 &record.sampled_display,
+                                record.compositor_output.as_deref(),
                             )
                             .ok();
                             tracing::info!(
@@ -819,7 +838,23 @@ fn apply_update(
         SamplerUpdate::DisplayContext(context) => {
             let was_present = runtime.display.display.is_some();
             let is_present = context.display.is_some();
+            let consent_bound_drifted = runtime
+                .display
+                .display
+                .as_ref()
+                .zip(context.display.as_ref())
+                .is_some_and(|(old, new)| {
+                    old.display != new.display || old.compositor_output != new.compositor_output
+                });
             runtime.display = context;
+            if consent_bound_drifted {
+                runtime.record = None;
+                return Some(apply_trigger(
+                    runtime,
+                    Trigger::ConfigChanged(ConfigDelta::SampledDisplayChanged),
+                    status_tx,
+                ));
+            }
             (was_present != is_present).then(|| {
                 apply_trigger(
                     runtime,
@@ -1266,6 +1301,11 @@ pub struct ConsentBinding<'a> {
     pub granted_width: u32,
     /// Native height observed in the first frame delivered at grant time.
     pub granted_height: u32,
+    /// Logical `(x, y)` recorded at grant time. When the portal has
+    /// provided a position for the reattached stream, the binding check
+    /// compares the two — a mismatch means the operator re-bound the
+    /// grant to a different monitor.
+    pub stream_position: Option<(i32, i32)>,
 }
 
 /// Display identity used to request a fresh portal grant.
@@ -1273,6 +1313,11 @@ pub struct ConsentBinding<'a> {
 pub struct DisplayExpectation {
     /// Configured display identity.
     pub display: String,
+    /// Compositor output the operator bound this sampler to. A drift
+    /// between this and the recorded consent binding invalidates the
+    /// saved grant so a reconfigure does not silently relabel a
+    /// monitor. `None` for samplers without an explicit output.
+    pub compositor_output: Option<String>,
 }
 
 /// Metadata from a connected portal stream.
@@ -1664,6 +1709,7 @@ impl CaptureSource for ScriptedCaptureSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dormant_core::config::schema::DisplayConfig;
     use std::io::Write;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1790,6 +1836,7 @@ mod tests {
             SamplerUpdate::DisplayContext(DisplaySamplingContext {
                 display: Some(DisplayExpectation {
                     display: "oled".to_owned(),
+                    compositor_output: None,
                 }),
                 phase: Phase::Active,
                 stage_active: true,
@@ -1799,6 +1846,218 @@ mod tests {
         .expect("display restoration has a lifecycle transition");
         assert_eq!(runtime.state, SamplingState::Connecting);
         assert_eq!(restored.effects, vec![Effect::Connect]);
+    }
+
+    #[test]
+    fn compositor_output_drift_invalidates_consent_record() {
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        // Seed a record that already pins the grant to HDMI-A-1.
+        crate::screencast_consent::store_atomic(
+            &consent_path,
+            &crate::screencast_consent::ConsentRecord {
+                token: "saved".to_owned(),
+                sampled_display: "oled".to_owned(),
+                granted_at: OffsetDateTime::UNIX_EPOCH,
+                portal_persistent_ids: vec!["test-panel".to_owned()],
+                granted_width: 16,
+                granted_height: 9,
+                stream_position: None,
+                compositor_output: Some("HDMI-A-1".to_owned()),
+            },
+        )
+        .unwrap();
+        let config = active_config(Duration::from_secs(10));
+        let mut runtime = Runtime::new(&config, &consent_path, &DisplayId("oled".to_owned()));
+        let (status_tx, _) = watch::channel(initial_status(&config));
+        assert!(runtime.record.is_some(), "seed record must load");
+
+        let transition = apply_update(
+            &mut runtime,
+            SamplerUpdate::DisplayContext(DisplaySamplingContext {
+                display: Some(DisplayExpectation {
+                    display: "oled".to_owned(),
+                    compositor_output: Some("HDMI-A-2".to_owned()),
+                }),
+                phase: Phase::Active,
+                stage_active: true,
+            }),
+            &status_tx,
+        )
+        .expect("drift must emit a lifecycle transition");
+
+        assert!(
+            runtime.record.is_none(),
+            "compositor_output drift must invalidate the consent record"
+        );
+        assert_eq!(
+            transition.effects,
+            vec![
+                Effect::CloseSession,
+                Effect::EnterUniform(WEAR_SAMPLING_DISPLAY_CHANGED),
+            ]
+        );
+    }
+
+    #[test]
+    fn display_id_drift_invalidates_consent_record() {
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        test_record(&consent_path);
+        let config = active_config(Duration::from_secs(10));
+        let mut runtime = Runtime::new(&config, &consent_path, &DisplayId("oled".to_owned()));
+        let (status_tx, _) = watch::channel(initial_status(&config));
+        assert!(runtime.record.is_some(), "seed record must load");
+
+        let transition = apply_update(
+            &mut runtime,
+            SamplerUpdate::DisplayContext(DisplaySamplingContext {
+                display: Some(DisplayExpectation {
+                    display: "other-monitor".to_owned(),
+                    compositor_output: None,
+                }),
+                phase: Phase::Active,
+                stage_active: true,
+            }),
+            &status_tx,
+        )
+        .expect("display drift must emit a lifecycle transition");
+
+        assert!(
+            runtime.record.is_none(),
+            "display id drift must invalidate the consent record"
+        );
+        assert_eq!(
+            transition.effects,
+            vec![
+                Effect::CloseSession,
+                Effect::EnterUniform(WEAR_SAMPLING_DISPLAY_CHANGED),
+            ]
+        );
+    }
+
+    #[test]
+    fn unchanged_consent_bound_display_does_not_invalidate_record() {
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        test_record(&consent_path);
+        let config = active_config(Duration::from_secs(10));
+        let mut runtime = Runtime::new(&config, &consent_path, &DisplayId("oled".to_owned()));
+        let (status_tx, _) = watch::channel(initial_status(&config));
+        assert!(runtime.record.is_some(), "seed record must load");
+
+        let transition = apply_update(
+            &mut runtime,
+            SamplerUpdate::DisplayContext(DisplaySamplingContext {
+                display: Some(DisplayExpectation {
+                    display: "oled".to_owned(),
+                    compositor_output: None,
+                }),
+                phase: Phase::Active,
+                stage_active: true,
+            }),
+            &status_tx,
+        );
+
+        assert!(
+            runtime.record.is_some(),
+            "unchanged display identity must not invalidate the record"
+        );
+        assert!(
+            transition.is_none(),
+            "no transition expected on identity-preserving update"
+        );
+    }
+
+    #[test]
+    fn config_bound_compositor_output_survives_identity_publish() {
+        // Regression: the publish path must carry the configured
+        // `compositor_output` so the reattach drift check sees the same
+        // value the runtime was seeded with. Publishing `None` for a
+        // configured `Some(...)` would look like drift to the runtime
+        // and wipe the consent record on every spawn / reload.
+        let dir = tempdir().unwrap();
+        let consent_path = dir.path().join("consent.json");
+        let mut config = (*active_config(Duration::from_secs(10))).clone();
+        config.displays.insert(
+            "oled".to_owned(),
+            DisplayConfig {
+                controllers: vec![],
+                scope: dormant_core::config::schema::DisplayScope::default(),
+                shared_input_code: None,
+                shared_input_write_code: None,
+                shared_peer_input_write_code: None,
+                shared_peer_input_code: None,
+                hooks: dormant_core::config::schema::HookSlots::default(),
+                blank_mode: None,
+                degraded_mode: None,
+                ladder: vec![],
+                screensaver: None,
+                output: None,
+                ddc_display: None,
+                host: None,
+                wol_mac: None,
+                blank_command: None,
+                wake_command: None,
+                modes: None,
+                ha_url: None,
+                blank_service: None,
+                blank_data: None,
+                wake_service: None,
+                wake_data: None,
+                command_timeout: Duration::from_secs(5),
+                restore_brightness: 100,
+                samsung_restore_backlight:
+                    dormant_core::config::defaults::SAMSUNG_RESTORE_BACKLIGHT,
+                treat_unreachable_as_blanked: true,
+                panel_type: dormant_core::wear::PanelType::default(),
+                power_off_opt_in: false,
+                compositor_output: Some("HDMI-A-1".to_owned()),
+                sampling: None,
+            },
+        );
+        crate::screencast_consent::store_atomic(
+            &consent_path,
+            &crate::screencast_consent::ConsentRecord {
+                token: "saved".to_owned(),
+                sampled_display: "oled".to_owned(),
+                granted_at: OffsetDateTime::UNIX_EPOCH,
+                portal_persistent_ids: vec!["test-panel".to_owned()],
+                granted_width: 16,
+                granted_height: 9,
+                stream_position: None,
+                compositor_output: Some("HDMI-A-1".to_owned()),
+            },
+        )
+        .unwrap();
+        let mut runtime = Runtime::new(&config, &consent_path, &DisplayId("oled".to_owned()));
+        let (status_tx, _) = watch::channel(initial_status(&config));
+        assert!(
+            runtime.record.is_some(),
+            "seed record must load when config and record share the compositor_output"
+        );
+
+        let transition = apply_update(
+            &mut runtime,
+            SamplerUpdate::DisplayContext(DisplaySamplingContext {
+                display: Some(DisplayExpectation {
+                    display: "oled".to_owned(),
+                    compositor_output: Some("HDMI-A-1".to_owned()),
+                }),
+                phase: Phase::Active,
+                stage_active: true,
+            }),
+            &status_tx,
+        );
+
+        assert!(
+            runtime.record.is_some(),
+            "identity-preserving context publish must not invalidate the record"
+        );
+        assert!(
+            transition.is_none(),
+            "no transition expected when the publish matches the seed"
+        );
     }
 
     #[derive(Clone)]
@@ -2027,6 +2286,8 @@ mod tests {
                 portal_persistent_ids: vec!["test-panel".to_owned()],
                 granted_width: 16,
                 granted_height: 9,
+                stream_position: None,
+                compositor_output: None,
             },
         )
         .unwrap();
@@ -2102,6 +2363,8 @@ mod tests {
                 portal_persistent_ids: vec![format!("panel-{display}")],
                 granted_width: 16,
                 granted_height: 9,
+                stream_position: None,
+                compositor_output: None,
             },
         )
         .unwrap();
@@ -2188,14 +2451,14 @@ mod tests {
         assert_eq!(grants_a.load(Ordering::SeqCst), 1);
         assert_eq!(grants_b.load(Ordering::SeqCst), 1);
         assert_eq!(
-            crate::screencast_consent::load(&path_a, "oled-a")
+            crate::screencast_consent::load(&path_a, "oled-a", None)
                 .unwrap()
                 .record()
                 .sampled_display,
             "oled-a"
         );
         assert_eq!(
-            crate::screencast_consent::load(&path_b, "oled-b")
+            crate::screencast_consent::load(&path_b, "oled-b", None)
                 .unwrap()
                 .record()
                 .sampled_display,
@@ -2517,6 +2780,7 @@ mod tests {
             .send(SamplerUpdate::DisplayContext(DisplaySamplingContext {
                 display: Some(DisplayExpectation {
                     display: "oled".to_owned(),
+                    compositor_output: None,
                 }),
                 phase: Phase::Active,
                 stage_active: true,
@@ -2875,7 +3139,7 @@ mod tests {
 
         tokio::task::yield_now().await;
         assert_eq!(
-            crate::screencast_consent::load(&consent_path, "oled")
+            crate::screencast_consent::load(&consent_path, "oled", None)
                 .unwrap()
                 .record()
                 .token,
@@ -3391,7 +3655,7 @@ mod tests {
         .await;
 
         assert_eq!(reply_rx.await.unwrap(), ConsentFlowStatus::Granted);
-        let record = crate::screencast_consent::load(&consent_path, "oled")
+        let record = crate::screencast_consent::load(&consent_path, "oled", None)
             .expect("fresh grant record loads");
         assert_eq!(
             (
@@ -3434,7 +3698,7 @@ mod tests {
         .await;
 
         assert!(matches!(reply_rx.await.unwrap(), Ok(())));
-        assert!(crate::screencast_consent::load(&consent_path, "oled").is_ok());
+        assert!(crate::screencast_consent::load(&consent_path, "oled", None).is_ok());
         assert_eq!(source.close_calls(), 1);
     }
 
@@ -4258,9 +4522,11 @@ mod tests {
             portal_persistent_ids: &[],
             granted_width: 1920,
             granted_height: 1080,
+            stream_position: None,
         };
         let display = DisplayExpectation {
             display: "oled".to_owned(),
+            compositor_output: None,
         };
 
         assert_eq!(source.connect(&binding).await, Ok(stream));

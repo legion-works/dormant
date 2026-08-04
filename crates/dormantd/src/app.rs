@@ -6693,6 +6693,8 @@ mod render_tests {
             treat_unreachable_as_blanked: true,
             panel_type: dormant_core::wear::PanelType::default(),
             power_off_opt_in: false,
+            compositor_output: None,
+            sampling: None,
         }
     }
 
@@ -7281,6 +7283,8 @@ mod render_tests {
                         treat_unreachable_as_blanked: true,
                         panel_type: dormant_core::wear::PanelType::default(),
                         power_off_opt_in: false,
+                        compositor_output: None,
+                        sampling: None,
                     },
                 );
                 m
@@ -8436,6 +8440,8 @@ mod macos_gamma_black_assembly_tests {
             treat_unreachable_as_blanked: true,
             panel_type: dormant_core::wear::PanelType::default(),
             power_off_opt_in: false,
+            compositor_output: None,
+            sampling: None,
         };
         let mut displays = IndexMap::new();
         displays.insert("panel".to_string(), display);
@@ -8519,6 +8525,8 @@ mod macos_gamma_black_assembly_tests {
             treat_unreachable_as_blanked: true,
             panel_type: dormant_core::wear::PanelType::default(),
             power_off_opt_in: false,
+            compositor_output: None,
+            sampling: None,
         };
         let mut displays = IndexMap::new();
         displays.insert("panel".to_string(), display);
@@ -8792,6 +8800,8 @@ mod gamma_reload_tests {
             treat_unreachable_as_blanked: true,
             panel_type: dormant_core::wear::PanelType::default(),
             power_off_opt_in: false,
+            compositor_output: None,
+            sampling: None,
         }
     }
 

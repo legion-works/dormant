@@ -333,6 +333,8 @@ mod dispatch_gate_tests {
             panel_type: PanelType::default(),
             hooks: dormant_core::config::HookSlots::default(),
             power_off_opt_in: false,
+            compositor_output: None,
+            sampling: None,
         }
     }
 

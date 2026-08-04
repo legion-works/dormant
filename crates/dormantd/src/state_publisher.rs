@@ -1741,6 +1741,8 @@ mod tests {
                 treat_unreachable_as_blanked: true,
                 panel_type: dormant_core::wear::PanelType::Unknown,
                 power_off_opt_in: false,
+                compositor_output: None,
+                sampling: None,
             },
         );
         cfg
@@ -3170,6 +3172,8 @@ mod async_tests {
                 treat_unreachable_as_blanked: true,
                 panel_type: dormant_core::wear::PanelType::Unknown,
                 power_off_opt_in: false,
+                compositor_output: None,
+                sampling: None,
             },
         );
         cfg

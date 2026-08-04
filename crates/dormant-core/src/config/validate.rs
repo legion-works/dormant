@@ -3949,6 +3949,8 @@ gracee_period = "60s"
             treat_unreachable_as_blanked: true,
             panel_type: crate::wear::PanelType::default(),
             power_off_opt_in: false,
+            compositor_output: None,
+            sampling: None,
         }
     }
 
@@ -4748,6 +4750,8 @@ password = "test-pass"
                     treat_unreachable_as_blanked: true,
                     panel_type: crate::wear::PanelType::default(),
                     power_off_opt_in: false,
+                    compositor_output: None,
+                    sampling: None,
                 },
             )]),
             rules: IndexMap::new(),
@@ -4816,6 +4820,8 @@ password = "test-pass"
                     treat_unreachable_as_blanked: true,
                     panel_type: crate::wear::PanelType::default(),
                     power_off_opt_in: false,
+                    compositor_output: None,
+                    sampling: None,
                 },
             )]),
             rules: IndexMap::new(),
@@ -4961,6 +4967,8 @@ password = "test-pass"
             treat_unreachable_as_blanked: true,
             panel_type: crate::wear::PanelType::default(),
             power_off_opt_in: false,
+            compositor_output: None,
+            sampling: None,
         };
         let ladder = dc.normalized_ladder();
         assert_eq!(ladder.len(), 1);
@@ -6060,6 +6068,8 @@ kind = "power_off"
             treat_unreachable_as_blanked: true,
             panel_type: crate::wear::PanelType::default(),
             power_off_opt_in: false,
+            compositor_output: None,
+            sampling: None,
         }
     }
 

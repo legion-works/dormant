@@ -661,6 +661,8 @@ mod tests {
             treat_unreachable_as_blanked: true,
             panel_type: PanelType::default(),
             power_off_opt_in: false,
+            compositor_output: None,
+            sampling: None,
         }
     }
 

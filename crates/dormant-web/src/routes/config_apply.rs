@@ -2353,6 +2353,8 @@ shared_input_write_code = 0x15
                 #[allow(clippy::default_trait_access)]
                 panel_type: Default::default(),
                 power_off_opt_in: false,
+                compositor_output: None,
+                sampling: None,
             },
         );
         let cfg = Config {

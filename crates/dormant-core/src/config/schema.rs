@@ -782,6 +782,37 @@ pub enum StreamMode {
     PerTick,
 }
 
+/// Per-display compositor-sampling declaration (the optional
+/// `[displays.<id>.sampling]` TOML table).
+///
+/// Declares a remote-only display's compositor output so the active
+/// sampler can observe it; absent means the display is not opted in. The
+/// `stream_mode` field reuses the same `StreamMode` enum the wear path
+/// uses (kebab-case `warm` / `per-tick`) — no display-specific enum.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DisplaySamplingConfig {
+    /// Expected input source label the compositor should report. Free-form
+    /// — the compositor's source-monitor normalizes/canonicalizes before
+    /// compare. `None` is accepted and treated as "skip source-verification".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_source: Option<String>,
+
+    /// Cadence for the compositor-side source poll. Default
+    /// [`defaults::WEAR_SOURCE_POLL_INTERVAL`] (15s); the active-sampling
+    /// pipeline clamps it elsewhere.
+    #[serde(
+        default = "default_wear_source_poll_interval",
+        with = "humantime_serde"
+    )]
+    pub source_poll_interval: Duration,
+
+    /// Stream setup strategy. `None` means the operator has not declared
+    /// a strategy — the active-sampling layer falls back to the wear
+    /// section's `active_sampling.stream_mode` for global consistency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_mode: Option<StreamMode>,
+}
+
 impl Default for WearConfig {
     fn default() -> Self {
         Self {
@@ -1439,6 +1470,22 @@ pub struct DisplayConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shared_input_code: Option<u8>,
 
+    /// Explicit compositor output declaration for active sampling. SEPARATE
+    /// from the `KWin` render-controller key `output` (above): `output` names
+    /// the local `KWin` output the render-controller targets, while
+    /// `compositor_output` names the compositor output the active sampler
+    /// should observe. For a remote-only TV the renderer never sees the
+    /// panel; the operator declares this key to opt the display into the
+    /// sampling path. NEVER inferred from `output` — keeping the two keys
+    /// disjoint avoids a silent dual-use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compositor_output: Option<String>,
+
+    /// Compositor-sampling declaration table. Absent when the operator has
+    /// not opted this display into active sampling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling: Option<DisplaySamplingConfig>,
+
     /// DDC/CI input-source value to WRITE when selecting this machine's input.
     ///
     /// Defaults to `shared_input_code`; set only when the panel accepts a
@@ -1695,6 +1742,17 @@ impl DisplayConfig {
             .iter()
             .all(|c| matches!(c.as_str(), "samsung-tizen" | "ha-passthrough"));
         has_local && !only_remote
+    }
+
+    /// True when this display is eligible for active sampling. A display
+    /// is sampling-eligible when it is render-eligible OR it has an
+    /// explicit `compositor_output` declaration. The composite predicate
+    /// keeps [`Self::is_render_eligible`] unchanged so the wear-sampling
+    /// gate can flip to the wider rule independently, once source gating
+    /// lands.
+    #[must_use]
+    pub fn is_sampling_eligible(&self) -> bool {
+        self.is_render_eligible() || self.compositor_output.is_some()
     }
 }
 
@@ -1988,6 +2046,9 @@ fn default_active_sampling_failure_threshold() -> u32 {
 }
 fn default_active_sampling_circuit_reset_after() -> Duration {
     defaults::WEAR_ACTIVE_SAMPLING_CIRCUIT_RESET_AFTER
+}
+fn default_wear_source_poll_interval() -> Duration {
+    defaults::WEAR_SOURCE_POLL_INTERVAL
 }
 fn default_notify_enabled() -> bool {
     defaults::NOTIFY_ENABLED
@@ -3032,5 +3093,245 @@ idle_source = "macos"
         )
         .unwrap();
         assert!(crate::config::load_config(&path, Strictness::Strict).is_err());
+    }
+
+    // ── [displays.<id>.sampling] + compositor_output + is_sampling_eligible ──
+
+    #[test]
+    fn sampling_eligible_legacy_display_parses_with_both_new_fields_none() {
+        // A config written against the previous schema (no `sampling`,
+        // no `compositor_output`) must still parse: both new fields fall
+        // back to `None` and the legacy `output` key is unaffected.
+        let toml_str = r#"
+config_version = 1
+[displays.main_monitor]
+controllers = ["kwin-dpms", "ddcci"]
+blank_mode = "power_off"
+output = "DP-1"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        let display = &cfg.displays["main_monitor"];
+        assert_eq!(display.compositor_output, None);
+        assert!(display.sampling.is_none());
+        // `output` is the existing KWin render-controller key — must
+        // remain untouched.
+        assert_eq!(display.output.as_deref(), Some("DP-1"));
+    }
+
+    #[test]
+    fn sampling_eligible_sampling_table_omitting_stream_mode_yields_none() {
+        // A bare `[displays.<id>.sampling]` table with only the
+        // source-poll key explicit must yield `stream_mode = None`,
+        // not the default `Warm` — the sampling table is opt-in, so the
+        // default is "no mode declared" rather than "warm".
+        let toml_str = r#"
+config_version = 1
+[displays.tv]
+controllers = ["samsung-tizen"]
+blank_mode = "screen_off_audio_on"
+[displays.tv.sampling]
+expected_source = "HDMI4"
+source_poll_interval = "30s"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        let sampling = cfg.displays["tv"]
+            .sampling
+            .as_ref()
+            .expect("sampling table must parse");
+        assert_eq!(sampling.expected_source.as_deref(), Some("HDMI4"));
+        assert_eq!(sampling.source_poll_interval, Duration::from_secs(30));
+        assert_eq!(sampling.stream_mode, None);
+    }
+
+    #[test]
+    fn sampling_eligible_full_tv_toml_parses_with_defaults_and_per_tick() {
+        let toml_str = r#"
+config_version = 1
+[displays.tv]
+controllers = ["samsung-tizen"]
+blank_mode = "screen_off_audio_on"
+host = "192.168.1.50"
+compositor_output = "HDMI-A-1"
+[displays.tv.sampling]
+expected_source = "HDMI4"
+stream_mode = "per-tick"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        let display = &cfg.displays["tv"];
+        assert_eq!(display.compositor_output.as_deref(), Some("HDMI-A-1"));
+        let sampling = display.sampling.as_ref().expect("sampling table missing");
+        assert_eq!(sampling.expected_source.as_deref(), Some("HDMI4"));
+        // source_poll_interval omitted → defaults to WEAR_SOURCE_POLL_INTERVAL (15s).
+        assert_eq!(sampling.source_poll_interval, Duration::from_secs(15));
+        assert_eq!(sampling.stream_mode, Some(StreamMode::PerTick));
+    }
+
+    #[test]
+    fn sampling_eligible_round_trip_preserves_override() {
+        // Round-trip a sampling table with an explicit source-poll override
+        // and per-tick mode through serde to confirm the override survives
+        // a serialize→parse cycle. The `Option::is_none` skip on the table
+        // is belt-and-braces — the durable absence proof lives in
+        // `sampling_eligible_absent_sampling_serializes_as_absent`.
+        let toml_str = r#"
+config_version = 1
+[displays.tv]
+controllers = ["samsung-tizen"]
+blank_mode = "screen_off_audio_on"
+[displays.tv.sampling]
+expected_source = "HDMI4"
+source_poll_interval = "30s"
+stream_mode = "per-tick"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        let serialized = toml::to_string(&cfg).expect("serialize config");
+        let cfg2: Config = toml::from_str(&serialized).expect("re-parse serialized config");
+        let sampling = cfg2.displays["tv"]
+            .sampling
+            .as_ref()
+            .expect("sampling table must survive round-trip");
+        assert_eq!(sampling.expected_source.as_deref(), Some("HDMI4"));
+        assert_eq!(sampling.source_poll_interval, Duration::from_secs(30));
+        assert_eq!(sampling.stream_mode, Some(StreamMode::PerTick));
+    }
+
+    #[test]
+    fn sampling_eligible_invalid_stream_mode_underscore_rejected() {
+        // The shared `StreamMode` enum uses kebab-case in serde ("per-tick"),
+        // not snake_case ("per_tick"). A config that supplies the wrong
+        // casing must be rejected by the same enum deserializer the wear
+        // path uses — no display-specific shim.
+        let toml_str = r#"
+config_version = 1
+[displays.tv]
+controllers = ["samsung-tizen"]
+[displays.tv.sampling]
+stream_mode = "per_tick"
+"#;
+        let error = toml::from_str::<Config>(toml_str).unwrap_err().to_string();
+        assert!(
+            error.contains("per_tick") || error.to_lowercase().contains("stream_mode"),
+            "expected stream_mode / per_tick error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn sampling_eligible_explicit_source_poll_interval_parses() {
+        let toml_str = r#"
+config_version = 1
+[displays.tv]
+controllers = ["samsung-tizen"]
+[displays.tv.sampling]
+source_poll_interval = "30s"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        let sampling = cfg.displays["tv"].sampling.as_ref().unwrap();
+        assert_eq!(sampling.source_poll_interval, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn sampling_eligible_local_display_remains_sampling_eligible() {
+        // A local display (kwin-dpms + ddcci controllers) is already
+        // render-eligible; is_sampling_eligible must surface that.
+        let display = DisplayConfig {
+            controllers: vec!["kwin-dpms".to_owned(), "ddcci".to_owned()],
+            ..make_minimal_display()
+        };
+        assert!(display.is_render_eligible());
+        assert!(display.is_sampling_eligible());
+        assert_eq!(display.compositor_output, None);
+    }
+
+    #[test]
+    fn sampling_eligible_remote_only_display_false_until_compositor_output_set() {
+        // A remote-only TV (samsung-tizen) is NOT render-eligible — the
+        // previous (N1) predicate rejected it. Sampling flips to true
+        // once the operator explicitly declares a compositor output.
+        let mut display = DisplayConfig {
+            controllers: vec!["samsung-tizen".to_owned()],
+            ..make_minimal_display()
+        };
+        assert!(!display.is_render_eligible());
+        assert!(!display.is_sampling_eligible());
+
+        display.compositor_output = Some("HDMI-A-1".to_owned());
+        assert!(!display.is_render_eligible());
+        assert!(display.is_sampling_eligible());
+    }
+
+    #[test]
+    fn sampling_eligible_is_render_eligible_unchanged() {
+        // The trap: this task is carefully NOT to modify
+        // `is_render_eligible`. A remote-only TV with `compositor_output`
+        // set is sampling-eligible but still NOT render-eligible — the
+        // existing N1 contract (`validate_wear` rejects non-render-
+        // eligible displays) is preserved until source gating lands.
+        let display = DisplayConfig {
+            controllers: vec!["samsung-tizen".to_owned()],
+            compositor_output: Some("HDMI-A-1".to_owned()),
+            ..make_minimal_display()
+        };
+        assert!(!display.is_render_eligible());
+        assert!(display.is_sampling_eligible());
+    }
+
+    #[test]
+    fn sampling_eligible_absent_sampling_serializes_as_absent() {
+        // A display with no `[sampling]` table must serialize WITHOUT
+        // inventing the table — the round-trip identity is the contract.
+        let toml_str = r#"
+config_version = 1
+[displays.main_monitor]
+controllers = ["kwin-dpms"]
+blank_mode = "power_off"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        let serialized = toml::to_string(&cfg).expect("serialize config");
+        assert!(
+            !serialized.contains("[displays.main_monitor.sampling]"),
+            "absent sampling table must not be serialized, got: {serialized}"
+        );
+        let cfg2: Config = toml::from_str(&serialized).expect("re-parse");
+        assert!(cfg2.displays["main_monitor"].sampling.is_none());
+    }
+
+    /// Minimal valid `DisplayConfig` for unit-testing the predicate and
+    /// compositor-output round-trip; the schema-wide required-field list
+    /// is incompletely modelled here but every field the new code reads
+    /// is set explicitly.
+    fn make_minimal_display() -> DisplayConfig {
+        DisplayConfig {
+            controllers: Vec::new(),
+            scope: crate::config::schema::DisplayScope::Private,
+            shared_input_code: None,
+            shared_input_write_code: None,
+            shared_peer_input_write_code: None,
+            shared_peer_input_code: None,
+            hooks: crate::config::HookSlots::default(),
+            blank_mode: None,
+            degraded_mode: None,
+            ladder: Vec::new(),
+            screensaver: None,
+            output: None,
+            ddc_display: None,
+            host: None,
+            wol_mac: None,
+            blank_command: None,
+            wake_command: None,
+            modes: None,
+            ha_url: None,
+            blank_service: None,
+            blank_data: None,
+            wake_service: None,
+            wake_data: None,
+            command_timeout: Duration::from_secs(10),
+            restore_brightness: 80,
+            samsung_restore_backlight: 50,
+            treat_unreachable_as_blanked: true,
+            panel_type: crate::wear::PanelType::Unknown,
+            power_off_opt_in: false,
+            compositor_output: None,
+            sampling: None,
+        }
     }
 }

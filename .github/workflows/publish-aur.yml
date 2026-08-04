@@ -13,6 +13,17 @@ on:
 
 jobs:
   publish-aur:
+    # Non-blocking: the AUR is third-party infrastructure and its git endpoint
+    # goes down for maintenance and restricts pushes during security incidents,
+    # neither of which says anything about this release. A failure here must not
+    # mark an otherwise-good release run as failed.
+    #
+    # The compensating control is end-state verification rather than this job's
+    # exit code: check the version the AUR actually serves —
+    #   curl -sS 'https://aur.archlinux.org/rpc/v5/info?arg[]=dormant-bin'
+    # A push that silently did nothing is caught there; a green job never proved
+    # the package landed anyway.
+    continue-on-error: true
     runs-on: ubuntu-latest
     env:
       RELEASE_TAG: ${{ fromJson(inputs.plan).announcement_tag }}

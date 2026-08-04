@@ -1,5 +1,7 @@
 //! Pure lifecycle rules and capture boundary for active wear sampling.
 
+pub mod source_gate;
+
 use async_trait::async_trait;
 use dormant_core::config::schema::{ActiveSamplingConfig, Config, StreamMode};
 use dormant_core::ipc_proto::WearSamplingStatus;

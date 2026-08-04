@@ -56,6 +56,14 @@ jobs:
           pattern: artifacts-*
           path: target/distrib/
           merge-multiple: true
+      # Install exactly the runtime libraries docs/src/installation.md tells a
+      # tarball user to install. The gate therefore also verifies that the
+      # documented list is SUFFICIENT: if the binary needs a library the docs
+      # omit, this step will not provide it and the smoke run fails.
+      - name: Install documented runtime libraries (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libpipewire-0.3-0
+
       - name: Smoke-test packaged dormantd / dormantctl (${{ matrix.triple }})
         run: |
           echo "$PLAN" > "$RUNNER_TEMP/dist-manifest.json"

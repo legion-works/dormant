@@ -133,3 +133,109 @@ describe("WearSection active sampling plural form", () => {
     ]));
   });
 });
+
+describe("WearSection sampled-displays selector — compositor_output opt-in", () => {
+  // Remote-only TV with no compositor_output — must NOT appear in the
+  // sampled-displays selector until the operator declares a
+  // compositor_output. The Rust `is_sampling_eligible` predicate widens
+  // the legacy `is_render_eligible` with a compositor_output OR branch;
+  // the TS mirror must do the same.
+  const singularWear: WearConfig = {
+    enabled: true,
+    active_sampling: {
+      enabled: true,
+      sampled_display: "desk",
+      stream_mode: "warm",
+      capture_timeout: "2s",
+      failure_threshold: 5,
+      circuit_reset_after: "5m",
+    },
+  };
+
+  it("excludes a remote-only TV from sampled-display options when compositor_output is unset", () => {
+    const store = createPatchStore();
+    render(
+      <WearSection
+        wear={singularWear}
+        displays={{
+          desk: { controllers: ["kwin-dpms"] },
+          tv: { controllers: ["samsung-tizen"] },
+        }}
+        store={store}
+        redactedPaths={[]}
+        onDirty={() => {}}
+        fieldErrors={{}}
+      />,
+    );
+    expect(screen.getByLabelText("active_sampling.sampled_display")).toHaveValue("desk");
+    expect(screen.queryByRole("option", { name: "tv" })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("active_sampling.sampled_display: tv")).not.toBeInTheDocument();
+  });
+
+  it("includes a remote-only TV in sampled-display options once compositor_output is non-empty", () => {
+    const store = createPatchStore();
+    render(
+      <WearSection
+        wear={singularWear}
+        displays={{
+          desk: { controllers: ["kwin-dpms"] },
+          tv: { controllers: ["samsung-tizen"], compositor_output: "HDMI-A-1" },
+        }}
+        store={store}
+        redactedPaths={[]}
+        onDirty={() => {}}
+        fieldErrors={{}}
+      />,
+    );
+    expect(screen.getByLabelText("active_sampling.sampled_display")).toHaveValue("desk");
+    expect(screen.getByRole("option", { name: "tv" })).toBeInTheDocument();
+  });
+
+  // Rust `is_sampling_eligible` widens on `is_some()` (schema.rs:1754-1756),
+  // TS on `trim().length > 0` (WearSection.tsx). The Rust side rejects
+  // whitespace-only compositor_output configs (validate.rs:1554-1563), so
+  // for any validated config the two definitions coincide — but the TS
+  // guard is what gates the selector. Pin the TS side explicitly so the
+  // asymmetry cannot silently flip the other way.
+  it("whitespace-only compositor_output does NOT qualify a remote-only display for sampling", () => {
+    const store = createPatchStore();
+    render(
+      <WearSection
+        wear={singularWear}
+        displays={{
+          desk: { controllers: ["kwin-dpms"] },
+          tv: { controllers: ["samsung-tizen"], compositor_output: "   " },
+        }}
+        store={store}
+        redactedPaths={[]}
+        onDirty={() => {}}
+        fieldErrors={{}}
+      />,
+    );
+    expect(screen.getByLabelText("active_sampling.sampled_display")).toHaveValue("desk");
+    expect(screen.queryByRole("option", { name: "tv" })).not.toBeInTheDocument();
+  });
+
+  // Mixed controllers — at least one local present so has_local is true;
+  // the controllers list is not composed solely of remote ones so
+  // only_remote is false. The display is render-eligible (and therefore
+  // sampling-eligible) on its own, with no compositor_output needed.
+  it("mixed controllers (one local + one remote) are sampling-eligible without compositor_output", () => {
+    const store = createPatchStore();
+    render(
+      <WearSection
+        wear={singularWear}
+        displays={{
+          desk: { controllers: ["kwin-dpms"] },
+          tv: { controllers: ["samsung-tizen", "ddcci"] },
+        }}
+        store={store}
+        redactedPaths={[]}
+        onDirty={() => {}}
+        fieldErrors={{}}
+      />,
+    );
+    expect(screen.getByLabelText("active_sampling.sampled_display")).toHaveValue("desk");
+    expect(screen.getByRole("option", { name: "tv" })).toBeInTheDocument();
+  });
+});

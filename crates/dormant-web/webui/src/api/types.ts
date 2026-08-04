@@ -682,6 +682,22 @@ export interface LadderStage {
   dwell?: string;
 }
 
+/** rust: config/schema.rs DisplaySamplingConfig — per-display compositor
+ * sampling declaration (`[displays.<id>.sampling]` TOML table).
+ *
+ * All three fields are optional — the table is opt-in. `source_poll_interval`
+ * defaults server-side to `defaults::WEAR_SOURCE_POLL_INTERVAL` (15s); the
+ * TS mirror leaves it `undefined` so the operator can clear/override it
+ * explicitly. `stream_mode` reuses the same `StreamMode` enum the wear path
+ * uses (kebab-case `warm` / `per-tick`); absent means "inherit the global
+ * wear.active_sampling.stream_mode" and the editor surfaces an explicit
+ * "Inherit global" choice in the select. */
+export interface DisplaySamplingConfig {
+  expected_source?: string | null;
+  source_poll_interval?: string;
+  stream_mode?: "warm" | "per-tick" | null;
+}
+
 /** rust: config/schema.rs ScreensaverSource */
 export interface ScreensaverSource {
   path?: string;
@@ -757,6 +773,21 @@ export interface DisplayConfig {
    * operator to read the warning copy before flipping it on.
    */
   power_off_opt_in?: boolean;
+  /**
+   * Explicit compositor output declaration for active sampling. SEPARATE
+   * from the local KWin render-controller `output` key above: this names
+   * the compositor output the active sampler should observe, not the
+   * local KWin target. For a remote-only TV the renderer never sees the
+   * panel; the operator declares this to opt the display into the
+   * sampling path. Absent means no compositor source is wired.
+   */
+  compositor_output?: string | null;
+  /**
+   * Compositor-sampling declaration table. Absent when the operator has
+   * not opted this display into active sampling. Field shapes live in
+   * [`DisplaySamplingConfig`] above.
+   */
+  sampling?: DisplaySamplingConfig | null;
 }
 
 // ─── Config-apply wire types ──────────────────────────────────────────────

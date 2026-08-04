@@ -53,10 +53,37 @@ const FIELD_PLACEHOLDER: Record<string, string> = {
   advisory_after: "96h",
 };
 
+/**
+ * Render-eligibility predicate — mirrors `DisplayConfig::is_render_eligible`
+ * in `crates/dormant-core/src/config/schema.rs`. A display is render-eligible
+ * when at least one local controller (`kwin-dpms` / `ddcci` / `command`) is
+ * present AND the controller list is not composed solely of remote
+ * controllers (`samsung-tizen` / `ha-passthrough`). The two predicates
+ * must remain disjoint — the composite `is_sampling_eligible` widens this
+ * with a compositor_output branch so the wear-sampling selector can flip
+ * independently once source-gating lands.
+ */
 function isRenderEligible(display: DisplayConfig): boolean {
-  return display.controllers.some((controller) =>
-    controller === "kwin-dpms" || controller === "ddcci" || controller === "command",
-  );
+  const LOCAL = new Set(["kwin-dpms", "ddcci", "command"]);
+  const REMOTE = new Set(["samsung-tizen", "ha-passthrough"]);
+  const hasLocal = display.controllers.some((c) => LOCAL.has(c));
+  const onlyRemote = display.controllers.every((c) => REMOTE.has(c));
+  return hasLocal && !onlyRemote;
+}
+
+/**
+ * Sampling-eligibility predicate — mirrors `DisplayConfig::is_sampling_eligible`
+ * in `crates/dormant-core/src/config/schema.rs`. A display is sampling-eligible
+ * when it is render-eligible OR it carries an explicit non-empty
+ * `compositor_output` declaration. The compositor_output branch is what
+ * makes a remote-only TV show up in the wear sampled-displays list — the
+ * render path can never target it (no local controller), but the active
+ * sampler can observe its panel via a declared compositor output.
+ */
+function isSamplingEligible(display: DisplayConfig): boolean {
+  if (isRenderEligible(display)) return true;
+  const out = display.compositor_output;
+  return typeof out === "string" && out.trim().length > 0;
 }
 
 function ActiveSamplingFields({ value, displays, store, redactedPaths, onDirty, fieldErrors }: {
@@ -68,7 +95,7 @@ function ActiveSamplingFields({ value, displays, store, redactedPaths, onDirty, 
   fieldErrors: Record<string, string | undefined>;
 }) {
   const displayOptions = Object.entries(displays)
-    .filter(([, display]) => isRenderEligible(display))
+    .filter(([, display]) => isSamplingEligible(display))
     .map(([id]) => id);
   // Canonical multi-display field renders the plural selector when the
   // config carries a list; the legacy singular row is hidden so the

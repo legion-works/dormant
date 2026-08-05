@@ -636,7 +636,7 @@ describe("WearCard", () => {
       await waitFor(() =>
         expect(screen.getByText("not sampling — TV is on another source")).toBeInTheDocument(),
       );
-      expect(screen.getByText("Granted")).toBeInTheDocument();
+      await waitFor(() => expect(screen.getByText("Granted")).toBeInTheDocument());
       expect(screen.queryByText("Needs consent")).not.toBeInTheDocument();
     });
 

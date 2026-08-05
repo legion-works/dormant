@@ -1,6 +1,12 @@
 /** Wear-heat-map data model + colour ramps — grid normalization and the
  * deviation/heat colour helpers consumed by the WearHeatMap component and
  * the DisplayDetail legend. Pure data, no React. */
+
+/** Absolute-hours floor below which deviation colouring is suppressed.
+ * A panel with mean < 1 h has insufficient accumulated wear for the
+ * (hours − mean) / mean ratio to carry meaning — a 20 % relative
+ * spread on 0.1 h is two hundredths of an hour of absolute wear. */
+export const WEAR_FLOOR_HOURS = 1.0;
 import type { WearDetail } from "../../api/types";
 
 export const HEAT_RAMP_STOPS: readonly [number, number, number, number][] = [

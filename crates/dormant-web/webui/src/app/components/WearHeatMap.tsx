@@ -1,6 +1,6 @@
 /** Panel wear heat map derived from each cell's deviation from the panel mean. */
 import { useState } from "react";
-import { deviationColor, type NormalizedWearGrid } from "./wearHeatMapGrid";
+import { deviationColor, WEAR_FLOOR_HOURS, type NormalizedWearGrid } from "./wearHeatMapGrid";
 import "./WearHeatMap.css";
 
 function regionLabel(row: number, col: number, rows: number, cols: number): string {
@@ -19,11 +19,15 @@ function deltaLabel(deviation: number): string {
   return deviation > 0 ? `+${percent}% above mean` : `−${percent}% below mean`;
 }
 
+const NEUTRAL_COLOR = "rgba(195, 232, 141, 0.47)";
+
 export function WearHeatMap({ display, grid }: { display: string; grid: NormalizedWearGrid }) {
   const [activeCell, setActiveCell] = useState<number | null>(null);
   if (grid.rows === 0 || grid.cols === 0 || (!grid.hasGridSamples && !grid.hasHeatSamples)) {
     return <div className="wear-heat-map__empty">No spatial wear samples for this display yet.</div>;
   }
+
+  const belowFloor = grid.meanHours < WEAR_FLOOR_HOURS;
 
   return (
     <>
@@ -40,13 +44,16 @@ export function WearHeatMap({ display, grid }: { display: string; grid: Normaliz
           return (
             <div key={index} role="gridcell" tabIndex={0} aria-describedby={activeCell === index ? tooltipId : undefined}
               aria-label={`row ${row}, column ${col}`} className="wear-heat-map__cell"
-              style={{ backgroundColor: deviationColor(deviation) }}
+              style={{ backgroundColor: belowFloor ? NEUTRAL_COLOR : deviationColor(deviation) }}
               onFocus={() => setActiveCell(index)} onBlur={() => setActiveCell(null)}
               onMouseEnter={() => setActiveCell(index)} onMouseLeave={() => setActiveCell(null)} />
           );
         })}
       </div>
-      {!grid.hasSpatialVariation && (
+      {belowFloor && (
+        <div className="wear-heat-map__variation-note">insufficient wear data ({`<${WEAR_FLOOR_HOURS}h mean)`}</div>
+      )}
+      {!belowFloor && !grid.hasSpatialVariation && (
         <div className="wear-heat-map__variation-note">no spatial variation yet — {grid.sampleCount.toLocaleString()} samples</div>
       )}
       {activeCell !== null && (() => {

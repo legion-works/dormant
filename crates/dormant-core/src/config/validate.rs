@@ -694,7 +694,12 @@ pub fn validate_with_input_source_readers(
             creds,
             cfg.sensors
                 .values()
-                .any(|sensor| matches!(sensor, crate::config::SensorConfig::Mqtt(_))),
+                .any(|sensor| matches!(sensor, crate::config::SensorConfig::Mqtt(_)))
+                || cfg
+                    .publish
+                    .broker_url
+                    .as_ref()
+                    .is_some_and(|url| !url.trim().is_empty()),
             &mut errors,
         );
     }
@@ -2825,6 +2830,32 @@ gracee_period = "60s"
                 .iter()
                 .any(|error| error.what == crate::error::E_CONFIG_INVALID
                     && error.detail.contains("has hooks but is not shared"))
+        );
+    }
+
+    #[test]
+    fn mqtt_hook_accepts_publish_broker_without_sensor_broker() {
+        let errors = validate_str(
+            "config_version = 1\n[publish]\nbroker_url = \"tcp://publish.example:1883\"\n[displays.main]\ncontrollers = [\"ddcci\"]\nscope = \"shared\"\nshared_input_code = 1\nblank_mode = \"power_off\"\n[displays.main.hooks]\nbefore_release = [{ mqtt = { topic = \"hooks/topic\", payload = \"on\" } }]\n",
+        );
+        assert!(
+            !errors.iter().any(|error| error
+                .detail
+                .contains("mqtt action requires a configured MQTT broker")),
+            "publish broker should satisfy mqtt hook validation: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn mqtt_hook_without_any_broker_is_rejected() {
+        let errors = validate_str(
+            "config_version = 1\n[displays.main]\ncontrollers = [\"ddcci\"]\nscope = \"shared\"\nshared_input_code = 1\nblank_mode = \"power_off\"\n[displays.main.hooks]\nbefore_release = [{ mqtt = { topic = \"hooks/topic\", payload = \"on\" } }]\n",
+        );
+        assert!(
+            errors.iter().any(|error| error
+                .detail
+                .contains("mqtt action requires a configured MQTT broker")),
+            "mqtt hook without a broker must be rejected: {errors:?}"
         );
     }
 

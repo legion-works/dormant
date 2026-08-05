@@ -19,7 +19,9 @@ use dormant_core::types::DisplayId;
 use tokio::sync::{mpsc, watch};
 use tracing::warn;
 
-use crate::hooks::{Direction, HookContext, HookEngine, HookOutcome, HookSlot, Phase};
+use crate::hooks::{
+    Direction, HookContext, HookEngine, HookOutcome, HookSlot, MqttPublisher, Phase,
+};
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -199,6 +201,11 @@ impl DirectSwitchHandle {
             coordination,
             last_activity_pull: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Replace the MQTT hook publisher after an accepted configuration reload.
+    pub(crate) fn reconfigure_hooks(&self, publisher: Arc<MqttPublisher>) {
+        self.hooks.reconfigure(publisher);
     }
 
     /// Pull the display to this machine — write the local input code.

@@ -72,7 +72,7 @@ use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::io;
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -810,6 +810,10 @@ impl MqttPublisher {
         }
     }
 
+    fn config(&self) -> (String, Option<MqttCredential>) {
+        (self.broker_url.clone(), self.credential.clone())
+    }
+
     /// Publish `payload` to `topic`. `QoS` 1, `retain=false`.
     ///
     /// On the first call (or after a failure cleared the cache) this
@@ -1096,7 +1100,8 @@ impl HookRunner for ScriptedHookRunner {
 /// `HookRunner` used to execute a slot. Constructed once at app startup,
 /// shared across the lifetime of the daemon.
 pub struct HookEngine {
-    runner: Arc<dyn HookRunner>,
+    runner: RwLock<Arc<dyn HookRunner>>,
+    mqtt_config: RwLock<(String, Option<MqttCredential>)>,
 }
 
 impl HookEngine {
@@ -1104,14 +1109,39 @@ impl HookEngine {
     #[must_use]
     pub fn new(publisher: Arc<MqttPublisher>) -> Self {
         Self {
-            runner: Arc::new(RealHookRunner::new(publisher)),
+            mqtt_config: RwLock::new(publisher.config()),
+            runner: RwLock::new(Arc::new(RealHookRunner::new(publisher))),
         }
+    }
+
+    /// Replace the publisher used by subsequent hook actions after a config reload.
+    pub fn reconfigure(&self, publisher: Arc<MqttPublisher>) {
+        *self
+            .mqtt_config
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = publisher.config();
+        *self
+            .runner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Arc::new(RealHookRunner::new(publisher));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mqtt_config(&self) -> (String, Option<MqttCredential>) {
+        self.mqtt_config
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Build an engine with a custom runner (test seam).
     #[must_use]
     pub fn with_runner(runner: Arc<dyn HookRunner>) -> Self {
-        Self { runner }
+        Self {
+            runner: RwLock::new(runner),
+            mqtt_config: RwLock::new((String::new(), None)),
+        }
     }
 
     /// Snapshot a display's hook slots. Returns the slot-by-phase matrix
@@ -1123,7 +1153,12 @@ impl HookEngine {
 
     /// Run one slot end-to-end.
     pub async fn run_slot(&self, slot: HookSlot<'_>) -> HookOutcome {
-        run_slot(slot, Arc::clone(&self.runner)).await
+        let runner = self
+            .runner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        run_slot(slot, runner).await
     }
 }
 
@@ -1719,6 +1754,36 @@ mod tests {
         assert!(
             state.client.is_none(),
             "failure must clear the cache so the next call reconnects"
+        );
+    }
+
+    #[test]
+    fn hook_engine_reconfigure_replaces_mqtt_publisher_configuration() {
+        let initial = Arc::new(MqttPublisher::new(
+            "tcp://initial.example:1883".into(),
+            None,
+        ));
+        let engine = HookEngine::new(initial);
+        assert_eq!(engine.mqtt_config().0, "tcp://initial.example:1883");
+
+        let replacement = Arc::new(MqttPublisher::new(
+            "tcp://configured.example:1883".into(),
+            Some(MqttCredential {
+                username: "hook-user".into(),
+                password: "hook-password".into(),
+            }),
+        ));
+        engine.reconfigure(replacement);
+
+        let (broker_url, credential) = engine.mqtt_config();
+        assert_eq!(broker_url, "tcp://configured.example:1883");
+        assert_eq!(
+            credential.as_ref().map(|c| c.username.as_str()),
+            Some("hook-user")
+        );
+        assert_eq!(
+            credential.as_ref().map(|c| c.password.as_str()),
+            Some("hook-password")
         );
     }
 

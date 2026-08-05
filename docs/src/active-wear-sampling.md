@@ -1,24 +1,84 @@
 # Active wear sampling
 
 **What this gives you.** Optional content-weighted OLED wear tracking for one
-or more configured displays, using a compositor frame captured from the KDE
-Wayland session. Each frame becomes a luma grid for the existing wear ledger;
-raw pixels are not stored.
+or more configured displays. A compositor frame is captured from the KDE
+Wayland session (a local monitor) or from a declared compositor output behind
+an HDMI-connected Samsung TV, reduced to a luma grid for the existing wear
+ledger, and attributed only while the intended source is actually visible.
+Raw pixels are never stored.
 
-**Scope.** This feature is Linux/KDE Wayland only. It uses the xdg-desktop-
-portal ScreenCast flow and samples every display in the per-display
-`sampled_displays` list independently; the legacy `sampled_display` singular
-form remains accepted for backward compatibility. macOS and Windows remain on
-uniform attribution; this feature does not provide capture support for those
-platforms, GNOME, X11, or TVs.
+**When to use it.** When uniform brightness-weighted on-hours is too coarse
+for a panel you care about — a static UI on one half of the screen ages
+differently from a full-screen movie, and a TV showing Netflix instead of your
+HDMI input should not count as local-frame wear at all. Not for you if you have
+no KDE Wayland session (the capture path is Linux/KDE Wayland only), or if you
+only want the existing uniform ledger — active sampling is opt-in and changes
+attribution, not blank/wake timing. GNOME, X11, macOS, and Windows stay on
+uniform attribution; this feature does not provide capture for those
+platforms.
+
+**Quick setup.** Declare a compositor output and pin the source the sampler
+should expect, then opt the display into the wear section's sampled list:
+
+```toml
+[displays.tv]
+controllers = ["samsung-tizen"]
+host = "10.1.1.7"
+blank_mode = "screen_off_audio_on"
+compositor_output = "HDMI-A-1"
+
+[displays.tv.sampling]
+expected_source = "HDMI4"
+source_poll_interval = "15s"
+
+[wear.active_sampling]
+enabled = true
+sampled_displays = ["monitor", "tv"]
+```
+
+Verify the sampler can see the TV's input:
+
+```bash
+dormantctl status          # look for "(source: matched)" on the TV row
+dormantctl wear enable-sampling --display tv
+```
+
+---
+
+Full config reference · behaviour details · failure modes and troubleshooting
+
+## Scope and platforms
+
+Active sampling captures compositor frames on Linux/KDE Wayland through the
+xdg-desktop-portal ScreenCast flow. It samples every display in the
+per-display `sampled_displays` list independently; the legacy
+`sampled_display` singular form remains accepted for backward compatibility.
+
+Two display classes are sampling-eligible:
+
+- A **local render-eligible** display — one with a local controller
+  (`kwin-dpms`, `ddcci`, or `command`) in its `controllers` list and an
+  `output` set. The sampler captures the compositor frame driving that panel
+  directly.
+- A **remote-only TV** that declares `compositor_output` and a
+  `[displays.<id>.sampling]` table. Today the only shipping source reader is
+  `samsung-tizen` over Samsung IP Control (port 1516); no other TV vendor or
+  transport is supported. The sampler captures the local compositor output
+  that feeds the TV's HDMI input, not the TV's own framebuffer.
+
+`compositor_output` opts a remote display into the sampling path. It is
+separate from the `kwin-dpms` `output` key (which names the local render
+target) and does not enable any render-ladder stage — a remote-only TV
+still cannot run `render_black` or `render_screensaver` stages.
 
 ## What sampling means
 
-At each wear tick, dormant activates the restored PipeWire stream, captures one
-full-resolution compositor frame, reduces it to a 16×9 luma grid, and pauses
-the stream again. The grid is resampled to the configured `wear.grid_rows` ×
-`wear.grid_cols` ledger grid before attribution. The raw frame is transient;
-only the reduced grid remains in memory and contributes to the existing ledger.
+At each wear tick, dormant activates the restored PipeWire stream, captures
+one full-resolution compositor frame, reduces it to a 16×9 luma grid, and
+pauses the stream again. The grid is resampled to the configured
+`wear.grid_rows` × `wear.grid_cols` ledger grid before attribution. The raw
+frame is transient; only the reduced grid remains in memory and contributes to
+the existing ledger.
 
 The frame is sampled once per `wear.sample_interval` (default `60s`). This is
 a single-frame-per-tick approximation, not integration over the whole
@@ -83,11 +143,70 @@ PipeWire −0.008 percentage points over 30-minute windows), with pause→resume
 p95 of 14.4 ms. `"per-tick"` tears down the stream after each
 capture and recreates it on the next tick, without requiring consent again.
 
+### Per-display sampling table
+
+A remote-only TV declares its source gate under
+`[displays.<id>.sampling]` (see [Configuration](./configuration.md)):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `expected_source` | unset | Input source label the TV must report for a capture to count. Matched exactly and case-sensitively; required when `compositor_output` is set |
+| `source_poll_interval` | `"15s"` | Cadence for the Samsung IP Control source read; valid range `5s`–`5m` (inclusive) |
+| `stream_mode` | unset | Per-display override of `[wear.active_sampling] stream_mode`: `"warm"` or `"per-tick"`. Unset inherits the wear section's mode |
+
+`expected_source` is required once `compositor_output` is set — validation
+rejects a remote-only display that opts into sampling without pinning the
+source, because the source gate would have nothing to compare against. The
+`expected_source` string is free-form but must match the label Samsung IP
+Control returns verbatim (e.g. `"HDMI4"`, not `"hdmi 4"`); the match is exact
+and case-sensitive.
+
+`stream_mode = "per-tick"` is the two-stream fallback. Sampling two displays
+at once spawns one PipeWire stream per display; a TV that overrides to
+`per-tick` tears its stream down after each capture instead of holding a
+second warm stream alongside the monitor's, so the second concurrent stream
+exists only for the capture window. The monitor inherits the global `warm`
+mode unchanged. The two-stream resource cost is measured in
+[Two-stream active sampling](../research/active-sampling-two-streams.md);
+until those measurements land, multi-display sampling stays opt-in.
+
+## The source gate
+
+For a TV carrying `expected_source`, the daemon polls Samsung IP Control
+(`inputSourceControl`) every `source_poll_interval` and classifies the
+response before every capture:
+
+| State | Tag | When | Capture | Attribution |
+|---|---|---|---|---|
+| Matched | `matched` | The TV reports exactly `expected_source` | Runs | `sampled` (spatial, luma-weighted) |
+| Mismatched | `mismatched` | The TV reports a different source (e.g. Netflix) | Skipped | `uniform` tagged `source_mismatch` |
+| Unknown | `unknown` | The source cannot be read (poll failed, empty response) | Skipped | `uniform` tagged `source_unknown` |
+
+The gate is fail-safe toward attribution, never toward a zero span: while the
+TV is on another source the panel is still ON and still aging, so the tick
+degrades to uniform attribution tagged `source_mismatch` — spatial
+attribution is suppressed, but the on-hours still accrue. The same applies to
+`source_unknown`. A matched gate runs the capture and attributes spatially;
+a display with no `[displays.<id>.sampling]` table (a local monitor) has no
+gate and is treated as permanently matched.
+
+The poller runs only while the sampler is `Streaming` and bound to the
+matching expectation. Adding, removing, or changing `expected_source` tears
+down and re-spawns the poller without touching the consent record or closing
+the portal session — a gated capture is not a gated consent. No capture
+ticks fire while the gate is `mismatched` or `unknown`: the latest sampled
+grid is cleared on every transition away from matched so a stale grid is never
+promoted to a fresh attribution.
+
+The `WearSamplingSourceGate` daemon event fires only on a full gate change
+(`matched` → `mismatched` → `unknown` → …), not on every steady-state poll, so
+a long run of mismatched polls emits one event, not one per tick.
+
 ## Consent and revocation
 
-Enabling grants the daemon's graphical session persistent screen-capture access
-through **xdg-desktop-portal ScreenCast** with `persist_mode=2`. Each sampled
-display has its own consent record at
+Enabling grants the daemon's graphical session persistent screen-capture
+access through **xdg-desktop-portal ScreenCast** with `persist_mode=2`. Each
+sampled display has its own consent record at
 `$XDG_STATE_HOME/dormant/screencast-consent-<sanitized-display>.json` (or the
 platform state-dir fallback). On the first boot after upgrading from a
 singular `sampled_display` config, the legacy un-suffixed
@@ -95,9 +214,31 @@ singular `sampled_display` config, the legacy un-suffixed
 display; after that one-way copy the per-display file is authoritative and the
 legacy file is never read again. The parent directory is mode `0700`; each
 consent file is mode `0600`; every record is written with fsync and atomic
-rename. The record contains the restore token, the selected display, grant
-time, and portal persistent IDs. The token rotates on every reattach. Tokens
-and IDs are redacted from logs, status, events, IPC, HTTP, and doctor drafts.
+rename. Tokens and portal IDs are redacted from logs, status, events, IPC,
+HTTP, and doctor drafts.
+
+The record stores, in order: the restore `token`, the `sampled_display` id,
+the `granted_at` timestamp, the `portal_persistent_ids`, the granted
+`granted_width` and `granted_height`, the logical `stream_position` `(x, y)`
+the compositor reported at grant time, and the `compositor_output` name the
+operator bound the grant to. The last two bind the grant to the intended
+panel:
+
+- **`compositor_output` drift invalidates consent.** A reconfigure that
+  moves the sampler to a different compositor output (e.g. `HDMI-A-1` →
+  `HDMI-A-2`) no longer matches the stored record; the daemon treats this as
+  `wear_sampling_display_changed`, falls back to uniform attribution, and
+  requires a fresh grant. The same happens when `compositor_output` is added
+  to a display whose old record predates the field.
+- **`stream_position` is the second binding signal.** Two same-resolution 4K
+  monitors share a persistent id and dimensions; the compositor-reported
+  position is the only signal left to keep them apart. When both the recorded
+  and observed positions are present and differ, reattach fails with
+  `wear_sampling_wrong_monitor`. **Position omission fallback:** when either
+  side is absent — older records, or older compositors that omit the `position`
+  field — the position check is skipped and the dimension check alone remains
+  binding. Older on-disk records deserialize with both new fields as `None`, so
+  no migration is required.
 
 Disable in the configuration to close the session while retaining the record:
 
@@ -112,10 +253,14 @@ To cancel a pending flow, close the session, and erase the record, run:
 dormantctl wear disable-sampling --forget
 ```
 
-Without `--forget`, `disable-sampling` closes the active portal session but
-retains its consent record; a later `enable-sampling` reattaches silently
-without opening a consent dialog. A pending consent flow remains disabled
-after cancellation, so enabling it again requires a saved consent record.
+`--forget` is the recovery path for a drifted or stale consent record: it
+deletes the on-disk record so the next `enable-sampling` opens a fresh portal
+dialog instead of failing reattach against a record bound to a different
+output or position. Without `--forget`, `disable-sampling` closes the active
+portal session but retains its consent record; a later `enable-sampling`
+reattaches silently without opening a consent dialog. A pending consent flow
+remains disabled after cancellation, so enabling it again requires a saved
+consent record.
 
 The compositor grant can also be revoked outside dormant at **KDE System
 Settings → Applications → Screen Sharing permissions**. Revoking there makes
@@ -141,6 +286,43 @@ visible. A missing graphical session, disabled config, an in-flight flow, a
 denial, timeout, or monitor mismatch fails explicitly. On later daemon starts,
 a valid record is reattached silently.
 
+## Status and logs
+
+The per-display sampler status surfaces the redacted source gate alongside the
+lifecycle state:
+
+- **`dormantctl status`** appends `(source: <gate>)` to the sampling line —
+  e.g. `sampling: streaming (age: 1m 35s) (source: mismatched)`. The gate is
+  one of `matched`, `mismatched`, or `unknown`, and is omitted when the display
+  carries no gate configuration (a local monitor).
+- **`dormantctl wear enable-sampling` / `disable-sampling`** print a
+  `source: <gate>` hint line for the selected display before sending the
+  request, so the operator can see why a reattach is about to fail.
+- **`GET /api/wear`** adds `source_gate` and `uniform_reason` fields per
+  display to the wear summary. `source_gate` is the stable tag (`matched`,
+  `mismatched`, `unknown`); `uniform_reason` is the reason the current
+  interval is uniform while sampling is degraded (e.g. `source_mismatch`,
+  `source_unknown`). Both are absent when `None` so older UIs keep parsing.
+- **WearCard** renders a dedicated warning line for a gated TV:
+  `not sampling — TV is on another source` for `mismatched`, and
+  `not sampling — TV source unavailable` for `unknown`. A matched gate and a
+  no-gate monitor fall through to the normal sampling label.
+- **`wear_sampling_source_gate`** daemon event (web event log, `dormantctl
+  watch`) fires on every full gate change with the display, the new state,
+  and the observed source label for a mismatched poll.
+
+The daemon log emits four transition events on a gate change, plus a
+steady-state debug poll and a per-capture timing trace:
+
+| Event | Level | Meaning |
+|---|---|---|
+| `wear_sampling_source_matched` | info | The gate returned to `matched` |
+| `wear_sampling_source_mismatch` | warn | The TV reported a source other than `expected_source` (logs `observed` and `expected`) |
+| `wear_sampling_source_poll_failed` | warn | The Samsung IP Control read failed (logs `reason`) |
+| `wear_sampling_source_unknown` | warn | The source could not be established safely, e.g. an empty response (logs `reason`) |
+| `wear_sampling_source_poll` | debug | Every steady-state poll observation (logs `expected`, `state`, `observed`) |
+| `wear_sampling_capture_timing` | debug | Per-capture monotonic sequence with `stage = requested` / `frame_ready` / `reduction_complete` and `elapsed_ms` on the latter two; gated ticks emit none |
+
 ## Fallback and diagnostics
 
 Sampling falls back to uniform attribution whenever capture is unavailable,
@@ -148,8 +330,15 @@ stale, suspended, denied, timed out, the circuit is open, or reattach
 validation fails. The fallback is tagged `uniform`; it does not block blank,
 wake, screensaver, reload, or shutdown paths. A changed `sampled_display` also
 invalidates the old consent and requires a fresh grant.
-When the cooldown retry itself fails, status retains the
-`wear_sampling_cooldown` reason while the saved portal session is renegotiated.
+
+Source-gate fallback is additive: a `mismatched` or `unknown` gate degrades
+the tick to uniform attribution tagged `source_mismatch` or `source_unknown`
+respectively, and the gate reason outranks `suspended` — a gated-but-suspended
+status still tags the gate, because the panel keeps aging either way. No
+capture tick fires while gated; the on-hours still accrue as uniform for the
+full sample interval. When the cooldown retry itself fails, status retains the
+`wear_sampling_cooldown` reason while the saved portal session is
+renegotiated.
 
 The `wear-sampling` doctor probe is **live-only**. It runs from the web Doctor
 view or through the daemon's IPC service and checks the running sampler; there
@@ -163,5 +352,6 @@ No image-like data is persisted, logged, or exposed over IPC/HTTP. The
 consent record is the sensitive artifact and uses owner-only permissions and
 redaction. Active sampling does not perform RGB/channel attribution, panel-
 type weighting, compensation actions, or automated cadence tuning. It changes
-only attribution for the one selected Linux/KDE Wayland display; all other
-displays and non-Linux platforms remain uniform.
+only attribution for the sampled displays — local Linux/KDE Wayland monitors
+and source-gated Samsung TVs — while all other displays and non-Linux
+platforms remain uniform.

@@ -477,9 +477,20 @@ async fn apply_actions(
                 // Selection is intentionally I/O-free; Task 13 consumes its grid.
                 drop((display, sample));
             }
-            TrackerAction::UniformSelection { display, fallback } => {
-                // Selection is intentionally I/O-free; Task 13 consumes its tag.
-                drop((display, fallback));
+            TrackerAction::UniformSelection {
+                display: display_id,
+                fallback,
+            } => {
+                // A follow-up consumer will use this tag for spatial-fallback
+                // attribution; until then, log the reason literal so a gated
+                // stream is observable in the daemon log.
+                if let Some(tag) = fallback {
+                    tracing::debug!(
+                        event = "wear_uniform_selection",
+                        display = %display_id,
+                        reason = tag.as_str(),
+                    );
+                }
             }
             TrackerAction::Attribute { .. } => {
                 // Already applied to the ledger inside `tick`; nothing left
@@ -818,6 +829,32 @@ pub enum SampleFallbackTag {
     Stale,
     /// Sampling is suspended and has tagged uniform attribution explicitly.
     Suspended,
+    /// The source gate reports a different input than the expected source
+    /// (e.g. the TV is on Netflix, not our HDMI). The panel is still ON and
+    /// aging, so attribution degrades to uniform tagged `source_mismatch` —
+    /// never suspended, never a zero span; only spatial attribution is
+    /// suppressed.
+    SourceMismatch,
+    /// The source gate could not establish the active input safely. Like
+    /// [`SourceMismatch`](Self::SourceMismatch), the panel keeps aging and
+    /// attribution degrades to uniform tagged `source_unknown`.
+    SourceUnknown,
+}
+
+impl SampleFallbackTag {
+    /// Stable wire/log literal for this fallback reason. The source-gate
+    /// literals mirror `active_sampler::sampling_uniform_reason` so a grep
+    /// for `source_mismatch` / `source_unknown` spans both modules.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Stale => "stale",
+            Self::Suspended => "suspended",
+            Self::SourceMismatch => "source_mismatch",
+            Self::SourceUnknown => "source_unknown",
+        }
+    }
 }
 
 /// Phase-safe source selection for active and grace windows.
@@ -846,7 +883,24 @@ fn filter_sample_for_tick(
 fn sampler_status_fallback(
     status: Option<&crate::active_sampler::SamplerStatus>,
 ) -> Option<SampleFallbackTag> {
-    status.and_then(|status| {
+    let status = status?;
+    // Source-gate reasons outrank Missing/Stale/Suspended: a gated stream
+    // (TV on Netflix instead of our HDMI) still ages the panel, so the tick
+    // degrades to uniform attribution tagged with the gate reason — never
+    // suspended, never a zero span. The literals mirror
+    // `active_sampler::sampling_uniform_reason` (`source_mismatch` /
+    // `source_unknown`); `Matched` and an unconfigured gate (`None`) fall
+    // through to the suspended check.
+    let gate_tag = match status.source_gate.as_ref() {
+        Some(crate::active_sampler::source_gate::SourceGate::Mismatched { .. }) => {
+            Some(SampleFallbackTag::SourceMismatch)
+        }
+        Some(crate::active_sampler::source_gate::SourceGate::Unknown { .. }) => {
+            Some(SampleFallbackTag::SourceUnknown)
+        }
+        Some(crate::active_sampler::source_gate::SourceGate::Matched) | None => None,
+    };
+    gate_tag.or_else(|| {
         (status.uniform_reason == Some(crate::active_sampler::WEAR_SAMPLING_SUSPENDED))
             .then_some(SampleFallbackTag::Suspended)
     })
@@ -1709,6 +1763,8 @@ mod tests {
             treat_unreachable_as_blanked: true,
             panel_type: PanelType::Unknown,
             power_off_opt_in: false,
+            compositor_output: None,
+            sampling: None,
         }
     }
 
@@ -2284,6 +2340,7 @@ mod tests {
             uniform_reason: Some(crate::active_sampler::WEAR_SAMPLING_SUSPENDED),
             bound_display: Some(display.0.clone()),
             granted_at: None,
+            source_gate: None,
         }));
         let fallback = sampler_status_fallback(status_rx.borrow().as_ref());
         let mut samples = HashMap::new();
@@ -2321,6 +2378,318 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn source_gate_uniform_attribution() {
+        use crate::active_sampler::source_gate::SourceGate;
+        use crate::active_sampler::{SamplerStatus, SamplingState};
+
+        let display = DisplayId("mon".into());
+        let span = Duration::from_secs(60);
+        let max_age = span.saturating_mul(2);
+
+        let status = |gate| SamplerStatus {
+            state: SamplingState::Streaming,
+            last_capture: None,
+            uniform_reason: None,
+            bound_display: Some(display.0.clone()),
+            granted_at: None,
+            source_gate: gate,
+        };
+
+        // ── matched → sampled: gate open, fresh grid attributed spatially ──
+        let mut state = TrackerState::default();
+        state
+            .ledgers
+            .insert(display.clone(), fresh_ledger(&display, 0));
+        let mut cfg = WearConfig::default();
+        cfg.active_sampling.enabled = true;
+        cfg.active_sampling.sampled_display = Some(display.0.clone());
+        let matched = status(Some(SourceGate::Matched));
+        assert!(sampler_status_fallback(Some(&matched)).is_none());
+        let fresh_grid = SampledGrid {
+            grid: LumaGrid::new(vec![0.5; usize::from(LUMA_GRID_ROWS * LUMA_GRID_COLS)])
+                .expect("16x9 sampled grid"),
+            captured_at: Tick::now(),
+            phase_at_capture: dormant_core::state_machine::Phase::Active,
+        };
+        let mut brightness = HashMap::new();
+        brightness.insert(
+            display.clone(),
+            Some(PanelState {
+                power: None,
+                brightness: Some(100),
+            }),
+        );
+        let matched_actions = tick(
+            &mut state,
+            &snapshot_with(&display, "active", None),
+            &brightness,
+            &cfg,
+            60,
+            span,
+            Some(&fresh_grid),
+            sampler_status_fallback(Some(&matched)),
+            &HashMap::new(),
+        );
+        assert!(matched_actions.iter().any(|a| matches!(
+            a,
+            TrackerAction::SampledSelection { display: d, .. } if d == &display
+        )));
+        assert!(matched_actions.iter().any(|a| matches!(
+            a,
+            TrackerAction::Attribute {
+                display: d,
+                mode: WearAttributionMode::Sampled,
+                ..
+            } if d == &display
+        )));
+
+        // ── mismatch / unknown → UniformSelection with EXACT tag, Uniform, full span ──
+        let mismatched = status(Some(SourceGate::Mismatched {
+            observed: "hdmi2".into(),
+        }));
+        let unknown = status(Some(SourceGate::Unknown {
+            reason: "poll_failed",
+        }));
+        assert_eq!(
+            sampler_status_fallback(Some(&mismatched)),
+            Some(SampleFallbackTag::SourceMismatch),
+        );
+        assert_eq!(
+            sampler_status_fallback(Some(&mismatched)).unwrap().as_str(),
+            "source_mismatch",
+        );
+        assert_eq!(
+            sampler_status_fallback(Some(&unknown)),
+            Some(SampleFallbackTag::SourceUnknown),
+        );
+        assert_eq!(
+            sampler_status_fallback(Some(&unknown)).unwrap().as_str(),
+            "source_unknown",
+        );
+
+        // source-gate outranks suspended: a gated-but-suspended status still tags the gate.
+        let gated_suspended = SamplerStatus {
+            state: SamplingState::Suspended,
+            last_capture: None,
+            uniform_reason: Some(crate::active_sampler::WEAR_SAMPLING_SUSPENDED),
+            bound_display: Some(display.0.clone()),
+            granted_at: None,
+            source_gate: Some(SourceGate::Mismatched {
+                observed: "hdmi2".into(),
+            }),
+        };
+        assert_eq!(
+            sampler_status_fallback(Some(&gated_suspended)),
+            Some(SampleFallbackTag::SourceMismatch),
+        );
+
+        let mismatch_actions = tick(
+            &mut state,
+            &snapshot_with(&display, "active", None),
+            &HashMap::new(),
+            &cfg,
+            120,
+            span,
+            None,
+            sampler_status_fallback(Some(&mismatched)),
+            &HashMap::new(),
+        );
+        assert!(mismatch_actions.iter().any(|a| matches!(
+            a,
+            TrackerAction::UniformSelection {
+                display: d,
+                fallback: Some(SampleFallbackTag::SourceMismatch),
+            } if d == &display
+        )));
+        let mismatch_span = mismatch_actions.iter().find_map(|a| match a {
+            TrackerAction::Attribute {
+                display: d,
+                span: s,
+                mode: WearAttributionMode::Uniform,
+                ..
+            } if d == &display => Some(*s),
+            _ => None,
+        });
+        assert_eq!(mismatch_span, Some(span));
+        assert!(mismatch_span.unwrap() > Duration::ZERO);
+        let count_after_mismatch = state.ledgers[&display].sample_count;
+        assert!(count_after_mismatch > 0);
+
+        let unknown_actions = tick(
+            &mut state,
+            &snapshot_with(&display, "active", None),
+            &HashMap::new(),
+            &cfg,
+            180,
+            span,
+            None,
+            sampler_status_fallback(Some(&unknown)),
+            &HashMap::new(),
+        );
+        assert!(unknown_actions.iter().any(|a| matches!(
+            a,
+            TrackerAction::UniformSelection {
+                display: d,
+                fallback: Some(SampleFallbackTag::SourceUnknown),
+            } if d == &display
+        )));
+        let unknown_span = unknown_actions.iter().find_map(|a| match a {
+            TrackerAction::Attribute {
+                display: d,
+                span: s,
+                mode: WearAttributionMode::Uniform,
+                ..
+            } if d == &display => Some(*s),
+            _ => None,
+        });
+        assert_eq!(unknown_span, Some(span));
+        assert!(unknown_span.unwrap() > Duration::ZERO);
+        assert!(state.ledgers[&display].sample_count > count_after_mismatch);
+
+        // ── reasons survive a stale injected grid ──
+        // A stale grid filters to (None, Stale); the source-gate tag wins via
+        // `.or()` exactly as the shell combines them, so the tick still tags
+        // source_mismatch — the missing grid is intentional, not the reason.
+        let stale_grid = SampledGrid {
+            grid: LumaGrid::new(vec![0.5; usize::from(LUMA_GRID_ROWS * LUMA_GRID_COLS)])
+                .expect("16x9 sampled grid"),
+            captured_at: Tick(
+                Tick::now()
+                    .0
+                    .checked_sub(max_age + Duration::from_nanos(1))
+                    .unwrap(),
+            ),
+            phase_at_capture: dormant_core::state_machine::Phase::Active,
+        };
+        let (no_sample, stale_fallback) =
+            filter_sample_for_tick(Some(&stale_grid), Tick::now(), max_age);
+        assert!(no_sample.is_none());
+        assert_eq!(stale_fallback, Some(SampleFallbackTag::Stale));
+        let combined = sampler_status_fallback(Some(&mismatched)).or(stale_fallback);
+        assert_eq!(combined, Some(SampleFallbackTag::SourceMismatch));
+        let stale_actions = tick(
+            &mut state,
+            &snapshot_with(&display, "active", None),
+            &HashMap::new(),
+            &cfg,
+            240,
+            span,
+            None,
+            combined,
+            &HashMap::new(),
+        );
+        assert!(stale_actions.iter().any(|a| matches!(
+            a,
+            TrackerAction::UniformSelection {
+                display: d,
+                fallback: Some(SampleFallbackTag::SourceMismatch),
+            } if d == &display
+        )));
+        assert!(stale_actions.iter().any(|a| matches!(
+            a,
+            TrackerAction::Attribute {
+                display: d,
+                mode: WearAttributionMode::Uniform,
+                span,
+                ..
+            } if d == &display && *span > Duration::ZERO
+        )));
+
+        // ── ordered two-tick row: tick1 Unknown, tick2 Mismatched ──
+        let mut row_state = TrackerState::default();
+        row_state
+            .ledgers
+            .insert(display.clone(), fresh_ledger(&display, 0));
+        let tick1 = tick(
+            &mut row_state,
+            &snapshot_with(&display, "active", None),
+            &HashMap::new(),
+            &cfg,
+            300,
+            span,
+            None,
+            sampler_status_fallback(Some(&unknown)),
+            &HashMap::new(),
+        );
+        let tick1_uniform_idx = tick1.iter().position(|a| {
+            matches!(
+                a,
+                TrackerAction::UniformSelection {
+                    display: d,
+                    fallback: Some(SampleFallbackTag::SourceUnknown),
+                } if d == &display
+            )
+        });
+        let tick1_attr_idx = tick1.iter().position(|a| {
+            matches!(
+                a,
+                TrackerAction::Attribute {
+                    display: d,
+                    mode: WearAttributionMode::Uniform,
+                    span,
+                    ..
+                } if d == &display && *span > Duration::ZERO
+            )
+        });
+        assert!(tick1_uniform_idx.is_some());
+        assert!(tick1_attr_idx.is_some());
+        assert!(
+            tick1_uniform_idx < tick1_attr_idx,
+            "UniformSelection(source_unknown) precedes Attribute in tick1",
+        );
+        let count_after_tick1 = row_state.ledgers[&display].sample_count;
+
+        let tick2 = tick(
+            &mut row_state,
+            &snapshot_with(&display, "active", None),
+            &HashMap::new(),
+            &cfg,
+            360,
+            span,
+            None,
+            sampler_status_fallback(Some(&mismatched)),
+            &HashMap::new(),
+        );
+        let tick2_uniform_idx = tick2.iter().position(|a| {
+            matches!(
+                a,
+                TrackerAction::UniformSelection {
+                    display: d,
+                    fallback: Some(SampleFallbackTag::SourceMismatch),
+                } if d == &display
+            )
+        });
+        let tick2_attr_idx = tick2.iter().position(|a| {
+            matches!(
+                a,
+                TrackerAction::Attribute {
+                    display: d,
+                    mode: WearAttributionMode::Uniform,
+                    span,
+                    ..
+                } if d == &display && *span > Duration::ZERO
+            )
+        });
+        assert!(tick2_uniform_idx.is_some());
+        assert!(tick2_attr_idx.is_some());
+        assert!(
+            tick2_uniform_idx < tick2_attr_idx,
+            "UniformSelection(source_mismatch) precedes Attribute in tick2",
+        );
+        let count_after_tick2 = row_state.ledgers[&display].sample_count;
+        assert_eq!(
+            count_after_tick2 - count_after_tick1,
+            1,
+            "sample_count advances exactly once per tick",
+        );
+        assert_eq!(
+            count_after_tick2, 2,
+            "count advances twice across the two-tick row"
+        );
     }
 
     #[test]

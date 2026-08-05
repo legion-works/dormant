@@ -257,6 +257,12 @@ pub const WEAR_ACTIVE_SAMPLING_FAILURE_THRESHOLD: u32 = 5;
 /// Time before an open active-sampling circuit is retried.
 pub const WEAR_ACTIVE_SAMPLING_CIRCUIT_RESET_AFTER: Duration = Duration::from_secs(5 * 60);
 
+/// Default compositor-output poll cadence for active sampling. Split from
+/// the wire (per-tick) stream so the source-monitor side can tick at its own
+/// keyer cadence; the active-sampling pipeline clamps it to the per-tick
+/// bounds but the wearable-stream probe is allowed to drift a bit slower.
+pub const WEAR_SOURCE_POLL_INTERVAL: Duration = Duration::from_secs(15);
+
 // ── [notifications] section defaults ────────────────────────────────────────
 
 /// Whether wake-failure notifications are enabled by default.

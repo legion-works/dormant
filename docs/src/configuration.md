@@ -169,6 +169,8 @@ Each display has a user-chosen `id`. The `controllers` list is an ordered fallba
 | `samsung_restore_backlight` | integer | `50` | Samsung IP Control G2 backlight restored when no saved value exists (1–50) |
 | `treat_unreachable_as_blanked` | boolean | `true` | If controller is unreachable, assume display is blanked (fail-safe) |
 | `panel_type` | string | `"unknown"` | Panel classification recorded by panel-wear tracking: `"woled"`, `"qd-oled"`, or `"unknown"` |
+| `compositor_output` | string | unset | Compositor output name the active sampler observes (e.g. `"HDMI-A-1"`). Opts a remote-only display into active wear sampling; separate from the `kwin-dpms` `output` key, which names the local render target. See [Active wear sampling](./active-wear-sampling.md) |
+| `sampling` | table | unset | Per-display `[displays.<id>.sampling]` source-gate declaration for active sampling. See [Active wear sampling](./active-wear-sampling.md) |
 
 ### Manual-only displays
 
@@ -217,14 +219,29 @@ send `{"req":"blank","display":"x"}` with no `mode` field, which the daemon
 defaults to `soft` (safety-first).  The tray and web UI always send `hard`
 explicitly (with a confirm dialog) and are unaffected by the new default.
 
-Example — a Samsung Tizen TV controlled by hand:
+Example — a Samsung Tizen TV controlled by hand, with optional source-gated
+active sampling (see [Active wear sampling](./active-wear-sampling.md)):
 
 ```toml
 [displays.tv]
 controllers = ["samsung-tizen"]
+host = "10.1.1.7"
 blank_mode = "screen_off_audio_on"
-host = "192.168.1.50"
+compositor_output = "HDMI-A-1"
+
+[displays.tv.sampling]
+expected_source = "HDMI4"
+source_poll_interval = "15s"
+
+[wear.active_sampling]
+enabled = true
+sampled_displays = ["monitor", "tv"]
 ```
+
+`compositor_output` and the `[displays.tv.sampling]` table are optional — omit
+them for a manual-only TV with no wear sampling. `expected_source` is
+required once `compositor_output` is set, so the source gate can tell the
+TV's HDMI input from another source.
 
 ### Escalation ladder
 
@@ -408,6 +425,21 @@ single-stage ladder (`{ kind = "<blank_mode>" }`) with no dwell.
 
 `blank_mode` + `ladder` together is rejected. `degraded_mode` + `ladder` is
 also rejected (the ladder itself chains fallbacks).
+
+### `[displays.<id>.sampling]` — source-gated active sampling
+
+An optional subtable that opts a remote-only display (today only
+`samsung-tizen`) into active wear sampling and declares the source gate
+the sampler checks before every capture. A display carrying
+`compositor_output` without this table — or with `expected_source` unset —
+is rejected at validation time. See [Active wear sampling](./active-wear-sampling.md)
+for the consent binding, source-gate states, fallback, and recovery path.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `expected_source` | string | unset | Input source label the TV must report for a capture to count. Matched exactly and case-sensitively against the Samsung IP Control read; required when `compositor_output` is set |
+| `source_poll_interval` | duration | `"15s"` | Cadence for the Samsung IP Control source read. Valid range is `5s`–`5m` (inclusive) |
+| `stream_mode` | string | unset | Per-display override of `[wear.active_sampling] stream_mode`: `"warm"` or `"per-tick"`. When unset, the display inherits the wear section's stream mode |
 
 ## `[rules.<id>]` — rule definitions
 

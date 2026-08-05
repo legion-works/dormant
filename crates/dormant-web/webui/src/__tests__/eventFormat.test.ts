@@ -136,6 +136,37 @@ describe("eventFormat — unknown tag fallthrough (both formatters)", () => {
   });
 });
 
+describe("eventFormat — wear_sampling_source_gate", () => {
+  it("badgeForEvent labels it 'wear_sampling_source_gate'", () => {
+    const ev: DaemonEvent = {
+      event: "wear_sampling_source_gate",
+      display: "d1",
+      state: "mismatched",
+      observed: "HDMI3",
+    };
+    expect(badgeForEvent(ev).label).toBe("wear_sampling_source_gate");
+  });
+
+  it("messageForEvent includes the observed source for a mismatched gate", () => {
+    const ev: DaemonEvent = {
+      event: "wear_sampling_source_gate",
+      display: "d1",
+      state: "mismatched",
+      observed: "HDMI3",
+    };
+    expect(messageForEvent(ev)).toBe("d1: not sampling — TV is on HDMI3");
+  });
+
+  it("messageForEvent reports TV source unavailable for an unknown gate (no observed)", () => {
+    const ev: DaemonEvent = {
+      event: "wear_sampling_source_gate",
+      display: "d1",
+      state: "unknown",
+    };
+    expect(messageForEvent(ev)).toBe("d1: not sampling — TV source unavailable");
+  });
+});
+
 describe("eventFormat — history-seeded events (RecentEvent #[serde(flatten)])", () => {
   // The Rust RecentEvent struct uses #[serde(flatten)] on the DaemonEvent
   // field, so the JSON payload is flat — DaemonEvent fields sit alongside

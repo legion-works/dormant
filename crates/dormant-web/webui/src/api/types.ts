@@ -61,6 +61,7 @@ export const DAEMON_EVENT_TAGS = [
   "wake_recovered",
   "ownership",
   "operations_changed",
+  "wear_sampling_source_gate",
 ] as const;
 export type DaemonEventTag = (typeof DAEMON_EVENT_TAGS)[number];
 
@@ -302,7 +303,8 @@ export type DaemonEvent =
   | BlankRecoveredEvent
   | WakeRecoveredEvent
   | OwnershipEvent
-  | OperationsChangedEvent;
+  | OperationsChangedEvent
+  | WearSamplingSourceGateEvent;
 
 export interface SensorChangedEvent {
   event: "sensor_changed";
@@ -442,6 +444,23 @@ export interface OperationsChangedEvent {
   exercise_in_flight: string[];
   /** Whether a global web emergency wake is currently awaiting engine completion. */
   emergency_wake_in_flight: boolean;
+}
+
+/**
+ * rust: rules.rs DaemonEvent::WearSamplingSourceGate
+ * serde(tag = "event", rename_all = "snake_case"); `observed` is
+ * `#[serde(default)]` (absent on the wire when `None` — matched and unknown
+ * gates carry no observed source label). Emitted only on a full-gate
+ * transition (`matched` | `mismatched` | `unknown`); steady-state polls do
+ * not re-fire it. The webui refetches `GET /api/wear` on this event so the
+ * row picks up the new `source_gate` from the summary, rather than
+ * patching in-memory state from the event payload.
+ */
+export interface WearSamplingSourceGateEvent {
+  event: "wear_sampling_source_gate";
+  display: string;
+  state: "matched" | "mismatched" | "unknown";
+  observed?: string | null;
 }
 
 /**
@@ -682,6 +701,22 @@ export interface LadderStage {
   dwell?: string;
 }
 
+/** rust: config/schema.rs DisplaySamplingConfig — per-display compositor
+ * sampling declaration (`[displays.<id>.sampling]` TOML table).
+ *
+ * All three fields are optional — the table is opt-in. `source_poll_interval`
+ * defaults server-side to `defaults::WEAR_SOURCE_POLL_INTERVAL` (15s); the
+ * TS mirror leaves it `undefined` so the operator can clear/override it
+ * explicitly. `stream_mode` reuses the same `StreamMode` enum the wear path
+ * uses (kebab-case `warm` / `per-tick`); absent means "inherit the global
+ * wear.active_sampling.stream_mode" and the editor surfaces an explicit
+ * "Inherit global" choice in the select. */
+export interface DisplaySamplingConfig {
+  expected_source?: string | null;
+  source_poll_interval?: string;
+  stream_mode?: "warm" | "per-tick" | null;
+}
+
 /** rust: config/schema.rs ScreensaverSource */
 export interface ScreensaverSource {
   path?: string;
@@ -757,6 +792,21 @@ export interface DisplayConfig {
    * operator to read the warning copy before flipping it on.
    */
   power_off_opt_in?: boolean;
+  /**
+   * Explicit compositor output declaration for active sampling. SEPARATE
+   * from the local KWin render-controller `output` key above: this names
+   * the compositor output the active sampler should observe, not the
+   * local KWin target. For a remote-only TV the renderer never sees the
+   * panel; the operator declares this to opt the display into the
+   * sampling path. Absent means no compositor source is wired.
+   */
+  compositor_output?: string | null;
+  /**
+   * Compositor-sampling declaration table. Absent when the operator has
+   * not opted this display into active sampling. Field shapes live in
+   * [`DisplaySamplingConfig`] above.
+   */
+  sampling?: DisplaySamplingConfig | null;
 }
 
 // ─── Config-apply wire types ──────────────────────────────────────────────
@@ -947,6 +997,17 @@ export interface WearSummary {
   hours_since_long_dwell: number;
   wear_attribution_mode?: "uniform" | "sampled";
   content_weighted_since?: number | null;
+  /**
+   * Stable source-gate tag for this display (`"matched"`, `"mismatched"`, or
+   * `"unknown"`). Absent when the display has no gate configuration, or when
+   * no per-display status is selected for this display (absent from a
+   * populated map). Additive — older UIs keep parsing when this is absent. */
+  source_gate?: string | null;
+  /**
+   * Stable reason the current interval is uniform while sampling is degraded
+   * (e.g. `"source_mismatch"`, `"source_unknown"`). Set only when a status
+   * belonging to this display reports one. Additive — absent when `None`. */
+  uniform_reason?: string | null;
 }
 
 /** rust: routes/wear.rs — `GET /api/wear` response envelope. */

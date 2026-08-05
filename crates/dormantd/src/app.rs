@@ -52,7 +52,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use dormant_core::config::schema::{Config, Credentials, DisplayScope, RuleConfig};
+use dormant_core::config::schema::{Config, Credentials, DisplayConfig, DisplayScope, RuleConfig};
 use dormant_core::config::{
     Strictness, ValidationError, Warning, load_config, load_config_from_bytes, load_credentials,
     load_credentials_from_bytes, validate_with_input_source_readers,
@@ -155,6 +155,7 @@ fn active_sampler_reconfigure_plans(old: &Config, new: &Config) -> Vec<Reconfigu
 #[cfg(target_os = "linux")]
 fn active_sampler_display_context(
     display: &DisplayId,
+    display_config: &DisplayConfig,
     display_exists: bool,
     phase: Option<&str>,
 ) -> DisplaySamplingContext {
@@ -166,13 +167,41 @@ fn active_sampler_display_context(
         _ => Phase::Active,
     };
     let stage_active = display_exists && matches!(phase, Phase::Active | Phase::Grace { .. });
+    let compositor_output = display_config.compositor_output.clone();
+    let source_gate_expectation = build_active_sampler_gate_expectation(display_config);
+    let stream_mode = display_config
+        .sampling
+        .as_ref()
+        .and_then(|sampling| sampling.stream_mode);
     DisplaySamplingContext {
         display: display_exists.then(|| DisplayExpectation {
             display: display.0.clone(),
+            compositor_output,
         }),
         phase,
         stage_active,
+        source_gate_expectation,
+        stream_mode,
     }
+}
+
+/// Build a source-gate expectation from the selected display's
+/// `[displays.<id>.sampling]` table — only when an `expected_source` is
+/// configured together with the display's network `host` (the poller
+/// target). Returns `None` for render-only displays; the runtime then
+/// treats the gate as permanently matched.
+#[cfg(target_os = "linux")]
+fn build_active_sampler_gate_expectation(
+    display_config: &DisplayConfig,
+) -> Option<crate::active_sampler::source_gate::SourceGateExpectation> {
+    let sampling = display_config.sampling.as_ref()?;
+    let expected_source = sampling.expected_source.as_ref()?;
+    let host = display_config.host.as_ref()?;
+    Some(crate::active_sampler::source_gate::SourceGateExpectation {
+        host: host.clone(),
+        expected_source: expected_source.clone(),
+        poll_interval: sampling.source_poll_interval,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -220,7 +249,7 @@ fn migrate_legacy_consent(state_dir: &Path, cfg: &Config, display_id: &DisplayId
         return target;
     }
     let legacy = screencast_consent::legacy_consent_path(state_dir);
-    match screencast_consent::load(&legacy, &display_id.0) {
+    match screencast_consent::load(&legacy, &display_id.0, None) {
         Ok(record) => {
             if let Err(error) = screencast_consent::store_atomic(&target, record.record()) {
                 tracing::warn!(
@@ -242,12 +271,39 @@ fn migrate_legacy_consent(state_dir: &Path, cfg: &Config, display_id: &DisplayId
     target
 }
 
+/// Resolve the legacy singular display id from the current config.
+///
+/// The legacy `wear_sampling_rx` watch channel is a single-slot mirror of
+/// the per-display map for consumers that pre-date the multi-display
+/// registry (the web status API, the doctor probe's singular entry).
+/// The slot is keyed by the EXPLICIT legacy `sampled_display` when one
+/// is configured, otherwise by the FIRST entry of the canonical
+/// `sampled_displays` list — so the channel tracks the operator's
+/// intent rather than whichever status happened to arrive alone or
+/// first (the previous `statuses.len() == 1` cardinality test was a
+/// race: a TV whose status was published before the monitor could be
+/// selected as "the" singular entry, and a config reload that re-orders
+/// `sampled_displays` would re-bind the slot to a different display
+/// without the operator's intent ever changing).
+#[cfg(target_os = "linux")]
+fn legacy_singular_selector(cfg: &Config) -> Option<DisplayId> {
+    if let Some(display) = cfg.wear.active_sampling.sampled_display.as_deref() {
+        return Some(DisplayId(display.to_owned()));
+    }
+    cfg.wear
+        .active_sampling
+        .selected_displays()
+        .first()
+        .map(|display| DisplayId(display.clone()))
+}
+
 #[cfg(target_os = "linux")]
 fn publish_sampler_status(
     statuses: &SamplerStatuses,
     web_status: &watch::Sender<Option<dormant_core::wear::WearSamplingStatus>>,
     display: &DisplayId,
     status: Option<active_sampler::SamplerStatus>,
+    legacy_selector: Option<&DisplayId>,
 ) {
     let legacy = {
         let Ok(mut statuses) = statuses.write() else {
@@ -261,14 +317,13 @@ fn publish_sampler_status(
                 statuses.remove(display);
             }
         }
-        (statuses.len() == 1)
-            .then(|| {
-                statuses
-                    .values()
-                    .next()
-                    .map(|status| status.redacted(Tick::now()))
-            })
-            .flatten()
+        // Look up the SELECTED display only — the slot is bound to the
+        // operator's intent, not to whichever status is currently in the
+        // map. Absent for the selected display means legacy `None`;
+        // never substitute the TV or whichever status arrived first.
+        legacy_selector
+            .and_then(|selected| statuses.get(selected))
+            .map(|status| status.redacted(Tick::now()))
     };
     web_status.send_replace(legacy);
 }
@@ -300,6 +355,19 @@ fn publish_per_display_statuses(
 /// is unit-testable without a live `PipeWire` portal: a test builds its own
 /// `watch::channel::<SamplerStatus>`, drives a change through the sender, and
 /// asserts the per-display map advances.
+///
+/// The forwarder is wired to BOTH the per-display status watch AND the
+/// shared config watch (`config_rx`, a clone of the daemon's `config_tx`).
+/// On any change in either channel it re-borrows the LATEST config and
+/// re-publishes the legacy singular slot keyed by the current
+/// `legacy_singular_selector(&Config)`. A config reload that re-orders
+/// `sampled_displays` (or adds/drops the explicit `sampled_display`)
+/// without adding or removing a runtime (so the forwarder task survives
+/// the reload) must rebind the legacy slot to the new selection on the
+/// very next publication — otherwise the slot would carry whichever
+/// display the operator's earlier config had named, and the new
+/// selection's `status` would be invisible to legacy consumers for an
+/// unbounded window.
 #[cfg(target_os = "linux")]
 fn spawn_sampler_status_forwarder(
     display_id: DisplayId,
@@ -309,23 +377,47 @@ fn spawn_sampler_status_forwarder(
     status_per_display_tx: watch::Sender<
         std::collections::BTreeMap<String, dormant_core::wear::WearSamplingStatus>,
     >,
+    mut config_rx: watch::Receiver<Arc<Config>>,
     status_cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             tokio::select! {
                 () = status_cancel.cancelled() => break,
-                changed = status_rx.changed() => {
-                    if changed.is_err() {
-                        break;
-                    }
+                res = status_rx.changed() => {
+                    if res.is_err() { break; }
+                    let legacy_selector = {
+                        let cfg = config_rx.borrow().clone();
+                        legacy_singular_selector(&cfg)
+                    };
                     publish_sampler_status(
                         &status_map,
                         &status_web,
                         &display_id,
                         Some(status_rx.borrow().clone()),
+                        legacy_selector.as_ref(),
                     );
                     publish_per_display_statuses(&status_map, &status_per_display_tx);
+                }
+                res = config_rx.changed() => {
+                    if res.is_err() { break; }
+                    // Config reload that left the runtime set intact
+                    // (re-ordered `sampled_displays`, swapped
+                    // `sampled_display`, etc.). Re-publish the legacy
+                    // singular slot against the NEW selector without
+                    // touching the per-display map. The map is the
+                    // authoritative state — the legacy slot is just a
+                    // view of one entry under the current operator
+                    // intent.
+                    let legacy_selector = legacy_singular_selector(&config_rx.borrow());
+                    let legacy = {
+                        let Ok(statuses) = status_map.read() else { continue; };
+                        legacy_selector
+                            .as_ref()
+                            .and_then(|selected| statuses.get(selected))
+                            .map(|status| status.redacted(Tick::now()))
+                    };
+                    status_web.send_replace(legacy);
                 }
             }
         }
@@ -347,6 +439,7 @@ async fn spawn_active_sampler_runtime(
     per_display_statuses_tx: &watch::Sender<
         std::collections::BTreeMap<String, dormant_core::wear::WearSamplingStatus>,
     >,
+    config_rx: watch::Receiver<Arc<Config>>,
     event_tx: &mpsc::Sender<ControlMsg>,
 ) -> Option<ActiveSamplerRuntime> {
     let source = match active_sampler::linux::PortalPipeWireSource::new().await {
@@ -363,22 +456,42 @@ async fn spawn_active_sampler_runtime(
             return None;
         }
     };
+    // Construct the source-gate reader unconditionally — the runtime
+    // spawns a `SourceGatePoller` from it when both `Streaming` AND a
+    // `source_gate_expectation` are present, so render-only monitors
+    // carry a dormant reader that nothing else will touch. Building
+    // eagerly (instead of gating on the initial host) means a
+    // `DisplayContext` that later adds `host` + `expected_source` to
+    // an already-running runtime can still wire a poller — the
+    // operator's late config change isn't silently swallowed.
+    let source_reader = Some(active_sampler::source_gate::build_default_reader());
     let consent_path = migrate_legacy_consent(state_dir, &cfg, &display_id);
     let (updates, update_rx) = mpsc::channel::<SamplerUpdate>(16);
     let cancel = sampler_cancellation_token(root);
     let (handle, join) = active_sampler::spawn_with_handle(ActiveSamplerDeps {
-        initial_config: cfg,
+        initial_config: cfg.clone(),
         display_id: display_id.clone(),
         update_rx,
         latest_grids: latest_grids.clone(),
         source: Box::new(source),
+        source_reader,
         consent_path,
         cancel: cancel.clone(),
         env_reader: crate::active_sampler::production_env_reader,
         event_tx: Some(event_tx.clone()),
     });
+    let display_config = cfg
+        .displays
+        .get(&display_id.0)
+        .expect("display config present for selected sampler")
+        .clone();
     if let Err(error) = updates.try_send(SamplerUpdate::DisplayContext(
-        active_sampler_display_context(&display_id, display_exists, Some("active")),
+        active_sampler_display_context(
+            &display_id,
+            &display_config,
+            display_exists,
+            Some("active"),
+        ),
     )) {
         tracing::warn!(
             event = "wear_sampling_update_dropped",
@@ -391,11 +504,13 @@ async fn spawn_active_sampler_runtime(
         registry.insert(display_id.clone(), handle.clone());
     }
     let status_rx = handle.status();
+    let legacy_selector = legacy_singular_selector(&cfg);
     publish_sampler_status(
         statuses,
         web_status,
         &display_id,
         Some(status_rx.borrow().clone()),
+        legacy_selector.as_ref(),
     );
     publish_per_display_statuses(statuses, per_display_statuses_tx);
     let status_join = spawn_sampler_status_forwarder(
@@ -404,6 +519,7 @@ async fn spawn_active_sampler_runtime(
         statuses.clone(),
         web_status.clone(),
         per_display_statuses_tx.clone(),
+        config_rx,
         cancel.clone(),
     );
     Some(ActiveSamplerRuntime {
@@ -415,6 +531,7 @@ async fn spawn_active_sampler_runtime(
 }
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 async fn stop_active_sampler_runtime(
     display_id: &DisplayId,
     runtime: ActiveSamplerRuntime,
@@ -425,6 +542,7 @@ async fn stop_active_sampler_runtime(
     per_display_statuses_tx: &watch::Sender<
         std::collections::BTreeMap<String, dormant_core::wear::WearSamplingStatus>,
     >,
+    cfg: &Config,
 ) {
     runtime.cancel.cancel();
     for handle in [runtime.join, runtime.status_join] {
@@ -452,7 +570,14 @@ async fn stop_active_sampler_runtime(
         .read()
         .ok()
         .and_then(|s| s.get(display_id).cloned());
-    publish_sampler_status(statuses, web_status, display_id, None);
+    let legacy_selector = legacy_singular_selector(cfg);
+    publish_sampler_status(
+        statuses,
+        web_status,
+        display_id,
+        None,
+        legacy_selector.as_ref(),
+    );
     if let Some(captured) = per_display_capture {
         let now = Tick::now();
         let map =
@@ -462,6 +587,7 @@ async fn stop_active_sampler_runtime(
 }
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 async fn remove_unselected_active_samplers(
     runtimes: &mut BTreeMap<DisplayId, ActiveSamplerRuntime>,
     selected: &BTreeSet<DisplayId>,
@@ -472,6 +598,7 @@ async fn remove_unselected_active_samplers(
     per_display_statuses_tx: &watch::Sender<
         std::collections::BTreeMap<String, dormant_core::wear::WearSamplingStatus>,
     >,
+    cfg: &Config,
 ) {
     let removed: Vec<DisplayId> = runtimes
         .keys()
@@ -488,6 +615,7 @@ async fn remove_unselected_active_samplers(
                 statuses,
                 web_status,
                 per_display_statuses_tx,
+                cfg,
             )
             .await;
         }
@@ -518,6 +646,44 @@ mod active_sampler_reload_tests {
             keymap: dormant_core::config::KeymapConfig::default(),
             input_filter: dormant_core::config::InputFilterConfig::default(),
             publish: dormant_core::config::PublishConfig::default(),
+        }
+    }
+
+    /// Minimal `DisplayConfig` for tests that only exercise the active-sampler
+    /// context helper.
+    fn sample_display_config() -> DisplayConfig {
+        DisplayConfig {
+            controllers: Vec::new(),
+            scope: DisplayScope::default(),
+            shared_input_code: None,
+            shared_input_write_code: None,
+            shared_peer_input_write_code: None,
+            shared_peer_input_code: None,
+            hooks: dormant_core::config::schema::HookSlots::default(),
+            blank_mode: None,
+            degraded_mode: None,
+            ladder: Vec::new(),
+            screensaver: None,
+            output: None,
+            ddc_display: None,
+            host: None,
+            wol_mac: None,
+            blank_command: None,
+            wake_command: None,
+            modes: None,
+            ha_url: None,
+            blank_service: None,
+            blank_data: None,
+            wake_service: None,
+            wake_data: None,
+            command_timeout: Duration::from_secs(5),
+            restore_brightness: 100,
+            samsung_restore_backlight: dormant_core::config::defaults::SAMSUNG_RESTORE_BACKLIGHT,
+            treat_unreachable_as_blanked: true,
+            panel_type: dormant_core::wear::PanelType::default(),
+            power_off_opt_in: false,
+            compositor_output: None,
+            sampling: None,
         }
     }
 
@@ -648,15 +814,22 @@ mod active_sampler_reload_tests {
         cfg.wear.active_sampling.sampled_display = Some("oled".to_owned());
 
         let display = DisplayId("oled".to_owned());
-        let missing = active_sampler_display_context(&display, false, Some("active"));
+        let display_config = DisplayConfig {
+            compositor_output: None,
+            ..sample_display_config()
+        };
+        let missing =
+            active_sampler_display_context(&display, &display_config, false, Some("active"));
         assert_eq!(missing.display, None);
         assert!(!missing.stage_active);
 
-        let restored = active_sampler_display_context(&display, true, Some("grace"));
+        let restored =
+            active_sampler_display_context(&display, &display_config, true, Some("grace"));
         assert_eq!(restored.display.unwrap().display, "oled");
         assert!(restored.stage_active);
 
-        let blanked = active_sampler_display_context(&display, true, Some("blanked"));
+        let blanked =
+            active_sampler_display_context(&display, &display_config, true, Some("blanked"));
         assert!(!blanked.stage_active);
     }
 
@@ -666,9 +839,13 @@ mod active_sampler_reload_tests {
     fn plural_selection_context_reflects_per_display_identity() {
         let display_a = DisplayId("oled-a".to_owned());
         let display_b = DisplayId("oled-b".to_owned());
+        let display_config_a = sample_display_config();
+        let display_config_b = sample_display_config();
 
-        let ctx_a = active_sampler_display_context(&display_a, true, Some("active"));
-        let ctx_b = active_sampler_display_context(&display_b, true, Some("active"));
+        let ctx_a =
+            active_sampler_display_context(&display_a, &display_config_a, true, Some("active"));
+        let ctx_b =
+            active_sampler_display_context(&display_b, &display_config_b, true, Some("active"));
 
         assert_eq!(
             ctx_a
@@ -712,11 +889,35 @@ mod active_sampler_reload_tests {
         let mut cfg = config();
         cfg.wear.active_sampling.sampled_displays = vec!["oled-a".to_owned(), "oled-b".to_owned()];
 
-        let context =
-            active_sampler_display_context(&DisplayId("oled-a".to_owned()), true, Some("active"));
+        let display_config = sample_display_config();
+        let context = active_sampler_display_context(
+            &DisplayId("oled-a".to_owned()),
+            &display_config,
+            true,
+            Some("active"),
+        );
         assert_eq!(
             context.display.expect("selected display context").display,
             "oled-a"
+        );
+    }
+
+    #[test]
+    fn display_context_publishes_configured_compositor_output() {
+        let display = DisplayId("oled".to_owned());
+        let display_config = DisplayConfig {
+            compositor_output: Some("HDMI-A-1".to_owned()),
+            ..sample_display_config()
+        };
+        let context =
+            active_sampler_display_context(&display, &display_config, true, Some("active"));
+        assert_eq!(
+            context
+                .display
+                .expect("present display")
+                .compositor_output
+                .as_deref(),
+            Some("HDMI-A-1"),
         );
     }
 
@@ -755,6 +956,8 @@ mod active_sampler_reload_tests {
                 portal_persistent_ids: vec!["panel-oled".to_owned()],
                 granted_width: 1920,
                 granted_height: 1080,
+                stream_position: None,
+                compositor_output: None,
             },
         )
         .unwrap();
@@ -767,7 +970,7 @@ mod active_sampler_reload_tests {
         );
         assert_ne!(migrated, legacy);
         assert_eq!(
-            screencast_consent::load(&migrated, &display_id.0)
+            screencast_consent::load(&migrated, &display_id.0, None)
                 .unwrap()
                 .record()
                 .token,
@@ -879,12 +1082,20 @@ mod active_sampler_reload_tests {
     }
 
     fn test_sampler_status(display: &str) -> active_sampler::SamplerStatus {
+        test_sampler_status_with_gate(display, None)
+    }
+
+    fn test_sampler_status_with_gate(
+        display: &str,
+        source_gate: Option<crate::active_sampler::source_gate::SourceGate>,
+    ) -> active_sampler::SamplerStatus {
         active_sampler::SamplerStatus {
             state: active_sampler::SamplingState::Streaming,
             last_capture: None,
             uniform_reason: None,
             bound_display: Some(display.to_owned()),
             granted_at: None,
+            source_gate,
         }
     }
 
@@ -928,6 +1139,7 @@ mod active_sampler_reload_tests {
             &statuses,
             &web_status,
             &per_display_statuses_tx,
+            &config(),
         )
         .await;
 
@@ -947,6 +1159,7 @@ mod active_sampler_reload_tests {
             &statuses,
             &web_status,
             &per_display_statuses_tx,
+            &config(),
         )
         .await;
         assert!(cancel_b.is_cancelled());
@@ -978,6 +1191,7 @@ mod active_sampler_reload_tests {
             &statuses,
             &web_status,
             &per_display_statuses_tx,
+            &config(),
         )
         .await;
 
@@ -1042,6 +1256,7 @@ mod active_sampler_reload_tests {
         let (per_display_statuses_tx, mut per_display_statuses_rx) =
             watch::channel(std::collections::BTreeMap::default());
         let cancel = CancellationToken::new();
+        let (_cfg_tx, cfg_rx) = watch::channel(Arc::new(config()));
 
         let status_join = spawn_sampler_status_forwarder(
             display_id.clone(),
@@ -1049,6 +1264,7 @@ mod active_sampler_reload_tests {
             statuses,
             web_status,
             per_display_statuses_tx,
+            cfg_rx,
             cancel.clone(),
         );
 
@@ -1071,6 +1287,477 @@ mod active_sampler_reload_tests {
         .expect("per-display status watch closed");
         let entry = map.get(&display_id.0).unwrap();
         assert_eq!(entry.bound_display.as_ref(), Some(&display_id.0));
+
+        cancel.cancel();
+        let _ = timeout(Duration::from_millis(500), status_join)
+            .await
+            .expect("status forwarder must exit on cancel");
+    }
+
+    // ── TVS: legacy singular display selector is config-driven ───────────────
+    //
+    // The legacy `wear_sampling_rx` watch channel (consumed by the web status
+    // API and the doctor probe's singular entry) MUST be keyed by the
+    // operator's selected display, not by whichever status is currently
+    // present in the per-display map. Previously `publish_sampler_status`
+    // used `statuses.len() == 1` cardinality to pick the singular entry, so
+    // a TV whose status was published first could hijack the slot even when
+    // the operator had explicitly selected the monitor.
+    //
+    // This test pins the new selector across both config shapes
+    // (legacy `sampled_display` first vs. canonical `sampled_displays` only)
+    // and both insertion orders (TV before monitor, monitor before TV) so
+    // neither cardinality nor insertion timing can leak the wrong display
+    // into the legacy slot.
+    //
+    // Deviation from brief: brief specifies the test path as
+    // `dormantd::app::tests::legacy_sampler_status_uses_configured_first_selected_display`,
+    // but `app::tests` does not exist as a module. Per the brief's "nearest
+    // existing tests module" rule, the test lives in the nearest match
+    // (`active_sampler_reload_tests`) — the run is invoked with the brief's
+    // full path so any future `mod tests` can lift the test in one move.
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the spec is a single pin that walks both config shapes × both insertion orders; splitting would scatter the contract"
+    )]
+    fn legacy_sampler_status_uses_configured_first_selected_display() {
+        use crate::active_sampler::source_gate::SourceGate;
+        use dormant_core::config::schema::ActiveSamplingConfig;
+
+        let monitor = DisplayId("monitor".to_owned());
+        let tv = DisplayId("tv".to_owned());
+
+        // Shape A: legacy `sampled_display = monitor`, canonical
+        // `sampled_displays = [monitor, tv]`. The legacy slot MUST bind to
+        // monitor regardless of insertion order.
+        let mut cfg_a = config();
+        cfg_a.wear.active_sampling = ActiveSamplingConfig {
+            sampled_display: Some(monitor.0.clone()),
+            sampled_displays: vec![monitor.0.clone(), tv.0.clone()],
+            ..ActiveSamplingConfig::default()
+        };
+        let selector_a = legacy_singular_selector(&cfg_a);
+        assert_eq!(
+            selector_a.as_ref(),
+            Some(&monitor),
+            "legacy sampled_display wins over the plural list"
+        );
+
+        // Insertion order: TV first, then monitor. The singular slot
+        // stays `None` until the monitor's status lands (no cardinality
+        // hijack by whichever status arrived first).
+        let (web_status_a, web_rx_a) = watch::channel(None);
+        let statuses_a = active_sampler::new_sampler_statuses();
+        publish_sampler_status(
+            &statuses_a,
+            &web_status_a,
+            &tv,
+            Some(test_sampler_status_with_gate(
+                &tv.0,
+                Some(SourceGate::Matched),
+            )),
+            selector_a.as_ref(),
+        );
+        assert!(
+            web_rx_a.borrow().is_none(),
+            "TV alone must not populate the legacy slot when the operator selected monitor"
+        );
+        // Also pin the per-display map retains the TV entry — only the
+        // LEGACY slot is bound to the selected display; the per-display
+        // map is the source of truth and must keep both gates.
+        let (per_display_a, per_display_rx_a) =
+            watch::channel(std::collections::BTreeMap::<String, _>::default());
+        publish_per_display_statuses(&statuses_a, &per_display_a);
+        assert_eq!(
+            per_display_rx_a
+                .borrow()
+                .get(&tv.0)
+                .and_then(|s| s.source_gate.as_deref()),
+            Some("matched"),
+            "per-display map must retain the TV's gate even when it's not the singular"
+        );
+
+        // Now monitor arrives. Singular becomes monitor with the monitor's
+        // gate; the per-display map continues to carry BOTH entries.
+        publish_sampler_status(
+            &statuses_a,
+            &web_status_a,
+            &monitor,
+            Some(test_sampler_status_with_gate(
+                &monitor.0,
+                Some(SourceGate::Mismatched {
+                    observed: "HDMI3".to_owned(),
+                }),
+            )),
+            selector_a.as_ref(),
+        );
+        // Re-publish the per-display map so the new monitor entry
+        // lands in the watch channel — `publish_sampler_status` only
+        // touches the legacy slot, the per-display map is updated by
+        // its dedicated publish path in the runtime.
+        publish_per_display_statuses(&statuses_a, &per_display_a);
+        let singular_a = web_rx_a
+            .borrow()
+            .clone()
+            .expect("monitor's status must populate the singular slot");
+        assert_eq!(singular_a.source_gate.as_deref(), Some("mismatched"));
+        assert_eq!(singular_a.bound_display.as_deref(), Some("monitor"));
+        let per_display_after = per_display_rx_a.borrow();
+        assert_eq!(
+            per_display_after
+                .get(&tv.0)
+                .and_then(|s| s.source_gate.as_deref()),
+            Some("matched"),
+            "per-display map must still carry the TV's gate after monitor joins"
+        );
+        assert_eq!(
+            per_display_after
+                .get(&monitor.0)
+                .and_then(|s| s.source_gate.as_deref()),
+            Some("mismatched"),
+            "per-display map must carry the monitor's gate"
+        );
+
+        // Insertion order: monitor first, then TV. Singular stays bound to
+        // monitor (the selected display) — the later TV insertion cannot
+        // bump the slot to TV.
+        let (web_status_a2, web_rx_a2) = watch::channel(None);
+        let statuses_a2 = active_sampler::new_sampler_statuses();
+        publish_sampler_status(
+            &statuses_a2,
+            &web_status_a2,
+            &monitor,
+            Some(test_sampler_status_with_gate(
+                &monitor.0,
+                Some(SourceGate::Mismatched {
+                    observed: "HDMI3".to_owned(),
+                }),
+            )),
+            selector_a.as_ref(),
+        );
+        assert_eq!(
+            web_rx_a2
+                .borrow()
+                .as_ref()
+                .and_then(|s| s.source_gate.clone()),
+            Some("mismatched".to_owned()),
+            "monitor first insertion must populate the singular with monitor's gate"
+        );
+        publish_sampler_status(
+            &statuses_a2,
+            &web_status_a2,
+            &tv,
+            Some(test_sampler_status_with_gate(
+                &tv.0,
+                Some(SourceGate::Matched),
+            )),
+            selector_a.as_ref(),
+        );
+        // The singular slot MUST remain monitor's status — the explicit
+        // legacy `sampled_display` selection binds the slot to monitor
+        // independently of the per-display map's contents.
+        let after_tv = web_rx_a2.borrow().clone().expect("singular must be set");
+        assert_eq!(
+            after_tv.bound_display.as_deref(),
+            Some("monitor"),
+            "explicit legacy sampled_display must keep the singular bound to monitor even when TV is also present"
+        );
+        assert_eq!(
+            after_tv.source_gate.as_deref(),
+            Some("mismatched"),
+            "the slot must carry monitor's gate, not TV's matched"
+        );
+
+        // Shape B: no legacy `sampled_display`, only the canonical plural
+        // list. The singular MUST bind to the FIRST `sampled_displays`
+        // entry — pin by reordering the list and asserting the selector
+        // tracks the new head.
+        let mut cfg_b_tv_first = config();
+        cfg_b_tv_first.wear.active_sampling = ActiveSamplingConfig {
+            sampled_display: None,
+            sampled_displays: vec![tv.0.clone(), monitor.0.clone()],
+            ..ActiveSamplingConfig::default()
+        };
+        assert_eq!(
+            legacy_singular_selector(&cfg_b_tv_first).as_ref(),
+            Some(&tv),
+            "first sampled_displays entry wins when no legacy sampled_display is set"
+        );
+
+        let mut cfg_b_monitor_first = config();
+        cfg_b_monitor_first.wear.active_sampling = ActiveSamplingConfig {
+            sampled_display: None,
+            sampled_displays: vec![monitor.0.clone(), tv.0.clone()],
+            ..ActiveSamplingConfig::default()
+        };
+        assert_eq!(
+            legacy_singular_selector(&cfg_b_monitor_first).as_ref(),
+            Some(&monitor),
+            "reordering sampled_displays must rebind the singular to the new first entry"
+        );
+
+        // End-to-end with shape B: TV is first. Inserting monitor first
+        // does NOT populate the singular (selector says TV), and inserting
+        // TV afterwards does populate it.
+        let selector_b = legacy_singular_selector(&cfg_b_tv_first);
+        let (web_status_b, web_rx_b) = watch::channel(None);
+        let statuses_b = active_sampler::new_sampler_statuses();
+        publish_sampler_status(
+            &statuses_b,
+            &web_status_b,
+            &monitor,
+            Some(test_sampler_status_with_gate(
+                &monitor.0,
+                Some(SourceGate::Mismatched {
+                    observed: "HDMI3".to_owned(),
+                }),
+            )),
+            selector_b.as_ref(),
+        );
+        assert!(
+            web_rx_b.borrow().is_none(),
+            "monitor alone must not populate the singular when the operator's first sampled_displays entry is TV"
+        );
+        publish_sampler_status(
+            &statuses_b,
+            &web_status_b,
+            &tv,
+            Some(test_sampler_status_with_gate(
+                &tv.0,
+                Some(SourceGate::Unknown {
+                    reason: "awaiting_first_poll",
+                }),
+            )),
+            selector_b.as_ref(),
+        );
+        let singular_b = web_rx_b.borrow().clone().expect(
+            "TV's status must populate the singular when TV is the first sampled_displays entry",
+        );
+        assert_eq!(singular_b.source_gate.as_deref(), Some("unknown"));
+        assert_eq!(singular_b.bound_display.as_deref(), Some("tv"));
+
+        // Removing TV (e.g. via stop_active_sampler_runtime's `None` arg)
+        // must clear the singular even when monitor is still present —
+        // the slot is bound to TV, not to whichever status remains.
+        publish_sampler_status(&statuses_b, &web_status_b, &tv, None, selector_b.as_ref());
+        assert!(
+            web_rx_b.borrow().is_none(),
+            "removing the selected display must clear the singular, not fall back to a remaining non-selected status"
+        );
+        // Sanity: the per-display map still carries the monitor entry —
+        // only the LEGACY slot is bound to the selected display.
+        let (per_display_b, per_display_rx_b) =
+            watch::channel(std::collections::BTreeMap::<String, _>::default());
+        publish_per_display_statuses(&statuses_b, &per_display_b);
+        let final_map = per_display_rx_b.borrow();
+        assert!(
+            final_map.contains_key(&monitor.0),
+            "per-display map must keep monitor after TV removal, got: {final_map:?}"
+        );
+        assert!(
+            !final_map.contains_key(&tv.0),
+            "per-display map must drop TV after removal, got: {final_map:?}"
+        );
+    }
+
+    // ── TVS reload-rebind: the forwarder MUST re-evaluate the
+    // legacy singular selector against the CURRENT config, not against
+    // the spawn-time snapshot. A runtime that survives a reload keeps
+    // its forwarder task; the legacy `wear_sampling_rx` slot must
+    // rebind to the new selection when `sampled_displays` is reordered
+    // or the explicit `sampled_display` is changed/removed. Without
+    // this rebind, a TV whose status is already in the per-display map
+    // (because it joined before the reload) keeps hijacking the
+    // singular slot for an unbounded window after the operator changes
+    // the selection — the exact trap the plan forbids.
+    //
+    // Probe shape: spawn the forwarder with cfg_a (monitor legacy),
+    // insert monitor + tv statuses, assert legacy = monitor. Swap the
+    // config watch to cfg_b (no legacy, `sampled_displays = [tv, monitor]`
+    // so TV is the new head), drive a status change to wake the
+    // forwarder, assert legacy now tracks TV. With the spawn-time
+    // `Arc<Config>` snapshot the forwarder keeps publishing monitor's
+    // status — this test reds on that stale binding.
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "reload-rebind is one cfg_a → reload → cfg_b async flow; splitting would scatter the contract"
+    )]
+    async fn forwarder_rebinds_legacy_selector_on_config_reload() {
+        use crate::active_sampler::source_gate::SourceGate;
+        use dormant_core::config::schema::ActiveSamplingConfig;
+        use tokio::time::{Duration, timeout};
+
+        let monitor = DisplayId("monitor".to_owned());
+        let tv = DisplayId("tv".to_owned());
+
+        // cfg_a: monitor is the explicit legacy; the plural list is
+        // [monitor, tv].
+        let mut cfg_a = config();
+        cfg_a.wear.active_sampling = ActiveSamplingConfig {
+            sampled_display: Some(monitor.0.clone()),
+            sampled_displays: vec![monitor.0.clone(), tv.0.clone()],
+            ..ActiveSamplingConfig::default()
+        };
+        let cfg_a = Arc::new(cfg_a);
+
+        // cfg_b: no legacy; the plural list is REORDERED so TV is the
+        // new head. The operator has just changed the canonical
+        // selection without adding or removing displays — the runtime
+        // set is unchanged, so both forwarders survive the reload.
+        let mut cfg_b = config();
+        cfg_b.wear.active_sampling = ActiveSamplingConfig {
+            sampled_display: None,
+            sampled_displays: vec![tv.0.clone(), monitor.0.clone()],
+            ..ActiveSamplingConfig::default()
+        };
+        let cfg_b = Arc::new(cfg_b);
+
+        // Build a config watch seeded with cfg_a. The forwarder will
+        // subscribe to this watch and re-borrow on every publication.
+        let (config_tx, config_rx) = watch::channel(cfg_a.clone());
+
+        // web_rx must be `mut` so `wait_for` (the mutating future) can
+        // drive it; clone the receiver before the second borrow to
+        // avoid the borrowck conflict.
+        let (web_status, mut web_rx) = watch::channel(None);
+        let web_rx_after = web_rx.clone();
+
+        // Per-display status: spawn the forwarder for the monitor (so
+        // its `display_id` is monitor, and it always inserts monitor's
+        // status into the shared map). The TV entry below is hand-
+        // inserted to model a separate runtime that also survived the
+        // reload — the forwarder is allowed to look up TV's status for
+        // the legacy slot once the selector says TV.
+        let (status_tx, status_rx) = watch::channel(test_sampler_status_with_gate(
+            &monitor.0,
+            Some(SourceGate::Mismatched {
+                observed: "HDMI3".to_owned(),
+            }),
+        ));
+        let statuses = active_sampler::new_sampler_statuses();
+        let (per_display_statuses_tx, _per_display_rx) =
+            watch::channel(std::collections::BTreeMap::default());
+        let cancel = CancellationToken::new();
+
+        // Pre-populate the shared map with the TV entry so the
+        // forwarder can look it up after the reload.
+        statuses.write().unwrap().insert(
+            tv.clone(),
+            test_sampler_status_with_gate(&tv.0, Some(SourceGate::Matched)),
+        );
+
+        let status_join = spawn_sampler_status_forwarder(
+            monitor.clone(),
+            status_rx,
+            statuses.clone(),
+            web_status,
+            per_display_statuses_tx,
+            config_rx,
+            cancel.clone(),
+        );
+
+        // Drive an initial status change so the forwarder's first
+        // `status_rx.changed()` resolves and publishes against cfg_a.
+        // The initial channel value does not count as a "change" for
+        // `watch::Receiver::changed`, so without this send the
+        // forwarder would never publish.
+        let mut initial = test_sampler_status_with_gate(
+            &monitor.0,
+            Some(SourceGate::Mismatched {
+                observed: "HDMI3".to_owned(),
+            }),
+        );
+        initial.state = crate::active_sampler::SamplingState::Streaming;
+        status_tx.send_replace(initial);
+
+        // cfg_a → monitor is the legacy. The forwarder's first
+        // publication must populate the slot with monitor's status.
+        // `wait_for` returns a `Ref` that holds the watch's read lock
+        // for its lifetime — explicitly drop it before the post-reload
+        // phase or the forwarder's `send_replace` will block forever
+        // waiting for the lock to release.
+        let legacy_after_a: dormant_core::wear::WearSamplingStatus = {
+            let ref_ = timeout(
+                Duration::from_millis(500),
+                web_rx.wait_for(std::option::Option::is_some),
+            )
+            .await
+            .expect("cfg_a must populate the legacy slot within the wait window")
+            .expect("web status watch closed");
+            ref_.clone().expect("first publication should be Some")
+        };
+        assert_eq!(
+            legacy_after_a.bound_display.as_deref(),
+            Some("monitor"),
+            "cfg_a (monitor legacy) must bind the singular slot to monitor"
+        );
+        assert_eq!(
+            legacy_after_a.source_gate.as_deref(),
+            Some("mismatched"),
+            "cfg_a publication must carry monitor's mismatched gate"
+        );
+
+        // RELOAD: swap the config watch to cfg_b. The operator has
+        // re-ordered the selection (no add/remove, so both forwarders
+        // survive) and the explicit `sampled_display` is gone — the
+        // singular slot must rebind to TV on the next publication.
+        config_tx.send_replace(cfg_b.clone());
+
+        // Drive a status change to wake the forwarder's status_rx
+        // arm (the config_rx arm is exercised on its own by the reload
+        // but, due to a tokio watch interaction with the single-
+        // threaded test runtime, driving a status change is the most
+        // reliable way to force a publication in the test). The change
+        // is irrelevant; the rebind property is the selector picks
+        // the new config's head.
+        let mut changed = test_sampler_status_with_gate(
+            &monitor.0,
+            Some(SourceGate::Mismatched {
+                observed: "HDMI3".to_owned(),
+            }),
+        );
+        changed.state = crate::active_sampler::SamplingState::Suspended;
+        status_tx.send_replace(changed);
+
+        // The forwarder subscribes to the config watch and republishes
+        // the legacy slot against the NEW selector on its own — no
+        // status change is required to drive the rebind. A bounded
+        // wait on the slot's bound_display confirms the rebind
+        // (broken snapshot wiring would stay at "monitor" and
+        // exceed the wait).
+        //
+        // Use a flat sleep-then-check instead of `changed().await`:
+        // the latter can deadlock in a single-threaded test runtime
+        // when the forwarder is already mid-`send_replace` (the
+        // borrow inside the await can race the write lock).
+        let mut legacy_after_b: Option<dormant_core::wear::WearSamplingStatus> = None;
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        while std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let s = {
+                let r = web_rx_after.borrow();
+                r.clone()
+            };
+            if s.as_ref().and_then(|x| x.bound_display.as_deref()) == Some("tv") {
+                legacy_after_b = s;
+                break;
+            }
+        }
+        let legacy_after_b: dormant_core::wear::WearSamplingStatus = legacy_after_b
+            .expect("cfg_b must rebind the singular slot to TV within the wait window");
+
+        assert_eq!(
+            legacy_after_b.bound_display.as_deref(),
+            Some("tv"),
+            "after reload, the singular must track cfg_b's head (TV), got: {legacy_after_b:?}"
+        );
+        assert_eq!(
+            legacy_after_b.source_gate.as_deref(),
+            Some("matched"),
+            "after reload, the slot must carry TV's matched gate — not monitor's mismatched"
+        );
 
         cancel.cancel();
         let _ = timeout(Duration::from_millis(500), status_join)
@@ -2270,6 +2957,7 @@ impl App {
                 &sampler_statuses,
                 &web_sampling_tx,
                 &per_display_statuses_tx,
+                config_rx.clone(),
                 &front_ctl_tx,
             )
         })
@@ -2383,6 +3071,28 @@ impl App {
                         doctor: doctor_service.clone(),
                         wear: wear_handle.clone(),
                         wear_sampling_rx: web_sampling_rx,
+                        per_display_statuses_rx: {
+                            #[cfg(target_os = "linux")]
+                            {
+                                per_display_statuses_rx.clone()
+                            }
+                            // Feature-skew hotspot (project rule #2584): the
+                            // non-Linux build has no sampler registry, so the
+                            // per-display map is permanently empty. Construct
+                            // a fresh empty watch rather than reusing the
+                            // singular receiver or passing `None` — the field
+                            // is non-optional so the route's join logic stays
+                            // uniform across platforms.
+                            #[cfg(not(target_os = "linux"))]
+                            {
+                                tokio::sync::watch::channel(std::collections::BTreeMap::<
+                                    String,
+                                    dormant_core::wear::WearSamplingStatus,
+                                >::new(
+                                ))
+                                .1
+                            }
+                        },
                         web_bind: addr,
                         cancel: root.clone(),
                         reload_timeout: std::time::Duration::from_secs(10),
@@ -2874,7 +3584,7 @@ struct Runner {
     /// claim protocol. Constructed once in [`App::start`] and
     /// carried by `Runner` across every reload so IPC/hotkey
     /// callers can trigger local pull/push writes.
-    #[allow(dead_code, reason = "wired in Task 13")]
+    #[allow(dead_code, reason = "reserved for a follow-up dispatch surface")]
     direct_switch: Arc<DirectSwitchHandle>,
     /// Daemon-lifetime idle-observation tx — the stock idle source
     /// publishes into this channel; carried across reloads so
@@ -3131,6 +3841,7 @@ impl Runner {
             &self.sampler_statuses,
             &self.web_sampling_tx,
             &self.per_display_statuses_tx,
+            &self.generation.cfg,
         )
         .await;
 
@@ -3149,6 +3860,7 @@ impl Runner {
                 &self.sampler_statuses,
                 &self.web_sampling_tx,
                 &self.per_display_statuses_tx,
+                self.config_tx.subscribe(),
                 &self.sampler_event_tx,
             )
             .await
@@ -3166,9 +3878,14 @@ impl Runner {
             let Some(runtime) = self.active_sampler_runtimes.get(&display_id) else {
                 continue;
             };
+            let display_config = match self.generation.cfg.displays.get(&display_id.0) {
+                Some(display_config) => display_config.clone(),
+                None => continue,
+            };
             if let Err(error) = runtime.updates.try_send(SamplerUpdate::DisplayContext(
                 active_sampler_display_context(
                     &display_id,
+                    &display_config,
                     present.contains(&display_id),
                     Some("active"),
                 ),
@@ -4443,6 +5160,7 @@ async fn run_loop(
         let statuses = runner.sampler_statuses.clone();
         let web_status = runner.web_sampling_tx.clone();
         let per_display_statuses_tx = runner.per_display_statuses_tx.clone();
+        let cfg = runner.generation.cfg.clone();
         async move {
             for (display, runtime) in runtimes {
                 stop_active_sampler_runtime(
@@ -4453,6 +5171,7 @@ async fn run_loop(
                     &statuses,
                     &web_status,
                     &per_display_statuses_tx,
+                    &cfg,
                 )
                 .await;
             }
@@ -6693,6 +7412,8 @@ mod render_tests {
             treat_unreachable_as_blanked: true,
             panel_type: dormant_core::wear::PanelType::default(),
             power_off_opt_in: false,
+            compositor_output: None,
+            sampling: None,
         }
     }
 
@@ -7281,6 +8002,8 @@ mod render_tests {
                         treat_unreachable_as_blanked: true,
                         panel_type: dormant_core::wear::PanelType::default(),
                         power_off_opt_in: false,
+                        compositor_output: None,
+                        sampling: None,
                     },
                 );
                 m
@@ -8436,6 +9159,8 @@ mod macos_gamma_black_assembly_tests {
             treat_unreachable_as_blanked: true,
             panel_type: dormant_core::wear::PanelType::default(),
             power_off_opt_in: false,
+            compositor_output: None,
+            sampling: None,
         };
         let mut displays = IndexMap::new();
         displays.insert("panel".to_string(), display);
@@ -8519,6 +9244,8 @@ mod macos_gamma_black_assembly_tests {
             treat_unreachable_as_blanked: true,
             panel_type: dormant_core::wear::PanelType::default(),
             power_off_opt_in: false,
+            compositor_output: None,
+            sampling: None,
         };
         let mut displays = IndexMap::new();
         displays.insert("panel".to_string(), display);
@@ -8792,6 +9519,8 @@ mod gamma_reload_tests {
             treat_unreachable_as_blanked: true,
             panel_type: dormant_core::wear::PanelType::default(),
             power_off_opt_in: false,
+            compositor_output: None,
+            sampling: None,
         }
     }
 

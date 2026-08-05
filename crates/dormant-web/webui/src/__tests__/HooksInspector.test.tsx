@@ -103,6 +103,7 @@ describe("HooksInspector", () => {
       trackEdit(path, value) { edits[path.join("\x1E")] = value; },
       trackRemove() {},
       getEdit() { return undefined; },
+      isRemoved() { return false; },
       trackCreate() {},
       trackDelete() {},
       buildPatches() { return []; },

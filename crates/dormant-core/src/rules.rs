@@ -623,6 +623,21 @@ pub enum DaemonEvent {
         /// Stable reason for the degradation episode.
         reason: String,
     },
+    /// Source-gate observation for a sampled display changed to a new full
+    /// value (`matched` | `mismatched` | `unknown`). Steady-state polls do
+    /// NOT re-fire this event — the runtime deduplicates by full `SourceGate`
+    /// value so a long sequence of mismatched polls emits one event, not
+    /// N. `observed` carries the polled source label when the TV reported one;
+    /// `None` for matched and unknown gates.
+    WearSamplingSourceGate {
+        /// Display the gate is bound to.
+        display: DisplayId,
+        /// One of `matched`, `mismatched`, `unknown`.
+        state: String,
+        /// Observed source label for mismatched polls; `None` otherwise.
+        #[serde(default)]
+        observed: Option<String>,
+    },
     /// Advisory nudge: the display has gone this many hours since its last
     /// long-dwell static-content window (a hint the WebUI/CLI can use to
     /// suggest compensation, e.g. a pixel-shift or a brightness nudge).

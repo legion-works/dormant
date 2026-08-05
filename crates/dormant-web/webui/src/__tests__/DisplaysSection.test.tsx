@@ -4,6 +4,12 @@
  * Covers: Add button gated by entity_crud_enabled; create form emits
  * `create_entity` via the store; per-card delete with a
  * references-warning confirm naming referencing rules.
+ *
+ * DisplaySamplingEditor — per-display compositor-sampling fields
+ * (compositor_output + the [displays.<id>.sampling] table: expected_source,
+ * source_poll_interval, stream_mode). Streams overrides fall back to the
+ * global wear.active_sampling.stream_mode when unset; the editor surfaces
+ * this as an "Inherit global" select choice.
  */
 import { describe, it, expect, afterEach } from "vitest";
 import { render, screen, waitFor, fireEvent, cleanup, act } from "@testing-library/react";
@@ -235,5 +241,212 @@ describe("DisplaysSection — Delete affordance", () => {
       await Promise.resolve();
     });
     expect(store.buildPatches()).toEqual([]);
+  });
+});
+
+describe("DisplaysSection — DisplaySamplingEditor (display source-gate fields)", () => {
+  const TV_DISPLAY: DisplayConfig = {
+    controllers: ["samsung-tizen"],
+    host: "192.168.1.50",
+    blank_mode: "screen_off_audio_on",
+    compositor_output: undefined,
+    sampling: undefined,
+  };
+
+  function renderTv(overrides: Partial<DisplayConfig> = {}) {
+    const cfg: DisplayConfig = { ...TV_DISPLAY, ...overrides };
+    const store = createPatchStore();
+    render(
+      <DisplaysSection
+        displays={{ tv: cfg }}
+        store={store}
+        redactedPaths={[]}
+        onDirty={() => {}}
+        fieldErrors={{}}
+        entityCrudEnabled={false}
+        rules={{}}
+      />,
+    );
+    return store;
+  }
+
+  it("emits set on displays.tv.compositor_output when typed", () => {
+    const store = renderTv();
+    fireEvent.change(screen.getByLabelText("compositor_output"), { target: { value: "HDMI-A-1" } });
+    expect(store.buildPatches()).toContainEqual({
+      op: "set",
+      path: ["displays", "tv", "compositor_output"],
+      value: "HDMI-A-1",
+    });
+  });
+
+  it("emits set on displays.tv.sampling.expected_source when typed", () => {
+    const store = renderTv();
+    fireEvent.change(screen.getByLabelText("expected_source"), { target: { value: "HDMI4" } });
+    expect(store.buildPatches()).toContainEqual({
+      op: "set",
+      path: ["displays", "tv", "sampling", "expected_source"],
+      value: "HDMI4",
+    });
+  });
+
+  it("emits set on displays.tv.sampling.source_poll_interval when typed", () => {
+    const store = renderTv();
+    fireEvent.change(screen.getByLabelText("source_poll_interval"), { target: { value: "15s" } });
+    expect(store.buildPatches()).toContainEqual({
+      op: "set",
+      path: ["displays", "tv", "sampling", "source_poll_interval"],
+      value: "15s",
+    });
+  });
+
+  it("emits set on displays.tv.sampling.stream_mode when a mode is picked", () => {
+    const store = renderTv();
+    fireEvent.change(screen.getByLabelText("stream_mode"), { target: { value: "per-tick" } });
+    expect(store.buildPatches()).toContainEqual({
+      op: "set",
+      path: ["displays", "tv", "sampling", "stream_mode"],
+      value: "per-tick",
+    });
+  });
+
+  it("emits remove on displays.tv.sampling.stream_mode when the select is cleared back to inherit-global", () => {
+    const store = renderTv({ sampling: { expected_source: "HDMI4", source_poll_interval: "15s", stream_mode: "warm" } });
+    // First the select is seeded from fetched sampling.stream_mode = "warm";
+    // selecting the empty-value "Inherit global" option must remove the
+    // override entirely (so the global wear.active_sampling.stream_mode
+    // takes effect).
+    fireEvent.change(screen.getByLabelText("stream_mode"), { target: { value: "" } });
+    expect(store.buildPatches()).toContainEqual({
+      op: "remove",
+      path: ["displays", "tv", "sampling", "stream_mode"],
+    });
+  });
+
+  it("renders the stream_mode select with the 'Inherit global' choice as the unset state", () => {
+    renderTv({ sampling: { source_poll_interval: "15s" } });
+    const select = screen.getByLabelText("stream_mode") as HTMLSelectElement;
+    // The select exposes the unset sentinel as the first option; the
+    // currently-set value is "" (empty string for the absent Option),
+    // which the select renders with the placeholder text.
+    expect(select.value).toBe("");
+    expect(screen.getByRole("option", { name: /inherit global/i })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "warm" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "per-tick" })).toBeInTheDocument();
+  });
+
+  it("seeds expected_source from the fetched sampling table", () => {
+    renderTv({ sampling: { expected_source: "HDMI4", source_poll_interval: "15s", stream_mode: "warm" } });
+    expect((screen.getByLabelText("expected_source") as HTMLInputElement).value).toBe("HDMI4");
+    expect((screen.getByLabelText("source_poll_interval") as HTMLInputElement).value).toBe("15s");
+    expect((screen.getByLabelText("stream_mode") as HTMLSelectElement).value).toBe("warm");
+  });
+
+  // Clearing a touched text field must emit a remove patch, NOT set "".
+  // The server rejects empty strings (validate.rs:1554-1599 + humantime
+  // parse), so the only way to express "unset" on a touch-cleared field
+  // is to remove the key. This applies to all three text inputs and the
+  // stream_mode select (the select already does this via the empty-value
+  // sentinel; tests 5 + the new pinning below lock all four together).
+  it("clearing compositor_output emits remove (not set \"\")", () => {
+    const store = renderTv({ compositor_output: "HDMI-A-1" });
+    fireEvent.change(screen.getByLabelText("compositor_output"), { target: { value: "" } });
+    const patches = store.buildPatches();
+    expect(patches).toContainEqual({
+      op: "remove",
+      path: ["displays", "tv", "compositor_output"],
+    });
+    // The legacy `set ""` form must never appear — the server rejects it.
+    expect(patches).not.toContainEqual(expect.objectContaining({
+      op: "set",
+      path: ["displays", "tv", "compositor_output"],
+      value: "",
+    }));
+  });
+
+  it("clearing expected_source emits remove (not set \"\")", () => {
+    const store = renderTv({ sampling: { expected_source: "HDMI4", source_poll_interval: "15s" } });
+    fireEvent.change(screen.getByLabelText("expected_source"), { target: { value: "" } });
+    const patches = store.buildPatches();
+    expect(patches).toContainEqual({
+      op: "remove",
+      path: ["displays", "tv", "sampling", "expected_source"],
+    });
+    expect(patches).not.toContainEqual(expect.objectContaining({
+      op: "set",
+      path: ["displays", "tv", "sampling", "expected_source"],
+      value: "",
+    }));
+  });
+
+  it("clearing source_poll_interval emits remove (not set \"\")", () => {
+    const store = renderTv({ sampling: { source_poll_interval: "30s" } });
+    fireEvent.change(screen.getByLabelText("source_poll_interval"), { target: { value: "" } });
+    const patches = store.buildPatches();
+    expect(patches).toContainEqual({
+      op: "remove",
+      path: ["displays", "tv", "sampling", "source_poll_interval"],
+    });
+    expect(patches).not.toContainEqual(expect.objectContaining({
+      op: "set",
+      path: ["displays", "tv", "sampling", "source_poll_interval"],
+      value: "",
+    }));
+  });
+
+  it("whitespace-only input on a text field also emits remove (server rejects whitespace)", () => {
+    const store = renderTv({ compositor_output: "HDMI-A-1" });
+    fireEvent.change(screen.getByLabelText("compositor_output"), { target: { value: "   " } });
+    const patches = store.buildPatches();
+    expect(patches).toContainEqual({
+      op: "remove",
+      path: ["displays", "tv", "compositor_output"],
+    });
+  });
+
+  // SHOULD fix: after typing then clearing, the field must show the
+  // cleared state, not snap back to the fetched value. The pending
+  // remove is invisible to the editor's `effective()` helper today
+  // (getEdit returns undefined for removals), so when the parent
+  // re-renders (via the dirtyVersion counter on onDirty in
+  // SettingsForm.tsx), the React control snaps back to the stale
+  // fetched value while a remove patch stays queued.
+  //
+  // To verify the post-clear display state we wire `onDirty` to an
+  // RTL `rerender` trigger — mirroring SettingsForm's dirtyVersion
+  // counter — so the editor re-renders with the pending remove.
+  it("after edit-then-clear, the input shows the cleared state (not the fetched value)", () => {
+    const cfg: DisplayConfig = { ...TV_DISPLAY, compositor_output: "HDMI-A-1" };
+    const store = createPatchStore();
+    const onDirty = () => { rerender(<DisplaysSection
+      displays={{ tv: cfg }}
+      store={store}
+      redactedPaths={[]}
+      onDirty={onDirty}
+      fieldErrors={{}}
+      entityCrudEnabled={false}
+      rules={{}}
+    />); };
+    const { rerender } = render(
+      <DisplaysSection
+        displays={{ tv: cfg }}
+        store={store}
+        redactedPaths={[]}
+        onDirty={onDirty}
+        fieldErrors={{}}
+        entityCrudEnabled={false}
+        rules={{}}
+      />,
+    );
+    const input = screen.getByLabelText("compositor_output") as HTMLInputElement;
+    expect(input.value).toBe("HDMI-A-1");
+    fireEvent.change(input, { target: { value: "HDMI-A-2" } });
+    expect(input.value).toBe("HDMI-A-2");
+    fireEvent.change(input, { target: { value: "" } });
+    // After clear, the re-render driven by onDirty must surface the
+    // cleared/inherit state, NOT the previously-fetched "HDMI-A-1".
+    // (Without the Should fix, the editor falls back to the fetched
+    // prop because getEdit returns undefined for removals.)
+    expect(input.value).toBe("");
   });
 });

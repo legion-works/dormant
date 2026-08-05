@@ -10,6 +10,7 @@
 import FormSection from "./FormSection";
 import LadderEditor from "./LadderEditor";
 import ScreensaverEditor from "./ScreensaverEditor";
+import DisplaySamplingEditor from "./DisplaySamplingEditor";
 import { EnumField, HexCodeField, PANEL_TYPES } from "./fields";
 import { useState, useEffect, useCallback } from "react";
 import type { DisplayConfig, LadderStage, RuleConfig } from "../../api/types";
@@ -234,6 +235,18 @@ export default function DisplaysSection({
                     redactedPaths={redactedPaths} onDirty={onDirty} fieldErrors={fieldErrors} />
                 </div>
               )}
+
+              <div style={{ marginTop: "14px" }}>
+                <DisplaySamplingEditor
+                  displayId={id}
+                  compositor_output={cfg.compositor_output}
+                  sampling={cfg.sampling}
+                  store={store}
+                  redactedPaths={redactedPaths}
+                  onDirty={onDirty}
+                  fieldErrors={fieldErrors}
+                />
+              </div>
             </>
             )}
           </div>

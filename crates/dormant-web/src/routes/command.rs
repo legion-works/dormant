@@ -364,6 +364,7 @@ fn command_test_router_at(
         cancel,
         reload_timeout: Duration::from_secs(10),
         wear_sampling_rx: tokio::sync::watch::channel(None).1,
+        per_display_statuses_rx: tokio::sync::watch::channel(std::collections::BTreeMap::new()).1,
     }));
 
     // Keep the reload trigger receiver alive in a spawned task so the
@@ -476,6 +477,10 @@ mod tests {
                 cancel,
                 reload_timeout: Duration::from_secs(10),
                 wear_sampling_rx: tokio::sync::watch::channel(None).1,
+                per_display_statuses_rx: tokio::sync::watch::channel(
+                    std::collections::BTreeMap::new(),
+                )
+                .1,
             },
         ))
     }
@@ -1051,6 +1056,10 @@ mod tests {
                 cancel,
                 reload_timeout: Duration::from_secs(10),
                 wear_sampling_rx: tokio::sync::watch::channel(None).1,
+                per_display_statuses_rx: tokio::sync::watch::channel(
+                    std::collections::BTreeMap::new(),
+                )
+                .1,
             },
         ));
 

@@ -1529,6 +1529,7 @@ pub fn event_records(cfg: &Config, event: &DaemonEvent, instance: &str) -> Vec<P
         | DaemonEvent::WearSnapshot { .. }
         | DaemonEvent::WearSamplingStarted
         | DaemonEvent::WearSamplingDegraded { .. }
+        | DaemonEvent::WearSamplingSourceGate { .. }
         | DaemonEvent::CompensationAdvisory { .. }
         | DaemonEvent::BlankFailure { .. }
         | DaemonEvent::BlankRecovered { .. }
@@ -1741,6 +1742,8 @@ mod tests {
                 treat_unreachable_as_blanked: true,
                 panel_type: dormant_core::wear::PanelType::Unknown,
                 power_off_opt_in: false,
+                compositor_output: None,
+                sampling: None,
             },
         );
         cfg
@@ -3170,6 +3173,8 @@ mod async_tests {
                 treat_unreachable_as_blanked: true,
                 panel_type: dormant_core::wear::PanelType::Unknown,
                 power_off_opt_in: false,
+                compositor_output: None,
+                sampling: None,
             },
         );
         cfg

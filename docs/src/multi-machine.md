@@ -166,6 +166,25 @@ admitted local edge, zero poll-caused writes, no sustained ping-pong. The
 rare double-flip is the accepted cost of a lock-free design — do not expect
 serialization we don't provide.
 
+## Not the TV wear-sampling source gate
+
+Multi-machine switching and Samsung TV source gating both read a "source",
+but they are different mechanisms solving different problems:
+
+- **This chapter** reads VCP `0x60` over DDC/CI to observe *which machine owns*
+a shared panel, and writes the input code to pull the panel between machines.
+It is a soft-KVM ownership switch.
+- **[Active wear sampling](./active-wear-sampling.md)** reads Samsung IP
+  Control (`inputSourceControl`) to gate *whether the TV is showing the HDMI
+  input the sampler expects* before counting a captured frame as wear. It
+  never switches the TV's input and never writes anything; it is wear-
+  attribution safety so a TV on Netflix does not accrue local-frame wear.
+
+The two never interact: the DDC ownership poll is local to each machine's own
+bus, and the wear-sampling source gate is a read-only check against the TV's
+reported input. A `samsung-tizen` display carrying `[displays.<id>.sampling]`
+gets the wear gate regardless of whether any display is `scope = "shared"`.
+
 ## Activity follow
 
 When `coordination.activity_follow = true` (default `false`), a **genuine

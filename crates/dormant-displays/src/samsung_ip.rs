@@ -1,5 +1,5 @@
-//! Samsung IP Control G2 (port 1516) — JSON-RPC transport for the
-//! `backlightControl` family of methods.
+//! Samsung IP Control G2 (port 1516) — JSON-RPC transport for TV
+//! settings methods.
 //!
 //! ## What lives here
 //!
@@ -52,6 +52,10 @@
 //!   (0–50). Backlight is read via this method, not `getVideoStates` —
 //!   `getVideoStates` does not include the backlight field on this TV.
 //! - `backlightControl` (with `backlight`) → writes the panel backlight.
+//! - `inputSourceControl` → reads `"result.inputSource"`.
+//!
+//! Samsung reads use `<noun>Control` naming — `get<Noun>` probes return
+//! `-32601 Method not found`.
 //!
 //! Errors are JSON-RPC `{"error":{"code":C,"message":M}}`. Known codes:
 //!
@@ -122,6 +126,9 @@ pub trait BacklightTransport: Send + Sync {
 
     /// Read the current panel backlight (0–50).
     async fn get_backlight(&self, host: &str, token: &str) -> Result<u8, String>;
+
+    /// Read the active input source (for example, `HDMI4`).
+    async fn input_source(&self, host: &str, token: &str) -> Result<String, String>;
 
     /// Set the panel backlight (0–50; 0 ≈ dim).
     async fn set_backlight(&self, host: &str, token: &str, value: u8) -> Result<(), String>;
@@ -303,8 +310,7 @@ impl RealBacklightTransport {
             .post(&url)
             // The port-1516 endpoint is pedantic: a request with the
             // reqwest default `Accept: */*` returns HTTP 400 Bad Request.
-            // Pin to `application/json` so all three methods
-            // (createAccessToken, backlightControl) match.
+            // Pin to `application/json` so every IP Control method matches.
             .header(reqwest::header::ACCEPT, "application/json")
             .json(&body)
             .send()
@@ -429,6 +435,23 @@ impl BacklightTransport for RealBacklightTransport {
             .and_then(serde_json::Value::as_u64)
             .ok_or_else(|| "missing result.backlight".to_string())?;
         u8::try_from(backlight).map_err(|e| format!("backlight out of range: {e}"))
+    }
+
+    async fn input_source(&self, host: &str, token: &str) -> Result<String, String> {
+        let value = self
+            .call(
+                host,
+                "inputSourceControl",
+                Some(json!({ "AccessToken": token })),
+            )
+            .await?;
+        value
+            .get("result")
+            .and_then(|result| result.get("inputSource"))
+            .and_then(Value::as_str)
+            .filter(|source| !source.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| "missing result.inputSource".to_owned())
     }
 
     async fn set_backlight(&self, host: &str, token: &str, value: u8) -> Result<(), String> {
@@ -559,6 +582,8 @@ pub struct FakeBacklightTransport {
     pub acquire_results: StdMutex<Vec<Result<String, String>>>,
     /// Return values for successive `get_backlight` calls.
     pub get_results: StdMutex<Vec<Result<u8, String>>>,
+    /// Return values for successive `input_source` calls.
+    pub input_source_results: StdMutex<Vec<Result<String, String>>>,
     /// Return values for successive `set_backlight` calls.
     pub set_results: StdMutex<Vec<Result<(), String>>>,
     /// Hosts that requested `acquire_token`, in order.
@@ -567,6 +592,8 @@ pub struct FakeBacklightTransport {
     pub set_calls: StdMutex<Vec<(String, u8)>>,
     /// Hosts + tokens passed to `get_backlight`, in order.
     pub get_calls: StdMutex<Vec<(String, String)>>,
+    /// Hosts + tokens passed to `input_source`, in order.
+    pub input_source_calls: StdMutex<Vec<(String, String)>>,
 }
 
 impl FakeBacklightTransport {
@@ -599,6 +626,19 @@ impl BacklightTransport for FakeBacklightTransport {
         let mut results = self.get_results.lock().unwrap();
         if results.is_empty() {
             Ok(40)
+        } else {
+            results.remove(0)
+        }
+    }
+
+    async fn input_source(&self, host: &str, token: &str) -> Result<String, String> {
+        self.input_source_calls
+            .lock()
+            .unwrap()
+            .push((host.to_string(), token.to_string()));
+        let mut results = self.input_source_results.lock().unwrap();
+        if results.is_empty() {
+            Ok("HDMI1".to_string())
         } else {
             results.remove(0)
         }
@@ -849,6 +889,35 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn fake_input_source_records_host_and_token_and_consumes_script() {
+        let fake = FakeBacklightTransport::new();
+        fake.input_source_results
+            .lock()
+            .unwrap()
+            .push(Ok("HDMI1".to_string()));
+        fake.input_source_results
+            .lock()
+            .unwrap()
+            .push(Ok("HDMI4".to_string()));
+
+        assert_eq!(
+            fake.input_source("192.0.2.7", "tok-1").await.unwrap(),
+            "HDMI1"
+        );
+        assert_eq!(
+            fake.input_source("192.0.2.8", "tok-2").await.unwrap(),
+            "HDMI4"
+        );
+        assert_eq!(
+            *fake.input_source_calls.lock().unwrap(),
+            vec![
+                ("192.0.2.7".to_string(), "tok-1".to_string()),
+                ("192.0.2.8".to_string(), "tok-2".to_string()),
+            ]
+        );
+    }
+
     #[test]
     fn map_transport_error_unauthorized_includes_code_and_e_display_io() {
         let fake = FakeBacklightTransport::new();
@@ -1092,6 +1161,90 @@ mod tests {
         let tok = transport.acquire_token("192.0.2.7").await.unwrap();
         let value = transport.get_backlight("192.0.2.7", &tok).await.unwrap();
         assert_eq!(value, 37);
+    }
+
+    #[tokio::test]
+    async fn real_transport_input_source_uses_control_method_and_parses_string() {
+        use wiremock::matchers::{body_partial_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(header("accept", "application/json"))
+            .and(body_partial_json(json!({
+                "method": "createAccessToken"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": { "AccessToken": "tok" }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(header("accept", "application/json"))
+            .and(body_partial_json(json!({
+                "method": "inputSourceControl",
+                "params": { "AccessToken": "tok" }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": { "inputSource": "HDMI4" }
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let transport =
+            RealBacklightTransport::for_test_with_base_url(mock.uri(), Duration::from_secs(5));
+        let token = transport.acquire_token("192.0.2.7").await.unwrap();
+
+        assert_eq!(
+            transport.input_source("192.0.2.7", &token).await.unwrap(),
+            "HDMI4"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_transport_input_source_rejects_missing_or_non_string_result() {
+        use wiremock::matchers::{body_partial_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let cases = [
+            ("missing result", json!({})),
+            ("missing inputSource", json!({ "result": {} })),
+            (
+                "non-string inputSource",
+                json!({ "result": { "inputSource": 4 } }),
+            ),
+            (
+                "empty inputSource",
+                json!({ "result": { "inputSource": "" } }),
+            ),
+        ];
+
+        for (name, response) in cases {
+            let mock = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/"))
+                .and(header("accept", "application/json"))
+                .and(body_partial_json(json!({
+                    "method": "inputSourceControl",
+                    "params": { "AccessToken": "tok" }
+                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(response))
+                .expect(1)
+                .mount(&mock)
+                .await;
+
+            let transport =
+                RealBacklightTransport::for_test_with_base_url(mock.uri(), Duration::from_secs(5));
+            let result = transport.input_source("192.0.2.7", "tok").await;
+
+            assert!(result.is_err(), "{name}: expected malformed result to fail");
+        }
     }
 
     /// Pin the `Accept: application/json` header on every port-1516 POST.

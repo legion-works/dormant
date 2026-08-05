@@ -21,6 +21,16 @@ export interface PatchStore {
   /** Return the pending set value for a path, or undefined if not tracked (or a remove is pending). */
   getEdit(path: string[]): unknown | undefined;
   /**
+   * Return true when a `remove` is pending for this path and no later
+   * `trackEdit` has replaced it. Editors use this to distinguish the
+   * "operator typed then cleared" state from the "no edit ever
+   * tracked" state — `getEdit` collapses both to `undefined`, which
+   * makes the editor's `effective()` helper fall back to the fetched
+   * prop and snap the UI back to the stale fetched value while a
+   * remove patch stays queued.
+   */
+  isRemoved(path: string[]): boolean;
+  /**
    * Track a pending `CreateEntity` for `id` in `collection` (spec §3/§7).
    * A later `trackDelete` for the same `collection`/`id` replaces it
    * (last-write-wins, mirroring the trackEdit/trackRemove pair).
@@ -72,11 +82,22 @@ export function createPatchStore(): PatchStore {
    * Returns undefined when the path has a pending remove, has never
    * been edited, or was last touched by a remove.  Components use this
    * to compute their effective working state: `getEdit(path) ?? fetched`.
+   * Pair with [`Self::isRemoved`] when the caller needs to distinguish
+   * "no edit ever" from "operator cleared the field".
    */
   function getEdit(path: string[]): unknown | undefined {
     const key = pathKey(path);
     if (removals.has(key)) return undefined;
     return edits.get(key);
+  }
+
+  /**
+   * Return true when a `remove` is pending for this path and no later
+   * `trackEdit` has replaced it. Last-write-wins mirrors `getEdit`:
+   * an edit after a remove clears the removal.
+   */
+  function isRemoved(path: string[]): boolean {
+    return removals.has(pathKey(path));
   }
 
   function trackCreate(collection: string, id: string, value: unknown): void {
@@ -169,6 +190,7 @@ export function createPatchStore(): PatchStore {
     trackEdit,
     trackRemove,
     getEdit,
+    isRemoved,
     trackCreate,
     trackDelete,
     buildPatches,

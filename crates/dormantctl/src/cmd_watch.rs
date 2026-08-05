@@ -80,6 +80,14 @@ fn fmt_event(event: &DaemonEvent) -> String {
         DaemonEvent::WearSamplingDegraded { reason } => {
             format!("wear sampling degraded: {reason}")
         }
+        DaemonEvent::WearSamplingSourceGate {
+            display,
+            state,
+            observed,
+        } => match observed {
+            Some(source) => format!("wear source-gate {state} for {display} (observed {source})"),
+            None => format!("wear source-gate {state} for {display}"),
+        },
         DaemonEvent::CompensationAdvisory {
             display,
             hours_since_long_dwell,

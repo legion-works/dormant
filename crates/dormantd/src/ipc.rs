@@ -535,6 +535,7 @@ fn sampler_status_views(
             WearSamplingStatusMapEntry {
                 state: wire.state,
                 uniform_reason: wire.uniform_reason.clone(),
+                source_gate: wire.source_gate.clone(),
             },
         );
         redacted.push(wire);
@@ -921,6 +922,7 @@ mod tests {
                     uniform_reason: None,
                     bound_display: Some("oled-a".to_owned()),
                     granted_at: None,
+                    source_gate: None,
                 },
             ),
             (
@@ -931,6 +933,7 @@ mod tests {
                     uniform_reason: Some(crate::active_sampler::WEAR_SAMPLING_CAPTURE_FAILED),
                     bound_display: Some("oled-b".to_owned()),
                     granted_at: None,
+                    source_gate: None,
                 },
             ),
         ];

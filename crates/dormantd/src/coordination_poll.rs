@@ -462,6 +462,8 @@ mod tests {
                 panel_type: PanelType::Unknown,
                 hooks: dormant_core::config::HookSlots::default(),
                 power_off_opt_in: false,
+                compositor_output: None,
+                sampling: None,
             },
         );
         Config {

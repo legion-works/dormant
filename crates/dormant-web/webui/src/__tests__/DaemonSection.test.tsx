@@ -18,6 +18,7 @@ function mockStore(): PatchStore {
     trackEdit() {},
     trackRemove() {},
     getEdit() { return undefined; },
+    isRemoved() { return false; },
     trackCreate() {},
     trackDelete() {},
     buildPatches() { return []; },

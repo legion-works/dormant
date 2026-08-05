@@ -417,6 +417,10 @@ mod tests {
                 cancel,
                 reload_timeout: Duration::from_secs(10),
                 wear_sampling_rx: tokio::sync::watch::channel(None).1,
+                per_display_statuses_rx: tokio::sync::watch::channel(
+                    std::collections::BTreeMap::new(),
+                )
+                .1,
             },
         ))
     }
@@ -722,6 +726,8 @@ mod tests {
             treat_unreachable_as_blanked: false,
             panel_type: dormant_core::wear::PanelType::default(),
             power_off_opt_in: false,
+            compositor_output: None,
+            sampling: None,
         }
     }
 
@@ -1105,6 +1111,8 @@ field = "/val"
             treat_unreachable_as_blanked: false,
             panel_type: dormant_core::wear::PanelType::default(),
             power_off_opt_in: false,
+            compositor_output: None,
+            sampling: None,
         }
     }
 

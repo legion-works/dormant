@@ -289,7 +289,7 @@ describe("WearCard", () => {
     expect(window.location.hash).toBe("#/displays");
   });
 
-  // ── #186 Task 19 — platform-gated active-sampling onboarding nudge ───
+  // ── platform-gated active-sampling onboarding nudge ───────────────
 
   describe("#186 onboarding nudge", () => {
     it("shows the nudge with Enable + Dismiss when platform supports sampling, config is enabled, and attribution is uniform with no consent", async () => {
@@ -571,6 +571,109 @@ describe("WearCard", () => {
       expect(within(deskRow).getByTestId("wear-sampling-nudge")).toBeInTheDocument();
       const tvRow = screen.getByTestId("wear-row-tv");
       expect(within(tvRow).queryByTestId("wear-sampling-nudge")).not.toBeInTheDocument();
+    });
+  });
+
+  // ── source-gated TV state row copy ───────────────────────────────────
+
+  describe("source-gate row states", () => {
+    // The gate comes from `WearSummary.source_gate` (the per-display
+    // sampler status), which is DISTINCT from the consent `WearSamplingStatus`
+    // that drives the "Granted / Needs consent" label. A mismatched/unknown
+    // gate renders its own line; matched and no-gate fall through to the
+    // normal sampling label so the monitor row stays unchanged.
+    function setGateState(
+      gate: string | null | undefined,
+      samplingStatus: { status: string; reason?: string } = { status: "granted" },
+    ) {
+      mocks.getConfig.mockResolvedValue({ inventory: { wear: { active_sampling: { enabled: true } } } });
+      mocks.getWearSamplingStatusFor.mockResolvedValue(samplingStatus);
+      setState({
+        wear: {
+          displays: [
+            summary({
+              source_gate: gate ?? undefined,
+              wear_attribution_mode: gate === "matched" ? "sampled" : "uniform",
+            }),
+          ],
+        },
+      });
+    }
+
+    it("matched renders the normal sampling label and no source-gate copy", async () => {
+      setGateState("matched");
+      render(<WearCard />);
+      await waitFor(() => expect(screen.getByText("Granted")).toBeInTheDocument());
+      expect(screen.queryByText(/not sampling — TV/)).not.toBeInTheDocument();
+    });
+
+    it("mismatched renders 'not sampling — TV is on another source'", async () => {
+      setGateState("mismatched");
+      render(<WearCard />);
+      await waitFor(() =>
+        expect(screen.getByText("not sampling — TV is on another source")).toBeInTheDocument(),
+      );
+    });
+
+    it("unknown renders 'not sampling — TV source unavailable'", async () => {
+      setGateState("unknown");
+      render(<WearCard />);
+      await waitFor(() =>
+        expect(screen.getByText("not sampling — TV source unavailable")).toBeInTheDocument(),
+      );
+    });
+
+    it("no gate (AOC monitor) renders no source-gate copy — existing behavior unchanged", async () => {
+      setGateState(undefined);
+      render(<WearCard />);
+      await waitFor(() => expect(screen.getByText("Granted")).toBeInTheDocument());
+      expect(screen.queryByText(/not sampling — TV/)).not.toBeInTheDocument();
+    });
+
+    it("a mismatched row remains lifecycle-granted rather than showing Needs consent", async () => {
+      setGateState("mismatched", { status: "granted" });
+      render(<WearCard />);
+      await waitFor(() =>
+        expect(screen.getByText("not sampling — TV is on another source")).toBeInTheDocument(),
+      );
+      expect(screen.getByText("Granted")).toBeInTheDocument();
+      expect(screen.queryByText("Needs consent")).not.toBeInTheDocument();
+    });
+
+    // Vacuity guard: the single-display tests above cannot detect a
+    // per-row attribution regression — a component that renders displays[0]'s
+    // gate on every row passes them all. Two displays with DIFFERENT gates
+    // (d1 mismatched, d2 no-gate) pin per-row attribution: the testid is
+    // keyed by display_name, so a first-gate-everywhere mutant would render
+    // `wear-row-source-gate-monitor` on d2 and redden the absence assertion.
+    it("renders each row's own source gate — a first-gate-everywhere mutant would red this", async () => {
+      mocks.getConfig.mockResolvedValue({ inventory: { wear: { active_sampling: { enabled: true } } } });
+      mocks.getWearSamplingStatusFor.mockResolvedValue({ status: "granted" });
+      setState({
+        wear: {
+          displays: [
+            summary({
+              display: "tv",
+              display_name: "tv",
+              source_gate: "mismatched",
+              wear_attribution_mode: "uniform",
+            }),
+            summary({
+              display: "monitor",
+              display_name: "monitor",
+              wear_attribution_mode: "uniform",
+            }),
+          ],
+        },
+      });
+
+      render(<WearCard />);
+
+      await waitFor(() =>
+        expect(screen.getByTestId("wear-row-source-gate-tv")).toBeInTheDocument(),
+      );
+      // The no-gate row must NOT carry the first row's gate copy.
+      expect(screen.queryByTestId("wear-row-source-gate-monitor")).not.toBeInTheDocument();
     });
   });
 });

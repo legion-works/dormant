@@ -6,7 +6,7 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen, waitFor, cleanup, act } from "@testing-library/react";
 import { LiveStateProvider } from "../app/state";
 import { useLiveState, useEventLog } from "../app/hooks/useLiveState";
-import type { StateSnapshot, DisplaySnapshot } from "../api/types";
+import type { StateSnapshot, DisplaySnapshot, WearListResponse } from "../api/types";
 
 
 const { mocks, fixtures } = vi.hoisted(() => {
@@ -987,4 +987,177 @@ describe("LiveStateProvider operations_changed event (issue #184)", () => {
     expect(screen.getByTestId("ops-em")).toHaveTextContent("true");
   });
 
+});
+
+// ── wear_sampling_source_gate live event ───────────────────────────────────
+
+describe("LiveStateProvider wear_sampling_source_gate event", () => {
+  it("wear_sampling_source_gate triggers a background wear refetch that updates the event's display row", async () => {
+    const { getWear } = await import("../api/client");
+    const getWearMock = vi.mocked(getWear);
+    // Reset any leftover queued return values from prior tests (the shared
+    // afterEach clears calls but not the mockResolvedValueOnce queue).
+    getWearMock.mockReset();
+
+    // Initial wear list: both displays on a matched gate.
+    const initial: WearListResponse = {
+      displays: [
+        {
+          display: "d1",
+          display_name: "d1",
+          panel_type: "qd-oled",
+          total_on_hours: 1,
+          sample_count: 1,
+          advisory: false,
+          hours_since_long_dwell: 0,
+          source_gate: "matched",
+        },
+        {
+          display: "d2",
+          display_name: "d2",
+          panel_type: "qd-oled",
+          total_on_hours: 2,
+          sample_count: 2,
+          advisory: false,
+          hours_since_long_dwell: 0,
+          source_gate: "matched",
+        },
+      ],
+    };
+    // After the transition, only d1 (the event's display) flips to mismatched;
+    // d2 is unchanged — the refetch updates the event's display row.
+    const updated: WearListResponse = {
+      displays: [
+        {
+          display: "d1",
+          display_name: "d1",
+          panel_type: "qd-oled",
+          total_on_hours: 1,
+          sample_count: 1,
+          advisory: false,
+          hours_since_long_dwell: 0,
+          source_gate: "mismatched",
+        },
+        {
+          display: "d2",
+          display_name: "d2",
+          panel_type: "qd-oled",
+          total_on_hours: 2,
+          sample_count: 2,
+          advisory: false,
+          hours_since_long_dwell: 0,
+          source_gate: "matched",
+        },
+      ],
+    };
+
+    getWearMock.mockResolvedValue(initial);
+
+    function WearListConsumer() {
+      const { wear } = useLiveState();
+      if (!wear) return <span>loading</span>;
+      return (
+        <div>
+          {wear.displays.map((d) => (
+            <span key={d.display} data-testid={`wear-gate-${d.display}`}>
+              {d.display}:{d.source_gate ?? "none"}
+            </span>
+          ))}
+        </div>
+      );
+    }
+
+    render(
+      <LiveStateProvider>
+        <WearListConsumer />
+      </LiveStateProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("wear-gate-d1")).toHaveTextContent("d1:matched");
+    });
+    expect(screen.getByTestId("wear-gate-d2")).toHaveTextContent("d2:matched");
+
+    const callsBefore = getWearMock.mock.calls.length;
+
+    // Swap the wear list so the next reflects d1's transition to mismatched.
+    getWearMock.mockResolvedValue(updated);
+
+    // Drive a source-gate transition for d1 only.
+    act(() => {
+      mocks.onMessage?.({
+        event: "wear_sampling_source_gate",
+        display: "d1",
+        state: "mismatched",
+        observed: "HDMI3",
+      });
+    });
+
+    // The event must trigger a background refetch of /api/wear.
+    await waitFor(() => {
+      expect(getWearMock.mock.calls.length).toBeGreaterThan(callsBefore);
+    });
+
+    // The refetch updates d1's row to mismatched; d2 stays matched.
+    await waitFor(() => {
+      expect(screen.getByTestId("wear-gate-d1")).toHaveTextContent("d1:mismatched");
+    });
+    expect(screen.getByTestId("wear-gate-d2")).toHaveTextContent("d2:matched");
+  });
+
+  it("an unknown WS event tag still leaves the wear list unchanged (additive union)", async () => {
+    const { getWear } = await import("../api/client");
+    const getWearMock = vi.mocked(getWear);
+    getWearMock.mockReset();
+
+    getWearMock.mockResolvedValue({
+      displays: [
+        {
+          display: "d1",
+          display_name: "d1",
+          panel_type: "qd-oled",
+          total_on_hours: 1,
+          sample_count: 1,
+          advisory: false,
+          hours_since_long_dwell: 0,
+          source_gate: "matched",
+        },
+      ],
+    } as WearListResponse);
+
+    function WearListConsumer() {
+      const { wear } = useLiveState();
+      if (!wear) return <span>loading</span>;
+      return (
+        <div>
+          {wear.displays.map((d) => (
+            <span key={d.display} data-testid={`wear-gate-${d.display}`}>
+              {d.display}:{d.source_gate ?? "none"}
+            </span>
+          ))}
+        </div>
+      );
+    }
+
+    render(
+      <LiveStateProvider>
+        <WearListConsumer />
+      </LiveStateProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("wear-gate-d1")).toHaveTextContent("d1:matched");
+    });
+
+    const callsBefore = getWearMock.mock.calls.length;
+
+    act(() => {
+      mocks.onMessage?.({ event: "some_future_tag", display: "d1", whatever: 1 });
+    });
+
+    // Give any (incorrect) handler a chance to run, then assert no refetch.
+    await new Promise((r) => setTimeout(r, 10));
+    expect(getWearMock.mock.calls.length).toBe(callsBefore);
+    expect(screen.getByTestId("wear-gate-d1")).toHaveTextContent("d1:matched");
+  });
 });

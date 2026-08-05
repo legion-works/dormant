@@ -257,6 +257,8 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "treat_unreachable_as_blanked",
             "panel_type",
             "power_off_opt_in",
+            "compositor_output",
+            "sampling",
             "hooks",
         ],
     ),
@@ -317,6 +319,10 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
     (
         "displays..hooks.on_observed_loss.mqtt",
         &["topic", "payload"],
+    ),
+    (
+        "displays..sampling",
+        &["expected_source", "source_poll_interval", "stream_mode"],
     ),
     // ── displays.<id>.screensaver ─────────────────────────────────────────
     (
@@ -1256,12 +1262,30 @@ fn validate_wear(cfg: &Config, errors: &mut Vec<ValidationError>) {
                         "wear.active_sampling.sampled_display '{display_id}' is not configured"
                     ),
                 }),
-                Some(display) if !display.is_render_eligible() => errors.push(ValidationError {
-                    what: "E_CONFIG_INVALID".into(),
-                    detail: format!(
-                        "wear.active_sampling.sampled_display '{display_id}' is not wear-tracked eligible"
-                    ),
-                }),
+                Some(display)
+                    if !display.is_sampling_eligible()
+                        || (display.compositor_output.is_some()
+                            && display
+                                .sampling
+                                .as_ref()
+                                .and_then(|s| s.expected_source.as_ref())
+                                .is_none_or(String::is_empty)) =>
+                {
+                    let remote_without_source = display.compositor_output.is_some();
+                    let detail = if remote_without_source {
+                        format!(
+                            "sampled display '{display_id}' is remote-controlled: sampling requires [displays.{display_id}.sampling] expected_source"
+                        )
+                    } else {
+                        format!(
+                            "wear.active_sampling.sampled_display '{display_id}' is not wear-tracked eligible"
+                        )
+                    };
+                    errors.push(ValidationError {
+                        what: "E_CONFIG_INVALID".into(),
+                        detail,
+                    });
+                }
                 Some(_) => {}
             }
         }
@@ -1545,6 +1569,54 @@ fn validate_display_with_input_source_readers(
     has_mqtt_broker: bool,
     errors: &mut Vec<ValidationError>,
 ) {
+    if dc
+        .compositor_output
+        .as_ref()
+        .is_some_and(|output| output.trim().is_empty())
+    {
+        errors.push(ValidationError {
+            what: crate::error::E_CONFIG_INVALID.into(),
+            detail: format!("display '{display_id}' compositor_output must not be empty"),
+        });
+    }
+
+    if let Some(sampling) = &dc.sampling {
+        if sampling
+            .expected_source
+            .as_ref()
+            .is_some_and(|source| source.trim().is_empty())
+        {
+            errors.push(ValidationError {
+                what: crate::error::E_CONFIG_INVALID.into(),
+                detail: format!(
+                    "display '{display_id}' sampling.expected_source must not be empty"
+                ),
+            });
+        }
+        if sampling.expected_source.is_some()
+            && !dc
+                .controllers
+                .iter()
+                .any(|controller| controller == "samsung-tizen")
+        {
+            errors.push(ValidationError {
+                what: crate::error::E_CONFIG_INVALID.into(),
+                detail: "expected_source requires a samsung-tizen controller".into(),
+            });
+        }
+        if !(Duration::from_secs(5)..=Duration::from_secs(300))
+            .contains(&sampling.source_poll_interval)
+        {
+            errors.push(ValidationError {
+                what: crate::error::E_CONFIG_INVALID.into(),
+                detail: format!(
+                    "display '{display_id}' sampling.source_poll_interval {:?} is out of range — allowed: 5s..=300s",
+                    sampling.source_poll_interval
+                ),
+            });
+        }
+    }
+
     // controllers must be non-empty.
     if dc.controllers.is_empty() {
         errors.push(ValidationError {
@@ -3949,6 +4021,8 @@ gracee_period = "60s"
             treat_unreachable_as_blanked: true,
             panel_type: crate::wear::PanelType::default(),
             power_off_opt_in: false,
+            compositor_output: None,
+            sampling: None,
         }
     }
 
@@ -4748,6 +4822,8 @@ password = "test-pass"
                     treat_unreachable_as_blanked: true,
                     panel_type: crate::wear::PanelType::default(),
                     power_off_opt_in: false,
+                    compositor_output: None,
+                    sampling: None,
                 },
             )]),
             rules: IndexMap::new(),
@@ -4816,6 +4892,8 @@ password = "test-pass"
                     treat_unreachable_as_blanked: true,
                     panel_type: crate::wear::PanelType::default(),
                     power_off_opt_in: false,
+                    compositor_output: None,
+                    sampling: None,
                 },
             )]),
             rules: IndexMap::new(),
@@ -4961,6 +5039,8 @@ password = "test-pass"
             treat_unreachable_as_blanked: true,
             panel_type: crate::wear::PanelType::default(),
             power_off_opt_in: false,
+            compositor_output: None,
+            sampling: None,
         };
         let ladder = dc.normalized_ladder();
         assert_eq!(ladder.len(), 1);
@@ -6060,6 +6140,8 @@ kind = "power_off"
             treat_unreachable_as_blanked: true,
             panel_type: crate::wear::PanelType::default(),
             power_off_opt_in: false,
+            compositor_output: None,
+            sampling: None,
         }
     }
 
@@ -6229,6 +6311,146 @@ kind = "power_off"
         );
     }
 
+    #[test]
+    fn display_sampling_source_validation_is_strict() {
+        let validate_case = |controller: &str,
+                             compositor_output: &str,
+                             expected_source: &str,
+                             source_poll_interval: &str| {
+            validate_str(&format!(
+                r#"
+config_version = 1
+
+[displays.sampled]
+controllers = ["{controller}"]
+blank_mode = "brightness_zero"
+host = "192.168.1.50"
+compositor_output = "{compositor_output}"
+
+[displays.sampled.sampling]
+expected_source = "{expected_source}"
+source_poll_interval = "{source_poll_interval}"
+stream_mode = "warm"
+"#,
+            ))
+        };
+
+        for (name, controller, compositor_output, expected_source, interval, detail) in [
+            (
+                "empty compositor output",
+                "samsung-tizen",
+                "   ",
+                "HDMI 1",
+                "15s",
+                "compositor_output",
+            ),
+            (
+                "empty expected source",
+                "samsung-tizen",
+                "DP-1",
+                " \\t ",
+                "15s",
+                "sampling.expected_source",
+            ),
+            (
+                "expected source without samsung-tizen",
+                "ddcci",
+                "DP-1",
+                "HDMI 1",
+                "15s",
+                "expected_source requires a samsung-tizen controller",
+            ),
+            (
+                "source poll below floor",
+                "samsung-tizen",
+                "DP-1",
+                "HDMI 1",
+                "4s",
+                "sampling.source_poll_interval",
+            ),
+            (
+                "source poll above ceiling",
+                "samsung-tizen",
+                "DP-1",
+                "HDMI 1",
+                "301s",
+                "sampling.source_poll_interval",
+            ),
+        ] {
+            let errors = validate_case(controller, compositor_output, expected_source, interval);
+            assert_eq!(errors.len(), 1, "{name}: unexpected findings: {errors:?}");
+            assert_eq!(errors[0].what, crate::error::E_CONFIG_INVALID, "{name}");
+            assert!(
+                errors[0].detail.contains(detail),
+                "{name}: expected detail containing {detail:?}, got {:?}",
+                errors[0].detail
+            );
+            if name == "expected source without samsung-tizen" {
+                assert_eq!(errors[0].detail, detail);
+            }
+        }
+
+        for interval in ["5s", "300s"] {
+            let errors = validate_case("samsung-tizen", "DP-1", "HDMI 1", interval);
+            assert!(
+                errors.is_empty(),
+                "inclusive bound {interval} must pass, got {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn known_keys_accept_display_sampling_subtable_and_reject_typo() {
+        let typo_key = format!("source_poll_interval{}", 'l');
+        for (name, toml_str, expected_unknown) in [
+            (
+                "declared sampling keys",
+                r#"
+config_version = 1
+
+[displays.tv]
+controllers = ["samsung-tizen"]
+blank_mode = "brightness_zero"
+compositor_output = "DP-1"
+
+[displays.tv.sampling]
+expected_source = "HDMI 1"
+source_poll_interval = "15s"
+stream_mode = "warm"
+"#
+                .to_string(),
+                Vec::<String>::new(),
+            ),
+            (
+                "sampling key typo",
+                format!(
+                    r#"
+config_version = 1
+
+[displays.tv]
+controllers = ["samsung-tizen"]
+blank_mode = "brightness_zero"
+compositor_output = "DP-1"
+
+[displays.tv.sampling]
+expected_source = "HDMI 1"
+{typo_key} = "15s"
+stream_mode = "warm"
+"#
+                ),
+                vec![format!("displays.tv.sampling.{typo_key}")],
+            ),
+        ] {
+            let value: toml::Value = toml::from_str(&toml_str).unwrap();
+            let unknown = collect_unknown_keys(&value);
+            let paths = unknown
+                .iter()
+                .map(|finding| finding.key_path.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(paths, expected_unknown, "{name}");
+        }
+    }
+
     fn active_sampling_validation_errors(body: &str, displays: &str) -> Vec<ValidationError> {
         let toml_str = format!(
             "config_version = 1\n[wear]\nsample_interval = \"10s\"\n[wear.active_sampling]\nenabled = true\n{body}\n{displays}"
@@ -6249,6 +6471,56 @@ kind = "power_off"
                     .iter()
                     .any(|e| e.what == "E_CONFIG_INVALID" && e.detail.contains("sampled_display"))
             );
+        }
+    }
+
+    /// A remote-only display that opts into active sampling via
+    /// `compositor_output` must also pin `sampling.expected_source` so the
+    /// source-gate poller can decide whether the TV's current input is the
+    /// one we want to capture from. A local display without any `sampling`
+    /// subtable is still valid: the gate is configured per display, and a
+    /// digital-pedestal AOC has no remote source exposure to gate on.
+    #[test]
+    fn active_sampling_remote_display_without_expected_source_is_rejected() {
+        let cases: &[(&str, &str, &str, Option<&str>)] = &[
+            (
+                "remote-no-expected-source",
+                "sampled_display = \"tv\"\n[displays.tv.sampling]\nsource_poll_interval = \"5s\"\n",
+                "[displays.tv]\ncontrollers = [\"samsung-tizen\"]\nblank_mode = \"brightness_zero\"\nhost = \"tv.local\"\ncompositor_output = \"HDMI-A-1\"\n[displays.aoc]\ncontrollers = [\"ddcci\"]\nblank_mode = \"brightness_zero\"\n",
+                Some(
+                    "sampled display 'tv' is remote-controlled: sampling requires [displays.tv.sampling] expected_source",
+                ),
+            ),
+            (
+                "remote-with-expected-source",
+                "sampled_display = \"tv\"\n[displays.tv.sampling]\nexpected_source = \"HDMI4\"\n",
+                "[displays.tv]\ncontrollers = [\"samsung-tizen\"]\nblank_mode = \"brightness_zero\"\nhost = \"tv.local\"\ncompositor_output = \"HDMI-A-1\"\n",
+                None,
+            ),
+            (
+                "local-no-sampling-table",
+                "sampled_display = \"aoc\"\n",
+                "[displays.aoc]\ncontrollers = [\"ddcci\"]\nblank_mode = \"brightness_zero\"\n",
+                None,
+            ),
+        ];
+        for (label, body, displays, expected_detail) in cases {
+            let errors = active_sampling_validation_errors(body, displays);
+            match expected_detail {
+                Some(detail) => assert!(
+                    errors
+                        .iter()
+                        .any(|e| e.what == "E_CONFIG_INVALID" && e.detail == *detail),
+                    "{label}: missing expected detail {detail:?}, got: {errors:?}"
+                ),
+                None => {
+                    assert!(
+                        !errors.iter().any(|e| e.what == "E_CONFIG_INVALID"
+                            && e.detail.contains("remote-controlled")),
+                        "{label}: unexpected remote-controlled error: {errors:?}"
+                    );
+                }
+            }
         }
     }
 

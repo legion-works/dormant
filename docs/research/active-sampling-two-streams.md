@@ -26,9 +26,9 @@ From `docs/research/2026-07-31-m2-capture-spike.md` (KDE Plasma Wayland,
 | one-frame acquisition via portal + GStreamer (upper bound, incl. setup/teardown) | 213.770 ms initial; 241.032 ms restore |
 | sRGB→luma + 16×9 reduction, NumPy reference (not the Rust target) | median 173.431 ms; p95 180.329 ms |
 
-## M1 — five-minute idle CPU, both displays sampling
+## M1 — thirty-minute idle CPU, both displays sampling
 
-Warm-paused streams on both selected displays, idle desktop, 300 s window.
+Warm-paused streams on both selected displays, idle desktop, 1800 s window.
 Method: same `/proc/<pid>/stat` tick sampling as the baseline (`USER_HZ=100`),
 stable process IDs recorded before the window.
 

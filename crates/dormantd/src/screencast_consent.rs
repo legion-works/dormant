@@ -16,6 +16,8 @@ mod tests {
             portal_persistent_ids: vec!["persistent-portal-id".into()],
             granted_width: 3840,
             granted_height: 2160,
+            stream_position: None,
+            compositor_output: None,
         }
     }
 
@@ -25,7 +27,7 @@ mod tests {
         let path = dir.path().join("consent.json");
         let expected = record();
         store_atomic(&path, &expected).unwrap();
-        let loaded = load(&path, "oled-main").unwrap();
+        let loaded = load(&path, "oled-main", None).unwrap();
         assert!(loaded.record() == &expected);
         let binding = loaded.as_binding();
         assert_eq!(binding.granted_width, 3840);
@@ -37,7 +39,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("consent.json");
         store_atomic(&path, &record()).unwrap();
-        let error = load(&path, "other-display").err().unwrap();
+        let error = load(&path, "other-display", None).err().unwrap();
         assert!(matches!(error, ConsentError::DisplayChanged));
         assert_eq!(error.to_string(), "wear_sampling_display_changed");
     }
@@ -45,7 +47,7 @@ mod tests {
     #[test]
     fn corrupt_and_absent_records_are_distinct_errors() {
         let dir = tempdir().unwrap();
-        let absent = load(&dir.path().join("missing.json"), "oled-main")
+        let absent = load(&dir.path().join("missing.json"), "oled-main", None)
             .err()
             .unwrap();
         assert!(matches!(absent, ConsentError::NotFound));
@@ -57,7 +59,7 @@ mod tests {
             fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         }
-        let corrupt = load(&path, "oled-main").err().unwrap();
+        let corrupt = load(&path, "oled-main", None).err().unwrap();
         assert!(matches!(corrupt, ConsentError::InvalidJson));
     }
 
@@ -70,12 +72,12 @@ mod tests {
         rotated.token = "new-rotated-secret".into();
         store_atomic(&path, &rotated).unwrap();
         assert_eq!(
-            load(&path, "oled-main").unwrap().record().token,
+            load(&path, "oled-main", None).unwrap().record().token,
             rotated.token
         );
         forget(&path).unwrap();
         assert!(matches!(
-            load(&path, "oled-main"),
+            load(&path, "oled-main", None),
             Err(ConsentError::NotFound)
         ));
     }
@@ -116,7 +118,7 @@ mod tests {
         store_atomic(&path, &record()).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(matches!(
-            load(&path, "oled-main"),
+            load(&path, "oled-main", None),
             Err(ConsentError::InsecurePermissions)
         ));
     }
@@ -190,19 +192,19 @@ mod tests {
         tv_record.token = "tv-token".into();
         store_atomic(&path_tv, &tv_record).unwrap();
 
-        let loaded_desk = load(&path_desk, "desk").unwrap();
+        let loaded_desk = load(&path_desk, "desk", None).unwrap();
         assert_eq!(loaded_desk.record().token, "desk-token");
-        let loaded_tv = load(&path_tv, "tv").unwrap();
+        let loaded_tv = load(&path_tv, "tv", None).unwrap();
         assert_eq!(loaded_tv.record().token, "tv-token");
 
         // Cross-binding fails: loading the desk record bound to "tv" must
         // surface DisplayChanged, never silently succeed.
         assert!(matches!(
-            load(&path_desk, "tv"),
+            load(&path_desk, "tv", None),
             Err(ConsentError::DisplayChanged)
         ));
         assert!(matches!(
-            load(&path_tv, "desk"),
+            load(&path_tv, "desk", None),
             Err(ConsentError::DisplayChanged)
         ));
         // The two on-disk files have distinct names after sanitization,
@@ -225,12 +227,78 @@ mod tests {
             legacy_path,
             "legacy path must be the un-suffixed screencast-consent.json",
         );
-        let loaded = load(&legacy_path, "oled-main").unwrap();
+        let loaded = load(&legacy_path, "oled-main", None).unwrap();
         assert_eq!(loaded.record().sampled_display, "oled-main");
         assert!(matches!(
-            load(&legacy_path, "other-display"),
+            load(&legacy_path, "other-display", None),
             Err(ConsentError::DisplayChanged)
         ));
+    }
+
+    #[test]
+    fn legacy_json_without_position_or_output_deserializes() {
+        // Records written before the position/output fields landed must
+        // continue to load: both new fields default to None so the
+        // legacy on-disk JSON does not need a migration.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("consent.json");
+        let legacy_json = r#"{
+            "token": "saved-token",
+            "sampled_display": "oled-main",
+            "granted_at": 1754000000,
+            "portal_persistent_ids": ["persistent-portal-id"],
+            "granted_width": 3840,
+            "granted_height": 2160
+        }"#;
+        fs::write(&path, legacy_json).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let loaded = load(&path, "oled-main", None).unwrap();
+        assert_eq!(loaded.record().stream_position, None);
+        assert_eq!(loaded.record().compositor_output, None);
+    }
+
+    #[test]
+    fn round_trip_preserves_position_and_compositor_output() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("consent.json");
+        let mut expected = record();
+        expected.stream_position = Some((0, 0));
+        expected.compositor_output = Some("HDMI-A-1".to_owned());
+        store_atomic(&path, &expected).unwrap();
+        let loaded = load(&path, "oled-main", Some("HDMI-A-1")).unwrap();
+        assert_eq!(loaded.record().stream_position, Some((0, 0)));
+        assert_eq!(
+            loaded.record().compositor_output.as_deref(),
+            Some("HDMI-A-1")
+        );
+        let binding = loaded.as_binding();
+        assert_eq!(binding.stream_position, Some((0, 0)));
+    }
+
+    #[test]
+    fn compositor_output_drift_invalidates_with_existing_literal() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("consent.json");
+        let mut stored = record();
+        stored.compositor_output = Some("HDMI-A-1".to_owned());
+        store_atomic(&path, &stored).unwrap();
+        let error = load(&path, "oled-main", Some("HDMI-A-2")).err().unwrap();
+        assert!(matches!(error, ConsentError::DisplayChanged));
+        assert_eq!(error.to_string(), "wear_sampling_display_changed");
+    }
+
+    #[test]
+    fn configured_compositor_output_none_accepts_legacy_record() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("consent.json");
+        store_atomic(&path, &record()).unwrap();
+        let loaded = load(&path, "oled-main", None).unwrap();
+        assert_eq!(loaded.record().sampled_display, "oled-main");
     }
 }
 use std::fmt;
@@ -285,6 +353,18 @@ pub struct ConsentRecord {
     pub portal_persistent_ids: Vec<String>,
     pub granted_width: u32,
     pub granted_height: u32,
+    /// Logical `(x, y)` of the portal stream at grant time. The compositor
+    /// reports this as the top-left of the output in its own coordinate
+    /// space; two same-resolution 4K monitors stay distinguishable only
+    /// while this signal is present (older compositors omit it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_position: Option<(i32, i32)>,
+    /// Compositor output name the operator bound this grant to. A
+    /// subsequent reconfigure that moves the sampler to a different
+    /// output invalidates the record so the daemon does not silently
+    /// relabel a mirror seat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compositor_output: Option<String>,
 }
 
 impl dormant_doctor::ConsentSecrets for ConsentRecord {
@@ -313,6 +393,7 @@ impl BoundConsent {
             portal_persistent_ids: &self.record.portal_persistent_ids,
             granted_width: self.record.granted_width,
             granted_height: self.record.granted_height,
+            stream_position: self.record.stream_position,
         }
     }
 
@@ -362,12 +443,24 @@ impl std::error::Error for ConsentError {}
 
 /// Read, parse, permission-check, and bind a saved grant to its configured display.
 ///
+/// `configured_compositor_output` is the compositor output the
+/// sampler is currently keyed to. A stored record that pinned a different
+/// output is rejected with [`ConsentError::DisplayChanged`] so a reconfigure
+/// that moves the sampler to a different monitor does not silently re-bind
+/// the old grant. `None` here means the sampler has no configured output
+/// (legacy config), in which case the field is not consulted — the record
+/// itself may still carry one for future runs.
+///
 /// # Errors
 ///
 /// Returns [`ConsentError::NotFound`] when no record exists, or another
 /// [`ConsentError`] variant when the record is malformed, insecure, or bound to
 /// a different display.
-pub fn load(path: &Path, configured_display: &str) -> Result<BoundConsent, ConsentError> {
+pub fn load(
+    path: &Path,
+    configured_display: &str,
+    configured_compositor_output: Option<&str>,
+) -> Result<BoundConsent, ConsentError> {
     let metadata = std::fs::metadata(path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             ConsentError::NotFound
@@ -380,6 +473,11 @@ pub fn load(path: &Path, configured_display: &str) -> Result<BoundConsent, Conse
     let record =
         serde_json::from_str::<ConsentRecord>(&raw).map_err(|_| ConsentError::InvalidJson)?;
     if record.sampled_display != configured_display {
+        return Err(ConsentError::DisplayChanged);
+    }
+    if let Some(configured) = configured_compositor_output
+        && record.compositor_output.as_deref() != Some(configured)
+    {
         return Err(ConsentError::DisplayChanged);
     }
     Ok(BoundConsent { record })

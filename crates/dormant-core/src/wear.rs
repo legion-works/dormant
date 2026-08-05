@@ -76,6 +76,14 @@ pub struct WearSamplingStatus {
     /// Epoch seconds at which the active consent grant was made.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub granted_at_epoch_s: Option<i64>,
+    /// Stable, redacted source-gate state for this display: one of
+    /// `"matched"`, `"mismatched"`, or `"unknown"`. `None` means the
+    /// display carries no gate configuration — the runtime treats the
+    /// gate as permanently matched, and the field is elided from the
+    /// wire. Wire-compat is preserved: payloads produced before the
+    /// field was added deserialize with `source_gate: None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_gate: Option<String>,
 }
 
 /// Coarse panel technology classification.
@@ -1028,6 +1036,60 @@ mod tests {
             l.resize_grid(r2, c2);
             let after: f64 = l.cells.iter().map(|c| c.wear_hours).sum();
             proptest::prop_assert_eq!(after, before);
+        }
+    }
+
+    // ── redacted source-gate field ───────────────────────────────────────────
+    //
+    // `source_gate` is the redacted string form of the TV-attribution gate
+    // (`"matched"` | `"mismatched"` | `"unknown"`). `None` on the wire means
+    // the display carries no gate configuration, NOT "unknown" — a TV-less
+    // monitor never reports the gate. The field must be omitted when `None`
+    // (no extra key on pre-Task-10 frames) and must default to `None` on
+    // legacy payloads that don't carry it (wire-compat for older daemons).
+
+    #[test]
+    fn wear_sampling_status_source_gate_defaults_and_round_trips() {
+        // Legacy JSON without the field must deserialize with `source_gate: None`.
+        let legacy_json = r#"{"state":"streaming","last_capture_age_s":5}"#;
+        let legacy: WearSamplingStatus = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(legacy.source_gate, None);
+        assert_eq!(legacy.state, WearSamplingState::Streaming);
+
+        // `None` is elided from the serialized wire so the legacy frame shape
+        // for a no-gate display is byte-identical to the pre-Task-10 shape.
+        let no_gate = WearSamplingStatus {
+            state: WearSamplingState::Streaming,
+            last_capture_age_s: Some(5),
+            uniform_reason: None,
+            bound_display: None,
+            granted_at_epoch_s: None,
+            source_gate: None,
+        };
+        let json = serde_json::to_string(&no_gate).unwrap();
+        assert!(
+            !json.contains("source_gate"),
+            "source_gate: None must be elided from the wire, got: {json}"
+        );
+
+        // All three stable gate states round-trip.
+        for gate in ["matched", "mismatched", "unknown"] {
+            let value = WearSamplingStatus {
+                state: WearSamplingState::Streaming,
+                last_capture_age_s: None,
+                uniform_reason: None,
+                bound_display: None,
+                granted_at_epoch_s: None,
+                source_gate: Some(gate.to_owned()),
+            };
+            let json = serde_json::to_string(&value).unwrap();
+            let expected = format!(r#""source_gate":"{gate}""#);
+            assert!(
+                json.contains(&expected),
+                "{gate} must serialize as {expected}, got: {json}"
+            );
+            let back: WearSamplingStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.source_gate, Some(gate.to_owned()));
         }
     }
 }

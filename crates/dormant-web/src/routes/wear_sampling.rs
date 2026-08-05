@@ -229,6 +229,10 @@ mod tests {
                 cancel: tokio_util::sync::CancellationToken::new(),
                 reload_timeout: std::time::Duration::from_secs(1),
                 wear_sampling_rx: tokio::sync::watch::channel(None).1,
+                per_display_statuses_rx: tokio::sync::watch::channel(
+                    std::collections::BTreeMap::new(),
+                )
+                .1,
             },
             ipc,
         ))
@@ -328,7 +332,7 @@ mod tests {
         );
     }
 
-    // ── #186 Task 19 — onboarding nudge dismiss endpoint ─────────────────
+    // ── onboarding nudge dismiss endpoint ─────────────────────────────────
     //
     // Mirrors the star-nudge dismiss discipline (same atomic tempfile+rename
     // with `create_new(true)`, same idempotent path) — the only thing that

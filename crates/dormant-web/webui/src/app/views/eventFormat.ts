@@ -41,6 +41,8 @@ export function badgeForEvent(ev: DaemonEvent): EventBadge {
       return { color: "var(--success)", bg: "color-mix(in oklab, var(--success) 14%, transparent)", label: "wake_recovered" };
     case "ownership":
       return { color: "var(--accent-warm)", bg: "var(--accent-warm-muted)", label: "ownership" };
+    case "wear_sampling_source_gate":
+      return { color: "var(--warning)", bg: "color-mix(in oklab, var(--warning) 14%, transparent)", label: "wear_sampling_source_gate" };
     default:
       return { color: "var(--text-muted)", bg: "var(--bg-sunken)", label: (ev as { event: string }).event };
   }
@@ -79,6 +81,17 @@ export function messageForEvent(ev: DaemonEvent): string {
     case "ownership": {
       const ver = ev.verified === true ? "✓" : ev.verified === false ? "✗" : "";
       return `${ev.display}: ${ev.cause} → ${ev.owned ? "ours" : "peer"} ${ver}${ev.degraded ? " degraded" : ""}`;
+    }
+    case "wear_sampling_source_gate": {
+      // The event log may surface the observed source label; the WearCard
+      // sentence stays stable and does not expose it. Unknown must not claim
+      // the TV is on another source. An unexpected `state` value (a future
+      // wire addition the TS union does not yet model) falls through to a
+      // JSON dump rather than the mismatched branch.
+      if (ev.state === "matched") return `${ev.display}: sampling source matched`;
+      if (ev.state === "unknown") return `${ev.display}: not sampling — TV source unavailable`;
+      if (ev.state === "mismatched") return `${ev.display}: not sampling — TV is on ${ev.observed ?? "another source"}`;
+      return JSON.stringify(ev);
     }
     default:
       return JSON.stringify(ev);

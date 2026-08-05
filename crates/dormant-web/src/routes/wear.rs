@@ -900,6 +900,54 @@ mod tests {
         assert!(by_id["orphan"].uniform_reason.is_none());
     }
 
+    #[tokio::test]
+    async fn per_display_source_gate_absent_in_populated_map_ignores_legacy_singular() {
+        // T11 review Should (carried forward): the sibling above pins the
+        // absent-in-populated-map guard with `legacy_singular: None`. This
+        // test pins the stronger property — when the per-display map is
+        // populated AND a legacy singular status IS present, a display
+        // absent from the map still yields `None` rather than inheriting
+        // the legacy fallback. The legacy status is bound to the ABSENT
+        // display ("orphan") so the test is meaningful: if the
+        // `per_display.is_empty()` guard were dropped, orphan would match
+        // on `bound_display` and inherit the legacy gate — this catches
+        // that regression.
+        let mut wear = HashMap::new();
+        wear.insert(
+            "tv".to_string(),
+            ledger_for("tv", "Living Room TV", PanelType::QdOled),
+        );
+        wear.insert(
+            "orphan".to_string(),
+            ledger_for("orphan", "Orphan Panel", PanelType::Unknown),
+        );
+        let mut per_display = BTreeMap::new();
+        per_display.insert("tv".to_string(), tv_mismatched_status());
+        // Legacy singular status bound to the ABSENT display — a broken
+        // fallback (no is_empty guard) would attribute this gate to orphan;
+        // the correct path returns None because the map is non-empty.
+        let legacy = dormant_core::wear::WearSamplingStatus {
+            state: dormant_core::wear::WearSamplingState::Streaming,
+            last_capture_age_s: Some(5),
+            uniform_reason: Some("source_mismatch".to_owned()),
+            bound_display: Some("orphan".to_owned()),
+            granted_at_epoch_s: Some(1_700_000_000),
+            source_gate: Some("mismatched".to_owned()),
+        };
+
+        let state =
+            test_state_with_sampling(wear, WearConfig::default(), BIND, per_display, Some(legacy));
+        let Json(resp) = get_wear(State(state)).await;
+        let by_id = by_config_id(&resp);
+
+        assert_eq!(by_id["tv"].source_gate.as_deref(), Some("mismatched"));
+        assert!(
+            by_id["orphan"].source_gate.is_none(),
+            "absent-in-populated-map must NOT inherit the legacy singular -> None"
+        );
+        assert!(by_id["orphan"].uniform_reason.is_none());
+    }
+
     // ── Router-level: guard + HTTP status ──────────────────────────────────
 
     #[tokio::test]

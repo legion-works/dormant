@@ -52,7 +52,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use dormant_core::config::schema::{Config, Credentials, DisplayConfig, DisplayScope, RuleConfig};
+use dormant_core::config::schema::{
+    Config, Credentials, DisplayConfig, DisplayScope, MqttCredential, RuleConfig, SensorConfig,
+};
 use dormant_core::config::{
     Strictness, ValidationError, Warning, load_config, load_config_from_bytes, load_credentials,
     load_credentials_from_bytes, validate_with_input_source_readers,
@@ -98,7 +100,7 @@ use crate::active_sampler::{
 use crate::boot_guard::{self, PromoteVerdict};
 use crate::coordination_poll::{self, CoordinationPollDeps};
 use crate::direct_switch::DirectSwitchHandle;
-use crate::hooks::HookEngine;
+use crate::hooks::{HookEngine, MqttPublisher};
 use crate::inhibit_activity::{self, ActivityRule};
 use crate::inhibit_audio::{self, AudioRule};
 use crate::macos_idle;
@@ -1947,6 +1949,108 @@ pub struct ValidationReport {
     pub load_error: Option<String>,
 }
 
+/// Resolve hook MQTT settings from the sensor plane first, falling back to the
+/// optional state-publish broker when no MQTT sensor is configured.
+fn hook_mqtt_config(cfg: &Config, creds: &Credentials) -> Option<(String, Option<MqttCredential>)> {
+    let broker_url = cfg
+        .sensors
+        .values()
+        .find_map(|sensor| match sensor {
+            SensorConfig::Mqtt(mqtt) => Some(mqtt.broker_url.clone()),
+            _ => None,
+        })
+        .or_else(|| cfg.publish.broker_url.clone());
+    broker_url.map(|url| {
+        let credential = creds.mqtt.get(&url).cloned();
+        (url, credential)
+    })
+}
+
+fn build_hook_publisher(cfg: &Config, creds: &Credentials) -> Arc<MqttPublisher> {
+    let (broker_url, credential) = hook_mqtt_config(cfg, creds).unwrap_or_else(|| {
+        tracing::debug!(
+            event = "hook_mqtt_broker_unconfigured",
+            "no MQTT broker configured; MQTT hook actions remain blocked by validation"
+        );
+        (String::new(), None)
+    });
+    Arc::new(MqttPublisher::new(broker_url, credential))
+}
+
+fn build_hook_engine(cfg: &Config, creds: &Credentials) -> Arc<HookEngine> {
+    Arc::new(HookEngine::new(build_hook_publisher(cfg, creds)))
+}
+
+#[cfg(test)]
+mod hook_publisher_tests {
+    use super::*;
+    use dormant_core::config::schema::{
+        AudioConfig, DaemonConfig, MqttSensorCfg, NotificationsConfig, WatchdogConfig, WearConfig,
+    };
+    use indexmap::IndexMap;
+
+    fn config() -> Config {
+        Config {
+            coordination: dormant_core::config::CoordinationConfig::default(),
+            config_version: 1,
+            daemon: DaemonConfig::default(),
+            sensors: IndexMap::new(),
+            zones: IndexMap::new(),
+            displays: IndexMap::new(),
+            rules: IndexMap::new(),
+            wear: WearConfig::default(),
+            notifications: NotificationsConfig::default(),
+            watchdog: WatchdogConfig::default(),
+            audio: AudioConfig::default(),
+            keymap: dormant_core::config::KeymapConfig::default(),
+            input_filter: dormant_core::config::InputFilterConfig::default(),
+            publish: dormant_core::config::PublishConfig::default(),
+        }
+    }
+
+    #[test]
+    fn hook_publisher_uses_first_sensor_broker_and_credentials() {
+        let mut cfg = config();
+        cfg.sensors.insert(
+            "presence".into(),
+            SensorConfig::Mqtt(MqttSensorCfg {
+                broker_url: "tcp://sensor-broker.example:1883".into(),
+                topic: "presence/room".into(),
+                field: "/occupancy".into(),
+                payload_on: None,
+                payload_off: None,
+                availability_topic: None,
+                availability_payload_online: "online".into(),
+                availability_payload_offline: "offline".into(),
+                kind: dormant_core::config::schema::SensorKind::Presence,
+                hold_time: None,
+                stale_timeout: None,
+            }),
+        );
+        cfg.publish.broker_url = Some("tcp://publish-broker.example:1883".into());
+        let mut creds = Credentials::default();
+        creds.mqtt.insert(
+            "tcp://sensor-broker.example:1883".into(),
+            MqttCredential {
+                username: "sensor-user".into(),
+                password: "sensor-password".into(),
+            },
+        );
+
+        let engine = build_hook_engine(&cfg, &creds);
+        let (broker_url, credential) = engine.mqtt_config();
+        assert_eq!(broker_url, "tcp://sensor-broker.example:1883");
+        assert_eq!(
+            credential.as_ref().map(|c| c.username.as_str()),
+            Some("sensor-user")
+        );
+        assert_eq!(
+            credential.as_ref().map(|c| c.password.as_str()),
+            Some("sensor-password")
+        );
+    }
+}
+
 impl ValidationReport {
     /// Whether the configuration is usable (no load error and no validation
     /// errors).
@@ -2726,7 +2830,7 @@ impl App {
             |state| Arc::new(CoordinationGate::new(state.clone())) as Arc<dyn OwnershipGate>,
         );
         let (config_tx, config_rx) = watch::channel(Arc::new(cfg_clone.clone()));
-        let (creds_tx, creds_rx) = watch::channel(Arc::new(creds_clone));
+        let (creds_tx, creds_rx) = watch::channel(Arc::new(creds_clone.clone()));
         let (executors_tx, executors_rx) = watch::channel(Arc::new(HashMap::new()));
         let (front_ctl_tx, front_ctl_rx) = mpsc::channel::<ControlMsg>(64);
 
@@ -2741,8 +2845,7 @@ impl App {
         // epochs, replay windows, TCP transport, claim-engine state machine).
         // Every write is verified against the semantic readback code; no
         // network, no peer identity.
-        let publisher = Arc::new(crate::hooks::MqttPublisher::new(String::new(), None));
-        let hook_engine = Arc::new(HookEngine::new(publisher));
+        let hook_engine = build_hook_engine(&cfg_clone, &creds_clone);
         let direct_switch = Arc::new(DirectSwitchHandle::new(
             executors_rx.clone(),
             config_rx.clone(),
@@ -4435,6 +4538,8 @@ impl Runner {
                 self.install_generation(spawn).await;
                 self.applied_revision = requested_revision.clone();
                 self.generation_id = next_generation;
+                self.direct_switch
+                    .reconfigure_hooks(build_hook_publisher(&new_cfg, &new_creds));
                 self.observations
                     .emit(DaemonObservation::GenerationStarted {
                         generation: self.generation_id,

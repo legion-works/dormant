@@ -83,7 +83,11 @@ dist = true
 # share/com.legionworks.dormant.plist — the SAME bytes `dormantctl launchd
 # install` embeds via include_bytes! (crates/dormantctl/src/cmd_launchd.rs),
 # so the archived file and the installed file are provably identical.
-include = ["share/com.legionworks.dormant.plist", "systemd/dormant.service"]
+include = [
+  "share/com.legionworks.dormant.plist",
+  "share/dormant.desktop",
+  "systemd/dormant.service",
+]
 # Printed by the shell installer on success. Tells operators the next step
 # without running anything on their behalf: neither `dormantctl launchd
 # install` nor `launchctl bootstrap` is safe to run unattended (it would

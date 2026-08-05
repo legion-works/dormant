@@ -127,6 +127,36 @@ systemctl --user status dormant
 journalctl --user -u dormant -f
 ```
 
+### Portal casting identity
+
+The daemon release archive also contains `dormant.desktop`. Install it in the
+user application directory so KDE and other portal backends can resolve the
+daemon's display name when presenting an active wear-sampling session:
+
+```bash
+mkdir -p ~/.local/share/applications
+
+# From source:
+install -Dm644 crates/dormantd/share/dormant.desktop \
+    ~/.local/share/applications/dormant.desktop
+
+# From a release tarball:
+tar -xf dormantd-x86_64-unknown-linux-gnu.tar.xz \
+    dormantd-x86_64-unknown-linux-gnu/dormant.desktop
+install -Dm644 dormantd-x86_64-unknown-linux-gnu/dormant.desktop \
+    ~/.local/share/applications/dormant.desktop
+```
+
+The entry is marked `NoDisplay=true`; it is identity metadata, not a launcher
+or an autostart entry. Refresh the desktop application database or log in
+again if the portal backend cached the old application list.
+
+Portal implementations that require the systemd application-unit convention
+(`app-<ApplicationID>-…`) may still need that unit naming in addition to the
+desktop entry. dormant keeps the shipped `dormant.service` name for upgrade
+compatibility, so this entry does not rename or replace the existing user
+service.
+
 The unit runs as `Type=notify`, restarts on failure, and uses a 150-second engine-liveness watchdog. Reload with `systemctl --user reload dormant`. To stop:
 
 ```bash

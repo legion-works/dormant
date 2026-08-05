@@ -128,7 +128,7 @@ stage_binary() {
     install -m 755 "$extracted_exe" "$PREFIX/bin/$app"
 }
 
-# Resolve a co-packaged FILE asset (e.g. the launchd plist) that ships in
+# Resolve a co-packaged FILE asset (e.g. the launchd plist or desktop entry) that ships in
 # the same "<app>-<triple>/" archive as an already-staged executable
 # (`stage_binary` must have already been called for $app). Only two exact,
 # manifest-informed candidate locations are tried, in this fixed order —
@@ -211,6 +211,12 @@ stage_file "dormantd" "$DAEMON_PLIST_NAME" "$STAGED_DAEMON_PLIST"
 # (it's a harmless 2 KB text file on macOS).
 STAGED_SERVICE="$WORKDIR/dormant.service"
 stage_file "dormantd" "dormant.service" "$STAGED_SERVICE"
+STAGED_DESKTOP="$WORKDIR/dormant.desktop"
+stage_file "dormantd" "dormant.desktop" "$STAGED_DESKTOP"
+grep -q '^Name=dormant$' "$STAGED_DESKTOP" \
+    || die "dormant.desktop has wrong Name"
+grep -q '^NoDisplay=true$' "$STAGED_DESKTOP" \
+    || die "dormant.desktop must set NoDisplay=true"
 
 case "$TARGET_TRIPLE" in
     *-apple-darwin)
@@ -270,10 +276,10 @@ assert_version "dormantctl"
 
 case "$TARGET_TRIPLE" in
     *-apple-darwin)
-        echo "release-artifact-smoke: dormantd, dormantctl, dormant-tray, $DAEMON_PLIST_NAME, $TRAY_PLIST_NAME ($TARGET_TRIPLE, $EXPECTED_VERSION) OK"
+        echo "release-artifact-smoke: dormantd, dormantctl, dormant-tray, $DAEMON_PLIST_NAME, $TRAY_PLIST_NAME, dormant.desktop ($TARGET_TRIPLE, $EXPECTED_VERSION) OK"
         ;;
     *-linux*)
-        echo "release-artifact-smoke: dormantd, dormantctl, dormant-tray, systemd units ($TARGET_TRIPLE, $EXPECTED_VERSION) OK"
+        echo "release-artifact-smoke: dormantd, dormantctl, dormant-tray, systemd units, dormant.desktop ($TARGET_TRIPLE, $EXPECTED_VERSION) OK"
         ;;
     *)
         echo "release-artifact-smoke: dormantd, dormantctl ($TARGET_TRIPLE, $EXPECTED_VERSION) OK"

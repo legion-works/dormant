@@ -98,6 +98,14 @@ impl SamplerStatus {
             SamplingState::Suspended => WearSamplingState::Suspended,
             SamplingState::Cooldown => WearSamplingState::Cooldown,
         };
+        // Redaction contract: only the STABLE GATE STATE STRING crosses
+        // the wire. The observed input source (Mismatched.observed) and the
+        // reason anchor (Unknown.reason) stay in transition events / logs
+        // — they can carry portal identifiers or operator-environment
+        // context and MUST NOT appear in a portable status. `None` here
+        // means "no gate configured" (a render-only monitor) and is
+        // serialized as a field-absent wire shape.
+        let source_gate = self.source_gate.as_ref().map(source_gate::SourceGate::tag);
         RedactedWearSamplingStatus {
             state,
             last_capture_age_s: self
@@ -106,6 +114,7 @@ impl SamplerStatus {
             uniform_reason: self.uniform_reason.map(str::to_owned),
             bound_display: self.bound_display.clone(),
             granted_at_epoch_s: self.granted_at.map(OffsetDateTime::unix_timestamp),
+            source_gate: source_gate.map(str::to_owned),
         }
     }
 }

@@ -181,7 +181,12 @@ pub enum WearSamplingStatus {
 /// Per-display redacted status entry for the multi-display aggregate.
 ///
 /// Token-free by construction; the wire shape carries only the lifecycle
-/// state and a stable reason for uniform attribution while degraded.
+/// state, a stable reason for uniform attribution while degraded, and the
+/// redacted source-gate state. `source_gate` is `None` for displays that
+/// carry no gate configuration (a render-only monitor, for example) — the
+/// runtime treats them as permanently matched and the field is elided from
+/// the wire. Wire-compat is preserved: payloads produced before the field
+/// was added deserialize with `source_gate: None`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WearSamplingStatusMapEntry {
     /// Current sampler lifecycle state for this display.
@@ -189,6 +194,11 @@ pub struct WearSamplingStatusMapEntry {
     /// Stable reason for uniform attribution while sampling is degraded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uniform_reason: Option<String>,
+    /// Stable, redacted source-gate state for this display: one of
+    /// `"matched"`, `"mismatched"`, or `"unknown"`. `None` means the
+    /// display carries no gate configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_gate: Option<String>,
 }
 
 /// Per-display sampler status keyed by configured display id. Serialized
@@ -882,6 +892,7 @@ mod tests {
             WearSamplingStatusMapEntry {
                 state: WearSamplingState::Streaming,
                 uniform_reason: None,
+                source_gate: None,
             },
         );
         map.insert(
@@ -889,6 +900,7 @@ mod tests {
             WearSamplingStatusMapEntry {
                 state: WearSamplingState::NeedsConsent,
                 uniform_reason: Some("wear_sampling_no_consent".to_owned()),
+                source_gate: None,
             },
         );
         let json = serde_json::to_string(&map).unwrap();
@@ -897,6 +909,14 @@ mod tests {
         assert!(
             desk_pos < tv_pos,
             "BTreeMap must serialize desk before tv, got: {json}"
+        );
+        // No-gate entries are wire-shaped WITHOUT a source_gate key —
+        // the same elision contract the singular WearSamplingStatus
+        // struct pins. Catches a stray `#[serde(serialize_always)]` or
+        // a future refactor that drops `skip_serializing_if`.
+        assert!(
+            !json.contains("source_gate"),
+            "no-gate map entry must elide source_gate from the wire, got: {json}"
         );
     }
 
@@ -946,6 +966,7 @@ mod tests {
             uniform_reason: None,
             bound_display: Some("desk".to_owned()),
             granted_at_epoch_s: Some(1_700_000_000),
+            source_gate: None,
         });
 
         let json = serde_json::to_value(response).unwrap();

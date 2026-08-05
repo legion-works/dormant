@@ -535,6 +535,7 @@ fn sampler_status_views(
             WearSamplingStatusMapEntry {
                 state: wire.state,
                 uniform_reason: wire.uniform_reason.clone(),
+                source_gate: wire.source_gate.clone(),
             },
         );
         redacted.push(wire);

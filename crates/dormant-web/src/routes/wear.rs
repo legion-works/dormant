@@ -275,6 +275,7 @@ mod tests {
             uniform_reason: None,
             bound_display: Some("desk".to_owned()),
             granted_at_epoch_s: Some(1_700_000_000),
+            source_gate: None,
         };
         let non_matching = dormant_core::wear::WearSamplingStatus {
             bound_display: Some("other".to_owned()),

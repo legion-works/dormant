@@ -171,6 +171,9 @@ fn render_table_with_sampling(
         if let Some(reason) = &sampling.uniform_reason {
             let _ = write!(out, " (uniform: {reason})");
         }
+        if let Some(gate) = &sampling.source_gate {
+            let _ = write!(out, " (source: {gate})");
+        }
         let _ = writeln!(out);
     }
 
@@ -333,6 +336,7 @@ mod tests {
             uniform_reason: None,
             bound_display: Some("desk".to_owned()),
             granted_at_epoch_s: Some(1_700_000_000),
+            source_gate: None,
         };
 
         let table = render_table_with_sampling(&canned_snapshot(), Some(&status));
@@ -347,6 +351,7 @@ mod tests {
             uniform_reason: None,
             bound_display: Some("desk".to_owned()),
             granted_at_epoch_s: Some(1_700_000_000),
+            source_gate: None,
         };
 
         let table = render_table_with_sampling(&canned_snapshot(), Some(&status));
@@ -361,10 +366,32 @@ mod tests {
             uniform_reason: Some("wear_sampling_suspended".to_owned()),
             bound_display: Some("desk".to_owned()),
             granted_at_epoch_s: None,
+            source_gate: None,
         };
 
         let table = render_table_with_sampling(&canned_snapshot(), Some(&status));
         assert!(table.contains("sampling: suspended (age: 7s) (uniform: wear_sampling_suspended)"));
+    }
+
+    /// TVS Task 10: the redacted source-gate state must surface on the
+    /// status line in the exact `(source: <gate>)` form. Pinned so a
+    /// future refactor can't silently drop the gate or change its token.
+    #[test]
+    fn source_gate_renders() {
+        let status = dormant_core::wear::WearSamplingStatus {
+            state: dormant_core::wear::WearSamplingState::Streaming,
+            last_capture_age_s: Some(95),
+            uniform_reason: None,
+            bound_display: Some("tv".to_owned()),
+            granted_at_epoch_s: Some(1_700_000_000),
+            source_gate: Some("mismatched".to_owned()),
+        };
+
+        let table = render_table_with_sampling(&canned_snapshot(), Some(&status));
+        assert!(
+            table.contains("sampling: streaming (age: 1m 35s) (source: mismatched)"),
+            "expected exact `sampling: streaming (age: 1m 35s) (source: mismatched)` line, got: {table}"
+        );
     }
 
     #[test]

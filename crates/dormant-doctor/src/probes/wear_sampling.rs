@@ -214,6 +214,7 @@ mod tests {
             uniform_reason: None,
             bound_display: Some("oled".into()),
             granted_at_epoch_s: None,
+            source_gate: None,
         }
     }
 
@@ -330,6 +331,7 @@ mod tests {
             uniform_reason: None,
             bound_display: Some(display.to_owned()),
             granted_at_epoch_s: None,
+            source_gate: None,
         }
     }
 

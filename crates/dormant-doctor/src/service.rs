@@ -858,6 +858,7 @@ mod tests {
                 uniform_reason: None,
                 bound_display: Some("desk".into()),
                 granted_at_epoch_s: None,
+                source_gate: None,
             },
         );
         statuses.insert(
@@ -868,6 +869,7 @@ mod tests {
                 uniform_reason: None,
                 bound_display: Some("tv".into()),
                 granted_at_epoch_s: None,
+                source_gate: None,
             },
         );
         let (statuses_tx, statuses_rx) = watch::channel(statuses);
@@ -940,6 +942,7 @@ mod tests {
                 uniform_reason: Some("token=persistent-id-should-not-leak".into()),
                 bound_display: Some("persistent-id-should-not-leak".into()),
                 granted_at_epoch_s: None,
+                source_gate: None,
             },
         );
         statuses.insert(
@@ -950,6 +953,7 @@ mod tests {
                 uniform_reason: Some("token=other-persistent-id".into()),
                 bound_display: Some("other-persistent-id".into()),
                 granted_at_epoch_s: None,
+                source_gate: None,
             },
         );
         let (statuses_tx, statuses_rx) = watch::channel(statuses);

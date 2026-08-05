@@ -19,8 +19,10 @@
 use axum::Json;
 use axum::extract::{Path, State};
 use dormant_core::wear::{
-    PanelType, WearAttributionMode, WearLedger, advisory_active, hours_since_effective_dwell,
+    PanelType, WearAttributionMode, WearLedger, WearSamplingStatus, advisory_active,
+    hours_since_effective_dwell,
 };
+use std::collections::BTreeMap;
 
 use crate::WebState;
 use crate::error::WebError;
@@ -70,6 +72,19 @@ pub(crate) struct WearSummary {
     /// Consent grant time when this display is content-weighted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) content_weighted_since: Option<i64>,
+    /// Stable source-gate tag for this display (`"matched"`, `"mismatched"`,
+    /// or `"unknown"`). `None` when the display carries no gate
+    /// configuration, or when no per-display status is selected for this
+    /// display (absent from a populated map). Additive: absent on the wire
+    /// when `None` so older UIs keep parsing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) source_gate: Option<String>,
+    /// Stable reason the current interval is uniform while sampling is
+    /// degraded (e.g. `"source_mismatch"`, `"source_unknown"`). Set only
+    /// when a status belonging to this display reports one. Additive:
+    /// absent on the wire when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) uniform_reason: Option<String>,
 }
 
 /// `GET /api/wear` response envelope.
@@ -117,13 +132,42 @@ fn summarize(
     ledger: &WearLedger,
     advisory_after: std::time::Duration,
     now_epoch_s: u64,
-    sampling: Option<&dormant_core::wear::WearSamplingStatus>,
+    per_display: &BTreeMap<String, WearSamplingStatus>,
+    legacy_singular: Option<&WearSamplingStatus>,
 ) -> WearSummary {
-    let content_weighted_since = sampling.and_then(|status| {
+    // Select this display's status by `config_display_id` — the same join
+    // key `content_weighted_since` uses, never wear-storage row order (#201
+    // display-name join bug class: the storage key may be panel identity,
+    // not the config display id). The per-display map is authoritative; the
+    // legacy singular status is a fallback ONLY when the map is empty. A
+    // display absent from a NON-empty map gets `None` (no gate, no reason)
+    // — falling back there would cross-attribute another display's gate.
+    let selected = ledger
+        .identity
+        .config_display_id
+        .as_deref()
+        .and_then(|id| per_display.get(id))
+        .or_else(|| {
+            if per_display.is_empty() {
+                // Empty map -> legacy singular fallback. The singular status
+                // belongs to this display only when its bound_display matches
+                // (uniform_reason is set solely for a status that belongs).
+                legacy_singular.filter(|s| {
+                    s.bound_display.as_deref() == ledger.identity.config_display_id.as_deref()
+                })
+            } else {
+                None
+            }
+        });
+
+    let content_weighted_since = selected.and_then(|status| {
         (status.bound_display.as_deref() == ledger.identity.config_display_id.as_deref())
             .then_some(status.granted_at_epoch_s)
             .flatten()
     });
+    let source_gate = selected.and_then(|s| s.source_gate.clone());
+    let uniform_reason = selected.and_then(|s| s.uniform_reason.clone());
+
     WearSummary {
         display: key.to_string(),
         display_name: ledger.identity.display_name.clone(),
@@ -151,6 +195,8 @@ fn summarize(
             WearAttributionMode::Uniform
         },
         content_weighted_since,
+        source_gate,
+        uniform_reason,
     }
 }
 
@@ -163,7 +209,8 @@ fn summarize(
 /// panic into an HTTP 500.
 pub(crate) async fn get_wear(State(state): State<WebState>) -> Json<WearListResponse> {
     let advisory_after = state.inner.config_rx.borrow().wear.advisory_after;
-    let sampling = state.inner.wear_sampling_rx.borrow().clone();
+    let per_display = state.inner.per_display_statuses_rx.borrow().clone();
+    let legacy_singular = state.inner.wear_sampling_rx.borrow().clone();
     let now = now_epoch_s();
 
     let Ok(guard) = state.inner.wear.read() else {
@@ -174,7 +221,16 @@ pub(crate) async fn get_wear(State(state): State<WebState>) -> Json<WearListResp
 
     let mut displays: Vec<WearSummary> = guard
         .iter()
-        .map(|(key, ledger)| summarize(key, ledger, advisory_after, now, sampling.as_ref()))
+        .map(|(key, ledger)| {
+            summarize(
+                key,
+                ledger,
+                advisory_after,
+                now,
+                &per_display,
+                legacy_singular.as_ref(),
+            )
+        })
         .collect();
     // Deterministic ordering for a stable UI list / test assertions.
     displays.sort_by(|a, b| a.display.cmp(&b.display));
@@ -203,8 +259,16 @@ pub(crate) async fn get_wear_detail(
         .get(&display)
         .ok_or_else(|| WebError::UnknownDisplay(display.clone()))?;
 
-    let sampling = state.inner.wear_sampling_rx.borrow().clone();
-    let summary = summarize(&display, ledger, advisory_after, now, sampling.as_ref());
+    let per_display = state.inner.per_display_statuses_rx.borrow().clone();
+    let legacy_singular = state.inner.wear_sampling_rx.borrow().clone();
+    let summary = summarize(
+        &display,
+        ledger,
+        advisory_after,
+        now,
+        &per_display,
+        legacy_singular.as_ref(),
+    );
     let cells: Vec<f64> = ledger.cells.iter().map(|c| c.wear_hours).collect();
     // Compute the max once and reuse it: it's the denominator the
     // heat map was normalized against, AND it's what the legend
@@ -233,7 +297,7 @@ mod tests {
     use dormant_core::config::schema::{Config, Credentials, DaemonConfig, WearConfig};
     use dormant_core::wear::{WearIdentity, WearLedger};
     use indexmap::IndexMap;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::{Arc, RwLock};
     use std::time::Duration;
@@ -286,13 +350,24 @@ mod tests {
             ..matching.clone()
         };
 
+        // Per-display map keyed by the ledger's config_display_id — the
+        // join the route uses. `non_matching` is keyed under "desk" but
+        // bound to "other", so the bound_display gate still suppresses
+        // content_weighted_since.
+        let map_for = |status: dormant_core::wear::WearSamplingStatus| {
+            let mut m = BTreeMap::new();
+            m.insert("desk".to_string(), status);
+            m
+        };
+
         assert_eq!(
             summarize(
                 "desk",
                 &ledger,
                 Duration::from_secs(1),
                 200,
-                Some(&matching)
+                &map_for(matching.clone()),
+                None
             )
             .content_weighted_since,
             Some(1_700_000_000)
@@ -303,7 +378,8 @@ mod tests {
                 &ledger,
                 Duration::from_secs(1),
                 200,
-                Some(&non_matching)
+                &map_for(non_matching),
+                None
             )
             .content_weighted_since
             .is_none()
@@ -314,7 +390,8 @@ mod tests {
                 &ledger,
                 Duration::from_secs(1),
                 200,
-                Some(&absent_consent)
+                &map_for(absent_consent),
+                None
             )
             .content_weighted_since
             .is_none()
@@ -325,6 +402,22 @@ mod tests {
         wear: HashMap<String, WearLedger>,
         wear_cfg: WearConfig,
         bind: SocketAddr,
+    ) -> WebState {
+        test_state_with_sampling(wear, wear_cfg, bind, BTreeMap::new(), None)
+    }
+
+    /// Like [`test_state_with`] but also injects the per-display sampler
+    /// status map and the legacy singular status. The per-display map is
+    /// the authoritative source the wear route joins on; the legacy
+    /// singular status is the fallback ONLY when the per-display map is
+    /// empty (issue #185 cycle B / Task 11).
+    #[allow(clippy::type_complexity)]
+    fn test_state_with_sampling(
+        wear: HashMap<String, WearLedger>,
+        wear_cfg: WearConfig,
+        bind: SocketAddr,
+        per_display: BTreeMap<String, dormant_core::wear::WearSamplingStatus>,
+        legacy_singular: Option<dormant_core::wear::WearSamplingStatus>,
     ) -> WebState {
         let (ctl_tx, _ctl_rx) = mpsc::channel::<dormant_core::rules::ControlMsg>(8);
         let (reload_trigger_tx, _reload_trigger_rx) =
@@ -372,7 +465,8 @@ mod tests {
                 web_bind: bind,
                 cancel,
                 reload_timeout: Duration::from_secs(10),
-                wear_sampling_rx: tokio::sync::watch::channel(None).1,
+                wear_sampling_rx: tokio::sync::watch::channel(legacy_singular).1,
+                per_display_statuses_rx: tokio::sync::watch::channel(per_display).1,
             },
         ))
     }
@@ -618,6 +712,192 @@ mod tests {
             Err(WebError::UnknownDisplay(name)) => assert_eq!(name, "bogus"),
             other => panic!("expected UnknownDisplay, got {other:?}"),
         }
+    }
+
+    // ── Per-display source gate (Task 11: per-display status watch) ────────
+
+    /// A TV whose source gate is mismatched (e.g. on Netflix, not our HDMI):
+    /// attribution degrades to uniform tagged `source_mismatch`.
+    fn tv_mismatched_status() -> dormant_core::wear::WearSamplingStatus {
+        dormant_core::wear::WearSamplingStatus {
+            state: dormant_core::wear::WearSamplingState::Streaming,
+            last_capture_age_s: Some(5),
+            uniform_reason: Some("source_mismatch".to_owned()),
+            bound_display: Some("tv".to_owned()),
+            granted_at_epoch_s: Some(1_700_000_000),
+            source_gate: Some("mismatched".to_owned()),
+        }
+    }
+
+    /// A monitor whose source gate is matched (the expected input).
+    fn monitor_matched_status() -> dormant_core::wear::WearSamplingStatus {
+        dormant_core::wear::WearSamplingStatus {
+            state: dormant_core::wear::WearSamplingState::Streaming,
+            last_capture_age_s: Some(5),
+            uniform_reason: None,
+            bound_display: Some("monitor".to_owned()),
+            granted_at_epoch_s: Some(1_700_000_000),
+            source_gate: Some("matched".to_owned()),
+        }
+    }
+
+    /// Ledger attributed to `[displays.<id>]` — the join key the per-display
+    /// status map is indexed by. `config_display_id` is set so selection is
+    /// by stable config id, never by wear-storage row order (#201).
+    fn ledger_for(id: &str, display_name: &str, panel_type: PanelType) -> WearLedger {
+        let mut ledger = WearLedger::new(
+            WearIdentity {
+                key: id.to_string(),
+                display_name: display_name.to_string(),
+                config_display_id: Some(id.to_string()),
+            },
+            panel_type,
+            2,
+            3,
+            now_epoch_s(),
+        );
+        ledger.attribute_uniform(Duration::from_secs(3600), 1.0);
+        ledger
+    }
+
+    /// Index a wear response by `config_display_id` so assertions are
+    /// independent of the (sorted) wire order.
+    fn by_config_id(resp: &WearListResponse) -> BTreeMap<&str, &WearSummary> {
+        resp.displays
+            .iter()
+            .map(|s| (s.config_display_id.as_deref().unwrap(), s))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn per_display_source_gate_maps_tv_mismatch_and_monitor_matched() {
+        let mut wear = HashMap::new();
+        wear.insert(
+            "tv".to_string(),
+            ledger_for("tv", "Living Room TV", PanelType::QdOled),
+        );
+        wear.insert(
+            "monitor".to_string(),
+            ledger_for("monitor", "Desk Monitor", PanelType::Woled),
+        );
+        let mut per_display = BTreeMap::new();
+        per_display.insert("tv".to_string(), tv_mismatched_status());
+        per_display.insert("monitor".to_string(), monitor_matched_status());
+
+        let state = test_state_with_sampling(wear, WearConfig::default(), BIND, per_display, None);
+        let Json(resp) = get_wear(State(state)).await;
+        let by_id = by_config_id(&resp);
+
+        assert_eq!(by_id["tv"].source_gate.as_deref(), Some("mismatched"));
+        assert_eq!(
+            by_id["tv"].uniform_reason.as_deref(),
+            Some("source_mismatch")
+        );
+        assert_eq!(by_id["monitor"].source_gate.as_deref(), Some("matched"));
+        assert!(
+            by_id["monitor"].uniform_reason.is_none(),
+            "matched gate must carry no uniform_reason"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_display_source_gate_independent_of_insertion_order() {
+        // Reverse both the ledger map and the status map insertion order.
+        // Selection is by config_display_id, not row order, so the mapping
+        // must be identical to the forward-order case.
+        let mut wear = HashMap::new();
+        wear.insert(
+            "monitor".to_string(),
+            ledger_for("monitor", "Desk Monitor", PanelType::Woled),
+        );
+        wear.insert(
+            "tv".to_string(),
+            ledger_for("tv", "Living Room TV", PanelType::QdOled),
+        );
+        let mut per_display = BTreeMap::new();
+        per_display.insert("monitor".to_string(), monitor_matched_status());
+        per_display.insert("tv".to_string(), tv_mismatched_status());
+
+        let state = test_state_with_sampling(wear, WearConfig::default(), BIND, per_display, None);
+        let Json(resp) = get_wear(State(state)).await;
+        let by_id = by_config_id(&resp);
+
+        assert_eq!(by_id["tv"].source_gate.as_deref(), Some("mismatched"));
+        assert_eq!(
+            by_id["tv"].uniform_reason.as_deref(),
+            Some("source_mismatch")
+        );
+        assert_eq!(by_id["monitor"].source_gate.as_deref(), Some("matched"));
+        assert!(by_id["monitor"].uniform_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn per_display_source_gate_legacy_singular_fallback_when_map_empty() {
+        // Per-display map empty -> legacy singular status is the fallback.
+        // The singular status is bound to "tv", so tv inherits its gate and
+        // reason; monitor does not belong (bound_display != config_display_id)
+        // and gets no gate — absent-in-empty-map falls back, absent-in-
+        // populated-map does not, but here the map is empty so the legacy
+        // slot is the only source.
+        let mut wear = HashMap::new();
+        wear.insert(
+            "tv".to_string(),
+            ledger_for("tv", "Living Room TV", PanelType::QdOled),
+        );
+        wear.insert(
+            "monitor".to_string(),
+            ledger_for("monitor", "Desk Monitor", PanelType::Woled),
+        );
+        let legacy = tv_mismatched_status();
+
+        let state = test_state_with_sampling(
+            wear,
+            WearConfig::default(),
+            BIND,
+            BTreeMap::new(),
+            Some(legacy),
+        );
+        let Json(resp) = get_wear(State(state)).await;
+        let by_id = by_config_id(&resp);
+
+        assert_eq!(by_id["tv"].source_gate.as_deref(), Some("mismatched"));
+        assert_eq!(
+            by_id["tv"].uniform_reason.as_deref(),
+            Some("source_mismatch")
+        );
+        assert!(
+            by_id["monitor"].source_gate.is_none(),
+            "monitor is not bound by the legacy singular status -> no gate"
+        );
+        assert!(by_id["monitor"].uniform_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn per_display_source_gate_absent_in_populated_map_is_none() {
+        // Trap guard: a display absent from a NON-empty per-display map gets
+        // no gate (NOT a legacy fallback). Only an EMPTY map falls back.
+        let mut wear = HashMap::new();
+        wear.insert(
+            "tv".to_string(),
+            ledger_for("tv", "Living Room TV", PanelType::QdOled),
+        );
+        wear.insert(
+            "orphan".to_string(),
+            ledger_for("orphan", "Orphan Panel", PanelType::Unknown),
+        );
+        let mut per_display = BTreeMap::new();
+        per_display.insert("tv".to_string(), tv_mismatched_status());
+
+        let state = test_state_with_sampling(wear, WearConfig::default(), BIND, per_display, None);
+        let Json(resp) = get_wear(State(state)).await;
+        let by_id = by_config_id(&resp);
+
+        assert_eq!(by_id["tv"].source_gate.as_deref(), Some("mismatched"));
+        assert!(
+            by_id["orphan"].source_gate.is_none(),
+            "absent-in-populated-map must NOT fall back to legacy -> None"
+        );
+        assert!(by_id["orphan"].uniform_reason.is_none());
     }
 
     // ── Router-level: guard + HTTP status ──────────────────────────────────

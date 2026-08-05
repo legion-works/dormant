@@ -3077,6 +3077,28 @@ impl App {
                         doctor: doctor_service.clone(),
                         wear: wear_handle.clone(),
                         wear_sampling_rx: web_sampling_rx,
+                        per_display_statuses_rx: {
+                            #[cfg(target_os = "linux")]
+                            {
+                                per_display_statuses_rx.clone()
+                            }
+                            // Feature-skew hotspot (project rule #2584): the
+                            // non-Linux build has no sampler registry, so the
+                            // per-display map is permanently empty. Construct
+                            // a fresh empty watch rather than reusing the
+                            // singular receiver or passing `None` — the field
+                            // is non-optional so the route's join logic stays
+                            // uniform across platforms.
+                            #[cfg(not(target_os = "linux"))]
+                            {
+                                tokio::sync::watch::channel(std::collections::BTreeMap::<
+                                    String,
+                                    dormant_core::wear::WearSamplingStatus,
+                                >::new(
+                                ))
+                                .1
+                            }
+                        },
                         web_bind: addr,
                         cancel: root.clone(),
                         reload_timeout: std::time::Duration::from_secs(10),

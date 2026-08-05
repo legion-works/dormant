@@ -978,6 +978,17 @@ export interface WearSummary {
   hours_since_long_dwell: number;
   wear_attribution_mode?: "uniform" | "sampled";
   content_weighted_since?: number | null;
+  /**
+   * Stable source-gate tag for this display (`"matched"`, `"mismatched"`, or
+   * `"unknown"`). Absent when the display has no gate configuration, or when
+   * no per-display status is selected for this display (absent from a
+   * populated map). Additive — older UIs keep parsing when this is absent. */
+  source_gate?: string | null;
+  /**
+   * Stable reason the current interval is uniform while sampling is degraded
+   * (e.g. `"source_mismatch"`, `"source_unknown"`). Set only when a status
+   * belonging to this display reports one. Additive — absent when `None`. */
+  uniform_reason?: string | null;
 }
 
 /** rust: routes/wear.rs — `GET /api/wear` response envelope. */

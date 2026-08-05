@@ -6,7 +6,7 @@
 //! `dormant-doctor`-owned type — no `dormantd`-local type, so there is
 //! no dependency cycle.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -112,6 +112,17 @@ pub struct WebStateInner {
     pub wear: WearHandle,
     /// Redacted daemon-owned active-sampling lifecycle status.
     pub wear_sampling_rx: watch::Receiver<Option<dormant_core::wear::WearSamplingStatus>>,
+    /// Per-display redacted sampler statuses (issue #185 cycle B / Task 11).
+    /// The daemon's sampler registry writes one entry per configured
+    /// display; `/api/wear` joins on `ledger.identity.config_display_id` to
+    /// attribute the right gate + uniform reason to each display. The
+    /// legacy singular [`wear_sampling_rx`](Self::wear_sampling_rx) is the
+    /// fallback ONLY when this map is empty — never when a display is
+    /// merely absent from a populated map. Off-Linux / no-sampler builds
+    /// carry an empty map (a fresh `watch::channel(BTreeMap::new())`), so
+    /// the route degrades to the legacy singular view there.
+    pub per_display_statuses_rx:
+        watch::Receiver<BTreeMap<String, dormant_core::wear::WearSamplingStatus>>,
 
     /// The socket address the web server is bound to.  Used by the
     /// security middleware to validate the Host header against the
@@ -235,6 +246,11 @@ pub struct WebStateInnerParams {
     pub doctor: DoctorService,
     pub wear: WearHandle,
     pub wear_sampling_rx: watch::Receiver<Option<dormant_core::wear::WearSamplingStatus>>,
+    /// Per-display sampler status watch — see
+    /// [`WebStateInner::per_display_statuses_rx`]. Off-Linux / no-sampler
+    /// call sites pass a fresh `watch::channel(BTreeMap::new()).1`.
+    pub per_display_statuses_rx:
+        watch::Receiver<BTreeMap<String, dormant_core::wear::WearSamplingStatus>>,
     pub web_bind: SocketAddr,
     pub cancel: CancellationToken,
     pub reload_timeout: Duration,
@@ -399,6 +415,7 @@ impl WebStateInner {
             doctor: params.doctor,
             wear: params.wear,
             wear_sampling_rx: params.wear_sampling_rx,
+            per_display_statuses_rx: params.per_display_statuses_rx,
             web_bind: params.web_bind,
             cancel: params.cancel,
             reload_timeout: params.reload_timeout,

@@ -375,6 +375,10 @@ mod tests {
                 cancel: cancel.clone(),
                 reload_timeout: Duration::from_secs(10),
                 wear_sampling_rx: tokio::sync::watch::channel(None).1,
+                per_display_statuses_rx: tokio::sync::watch::channel(
+                    std::collections::BTreeMap::new(),
+                )
+                .1,
             },
         ));
 
@@ -530,6 +534,10 @@ mod tests {
                 cancel: cancel.clone(),
                 reload_timeout: Duration::from_secs(10),
                 wear_sampling_rx: tokio::sync::watch::channel(None).1,
+                per_display_statuses_rx: tokio::sync::watch::channel(
+                    std::collections::BTreeMap::new(),
+                )
+                .1,
             },
         ));
 
@@ -657,6 +665,10 @@ mod tests {
                 cancel: cancel.clone(),
                 reload_timeout: Duration::from_secs(10),
                 wear_sampling_rx: tokio::sync::watch::channel(None).1,
+                per_display_statuses_rx: tokio::sync::watch::channel(
+                    std::collections::BTreeMap::new(),
+                )
+                .1,
             },
         ));
 
@@ -777,6 +789,10 @@ mod tests {
                 cancel: cancel.clone(),
                 reload_timeout: Duration::from_secs(10),
                 wear_sampling_rx: tokio::sync::watch::channel(None).1,
+                per_display_statuses_rx: tokio::sync::watch::channel(
+                    std::collections::BTreeMap::new(),
+                )
+                .1,
             },
         ));
 
@@ -948,6 +964,10 @@ mod tests {
                 cancel: cancel.clone(),
                 reload_timeout: Duration::from_secs(10),
                 wear_sampling_rx: tokio::sync::watch::channel(None).1,
+                per_display_statuses_rx: tokio::sync::watch::channel(
+                    std::collections::BTreeMap::new(),
+                )
+                .1,
             },
         ));
 
@@ -1125,6 +1145,10 @@ mod tests {
                 cancel: cancel.clone(),
                 reload_timeout: Duration::from_secs(10),
                 wear_sampling_rx: tokio::sync::watch::channel(None).1,
+                per_display_statuses_rx: tokio::sync::watch::channel(
+                    std::collections::BTreeMap::new(),
+                )
+                .1,
             },
         ));
 
@@ -1293,6 +1317,10 @@ mod tests {
                 cancel: cancel.clone(),
                 reload_timeout: Duration::from_secs(10),
                 wear_sampling_rx: tokio::sync::watch::channel(None).1,
+                per_display_statuses_rx: tokio::sync::watch::channel(
+                    std::collections::BTreeMap::new(),
+                )
+                .1,
             },
         ));
 
@@ -1529,6 +1557,10 @@ mod tests {
                 cancel: cancel.clone(),
                 reload_timeout: Duration::from_secs(10),
                 wear_sampling_rx: tokio::sync::watch::channel(None).1,
+                per_display_statuses_rx: tokio::sync::watch::channel(
+                    std::collections::BTreeMap::new(),
+                )
+                .1,
             },
         ));
 

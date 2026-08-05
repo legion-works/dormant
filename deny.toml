@@ -21,19 +21,29 @@ allow = [
   # not linked into the tray binary.
   "Zlib",
 ]
-# libmpv2 / libmpv2-sys declare license = "LGPL-2.1", which is a
-# deprecated SPDX expression in SPDX-3; cargo-deny's license parser
-# flags them as parse-errors and can't classify the crate against the
-# allow list.  The crates are LGPL-2.1 (equivalent to LGPL-2.1-only);
-# pinning the exception by crate name is the documented workaround for
-# unfixable upstream metadata.
+# libmpv2 / libmpv2-sys declare license = "LGPL-2.1" in their upstream
+# Cargo.toml — a deprecated SPDX expression that cargo-deny's parser flags
+# as a parse-error before the allow list is consulted.  A clarify block
+# overrides the manifest expression with the valid SPDX id (the deprecated
+# LGPL-2.1 maps to LGPL-2.1-only; the +/or-later postfix was separate),
+# and the exception permits it for these crates only.
+[[licenses.clarify]]
+crate = "libmpv2"
+expression = "LGPL-2.1-only"
+license-files = [{ path = "LICENSE", hash = 0x13b834cd }]
+
+[[licenses.clarify]]
+crate = "libmpv2-sys"
+expression = "LGPL-2.1-only"
+license-files = [{ path = "LICENSE", hash = 0x13b834cd }]
+
 [[licenses.exceptions]]
 crate = "libmpv2"
-allow = ["LGPL-2.1"]
+allow = ["LGPL-2.1-only"]
 
 [[licenses.exceptions]]
 crate = "libmpv2-sys"
-allow = ["LGPL-2.1"]
+allow = ["LGPL-2.1-only"]
 
 [[licenses.exceptions]]
 # Apache-2.0 superset with binary-attribution waiver, no copyleft; pulled in by pipewire→system-deps→cfg-expr.
@@ -59,8 +69,4 @@ ignore = [
   # MCCS capability database shipped in the crate, not user/network input);
   # dormant's own config format is TOML
   "RUSTSEC-2018-0005",
-  # quick-xml DOS vulns — wayland-scanner v0.31 pins quick-xml ^0.39; these are
-  # build-time codegen only (proc-macro), no runtime parse of untrusted XML
-  "RUSTSEC-2026-0194",
-  "RUSTSEC-2026-0195",
 ]

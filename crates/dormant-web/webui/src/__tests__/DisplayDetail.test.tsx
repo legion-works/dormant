@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import DisplayDetail from "../app/views/DisplayDetail";
-import { normalizeWearGrid } from "../app/components/WearHeatMap";
+import { normalizeWearGrid } from "../app/components/wearHeatMapGrid";
 import type { DisplayConfig, WearDetail } from "../api/types";
 
 const api = vi.hoisted(() => ({

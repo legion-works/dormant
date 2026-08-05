@@ -1,18 +1,7 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
-
-export interface SectionRegistration {
-  id: string;
-  title: string;
-  anchor: HTMLElement | null;
-}
-
-interface SectionRailContextValue {
-  register: (id: string, title: string, anchor: HTMLElement | null) => void;
-  unregister: (id: string, anchor: HTMLElement | null) => void;
-  sections: SectionRegistration[];
-}
-
-const SectionRailContext = createContext<SectionRailContextValue | null>(null);
+/** SectionRailProvider — owns the registration map and exposes it via the
+ * section-rail context defined in sectionRail.ts. */
+import { useCallback, useMemo, useRef, useState, type ReactNode } from "react";
+import { SectionRailContext, type SectionRegistration } from "./sectionRail";
 
 export function SectionRailProvider({ tab, children }: { tab: string; children: ReactNode }) {
   const registrations = useRef(new Map<string, SectionRegistration>());
@@ -38,26 +27,4 @@ export function SectionRailProvider({ tab, children }: { tab: string; children: 
   const value = useMemo(() => ({ register, unregister, sections }), [register, unregister, sections]);
 
   return <SectionRailContext.Provider value={value}>{children}</SectionRailContext.Provider>;
-}
-
-export function useRegisterSection(
-  id: string,
-  title: string,
-  anchor: HTMLElement | RefObject<HTMLElement | null> | null,
-) {
-  const context = useContext(SectionRailContext);
-  const register = context?.register;
-  const unregister = context?.unregister;
-  useEffect(() => {
-    if (!register || !unregister) return;
-    const anchorElement = anchor && "current" in anchor ? anchor.current : anchor;
-    register(id, title, anchorElement);
-    return () => unregister(id, anchorElement);
-  }, [anchor, register, unregister, id, title]);
-}
-
-export function useRegisteredSections() {
-  const context = useContext(SectionRailContext);
-  if (!context) throw new Error("useRegisteredSections must be used inside SectionRailProvider");
-  return context.sections;
 }

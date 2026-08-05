@@ -227,6 +227,10 @@ pub struct ActiveSamplerDeps {
     /// Source-gate poll reader. `None` for displays without a configured gate;
     /// the runtime then treats every capture as unconditionally matched.
     pub source_reader: Option<Arc<dyn source_gate::InputSourceReader>>,
+    /// Port-8001 app-visibility probe passed to every `SourceGatePoller`
+    /// the runtime spawns. `None` for displays without `watched_apps` — the
+    /// poller skips the 8001 cycle entirely (issue #232).
+    pub apps_probe: Option<Arc<dyn source_gate::AppVisibilityProbe>>,
     /// Secure persisted portal-consent record path.
     pub consent_path: PathBuf,
     /// Daemon shutdown signal.
@@ -297,6 +301,7 @@ fn build_gate_expectation(
         host: host.clone(),
         expected_source: expected_source.clone(),
         poll_interval: sampling.source_poll_interval,
+        watched_apps: Arc::from(sampling.watched_apps.clone()),
     })
 }
 
@@ -427,6 +432,10 @@ struct Runtime {
     /// Cached on `Runtime` so the `expectation`-only paths do not need to
     /// thread the reader through every call site.
     source_reader: Option<Arc<dyn source_gate::InputSourceReader>>,
+    /// Port-8001 app-visibility probe passed to every `SourceGatePoller`
+    /// the runtime spawns. `None` for render-only displays; the gate then
+    /// skips the app-overlay check entirely (issue #232).
+    apps_probe: Option<Arc<dyn source_gate::AppVisibilityProbe>>,
     /// Latest source-gate observation published to the status channel.
     gate_state: Option<source_gate::SourceGate>,
     /// Last gate value published on the additive `DaemonEvent` channel.
@@ -512,6 +521,7 @@ impl Runtime {
             gate_poller: None,
             gate_rx: None,
             source_reader: None,
+            apps_probe: None,
             gate_state: None,
             last_event_gate: None,
             capture_sequence: 0,
@@ -1027,6 +1037,13 @@ async fn apply_update_with_effects(
     if runtime.source_reader.is_none() && runtime.display.source_gate_expectation.is_some() {
         runtime.source_reader = Some(source_gate::build_default_reader());
     }
+    // App-visibility probe is per-runtime so a runtime that grows an
+    // expectation with `watched_apps` mid-flight gets a working probe
+    // without coordinated hand-off. `None` means no catalog
+    // configured — the poller skips the 8001 cycle entirely.
+    if runtime.apps_probe.is_none() && runtime.display.source_gate_expectation.is_some() {
+        runtime.apps_probe = Some(source_gate::build_default_app_probe());
+    }
     // Source-gate expectation may have swapped with the new context;
     // reconcile so the next Streaming tick spawns a poller bound to the
     // fresh expectation. The helper itself is also responsible for
@@ -1179,7 +1196,11 @@ fn reconcile_gate_poller(runtime: &mut Runtime, status_tx: &watch::Sender<Sample
     if runtime.gate_poller.take().is_some() {
         runtime.gate_rx = None;
     }
-    let poller = source_gate::SourceGatePoller::spawn(reader, expectation.clone());
+    let poller = source_gate::SourceGatePoller::spawn(
+        reader,
+        runtime.apps_probe.clone(),
+        expectation.clone(),
+    );
     let mut rx = poller.subscribe();
     // Reset both the live observation and the dedup anchor BEFORE
     // seeding — and do NOT pre-assign `gate_state`:
@@ -1344,6 +1365,7 @@ async fn run(
     let mut runtime = Runtime::new(&deps.initial_config, &deps.consent_path, &deps.display_id);
     runtime.event_tx = deps.event_tx.take();
     runtime.source_reader = deps.source_reader.take();
+    runtime.apps_probe = deps.apps_probe.take();
     // Rebind the cached grid map to the SHARED daemon-lifetime map.
     // `Runtime::new` cannot receive it (tests construct `Runtime`
     // literally), so without this handoff `reconcile_gate_poller`'s
@@ -2914,6 +2936,7 @@ mod tests {
                 latest_grids: latest_grids.clone(),
                 source: Box::new(source),
                 source_reader: None,
+                apps_probe: None,
                 consent_path,
                 cancel,
                 env_reader: test_env_reader,
@@ -3376,6 +3399,7 @@ mod tests {
             latest_grids: new_latest_grids(),
             source: Box::new(source),
             source_reader: None,
+            apps_probe: None,
             consent_path,
             cancel: cancel.clone(),
             env_reader: test_env_reader,
@@ -4005,6 +4029,7 @@ mod tests {
             latest_grids: new_latest_grids(),
             source: Box::new(ScriptedCaptureSource::with_pending_consent()),
             source_reader: None,
+            apps_probe: None,
             consent_path,
             cancel: cancel.clone(),
             env_reader: test_env_reader,
@@ -4424,6 +4449,7 @@ mod tests {
             latest_grids: new_latest_grids(),
             source: Box::new(source),
             source_reader: None,
+            apps_probe: None,
             consent_path: consent_path.clone(),
             cancel: cancel.clone(),
             env_reader: test_env_reader,
@@ -4545,6 +4571,7 @@ mod tests {
             latest_grids: new_latest_grids(),
             source: Box::new(ScriptedCaptureSource::with_pending_consent()),
             source_reader: None,
+            apps_probe: None,
             consent_path: consent_path.clone(),
             cancel: cancel.clone(),
             env_reader: test_env_reader,
@@ -5242,6 +5269,7 @@ mod tests {
             latest_grids: new_latest_grids(),
             source: Box::new(source),
             source_reader: None,
+            apps_probe: None,
             consent_path,
             cancel: cancel.clone(),
             env_reader: test_env_reader,
@@ -5317,6 +5345,7 @@ mod tests {
             latest_grids: latest_grids.clone(),
             source,
             source_reader: None,
+            apps_probe: None,
             consent_path,
             cancel: cancel.clone(),
             env_reader: test_env_reader,
@@ -5392,6 +5421,7 @@ mod tests {
                     expected_source: Some("HDMI4".to_owned()),
                     source_poll_interval: Duration::from_secs(2),
                     stream_mode: None,
+                    watched_apps: Vec::new(),
                 }),
             },
         );
@@ -5463,6 +5493,7 @@ mod tests {
             latest_grids: new_latest_grids(),
             source,
             source_reader: Some(reader),
+            apps_probe: None,
             consent_path: tv_path,
             cancel: cancel.clone(),
             env_reader: test_env_reader,
@@ -5798,6 +5829,7 @@ mod tests {
                 [Ok("HDMI4".to_owned())],
                 Ok("HDMI4".to_owned()),
             ))),
+            apps_probe: None,
             consent_path: tv_path,
             cancel: cancel.clone(),
             env_reader: test_env_reader,
@@ -5841,6 +5873,7 @@ mod tests {
                     host: "tv.local".to_owned(),
                     expected_source: "HDMI4".to_owned(),
                     poll_interval: Duration::from_secs(2),
+                    watched_apps: Arc::new([]),
                 }),
                 stream_mode: None,
             }))
@@ -5939,6 +5972,7 @@ mod tests {
             // itself when the late DisplayContext arrives (or the gate
             // silently never runs).
             source_reader: None,
+            apps_probe: None,
             consent_path: tv_path,
             cancel: cancel.clone(),
             env_reader: test_env_reader,
@@ -5965,6 +5999,7 @@ mod tests {
                     host: "tv.local".to_owned(),
                     expected_source: "HDMI4".to_owned(),
                     poll_interval: Duration::from_secs(2),
+                    watched_apps: Arc::new([]),
                 }),
                 stream_mode: None,
             }))
@@ -6051,6 +6086,7 @@ mod tests {
             // The poll can never answer: any grid clear observed after
             // the gate add MUST have come from the seed publish.
             source_reader: Some(Arc::new(PendingSourceReader)),
+            apps_probe: None,
             consent_path: tv_path,
             cancel: cancel.clone(),
             env_reader: test_env_reader,
@@ -6085,6 +6121,7 @@ mod tests {
                     host: "tv.local".to_owned(),
                     expected_source: "HDMI4".to_owned(),
                     poll_interval: Duration::from_secs(2),
+                    watched_apps: Arc::new([]),
                 }),
                 stream_mode: None,
             }))
@@ -6185,6 +6222,7 @@ mod tests {
             latest_grids: new_latest_grids(),
             source,
             source_reader: Some(reader),
+            apps_probe: None,
             consent_path: tv_path,
             cancel: cancel.clone(),
             env_reader: test_env_reader,
@@ -6217,6 +6255,7 @@ mod tests {
                     host: "tv.local".to_owned(),
                     expected_source: "HDMI4".to_owned(),
                     poll_interval: Duration::from_secs(2),
+                    watched_apps: Arc::new([]),
                 }),
                 stream_mode: None,
             }))
@@ -6310,6 +6349,7 @@ mod tests {
             latest_grids: new_latest_grids(),
             source,
             source_reader: Some(reader),
+            apps_probe: None,
             consent_path: tv_path,
             cancel: cancel.clone(),
             env_reader: test_env_reader,
@@ -6422,6 +6462,7 @@ mod tests {
             latest_grids: latest.clone(),
             source,
             source_reader: Some(reader),
+            apps_probe: None,
             consent_path: consent_path.to_path_buf(),
             cancel: cancel.clone(),
             env_reader: test_env_reader,
@@ -6489,6 +6530,7 @@ mod tests {
             latest_grids: new_latest_grids(),
             source: Box::new(aoc_inner),
             source_reader: None,
+            apps_probe: None,
             consent_path: aoc_path,
             cancel: cancel.clone(),
             env_reader: test_env_reader,
@@ -6548,6 +6590,7 @@ mod tests {
                 [Ok("HDMI4".to_owned())],
                 Ok("HDMI4".to_owned()),
             ))),
+            apps_probe: None,
             consent_path: tv_path,
             cancel: cancel.clone(),
             env_reader: test_env_reader,
@@ -6582,6 +6625,7 @@ mod tests {
                     host: "tv.local".to_owned(),
                     expected_source: "HDMI2".to_owned(),
                     poll_interval: Duration::from_secs(2),
+                    watched_apps: Arc::new([]),
                 }),
                 stream_mode: None,
             }))
@@ -6743,6 +6787,7 @@ mod tests {
                     expected_source: Some("HDMI4".to_owned()),
                     source_poll_interval: Duration::from_secs(2),
                     stream_mode: Some(StreamMode::PerTick),
+                    watched_apps: Vec::new(),
                 }),
             },
         );
@@ -6841,6 +6886,7 @@ mod tests {
             latest_grids: new_latest_grids(),
             source: Box::new(monitor_source),
             source_reader: None,
+            apps_probe: None,
             consent_path: monitor_path.clone(),
             cancel: cancel_monitor.clone(),
             env_reader: test_env_reader,
@@ -6853,6 +6899,7 @@ mod tests {
             latest_grids: new_latest_grids(),
             source: Box::new(tv_source),
             source_reader: None,
+            apps_probe: None,
             consent_path: tv_path.clone(),
             cancel: cancel_tv.clone(),
             env_reader: test_env_reader,

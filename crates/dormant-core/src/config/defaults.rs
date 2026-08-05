@@ -263,6 +263,28 @@ pub const WEAR_ACTIVE_SAMPLING_CIRCUIT_RESET_AFTER: Duration = Duration::from_se
 /// bounds but the wearable-stream probe is allowed to drift a bit slower.
 pub const WEAR_SOURCE_POLL_INTERVAL: Duration = Duration::from_secs(15);
 
+/// Default `watched_apps` seed for the source gate — the minimal shipped
+/// catalog of Tizen app ids the active-sampling gate probes for screen
+/// ownership via `GET /api/v2/applications/<id>` on port 8001. Operators
+/// should extend `[displays.<id>.sampling].watched_apps` for their installed
+/// set; no current Tizen firmware exposes a reliable enumeration
+/// endpoint, so a shipped seed plus a user-extensible list is the only
+/// honest compromise (see issue #232). The list is intentionally
+/// conservative — common streaming apps, no narrow-app guesses.
+pub const WEAR_SAMPLING_DEFAULT_WATCHED_APPS: &[&str] = &[
+    // Major streamers — observed via Home Assistant's samsungtv integration
+    // community catalog and live-drilled against the operator's S90D.
+    "111299001912",  // Netflix (Tizen app id, 2020+ firmware)
+    "3201512006963", // YouTube
+    "3201909017643", // Prime Video
+    "3201906019443", // Disney+
+    "3201612006753", // Apple TV
+    "3201601007223", // Hulu
+    "3201504001991", // Plex
+    // Smart-home dashboards often launch fullscreen.
+    "3201905017643", // SmartThings dashboard (best-effort)
+];
+
 // ── [notifications] section defaults ────────────────────────────────────────
 
 /// Whether wake-failure notifications are enabled by default.

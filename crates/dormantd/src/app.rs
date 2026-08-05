@@ -191,7 +191,10 @@ fn active_sampler_display_context(
 /// `[displays.<id>.sampling]` table — only when an `expected_source` is
 /// configured together with the display's network `host` (the poller
 /// target). Returns `None` for render-only displays; the runtime then
-/// treats the gate as permanently matched.
+/// treats the gate as permanently matched. The optional
+/// `[displays.<id>.sampling].watched_apps` catalog rides on the same
+/// expectation so the gate can detect screen-ownership by Tizen apps
+/// that do not flip `inputSourceControl` (issue #232).
 #[cfg(target_os = "linux")]
 fn build_active_sampler_gate_expectation(
     display_config: &DisplayConfig,
@@ -203,6 +206,7 @@ fn build_active_sampler_gate_expectation(
         host: host.clone(),
         expected_source: expected_source.clone(),
         poll_interval: sampling.source_poll_interval,
+        watched_apps: std::sync::Arc::from(sampling.watched_apps.clone()),
     })
 }
 
@@ -467,6 +471,11 @@ async fn spawn_active_sampler_runtime(
     // an already-running runtime can still wire a poller — the
     // operator's late config change isn't silently swallowed.
     let source_reader = Some(active_sampler::source_gate::build_default_reader());
+    // Probe is eagerly built so a configured `watched_apps` catalog gets
+    // exercised from the first poll, even when the operator added the
+    // catalog late via reload. Stays dormant in `Runtime::new` until the
+    // gate expectation actually has apps configured.
+    let apps_probe = Some(active_sampler::source_gate::build_default_app_probe());
     let consent_path = migrate_legacy_consent(state_dir, &cfg, &display_id);
     let (updates, update_rx) = mpsc::channel::<SamplerUpdate>(16);
     let cancel = sampler_cancellation_token(root);
@@ -477,6 +486,7 @@ async fn spawn_active_sampler_runtime(
         latest_grids: latest_grids.clone(),
         source: Box::new(source),
         source_reader,
+        apps_probe,
         consent_path,
         cancel: cancel.clone(),
         env_reader: crate::active_sampler::production_env_reader,

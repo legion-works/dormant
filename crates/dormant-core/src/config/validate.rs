@@ -322,7 +322,12 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
     ),
     (
         "displays..sampling",
-        &["expected_source", "source_poll_interval", "stream_mode"],
+        &[
+            "expected_source",
+            "source_poll_interval",
+            "stream_mode",
+            "watched_apps",
+        ],
     ),
     // ── displays.<id>.screensaver ─────────────────────────────────────────
     (
@@ -1617,6 +1622,32 @@ fn validate_display_with_input_source_readers(
                 detail: format!(
                     "display '{display_id}' sampling.source_poll_interval {:?} is out of range — allowed: 5s..=300s",
                     sampling.source_poll_interval
+                ),
+            });
+        }
+        // watched_apps entries must be non-empty (Tizen app ids are
+        // numeric strings); duplicates collapse to a single per-id probe
+        // but the validator rejects them so the operator's catalog stays
+        // grep-stable and the visible-app trace logs read consistently.
+        for (index, app_id) in sampling.watched_apps.iter().enumerate() {
+            if app_id.trim().is_empty() {
+                errors.push(ValidationError {
+                    what: crate::error::E_CONFIG_INVALID.into(),
+                    detail: format!(
+                        "display '{display_id}' sampling.watched_apps[{index}] must not be empty"
+                    ),
+                });
+            }
+        }
+        let mut seen: HashSet<&str> = HashSet::new();
+        for app_id in &sampling.watched_apps {
+            seen.insert(app_id.as_str());
+        }
+        if seen.len() != sampling.watched_apps.len() {
+            errors.push(ValidationError {
+                what: crate::error::E_CONFIG_INVALID.into(),
+                detail: format!(
+                    "display '{display_id}' sampling.watched_apps contains duplicate entries"
                 ),
             });
         }

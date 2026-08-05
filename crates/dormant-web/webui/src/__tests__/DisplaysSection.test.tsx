@@ -7,9 +7,12 @@
  *
  * DisplaySamplingEditor — per-display compositor-sampling fields
  * (compositor_output + the [displays.<id>.sampling] table: expected_source,
- * source_poll_interval, stream_mode). Streams overrides fall back to the
- * global wear.active_sampling.stream_mode when unset; the editor surfaces
- * this as an "Inherit global" select choice.
+ * source_poll_interval, stream_mode, watched_apps). Stream overrides fall
+ * back to the global wear.active_sampling.stream_mode when unset; the
+ * editor surfaces this as an "Inherit global" select choice.
+ * `watched_apps` is the port-8001 Tizen app id catalog the source gate
+ * probes each poll cycle (issue #232) — empty disables the app-visibility
+ * check and reverts to the daemon-shipped seed catalog.
  */
 import { describe, it, expect, afterEach } from "vitest";
 import { render, screen, waitFor, fireEvent, cleanup, act } from "@testing-library/react";
@@ -340,6 +343,73 @@ describe("DisplaysSection — DisplaySamplingEditor (display source-gate fields)
     expect((screen.getByLabelText("expected_source") as HTMLInputElement).value).toBe("HDMI4");
     expect((screen.getByLabelText("source_poll_interval") as HTMLInputElement).value).toBe("15s");
     expect((screen.getByLabelText("stream_mode") as HTMLSelectElement).value).toBe("warm");
+  });
+
+  // watched_apps is the port-8001 Tizen app catalog the source gate
+  // probes each poll cycle (issue #232). The editor surfaces it as a
+  // StringListField with the same `remove`-on-empty invariant the
+  // other optional fields use. The seed test below confirms the editor
+  // picks up the fetched list verbatim; the add/remove round-trip is
+  // exercised through the StringListField component's own test suite.
+  it("seeds watched_apps from the fetched sampling table", () => {
+    renderTv({
+      sampling: {
+        expected_source: "HDMI4",
+        source_poll_interval: "15s",
+        stream_mode: "warm",
+        watched_apps: ["111299001912", "3201512006963"],
+      },
+    });
+    // Use the textbox role + matching label — the `aria-label="Remove
+    // watched_apps item N"` button also matches the broader regex, so
+    // we narrow to the per-item edit input by role.
+    const items = screen.getAllByRole("textbox", { name: /watched_apps item/i });
+    expect(items).toHaveLength(2);
+    expect((items[0] as HTMLInputElement).value).toBe("111299001912");
+    expect((items[1] as HTMLInputElement).value).toBe("3201512006963");
+  });
+
+  it("emits a remove patch when the last watched_apps entry is removed", () => {
+    // Initial seed: a single app id; removing it (last entry) must
+    // promote to a `remove` patch so the operator's catalog reverts to
+    // the daemon-shipped seed (defaults::WEAR_SAMPLING_DEFAULT_WATCHED_APPS).
+    // The seed is the fail-safe default applied by the serde default fn;
+    // removing the explicit list hands the field back to the seed and
+    // restores out-of-the-box app detection.
+    const store = renderTv({
+      sampling: {
+        expected_source: "HDMI4",
+        source_poll_interval: "15s",
+        stream_mode: "warm",
+        watched_apps: ["111299001912"],
+      },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /remove watched_apps item 1/i }));
+    expect(store.buildPatches()).toContainEqual({
+      op: "remove",
+      path: ["displays", "tv", "sampling", "watched_apps"],
+    });
+  });
+
+  it("renders watched_apps with an empty input when the fetched config omits the field", () => {
+    // The TS editor reflects only what the server sent — when the
+    // field is absent, the seed is invisible to the operator (this is
+    // the documented UX: operators see the seed through the help text,
+    // not the input field). Adding an entry promotes the field to an
+    // explicit list; the seed is then overridden (per the serde
+    // default-fn contract — explicit values beat defaults).
+    renderTv({
+      sampling: {
+        expected_source: "HDMI4",
+        source_poll_interval: "15s",
+        stream_mode: "warm",
+      },
+    });
+    const items = screen.queryAllByRole("textbox", { name: /watched_apps item/i });
+    expect(items).toHaveLength(0);
+    // Help text surfaces the seeded-default behavior + opt-out signal.
+    expect(screen.getByText(/opt-out/i)).toBeInTheDocument();
+    expect(screen.getByText(/daemon-shipped seed/i)).toBeInTheDocument();
   });
 
   // Clearing a touched text field must emit a remove patch, NOT set "".

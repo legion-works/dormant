@@ -704,17 +704,35 @@ export interface LadderStage {
 /** rust: config/schema.rs DisplaySamplingConfig — per-display compositor
  * sampling declaration (`[displays.<id>.sampling]` TOML table).
  *
- * All three fields are optional — the table is opt-in. `source_poll_interval`
+ * All fields are optional — the table is opt-in. `source_poll_interval`
  * defaults server-side to `defaults::WEAR_SOURCE_POLL_INTERVAL` (15s); the
  * TS mirror leaves it `undefined` so the operator can clear/override it
  * explicitly. `stream_mode` reuses the same `StreamMode` enum the wear path
  * uses (kebab-case `warm` / `per-tick`); absent means "inherit the global
  * wear.active_sampling.stream_mode" and the editor surfaces an explicit
- * "Inherit global" choice in the select. */
+ * "Inherit global" choice in the select.
+ *
+ * `watched_apps` semantics (issue #232):
+ * - When the key is **absent** on the wire, the server-side serde
+ *   default fn seeds it with `defaults::WEAR_SAMPLING_DEFAULT_WATCHED_APPS`
+ *   (the fail-safe direction: a stock TV config suspends spatial
+ *   attribution under installed streaming apps out of the box).
+ * - When the key is present as an empty array `[]`, the operator has
+ *   opted out — pure input-only gate, no app-visibility probe.
+ * - When the key is present as a non-empty array, that list overrides
+ *   the seed (the operator's catalog is authoritative).
+ *
+ * The TS mirror surfaces `undefined` for the absent case and an array
+ * for the present case; the editor renders empty for both — it does NOT
+ * pre-populate the seed (the daemon's seeded list is documented in
+ * `docs/src/active-wear-sampling.md` and reflected in the field's help
+ * text). Operators who want to extend the seed list must declare an
+ * explicit array. */
 export interface DisplaySamplingConfig {
   expected_source?: string | null;
   source_poll_interval?: string;
   stream_mode?: "warm" | "per-tick" | null;
+  watched_apps?: string[] | null;
 }
 
 /** rust: config/schema.rs ScreensaverSource */

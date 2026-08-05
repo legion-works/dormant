@@ -118,6 +118,19 @@ function WearRow({
               ? "Sampling degraded"
               : "Sampling unavailable";
 
+  // Source-gate copy (Task 12): the gate comes from `WearSummary.source_gate`
+  // (the per-display sampler status), DISTINCT from the consent
+  // `WearSamplingStatus` that drives `samplingLabel` above. Only mismatched
+  // and unknown gates render a dedicated line; matched and no-gate fall
+  // through to the normal sampling label so the monitor row stays unchanged.
+  // Unknown must not claim the TV is on another source.
+  const sourceGateCopy =
+    summary.source_gate === "mismatched"
+      ? "not sampling — TV is on another source"
+      : summary.source_gate === "unknown"
+        ? "not sampling — TV source unavailable"
+        : null;
+
   const age = summary.last_sample_at_epoch_s;
   const ageText =
     age === undefined || age === null
@@ -147,6 +160,14 @@ function WearRow({
       {samplingEnabled && (
         <div className="wear-row__sampling">
           <span className="wear-row__sampling-state">{samplingLabel}</span>
+          {sourceGateCopy && (
+            <div
+              className="wear-row__tone wear-row__tone--warning"
+              data-testid={`wear-row-source-gate-${summary.display_name}`}
+            >
+              {sourceGateCopy}
+            </div>
+          )}
           <span>{ageText}</span>
           {samplingStatus?.status === "error" && !needsConsent && samplingStatus.reason && (
             <span className="wear-row__sampling-reason">{samplingStatus.reason}</span>

@@ -442,6 +442,15 @@ export function LiveStateProvider({ children }: { children: ReactNode }) {
             void refreshWear();
             return prev;
           }
+          case "wear_sampling_source_gate": {
+            // Source-gate transition: the gate state lives in GET /api/wear's
+            // `source_gate` field, not in StateSnapshot. Refetch the wear list
+            // via the existing reconciliation path so the row picks up the new
+            // gate; the snapshot itself is unchanged. No in-memory patch —
+            // the summary is the truth (mirrors wear_snapshot/compensation_advisory).
+            void refreshWear();
+            return prev;
+          }
           default:
             return prev;
         }

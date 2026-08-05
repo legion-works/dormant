@@ -61,6 +61,7 @@ export const DAEMON_EVENT_TAGS = [
   "wake_recovered",
   "ownership",
   "operations_changed",
+  "wear_sampling_source_gate",
 ] as const;
 export type DaemonEventTag = (typeof DAEMON_EVENT_TAGS)[number];
 
@@ -302,7 +303,8 @@ export type DaemonEvent =
   | BlankRecoveredEvent
   | WakeRecoveredEvent
   | OwnershipEvent
-  | OperationsChangedEvent;
+  | OperationsChangedEvent
+  | WearSamplingSourceGateEvent;
 
 export interface SensorChangedEvent {
   event: "sensor_changed";
@@ -442,6 +444,23 @@ export interface OperationsChangedEvent {
   exercise_in_flight: string[];
   /** Whether a global web emergency wake is currently awaiting engine completion. */
   emergency_wake_in_flight: boolean;
+}
+
+/**
+ * rust: rules.rs DaemonEvent::WearSamplingSourceGate
+ * serde(tag = "event", rename_all = "snake_case"); `observed` is
+ * `#[serde(default)]` (absent on the wire when `None` — matched and unknown
+ * gates carry no observed source label). Emitted only on a full-gate
+ * transition (`matched` | `mismatched` | `unknown`); steady-state polls do
+ * not re-fire it. The webui refetches `GET /api/wear` on this event so the
+ * row picks up the new `source_gate` from the summary, rather than
+ * patching in-memory state from the event payload.
+ */
+export interface WearSamplingSourceGateEvent {
+  event: "wear_sampling_source_gate";
+  display: string;
+  state: "matched" | "mismatched" | "unknown";
+  observed?: string | null;
 }
 
 /**

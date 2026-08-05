@@ -167,6 +167,25 @@ fn summarize(
     });
     let source_gate = selected.and_then(|s| s.source_gate.clone());
     let uniform_reason = selected.and_then(|s| s.uniform_reason.clone());
+    // The attribution mode reflects the CURRENT observation: the grant
+    // may exist (so `content_weighted_since` is set) but the source gate
+    // is currently Mismatched / Unknown or `uniform_reason` is filled,
+    // which means the wear tracker is degrading this tick to uniform.
+    // Reporting `Sampled` in that state would contradict the
+    // `uniform_reason` line on the same payload. `content_weighted_since`
+    // remains a historical "grant exists since" field; the current mode
+    // is derived from the live status.
+    // The current mode is Uniform unless a live Sampled is actually
+    // possible: any non-Matched gate (Mismatched / Unknown) forces
+    // uniform, a uniform_reason always forces uniform, and a missing
+    // grant can never be Sampled. Only a retained grant plus a Matched
+    // (or absent) gate yields Sampled.
+    let wear_attribution_mode = match (uniform_reason.as_deref(), source_gate.as_deref()) {
+        (_, Some("mismatched" | "unknown")) => WearAttributionMode::Uniform,
+        _ if uniform_reason.is_some() => WearAttributionMode::Uniform,
+        _ if content_weighted_since.is_some() => WearAttributionMode::Sampled,
+        _ => WearAttributionMode::Uniform,
+    };
 
     WearSummary {
         display: key.to_string(),
@@ -189,11 +208,7 @@ fn summarize(
             ledger.advisory_baseline_epoch_s,
             now_epoch_s,
         ),
-        wear_attribution_mode: if content_weighted_since.is_some() {
-            WearAttributionMode::Sampled
-        } else {
-            WearAttributionMode::Uniform
-        },
+        wear_attribution_mode,
         content_weighted_since,
         source_gate,
         uniform_reason,
@@ -410,7 +425,7 @@ mod tests {
     /// status map and the legacy singular status. The per-display map is
     /// the authoritative source the wear route joins on; the legacy
     /// singular status is the fallback ONLY when the per-display map is
-    /// empty (issue #185 cycle B / Task 11).
+    /// empty (issue #185 cycle B).
     #[allow(clippy::type_complexity)]
     fn test_state_with_sampling(
         wear: HashMap<String, WearLedger>,
@@ -714,7 +729,7 @@ mod tests {
         }
     }
 
-    // ── Per-display source gate (Task 11: per-display status watch) ────────
+    // ── Per-display source gate (per-display status watch) ─────────────
 
     /// A TV whose source gate is mismatched (e.g. on Netflix, not our HDMI):
     /// attribution degrades to uniform tagged `source_mismatch`.
@@ -797,6 +812,23 @@ mod tests {
         assert!(
             by_id["monitor"].uniform_reason.is_none(),
             "matched gate must carry no uniform_reason"
+        );
+        // Current-mode attribution must reflect the LIVE state, not the
+        // grant-existence heuristic. The TV has a retained grant
+        // (`granted_at_epoch_s` is set so `content_weighted_since` is
+        // `Some`) but the source gate is currently mismatched — the
+        // mode MUST be Uniform, not Sampled, or the wire payload
+        // contradicts `uniform_reason`.
+        assert_eq!(
+            by_id["tv"].wear_attribution_mode,
+            WearAttributionMode::Uniform,
+            "a TV with a retained grant and source_gate=mismatched must report wear_attribution_mode=Uniform; got {:?}",
+            by_id["tv"].wear_attribution_mode
+        );
+        assert_eq!(
+            by_id["monitor"].wear_attribution_mode,
+            WearAttributionMode::Sampled,
+            "a monitor with a retained grant and source_gate=matched must report wear_attribution_mode=Sampled"
         );
     }
 
@@ -902,7 +934,7 @@ mod tests {
 
     #[tokio::test]
     async fn per_display_source_gate_absent_in_populated_map_ignores_legacy_singular() {
-        // T11 review Should (carried forward): the sibling above pins the
+        // The sibling above pins the
         // absent-in-populated-map guard with `legacy_singular: None`. This
         // test pins the stronger property — when the per-display map is
         // populated AND a legacy singular status IS present, a display

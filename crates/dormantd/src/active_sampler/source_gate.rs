@@ -118,6 +118,21 @@ impl<T: BacklightTransport> InputSourceReader for SamsungInputSourceReader<T> {
     }
 }
 
+/// Build the production default reader (real Samsung IP Control
+/// transport on port 1516). Used when a `DisplayContext` adds a
+/// `source_gate_expectation` on a runtime that was spawned without one
+/// (the operator added the `host` after the runtime was already up).
+/// Returning a fresh transport is safe because the runtime only
+/// spawns a `SourceGatePoller` when the new expectation actually
+/// arrives — the reader sits dormant otherwise.
+#[must_use]
+pub fn build_default_reader() -> std::sync::Arc<dyn InputSourceReader> {
+    let transport =
+        std::sync::Arc::new(dormant_displays::samsung_ip::RealBacklightTransport::new());
+    std::sync::Arc::new(SamsungInputSourceReader::new(transport))
+        as std::sync::Arc<dyn InputSourceReader>
+}
+
 /// Interval-driven source gate task and its latest published state.
 pub struct SourceGatePoller {
     state_rx: watch::Receiver<SourceGate>,

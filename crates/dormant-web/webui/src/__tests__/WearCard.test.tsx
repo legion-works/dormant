@@ -289,7 +289,7 @@ describe("WearCard", () => {
     expect(window.location.hash).toBe("#/displays");
   });
 
-  // ── #186 Task 19 — platform-gated active-sampling onboarding nudge ───
+  // ── platform-gated active-sampling onboarding nudge ───────────────
 
   describe("#186 onboarding nudge", () => {
     it("shows the nudge with Enable + Dismiss when platform supports sampling, config is enabled, and attribution is uniform with no consent", async () => {
@@ -574,7 +574,7 @@ describe("WearCard", () => {
     });
   });
 
-  // ── Task 12 — source-gated TV state row copy ───────────────────────────
+  // ── source-gated TV state row copy ───────────────────────────────────
 
   describe("source-gate row states", () => {
     // The gate comes from `WearSummary.source_gate` (the per-display
@@ -640,7 +640,7 @@ describe("WearCard", () => {
       expect(screen.queryByText("Needs consent")).not.toBeInTheDocument();
     });
 
-    // T24b vacuity guard: the single-display tests above cannot detect a
+    // Vacuity guard: the single-display tests above cannot detect a
     // per-row attribution regression — a component that renders displays[0]'s
     // gate on every row passes them all. Two displays with DIFFERENT gates
     // (d1 mismatched, d2 no-gate) pin per-row attribution: the testid is

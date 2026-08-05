@@ -332,7 +332,7 @@ mod tests {
         );
     }
 
-    // ── #186 Task 19 — onboarding nudge dismiss endpoint ─────────────────
+    // ── onboarding nudge dismiss endpoint ─────────────────────────────────
     //
     // Mirrors the star-nudge dismiss discipline (same atomic tempfile+rename
     // with `create_new(true)`, same idempotent path) — the only thing that

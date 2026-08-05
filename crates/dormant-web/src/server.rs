@@ -465,7 +465,7 @@ mod tests {
         }
     }
 
-    // ── Default-local control-plane inventory (Task 19) ───────────────────
+    // ── Default-local control-plane inventory ───────────────────────────────
 
     /// Under default loopback bind, every registered POST route MUST
     /// reject a non-loopback Host header (403).  This is the behavioural
@@ -809,7 +809,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
-    // ── #186 Task 19 — onboarding-nudge identity fields ─────────────────
+    // ── onboarding-nudge identity fields ────────────────────────────────────
 
     /// The wear-sampling onboarding nudge (issue #186) derives its
     /// platform-capability gate from `GET /api/daemon` — crucially NOT

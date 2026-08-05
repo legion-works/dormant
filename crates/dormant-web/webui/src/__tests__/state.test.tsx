@@ -989,9 +989,9 @@ describe("LiveStateProvider operations_changed event (issue #184)", () => {
 
 });
 
-// ── Task 12: wear_sampling_source_gate live event ──────────────────────────
+// ── wear_sampling_source_gate live event ───────────────────────────────────
 
-describe("LiveStateProvider wear_sampling_source_gate event (Task 12)", () => {
+describe("LiveStateProvider wear_sampling_source_gate event", () => {
   it("wear_sampling_source_gate triggers a background wear refetch that updates the event's display row", async () => {
     const { getWear } = await import("../api/client");
     const getWearMock = vi.mocked(getWear);

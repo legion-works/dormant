@@ -373,7 +373,7 @@ mod tests {
         assert!(table.contains("sampling: suspended (age: 7s) (uniform: wear_sampling_suspended)"));
     }
 
-    /// TVS Task 10: the redacted source-gate state must surface on the
+    /// The redacted source-gate state must surface on the
     /// status line in the exact `(source: <gate>)` form. Pinned so a
     /// future refactor can't silently drop the gate or change its token.
     #[test]

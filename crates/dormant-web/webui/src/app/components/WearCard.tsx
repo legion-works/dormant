@@ -118,7 +118,7 @@ function WearRow({
               ? "Sampling degraded"
               : "Sampling unavailable";
 
-  // Source-gate copy (Task 12): the gate comes from `WearSummary.source_gate`
+  // Source-gate copy: the gate comes from `WearSummary.source_gate`
   // (the per-display sampler status), DISTINCT from the consent
   // `WearSamplingStatus` that drives `samplingLabel` above. Only mismatched
   // and unknown gates render a dedicated line; matched and no-gate fall

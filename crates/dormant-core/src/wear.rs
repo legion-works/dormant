@@ -1039,7 +1039,7 @@ mod tests {
         }
     }
 
-    // ── TVS Task 10: redacted source-gate field ─────────────────────────────
+    // ── redacted source-gate field ───────────────────────────────────────────
     //
     // `source_gate` is the redacted string form of the TV-attribution gate
     // (`"matched"` | `"mismatched"` | `"unknown"`). `None` on the wire means

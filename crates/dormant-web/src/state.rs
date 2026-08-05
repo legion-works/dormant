@@ -112,7 +112,7 @@ pub struct WebStateInner {
     pub wear: WearHandle,
     /// Redacted daemon-owned active-sampling lifecycle status.
     pub wear_sampling_rx: watch::Receiver<Option<dormant_core::wear::WearSamplingStatus>>,
-    /// Per-display redacted sampler statuses (issue #185 cycle B / Task 11).
+    /// Per-display redacted sampler statuses (issue #185 cycle B).
     /// The daemon's sampler registry writes one entry per configured
     /// display; `/api/wear` joins on `ledger.identity.config_display_id` to
     /// attribute the right gate + uniform reason to each display. The

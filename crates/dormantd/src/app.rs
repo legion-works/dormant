@@ -456,21 +456,15 @@ async fn spawn_active_sampler_runtime(
             return None;
         }
     };
-    // Construct the source-gate reader for displays that declare a TV
-    // `host` plus an `expected_source` — the runtime spawns a
-    // `SourceGatePoller` from this reader when the lifecycle is
-    // `Streaming`. Render-only monitors get `None` here.
-    let source_reader = cfg
-        .displays
-        .get(&display_id.0)
-        .and_then(|display| display.host.as_ref())
-        .map(|_host| {
-            let transport =
-                std::sync::Arc::new(dormant_displays::samsung_ip::RealBacklightTransport::new());
-            std::sync::Arc::new(active_sampler::source_gate::SamsungInputSourceReader::new(
-                transport,
-            )) as std::sync::Arc<dyn active_sampler::source_gate::InputSourceReader>
-        });
+    // Construct the source-gate reader unconditionally — the runtime
+    // spawns a `SourceGatePoller` from it when both `Streaming` AND a
+    // `source_gate_expectation` are present, so render-only monitors
+    // carry a dormant reader that nothing else will touch. Building
+    // eagerly (instead of gating on the initial host) means a
+    // `DisplayContext` that later adds `host` + `expected_source` to
+    // an already-running runtime can still wire a poller — the
+    // operator's late config change isn't silently swallowed.
+    let source_reader = Some(active_sampler::source_gate::build_default_reader());
     let consent_path = migrate_legacy_consent(state_dir, &cfg, &display_id);
     let (updates, update_rx) = mpsc::channel::<SamplerUpdate>(16);
     let cancel = sampler_cancellation_token(root);
@@ -1300,7 +1294,7 @@ mod active_sampler_reload_tests {
             .expect("status forwarder must exit on cancel");
     }
 
-    // ── TVS Task 10: legacy singular display selector is config-driven ──────
+    // ── TVS: legacy singular display selector is config-driven ───────────────
     //
     // The legacy `wear_sampling_rx` watch channel (consumed by the web status
     // API and the doctor probe's singular entry) MUST be keyed by the
@@ -1567,7 +1561,7 @@ mod active_sampler_reload_tests {
         );
     }
 
-    // ── TVS Task 10 reload-rebind: the forwarder MUST re-evaluate the
+    // ── TVS reload-rebind: the forwarder MUST re-evaluate the
     // legacy singular selector against the CURRENT config, not against
     // the spawn-time snapshot. A runtime that survives a reload keeps
     // its forwarder task; the legacy `wear_sampling_rx` slot must
@@ -3590,7 +3584,7 @@ struct Runner {
     /// claim protocol. Constructed once in [`App::start`] and
     /// carried by `Runner` across every reload so IPC/hotkey
     /// callers can trigger local pull/push writes.
-    #[allow(dead_code, reason = "wired in Task 13")]
+    #[allow(dead_code, reason = "reserved for a follow-up dispatch surface")]
     direct_switch: Arc<DirectSwitchHandle>,
     /// Daemon-lifetime idle-observation tx — the stock idle source
     /// publishes into this channel; carried across reloads so

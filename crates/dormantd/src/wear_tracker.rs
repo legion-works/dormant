@@ -481,7 +481,7 @@ async fn apply_actions(
                 display: display_id,
                 fallback,
             } => {
-                // Task 13 will consume this tag for spatial-fallback
+                // A follow-up consumer will use this tag for spatial-fallback
                 // attribution; until then, log the reason literal so a gated
                 // stream is observable in the daemon log.
                 if let Some(tag) = fallback {

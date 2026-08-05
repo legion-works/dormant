@@ -729,7 +729,7 @@ mod tests {
         );
     }
 
-    // ── TVS Task 10: source_gate surfaces in the per-display status hint ──
+    // ── source_gate surfaces in the per-display status hint ────────────────
     //
     // The enable/disable flows look up the per-display status map before
     // sending their request. The lookup MUST surface the redacted

@@ -25,6 +25,7 @@ pub mod linux;
 
 /// Stable fallback reason when sampling needs a new portal grant.
 pub const WEAR_SAMPLING_NEEDS_CONSENT: &str = "wear_sampling_needs_consent";
+pub const WEAR_SAMPLING_SOURCE_UNKNOWN: &str = "wear_sampling_source_unknown";
 /// Stable fallback reason for a timed-out or rejected consent flow.
 pub const WEAR_SAMPLING_CONSENT_TIMEOUT: &str = "wear_sampling_consent_timeout";
 /// Stable fallback reason when the portal transport cannot be reached.
@@ -200,7 +201,7 @@ pub enum SamplerUpdate {
     DisplayContext(DisplaySamplingContext),
 }
 
-/// Runtime configuration and its lifecycle trigger, constructed by Task 9.
+/// Runtime configuration and its lifecycle trigger.
 #[derive(Debug, Clone)]
 pub struct ReconfigurePlan {
     /// New active-sampling settings.
@@ -405,6 +406,9 @@ struct Runtime {
     active: ActiveSamplingConfig,
     sample_interval: Duration,
     display: DisplaySamplingContext,
+    /// Cached display identifier; gates + wear tracker reads use it for
+    /// `latest_grids` cleanup on gate transitions and on reload.
+    display_id: DisplayId,
     record: Option<crate::screencast_consent::BoundConsent>,
     failures: u32,
     reconnect_backoff: Duration,
@@ -440,6 +444,10 @@ struct Runtime {
     /// `reconcile_gate_poller` consults this to decide between no-op,
     /// same-expectation, and tear-down-and-respawn.
     active_gate_expectation: Option<source_gate::SourceGateExpectation>,
+    /// Shared latest-grid map; cached on `Runtime` so the gate helpers
+    /// can clear this display's entry on add/change/transition without
+    /// threading `&LatestGrids` through every call site.
+    latest_grids: LatestGrids,
 }
 
 impl Runtime {
@@ -494,6 +502,7 @@ impl Runtime {
             active,
             sample_interval: config.wear.sample_interval,
             display,
+            display_id: display_id.clone(),
             record,
             failures: 0,
             reconnect_backoff: Duration::from_secs(30),
@@ -508,6 +517,7 @@ impl Runtime {
             capture_sequence: 0,
             last_effective_stream_mode,
             active_gate_expectation: None,
+            latest_grids: new_latest_grids(),
         }
     }
 
@@ -1007,10 +1017,22 @@ async fn apply_update_with_effects(
     // daemon's outer bound so a raised `capture_timeout` actually takes
     // effect in warm mode (issue #211 defect A).
     source.set_capture_timeout(runtime.active.capture_timeout);
+    // The runtime caches its reader at spawn; if a `DisplayContext`
+    // adds a `source_gate_expectation` after spawn (operator added the
+    // `host` to an existing display) the cached reader is still `None`
+    // and `wants_poller` would be false forever. Build the production
+    // default reader on first need so the gate can actually run on
+    // live runtimes. The reader sits dormant until `reconcile_gate_poller`
+    // decides to spawn a poller.
+    if runtime.source_reader.is_none() && runtime.display.source_gate_expectation.is_some() {
+        runtime.source_reader = Some(source_gate::build_default_reader());
+    }
     // Source-gate expectation may have swapped with the new context;
     // reconcile so the next Streaming tick spawns a poller bound to the
-    // fresh expectation.
-    reconcile_gate_poller(runtime);
+    // fresh expectation. The helper itself is also responsible for
+    // publishing the gate-event / clearing `latest_grids` when an
+    // add/change actually spawns.
+    reconcile_gate_poller(runtime, status_tx);
     if transition
         .as_ref()
         .is_some_and(|transition| transition.effects.contains(&Effect::CloseSession))
@@ -1047,7 +1069,7 @@ fn transition_to(
     status_tx: &watch::Sender<SamplerStatus>,
 ) {
     runtime.state = state;
-    reconcile_gate_poller(runtime);
+    reconcile_gate_poller(runtime, status_tx);
     publish_status(status_tx, runtime, reason, None);
     if let Some(reason) = reason
         && runtime.episode_warned.insert(runtime.display_name())
@@ -1117,7 +1139,14 @@ fn publish_status(
 /// otherwise. Idempotent — calling it on a `Streaming` runtime that already
 /// matches the expectation is a no-op, while a reconfigure that swaps
 /// `expected_source` (or its host) tears down and re-spawns.
-fn reconcile_gate_poller(runtime: &mut Runtime) {
+///
+/// Spawning a fresh poller is itself an explicit transition: the
+/// previously-valid spatial grid (if any) is cleared, the status
+/// publishes `source_gate = Unknown{awaiting_first_poll}` with
+/// `uniform_reason = source_unknown`, and the additive gate event
+/// fires — so the wear tracker cannot spatially attribute a
+/// pre-reload grid during the gate's first-poll window.
+fn reconcile_gate_poller(runtime: &mut Runtime, status_tx: &watch::Sender<SamplerStatus>) {
     let streaming = runtime.state == SamplingState::Streaming;
     let expectation = runtime.display.source_gate_expectation.clone();
     let reader = runtime.source_reader.clone();
@@ -1152,13 +1181,30 @@ fn reconcile_gate_poller(runtime: &mut Runtime) {
     }
     let poller = source_gate::SourceGatePoller::spawn(reader, expectation.clone());
     let mut rx = poller.subscribe();
-    // Seed `gate_state` with the poller's initial value (Unknown with
-    // `awaiting_first_poll`) so a freshly-polling runtime reports a
-    // uniform_reason of `source_unknown` on its first cadence.
-    runtime.gate_state = Some(rx.borrow_and_update().clone());
+    // Reset both the live observation and the dedup anchor BEFORE
+    // seeding — and do NOT pre-assign `gate_state`:
+    // `apply_gate_observation` must observe the None → Some
+    // transition itself, or its `needs_clear` arm sees
+    // `prev == next` and skips the grid clear (and the transition
+    // publish) entirely.
+    runtime.gate_state = None;
+    runtime.last_event_gate = None;
+    let seed_observation = rx.borrow_and_update().clone();
     runtime.gate_rx = Some(rx);
     runtime.gate_poller = Some(poller);
     runtime.active_gate_expectation = Some(expectation);
+    // Snapshot the borrowed fields out of `runtime` so we can re-enter
+    // `apply_gate_observation` (which takes `&mut Runtime`) without the
+    // borrow checker fighting the nested immutable borrows.
+    let latest_grids = runtime.latest_grids.clone();
+    let display_id = runtime.display_id.clone();
+    apply_gate_observation(
+        runtime,
+        &seed_observation,
+        status_tx,
+        &latest_grids,
+        &display_id,
+    );
 }
 
 /// React to a fresh gate observation: publish status, emit additive
@@ -1253,7 +1299,7 @@ fn sampling_uniform_reason(gate: &source_gate::SourceGate) -> Option<&'static st
     match gate {
         source_gate::SourceGate::Matched => None,
         source_gate::SourceGate::Mismatched { .. } => Some("source_mismatch"),
-        source_gate::SourceGate::Unknown { .. } => Some("source_unknown"),
+        source_gate::SourceGate::Unknown { .. } => Some(WEAR_SAMPLING_SOURCE_UNKNOWN),
     }
 }
 
@@ -1298,6 +1344,13 @@ async fn run(
     let mut runtime = Runtime::new(&deps.initial_config, &deps.consent_path, &deps.display_id);
     runtime.event_tx = deps.event_tx.take();
     runtime.source_reader = deps.source_reader.take();
+    // Rebind the cached grid map to the SHARED daemon-lifetime map.
+    // `Runtime::new` cannot receive it (tests construct `Runtime`
+    // literally), so without this handoff `reconcile_gate_poller`'s
+    // seed-clear would target a private map while the wear tracker
+    // reads `deps.latest_grids` — the stale grid would survive until
+    // the poller's first poll instead of being cleared at gate-add.
+    runtime.latest_grids = deps.latest_grids.clone();
     // Push the configured per-capture deadline into the platform source at
     // startup so the inner warm-mode bound is in lockstep with the daemon
     // bound from the first tick (issue #211 defect A).
@@ -1310,7 +1363,7 @@ async fn run(
     };
     let initial_state = runtime.state;
     transition_to(&mut runtime, initial_state, initial_reason, &status_tx);
-    reconcile_gate_poller(&mut runtime);
+    reconcile_gate_poller(&mut runtime, &status_tx);
     let mut cadence = cadence_for(&runtime);
     cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut capture_now = runtime.state == SamplingState::Streaming;
@@ -2218,6 +2271,21 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .unwrap_or_else(|| self.default.clone())
+        }
+    }
+
+    /// `InputSourceReader` whose poll never resolves. Used to prove the
+    /// gate-add clear is IMMEDIATE: with a first poll that can never
+    /// land, only the seed-time clear in `reconcile_gate_poller` can
+    /// empty the shared grid — a clear deferred to the first poll (or
+    /// the next cadence tick) leaves the stale grid in place forever
+    /// and the test goes red.
+    struct PendingSourceReader;
+
+    #[async_trait]
+    impl source_gate::InputSourceReader for PendingSourceReader {
+        async fn input_source(&self, _host: &str) -> Result<String, String> {
+            std::future::pending().await
         }
     }
 
@@ -5271,7 +5339,7 @@ mod tests {
         let _ = update_tx;
     }
 
-    // ── Source-gate lifecycle (Task 8) ─────────────────────────────────
+    // ── Source-gate lifecycle ──────────────────────────────────────
 
     /// TV config that wires the gate-expectation into the active sampler:
     /// a Samsung-tizen display with a `host` plus a `sampling.expected_source`
@@ -5653,7 +5721,8 @@ mod tests {
             [Ok("HDMI4".to_owned())],
             Ok("HDMI4".to_owned()),
         )));
-        reconcile_gate_poller(&mut runtime);
+        let (status_tx, _) = watch::channel(initial_status(&config));
+        reconcile_gate_poller(&mut runtime, &status_tx);
         assert!(
             runtime.gate_poller.is_none(),
             "poller must NOT spawn in NeedsConsent lifecycle (streaming=false short-circuits the gate)"
@@ -5667,11 +5736,400 @@ mod tests {
         // spawns — the streaming-only gate is the only thing that
         // changes between the two reconcile calls.
         runtime.state = SamplingState::Streaming;
-        reconcile_gate_poller(&mut runtime);
+        reconcile_gate_poller(&mut runtime, &status_tx);
         assert!(
             runtime.gate_poller.is_some(),
             "poller MUST spawn once the lifecycle reaches Streaming"
         );
+    }
+
+    /// Step 4 (RED): adding a `source_gate_expectation` to a runtime that
+    /// was already streaming without one must be fail-safe IMMEDIATELY.
+    /// The previous spatial grid (if any) must be cleared, the status
+    /// must publish `source_gate = Unknown{awaiting_first_poll}` with
+    /// `uniform_reason = source_unknown`, and the additive gate event
+    /// must fire — so the wear tracker cannot spatially attribute a
+    /// pre-reload grid during the gate's first-poll window. The probe
+    /// seeds a real `SampledGrid` on `latest_grids`, then sends a
+    /// `DisplayContext` that adds the gate expectation. Without the
+    /// fix the grid survives (and the wear tracker's
+    /// `select_sample_for_attribution` prefers `Sampled` over fallback)
+    /// so a tick between the publish and the first poll would
+    /// spatially attribute stale content. With the fix the grid is
+    /// cleared and the status carries `source_unknown` until the first
+    /// poll lands.
+    #[tokio::test(start_paused = true)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "phase 1 capture then phase 2 gate-add then event-pinning reads cleanest as one flow"
+    )]
+    async fn source_gate_expectation_add_publishes_unknown_and_clears_grid() {
+        let dir = tempdir().unwrap();
+        let tv_path = dir.path().join("tv-consent.json");
+        test_tv_consent(&tv_path, "HDMI-A-1");
+        // Construct a runtime that starts WITHOUT a
+        // source_gate_expectation — strip expected_source (the host
+        // stays so `build_gate_expectation` returns `None`) and keep
+        // `sampled_display` populated so the runtime still reaches
+        // `Streaming` and captures freely on the first cadence tick.
+        let config = gated_tv_config(Duration::from_secs(10));
+        let mut config_clone = (*config).clone();
+        if let Some(display) = config_clone.displays.get_mut("tv")
+            && let Some(sampling) = display.sampling.as_mut()
+        {
+            sampling.expected_source = None;
+        }
+        let config = Arc::new(config_clone);
+        let (source_service, _, _, _) = service_source([TestCapture::Frame, TestCapture::Frame]);
+        let captures_seen = source_service.captures_seen.clone();
+        let source: Box<dyn CaptureSource + Send + Sync + 'static> =
+            Box::new(GateProbeSource::new(source_service));
+        let cancel = CancellationToken::new();
+        let (updates_tx, updates_rx) = mpsc::channel(4);
+        let latest_grids = new_latest_grids();
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let deps = ActiveSamplerDeps {
+            initial_config: config,
+            display_id: DisplayId("tv".to_owned()),
+            update_rx: updates_rx,
+            latest_grids: latest_grids.clone(),
+            source,
+            source_reader: Some(Arc::new(ScriptedSourceReader::new(
+                [Ok("HDMI4".to_owned())],
+                Ok("HDMI4".to_owned()),
+            ))),
+            consent_path: tv_path,
+            cancel: cancel.clone(),
+            env_reader: test_env_reader,
+            event_tx: Some(event_tx),
+        };
+        let (_handle, join) = spawn_with_handle(deps);
+        // Phase 1: let the runtime reach Streaming, advance past the
+        // first cadence tick so the pre-reload grid is populated. With
+        // no gate the runtime captures freely.
+        tokio::time::advance(Duration::from_secs(11)).await;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            captures_seen.load(Ordering::SeqCst) >= 1,
+            "the runtime must capture at least one frame before the gate add; got {}",
+            captures_seen.load(Ordering::SeqCst)
+        );
+        assert!(
+            latest_grids
+                .read()
+                .unwrap()
+                .contains_key(&DisplayId("tv".to_owned())),
+            "pre-reload state must carry a non-empty grid entry for the TV display"
+        );
+        // Phase 2: send a DisplayContext that adds a
+        // source_gate_expectation. With the fix this clears the
+        // display's grid entry and publishes Unknown; without the fix
+        // the grid survives and the status keeps its pre-reload source
+        // gate (None for render-eligible runtimes that didn't have one
+        // before).
+        updates_tx
+            .send(SamplerUpdate::DisplayContext(DisplaySamplingContext {
+                display: Some(DisplayExpectation {
+                    display: "tv".to_owned(),
+                    compositor_output: Some("HDMI-A-1".to_owned()),
+                }),
+                phase: Phase::Active,
+                stage_active: true,
+                source_gate_expectation: Some(source_gate::SourceGateExpectation {
+                    host: "tv.local".to_owned(),
+                    expected_source: "HDMI4".to_owned(),
+                    poll_interval: Duration::from_secs(2),
+                }),
+                stream_mode: None,
+            }))
+            .await
+            .unwrap();
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        // The grid entry for this display must be cleared so the wear
+        // tracker cannot fall back to the pre-reload `Sampled` value
+        // while the gate is still unknown (or if it transitions
+        // straight to Matched on the poller's first poll). The clear
+        // is what the test pins — the source_gate value can move on
+        // quickly to Matched once the poller's first poll lands, but
+        // the wear tick that races between gate-add and first-poll
+        // would otherwise spatially attribute the pre-reload grid.
+        assert!(
+            !latest_grids
+                .read()
+                .unwrap()
+                .contains_key(&DisplayId("tv".to_owned())),
+            "adding a gate must clear this display's latest_grids entry; the wear tracker would otherwise spatially attribute the pre-reload grid during the unknown gap"
+        );
+        // The additive `WearSamplingSourceGate` event must fire with
+        // state=unknown immediately — pinning the FIRST event is the
+        // fail-safe observable: if the fix is reverted the gate-add
+        // never emits an Unknown event (the natural drain would only
+        // see Matched on the poller's first poll, since drain runs
+        // AFTER the poller's first tick when both share the same
+        // select-wake). Without the explicit publish at gate-add, the
+        // status flips Unknown → Matched with no Unknown event ever
+        // firing for the additive channel.
+        let mut first_event: Option<DaemonEvent> = None;
+        while let Ok(msg) = event_rx.try_recv() {
+            if let ControlMsg::PublishDaemonEvent(event) = msg
+                && matches!(event, DaemonEvent::WearSamplingSourceGate { .. })
+                && first_event.is_none()
+            {
+                first_event = Some(event);
+            }
+        }
+        let first_event = first_event.expect(
+            "adding a gate must emit a WearSamplingSourceGate event with the seed observation",
+        );
+        match first_event {
+            DaemonEvent::WearSamplingSourceGate { state, .. } => {
+                assert_eq!(
+                    state, "unknown",
+                    "the first gate event must be state=unknown (got {state}); the pre-poll window MUST be visible downstream"
+                );
+            }
+            other => panic!("expected WearSamplingSourceGate, got {other:?}"),
+        }
+        cancel.cancel();
+        let _ = join.await;
+    }
+
+    /// Step 4 (RED): a runtime that was spawned without a
+    /// `source_gate_expectation` must still start its poller when a
+    /// later `DisplayContext` adds one (e.g. operator filled in the TV
+    /// `host` after the runtime was already up). The runtime caches a
+    /// source reader at spawn so `reconcile_gate_poller`'s
+    /// `wants_poller` arm fires the moment the new expectation
+    /// arrives — without this the late add would silently never run.
+    #[tokio::test(start_paused = true)]
+    async fn source_gate_expectation_late_add_starts_poller() {
+        let dir = tempdir().unwrap();
+        let tv_path = dir.path().join("tv-consent.json");
+        test_tv_consent(&tv_path, "HDMI-A-1");
+        let config = gated_tv_config(Duration::from_secs(10));
+        let (source_service, _, _, _) = service_source([TestCapture::Frame, TestCapture::Frame]);
+        let source: Box<dyn CaptureSource + Send + Sync + 'static> =
+            Box::new(GateProbeSource::new(source_service));
+        let cancel = CancellationToken::new();
+        let (updates_tx, updates_rx) = mpsc::channel(4);
+        // Construct a runtime that lacks a source_gate_expectation at
+        // spawn: we mutate the cloned config so the initial
+        // `build_gate_expectation` returns `None` (the host stays so
+        // we just strip expected_source — and keep `sampled_display`
+        // populated so the runtime reaches `Streaming`).
+        let mut config = (*config).clone();
+        if let Some(display) = config.displays.get_mut("tv")
+            && let Some(sampling) = display.sampling.as_mut()
+        {
+            sampling.expected_source = None;
+        }
+        let config = Arc::new(config);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let deps = ActiveSamplerDeps {
+            initial_config: config,
+            display_id: DisplayId("tv".to_owned()),
+            update_rx: updates_rx,
+            latest_grids: new_latest_grids(),
+            source,
+            // No source_reader at spawn: the runtime must build one
+            // itself when the late DisplayContext arrives (or the gate
+            // silently never runs).
+            source_reader: None,
+            consent_path: tv_path,
+            cancel: cancel.clone(),
+            env_reader: test_env_reader,
+            event_tx: Some(event_tx),
+        };
+        let (_handle, join) = spawn_with_handle(deps);
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        // Send a DisplayContext that adds the gate expectation. The
+        // runtime was spawned without one, so its pre-update
+        // `source_gate_expectation` was `None`. With the fix the
+        // expectation arrives, `wants_poller` flips true, and the
+        // poller spawns.
+        updates_tx
+            .send(SamplerUpdate::DisplayContext(DisplaySamplingContext {
+                display: Some(DisplayExpectation {
+                    display: "tv".to_owned(),
+                    compositor_output: Some("HDMI-A-1".to_owned()),
+                }),
+                phase: Phase::Active,
+                stage_active: true,
+                source_gate_expectation: Some(source_gate::SourceGateExpectation {
+                    host: "tv.local".to_owned(),
+                    expected_source: "HDMI4".to_owned(),
+                    poll_interval: Duration::from_secs(2),
+                }),
+                stream_mode: None,
+            }))
+            .await
+            .unwrap();
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        // Pin the additive `WearSamplingSourceGate` event sequence: the
+        // late add must emit `unknown` first, then transition to
+        // `matched` after the poller's first poll. The test fails if
+        // the runtime emits only `matched` (no `unknown`), which is
+        // what happens without the explicit publish at gate-add: the
+        // poller's first poll races ahead of any drain call, so the
+        // additive channel never observes the seed Unknown.
+        let mut first_event: Option<DaemonEvent> = None;
+        while let Ok(msg) = event_rx.try_recv() {
+            if let ControlMsg::PublishDaemonEvent(event) = msg
+                && matches!(event, DaemonEvent::WearSamplingSourceGate { .. })
+                && first_event.is_none()
+            {
+                first_event = Some(event);
+            }
+        }
+        let first_event = first_event
+            .expect("a late source_gate_expectation add must emit a WearSamplingSourceGate event");
+        match first_event {
+            DaemonEvent::WearSamplingSourceGate { state, .. } => {
+                assert_eq!(
+                    state, "unknown",
+                    "the first gate event for a late add must be state=unknown (got {state}); the pre-poll window MUST be visible downstream"
+                );
+            }
+            other => panic!("expected WearSamplingSourceGate, got {other:?}"),
+        }
+        cancel.cancel();
+        let _ = join.await;
+    }
+
+    /// Step 4 (RED): the gate-add clear must land on the SHARED
+    /// `latest_grids` IMMEDIATELY — inside `reconcile_gate_poller`,
+    /// before the poller's first poll can possibly answer. The probe
+    /// uses a reader whose poll never resolves, so no poll- or
+    /// cadence-driven clear can fire: only the seed-time clear can
+    /// empty the grid. Without the `run()` handoff that rebinds the
+    /// runtime's cached map to the daemon-lifetime shared map, the
+    /// seed clear targets a private map and the stale grid survives
+    /// indefinitely — exactly the pre-reload spatial-attribution
+    /// window the fail-safe rule forbids. The status must also carry
+    /// `uniform_reason = wear_sampling_source_unknown` from the seed
+    /// publish, not from a later poll.
+    #[tokio::test(start_paused = true)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "phase 1 capture then phase 2 gate-add then status/event pinning reads cleanest as one flow"
+    )]
+    async fn source_gate_expectation_add_clears_shared_grid_before_first_poll() {
+        let dir = tempdir().unwrap();
+        let tv_path = dir.path().join("tv-consent.json");
+        test_tv_consent(&tv_path, "HDMI-A-1");
+        // Spawn ungated (host stays, expected_source stripped) so the
+        // runtime reaches Streaming and captures freely on phase 1.
+        let config = gated_tv_config(Duration::from_secs(10));
+        let mut config_clone = (*config).clone();
+        if let Some(display) = config_clone.displays.get_mut("tv")
+            && let Some(sampling) = display.sampling.as_mut()
+        {
+            sampling.expected_source = None;
+        }
+        let config = Arc::new(config_clone);
+        let (source_service, _, _, _) = service_source([TestCapture::Frame, TestCapture::Frame]);
+        let source: Box<dyn CaptureSource + Send + Sync + 'static> =
+            Box::new(GateProbeSource::new(source_service));
+        let cancel = CancellationToken::new();
+        let (updates_tx, updates_rx) = mpsc::channel(4);
+        let latest_grids = new_latest_grids();
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let deps = ActiveSamplerDeps {
+            initial_config: config,
+            display_id: DisplayId("tv".to_owned()),
+            update_rx: updates_rx,
+            latest_grids: latest_grids.clone(),
+            source,
+            // The poll can never answer: any grid clear observed after
+            // the gate add MUST have come from the seed publish.
+            source_reader: Some(Arc::new(PendingSourceReader)),
+            consent_path: tv_path,
+            cancel: cancel.clone(),
+            env_reader: test_env_reader,
+            event_tx: Some(event_tx),
+        };
+        let (handle, join) = spawn_with_handle(deps);
+        let status_rx = handle.status();
+        // Phase 1: capture one frame so the shared grid is populated.
+        tokio::time::advance(Duration::from_secs(11)).await;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            latest_grids
+                .read()
+                .unwrap()
+                .contains_key(&DisplayId("tv".to_owned())),
+            "pre-reload state must carry a grid entry for the TV display"
+        );
+        // Phase 2: add the gate. The seed publish must clear the
+        // shared grid and publish `source_unknown` even though the
+        // poller's first poll can never land.
+        updates_tx
+            .send(SamplerUpdate::DisplayContext(DisplaySamplingContext {
+                display: Some(DisplayExpectation {
+                    display: "tv".to_owned(),
+                    compositor_output: Some("HDMI-A-1".to_owned()),
+                }),
+                phase: Phase::Active,
+                stage_active: true,
+                source_gate_expectation: Some(source_gate::SourceGateExpectation {
+                    host: "tv.local".to_owned(),
+                    expected_source: "HDMI4".to_owned(),
+                    poll_interval: Duration::from_secs(2),
+                }),
+                stream_mode: None,
+            }))
+            .await
+            .unwrap();
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !latest_grids
+                .read()
+                .unwrap()
+                .contains_key(&DisplayId("tv".to_owned())),
+            "the gate-add seed must clear the SHARED latest_grids entry immediately; a clear deferred to the first poll leaves the stale grid visible to the wear tracker"
+        );
+        let status = status_rx.borrow().clone();
+        assert_eq!(
+            status.uniform_reason,
+            Some(WEAR_SAMPLING_SOURCE_UNKNOWN),
+            "the seed publish must tag the status uniform_reason={WEAR_SAMPLING_SOURCE_UNKNOWN}; got {:?}",
+            status.uniform_reason
+        );
+        let mut first_event: Option<DaemonEvent> = None;
+        while let Ok(msg) = event_rx.try_recv() {
+            if let ControlMsg::PublishDaemonEvent(event) = msg
+                && matches!(event, DaemonEvent::WearSamplingSourceGate { .. })
+                && first_event.is_none()
+            {
+                first_event = Some(event);
+            }
+        }
+        let first_event = first_event.expect(
+            "adding a gate must emit a WearSamplingSourceGate event with the seed observation",
+        );
+        match first_event {
+            DaemonEvent::WearSamplingSourceGate { state, .. } => {
+                assert_eq!(
+                    state, "unknown",
+                    "the first gate event must be state=unknown (got {state})"
+                );
+            }
+            other => panic!("expected WearSamplingSourceGate, got {other:?}"),
+        }
+        cancel.cancel();
+        let _ = join.await;
     }
 
     /// Step 2 (RED): a gate flip DURING the cadence wait must skip the

@@ -153,6 +153,7 @@ A remote-only TV declares its source gate under
 | `expected_source` | unset | Input source label the TV must report for a capture to count. Matched exactly and case-sensitively; required when `compositor_output` is set |
 | `source_poll_interval` | `"15s"` | Cadence for the Samsung IP Control source read; valid range `5s`–`5m` (inclusive) |
 | `stream_mode` | unset | Per-display override of `[wear.active_sampling] stream_mode`: `"warm"` or `"per-tick"`. Unset inherits the wear section's mode |
+| `watched_apps` | seeded catalog | Tizen app ids the source gate probes for screen ownership via the unauthenticated `GET http://<host>:8001/api/v2/applications/<id>` endpoint. A `visible: true` response forces the gate to `mismatched` even when `expected_source` matches — apps own the panel without flipping `inputSourceControl`. **Absent** key inherits the daemon-shipped seed (`defaults::WEAR_SAMPLING_DEFAULT_WATCHED_APPS` — common streamers like `Netflix`, `YouTube`, `Prime Video`, `Disney+`, etc.) so a stock TV config suspends spatial attribution under installed apps out of the box. **Empty array** `watched_apps = []` is the explicit opt-out — pure input-only gate, no app-visibility probe at all. Operators can set an explicit list to override the seed; current Tizen firmware has no reliable enumeration endpoint, so the operator's catalog is the long-term source of truth. |
 
 `expected_source` is required once `compositor_output` is set — validation
 rejects a remote-only display that opts into sampling without pinning the
@@ -173,14 +174,15 @@ until those measurements land, multi-display sampling stays opt-in.
 ## The source gate
 
 For a TV carrying `expected_source`, the daemon polls Samsung IP Control
-(`inputSourceControl`) every `source_poll_interval` and classifies the
-response before every capture:
+(`inputSourceControl`) and, when `watched_apps` is non-empty, the
+Tizen REST endpoint on port 8001 for each configured app id; both probes
+ride the same `source_poll_interval` cycle (one timer, no second poll).
 
 | State | Tag | When | Capture | Attribution |
 |---|---|---|---|---|
-| Matched | `matched` | The TV reports exactly `expected_source` | Runs | `sampled` (spatial, luma-weighted) |
-| Mismatched | `mismatched` | The TV reports a different source (e.g. Netflix) | Skipped | `uniform` tagged `source_mismatch` |
-| Unknown | `unknown` | The source cannot be read (poll failed, empty response) | Skipped | `uniform` tagged `source_unknown` |
+| Matched | `matched` | The TV reports `expected_source` AND no watched app is currently visible | Runs | `sampled` (spatial, luma-weighted) |
+| Mismatched | `mismatched` | The TV reports a different source OR a watched app is currently visible (NetFlix, YouTube, etc.) | Skipped | `uniform` tagged `source_mismatch` |
+| Unknown | `unknown` | Both the input probe AND the app probes could not establish a verdict (network/parse/timeout) | Skipped | `uniform` tagged `source_unknown` |
 
 The gate is fail-safe toward attribution, never toward a zero span: while the
 TV is on another source the panel is still ON and still aging, so the tick
@@ -189,6 +191,65 @@ attribution is suppressed, but the on-hours still accrue. The same applies to
 `source_unknown`. A matched gate runs the capture and attributes spatially;
 a display with no `[displays.<id>.sampling]` table (a local monitor) has no
 gate and is treated as permanently matched.
+
+### Default seeded catalog (fail-safe opt-out via `[]`)
+
+The field defaults to the daemon-shipped seed
+(`defaults::WEAR_SAMPLING_DEFAULT_WATCHED_APPS` — common streamers like
+`Netflix`, `YouTube`, `Prime Video`, `Disney+`, etc.) when the
+`[displays.<id>.sampling]` table is present but `watched_apps` is omitted.
+The seed is the fail-safe direction: a stock TV config that declares
+`expected_source` gets app detection out of the box, so launching Netflix
+on the operator's S90D suspends spatial attribution immediately without
+requiring the operator to enumerate their installed app set first (current
+Tizen firmware has no reliable enumeration endpoint — see issue #232).
+
+The opt-out is **explicit** `watched_apps = []`: serde's per-field default
+function only fires for absent keys, so an empty array deserializes as an
+empty `Vec` and the gate runs in pure input-only mode (the pre-#232
+behavior). Operators who want to extend the catalog beyond the seed set
+the key to an explicit list — serde honors the operator's value over the
+default. To disable the probe entirely, write `watched_apps = []`.
+
+### Why a second probe (issue #232)
+
+The input-source check on port 1516 (`inputSourceControl`) is necessary but
+not sufficient. Tizen apps (Netflix, YouTube, Prime Video, etc.) own the
+panel without flipping the reported `inputSource` value — the operator's
+S90D kept reporting `HDMI4` while Netflix was fullscreen, which silently
+misattributed the local compositor's frames to panel-on-Netflix time. The
+8001 probe (`/api/v2/applications/{id}`) returns `visible: true` for any
+app currently owning the screen; the gate treats a positive result as
+"the panel is not showing our HDMI source" regardless of what
+`inputSourceControl` says.
+
+The app-visibility probe rides the existing 15-second source-poll cadence
+with a tight per-app timeout (2s) so a configured catalog of 5–8 apps fits
+inside one cycle; a confirmed `Visible` app short-circuits the cycle so the
+input read is skipped that tick — the gate is going to flip on this poll and
+one fewer port-1516 round-trip is one less load on the TV.
+
+### Fail-safe direction under app-visibility uncertainty
+
+The probe has three possible outcomes (`Visible`, `NotVisible`, `Unknown`).
+
+- **`Visible` forces `Mismatched`** — even when the input matches. The
+  wear-ledger integrity is the protected resource here: a false match
+  with a visible app silently corrupts the spatial attribution, while a
+  false mismatch only costs one cycle of uniform (still-on) attribution.
+  Spec invariant from `#232`: wear-ledger integrity beats sampling uptime.
+- **`NotVisible` degrades to the input-only verdict** — the steady state on
+  HDMI4.
+- **`Unknown` (network unreachable, parse failure, timeout) does NOT flip the
+  gate on its own.** When the input probe also failed the cycle is fully
+  degraded (`Unknown { reason: "poll_failed" }`). When the input probe
+  matched, an `Unknown` app degrades silently to the input-only `Matched`
+  verdict — preserves uniform attribution, never fabricates mismatch.
+
+This mirrors the source-gate's own fail-safe analysis: a screen that is
+likely-but-not-certainly not showing our content still ages uniformly; a
+screen that might be showing something we don't own cannot be recorded as
+ours.
 
 The poller runs only while the sampler is `Streaming` and bound to the
 matching expectation. Adding, removing, or changing `expected_source` tears

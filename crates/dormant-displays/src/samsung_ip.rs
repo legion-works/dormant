@@ -716,6 +716,237 @@ pub fn map_transport_error(
     }
 }
 
+// ── AppVisibilityProbe — port 8001 app visibility for the source gate ──────────
+
+/// HTTP port for the Tizen REST applications + device-info API. Distinct
+/// from the WebSocket control port (`8002`, used by [`crate::samsung_tizen`])
+/// and the JSON-RPC IP Control port (`1516`, used above). The endpoint is
+/// unauthenticated on the LAN — no token required.
+pub const TIZEN_REST_PORT: u16 = 8001;
+
+/// URL path template for a single installed-app query.
+///
+/// `GET /api/v2/applications/{app_id}` returns
+/// `{"name": "...", "running": bool, "visible": bool}`. `visible: true` is
+/// the screen-ownership oracle the active-sampling source gate reads —
+/// `inputSourceControl` on port 1516 stays stale while a Tizen app owns
+/// the panel (issue #232).
+pub const APPLICATIONS_PATH: &str = "/api/v2/applications/";
+
+/// Per-app visibility probe timeout. Kept tight so a configured catalog of
+/// 5–8 apps fits inside the 15-second source-poll budget even on a
+/// sluggish LAN link.
+pub const APP_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Log event literal: one or more watched apps is currently visible.
+pub const APP_VISIBLE_OBSERVED: &str = "wear_sampling_app_visible";
+
+/// Log event literal: an app-visibility probe failed (network, parse,
+/// non-2xx). Emitted at most once per poll cycle per failing app; the
+/// gate fails-safe to the input-only verdict on this signal.
+pub const APP_PROBE_FAILED: &str = "wear_sampling_app_probe_failed";
+
+/// Tri-state visibility outcome for a single configured app probe.
+///
+/// The source gate combines these into its overall verdict:
+/// - **any** `Visible` flips the gate to `Mismatched { observed: "app_visible:<id>" }`,
+///   regardless of `inputSourceControl` (issue #232 — apps own the panel
+///   without changing the reported input source).
+/// - `Unknown` only DEGRADES the input-only verdict when `inputSourceControl`
+///   also failed; an unknown probe never flips the gate on its own (fail
+///   toward uniform attribution, not toward false-positive mismatch).
+/// - `NotVisible` is a successful observation that the app is not on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppVisibility {
+    /// The app is currently visible (owns the panel).
+    Visible,
+    /// The app is installed but not visible.
+    NotVisible,
+    /// The probe could not establish visibility (network/parse/timeout).
+    Unknown,
+}
+
+impl AppVisibility {
+    /// Wire-friendly stable tag for logs and CLI surfaces.
+    #[must_use]
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Self::Visible => "visible",
+            Self::NotVisible => "not_visible",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Network boundary for the port-8001 app-visibility probe.
+///
+/// The real impl talks plain HTTP to the LAN-local TV; the fake used in
+/// tests records calls and returns pre-programmed outcomes.
+#[async_trait]
+pub trait AppVisibilityProbe: Send + Sync {
+    /// Probe one installed-app id and report the tri-state outcome.
+    async fn probe(&self, host: &str, app_id: &str) -> AppVisibility;
+}
+
+/// Production probe: `reqwest` + plain HTTP (port 8001 is unauthenticated,
+/// the LAN threat model is identical to the WebSocket/REST paths already
+/// used in [`crate::samsung_tizen`]). `APP_PROBE_TIMEOUT` bounds every
+/// call so a flaky network cannot pin the gate in `unknown`.
+pub struct RealAppVisibilityProbe {
+    client: reqwest::Client,
+    /// `None` in production (URLs are built from `host:TIZEN_REST_PORT`);
+    /// `Some` for tests that root URLs at a wiremock or other base URL.
+    base_url: Option<String>,
+}
+
+impl RealAppVisibilityProbe {
+    /// Build a probe with the documented per-app timeout.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `reqwest::Client` builder fails — does not happen
+    /// with the default settings used here.
+    #[must_use]
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(APP_PROBE_TIMEOUT)
+            .build()
+            .expect("reqwest::Client::builder should never fail with default settings");
+        Self {
+            client,
+            base_url: None,
+        }
+    }
+
+    /// Build a probe whose URLs are rooted at `base_url` (tests can point
+    /// at a wiremock without exercising the LAN path). The
+    /// `host` argument to `probe()` is appended after `base_url` so a
+    /// wiremock running on `127.0.0.1` is hit without DNS lookups.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `reqwest::Client` builder fails — does not happen
+    /// with the default settings used here.
+    #[cfg(test)]
+    #[must_use]
+    pub fn for_test_with_base_url(base_url: String) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(APP_PROBE_TIMEOUT)
+            .build()
+            .expect("reqwest::Client::builder should never fail");
+        Self {
+            client,
+            base_url: Some(base_url),
+        }
+    }
+}
+
+impl Default for RealAppVisibilityProbe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl AppVisibilityProbe for RealAppVisibilityProbe {
+    async fn probe(&self, host: &str, app_id: &str) -> AppVisibility {
+        let url = match &self.base_url {
+            // Test mode: trust the base_url and ignore the `host`
+            // argument (so wiremock's auto-assigned port works without
+            // re-resolution). Production never sets base_url.
+            Some(base) => format!("{base}{APPLICATIONS_PATH}{app_id}"),
+            None => format!("http://{host}:{TIZEN_REST_PORT}{APPLICATIONS_PATH}{app_id}"),
+        };
+        let Ok(response) = self.client.get(&url).send().await else {
+            return AppVisibility::Unknown;
+        };
+        if !response.status().is_success() {
+            // The TV responds with 404 for an id it does not know about.
+            // Treat as `not_visible` rather than `unknown` — the TV gave
+            // us a definitive answer, just not the one we hoped for. 5xx
+            // remains `unknown` (server-side problem, retry next cycle).
+            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                return AppVisibility::NotVisible;
+            }
+            return AppVisibility::Unknown;
+        }
+        let body: Value = match response.json().await {
+            Ok(b) => b,
+            Err(_) => return AppVisibility::Unknown,
+        };
+        match body.get("visible").and_then(Value::as_bool) {
+            Some(true) => AppVisibility::Visible,
+            Some(false) => AppVisibility::NotVisible,
+            // The body does not include a `visible` field — treat as
+            // unknown rather than inferring (older Tizen firmware may
+            // omit the field).
+            None => AppVisibility::Unknown,
+        }
+    }
+}
+
+// ── Test fake for app visibility ────────────────────────────────────────────────
+
+/// Test-only probe that records calls and returns pre-programmed outcomes.
+///
+/// The default for an unset app id is `NotVisible` (mirroring the real
+/// probe's 404 response) so tests can configure exactly one app and see
+/// the desired path without scripting every catalog entry.
+#[derive(Debug, Default)]
+pub struct FakeAppVisibilityProbe {
+    /// Hosts + app ids probed, in order — the poller's per-cycle
+    /// sequence is observable from the outside.
+    pub calls: StdMutex<Vec<(String, String)>>,
+    /// Pre-programmed outcomes keyed by app id. Missing keys yield
+    /// `NotVisible`.
+    pub results: StdMutex<HashMap<String, AppVisibility>>,
+    /// Force the next probe to return `Unknown` for any id (lets tests
+    /// simulate a fully unreachable 8001 endpoint with one flag).
+    pub force_unknown: StdMutex<bool>,
+}
+
+impl FakeAppVisibilityProbe {
+    /// Build an empty fake.
+    #[must_use]
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Pre-program an app id's outcome.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the results `Mutex` is poisoned — does not happen in
+    /// the test-only call patterns this method supports.
+    pub fn set(&self, app_id: &str, outcome: AppVisibility) {
+        self.results
+            .lock()
+            .unwrap()
+            .insert(app_id.to_string(), outcome);
+    }
+}
+
+#[async_trait]
+impl AppVisibilityProbe for FakeAppVisibilityProbe {
+    async fn probe(&self, host: &str, app_id: &str) -> AppVisibility {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((host.to_string(), app_id.to_string()));
+        if *self.force_unknown.lock().unwrap() {
+            return AppVisibility::Unknown;
+        }
+        self.results
+            .lock()
+            .unwrap()
+            .get(app_id)
+            .copied()
+            .unwrap_or(AppVisibility::NotVisible)
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1589,6 +1820,141 @@ mod tests {
         assert!(
             raw.contains("fresh-tok"),
             "fresh token must be persisted: {raw}"
+        );
+    }
+
+    // ── AppVisibilityProbe fake tests ────────────────────────────────────────────
+
+    /// `FakeAppVisibilityProbe` returns the programmed outcome and
+    /// records host + app id on each probe.
+    #[tokio::test]
+    async fn fake_app_probe_set_returns_value_and_records_call() {
+        let fake = FakeAppVisibilityProbe::new();
+        fake.set("3201512006963", AppVisibility::Visible);
+        assert_eq!(
+            fake.probe("tv.local", "3201512006963").await,
+            AppVisibility::Visible
+        );
+        assert_eq!(
+            &*fake.calls.lock().unwrap(),
+            &[("tv.local".to_owned(), "3201512006963".to_owned())]
+        );
+    }
+
+    /// An unconfigured app id is treated as `NotVisible` (the real
+    /// probe's 404 path) so tests can spot-configure a single app
+    /// without scripting every catalog entry.
+    #[tokio::test]
+    async fn fake_app_probe_unset_id_defaults_to_not_visible() {
+        let fake = FakeAppVisibilityProbe::new();
+        assert_eq!(
+            fake.probe("tv.local", "111299001912").await,
+            AppVisibility::NotVisible
+        );
+        assert_eq!(fake.calls.lock().unwrap().len(), 1);
+    }
+
+    /// `force_unknown` overrides every outcome to `Unknown`, simulating
+    /// a fully-unreachable 8001 endpoint. Used by
+    /// `source_gate` tests to verify the fail-safe direction.
+    #[tokio::test]
+    async fn fake_app_probe_force_unknown_overrides_outcomes() {
+        let fake = FakeAppVisibilityProbe::new();
+        fake.set("visible-app", AppVisibility::Visible);
+        fake.set("not-visible-app", AppVisibility::NotVisible);
+        *fake.force_unknown.lock().unwrap() = true;
+        assert_eq!(
+            fake.probe("tv.local", "visible-app").await,
+            AppVisibility::Unknown,
+            "force_unknown must override even a programmed Visible outcome"
+        );
+        assert_eq!(
+            fake.probe("tv.local", "missing-app").await,
+            AppVisibility::Unknown,
+            "force_unknown applies to unconfigured ids too"
+        );
+        assert_eq!(
+            fake.probe("tv.local", "not-visible-app").await,
+            AppVisibility::Unknown
+        );
+    }
+
+    /// `RealAppVisibilityProbe` is exercised end-to-end through
+    /// `wiremock` to confirm the wire shape: `GET /api/v2/applications/<id>`,
+    /// no auth header, plain HTTP. The 200/404/500 outcomes exercise
+    /// the three wire paths (`Visible`, `NotVisible` via 404, `Unknown` via
+    /// 5xx).
+    #[tokio::test]
+    async fn real_app_probe_parses_visible_true_and_404_returns_not_visible() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        // Happy path: app installed and on screen.
+        Mock::given(method("GET"))
+            .and(path("/api/v2/applications/3201512006963"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "YouTube",
+                "running": true,
+                "visible": true
+            })))
+            .mount(&server)
+            .await;
+        // 404 for an app id the TV doesn't recognize — must surface as
+        // NotVisible, NOT Unknown. A 404 is a definitive answer.
+        Mock::given(method("GET"))
+            .and(path("/api/v2/applications/uninstalled"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        // 500 surfaces as Unknown (server-side problem, retry next cycle).
+        Mock::given(method("GET"))
+            .and(path("/api/v2/applications/flaky"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let probe = RealAppVisibilityProbe::for_test_with_base_url(server.uri());
+        assert_eq!(
+            probe.probe("ignored-in-test", "3201512006963").await,
+            AppVisibility::Visible,
+            "200 with visible=true must yield Visible"
+        );
+        assert_eq!(
+            probe.probe("ignored-in-test", "uninstalled").await,
+            AppVisibility::NotVisible,
+            "404 must surface as NotVisible (definitive non-presence)"
+        );
+        assert_eq!(
+            probe.probe("ignored-in-test", "flaky").await,
+            AppVisibility::Unknown,
+            "5xx must surface as Unknown (transient — retry next cycle)"
+        );
+    }
+
+    /// Real probe treats a JSON body without `visible` as `Unknown`
+    /// rather than inferring visibility from `running`. Older Tizen
+    /// firmware may omit the field — the fail-safe direction is to
+    /// not assume `NotVisible` for ambiguous shapes.
+    #[tokio::test]
+    async fn real_app_probe_treats_missing_visible_field_as_unknown() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v2/applications/old-firmware"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "MysteryApp",
+                "running": true
+            })))
+            .mount(&server)
+            .await;
+        let probe = RealAppVisibilityProbe::for_test_with_base_url(server.uri());
+        assert_eq!(
+            probe.probe("ignored-in-test", "old-firmware").await,
+            AppVisibility::Unknown,
+            "missing visible field must surface as Unknown, not NotVisible"
         );
     }
 }

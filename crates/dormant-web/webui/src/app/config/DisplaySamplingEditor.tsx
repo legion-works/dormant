@@ -9,6 +9,7 @@
  *   - sampling.source_poll_interval (humantime duration string)
  *   - sampling.stream_mode      (enum with an explicit "Inherit global"
  *                                sentinel that maps to a `remove` patch)
+ *   - sampling.watched_apps     (list of Tizen app ids; issue #232)
  *
  * The stream_mode select intentionally exposes three options rather than
  * the two-element enum: the operator may want to inherit the global
@@ -17,7 +18,7 @@
  * global" emits a `remove` patch on the stream_mode path so the server
  * can fall back to the global setting.
  *
- * ALL FOUR FIELDS share the same "empty/cleared → remove" invariant.
+ * ALL FIVE FIELDS share the same "empty/cleared → remove" invariant.
  * The server rejects JSON `null` for Option fields (config_patch.rs
  * json_to_toml_value), rejects empty strings for the three Option /
  * humantime fields (validate.rs:1554-1599), and rejects whitespace-only
@@ -28,12 +29,17 @@
  * state. This mirrors ScreensaverEditor's `cleanSource` (which strips
  * empty optional fields before emit).
  *
+ * `watched_apps` follows the same empty-array → `remove` invariant:
+ * emptying the list disables the port-8001 app-visibility check and
+ * the operator's catalog reverts to the daemon-shipped seed
+ * ([`defaults::WEAR_SAMPLING_DEFAULT_WATCHED_APPS`]).
+ *
  * Patch paths are deep arrays (e.g. `["displays", id, "sampling",
  * "expected_source"]`) so the server builds the intermediate `sampling`
  * table lazily on first set (config_patch.rs walk_table auto-vivifies),
  * matching how the ScreensaverEditor handles its nested sources array.
  */
-import { DurationField, TextField } from "./fields";
+import { DurationField, StringListField, TextField } from "./fields";
 import type { PatchStore } from "./patch";
 import type { DisplaySamplingConfig } from "../../api/types";
 
@@ -102,6 +108,7 @@ export default function DisplaySamplingEditor({
   const expectedSourcePath = [...samplingPath, "expected_source"];
   const sourcePollIntervalPath = [...samplingPath, "source_poll_interval"];
   const streamModePath = [...samplingPath, "stream_mode"];
+  const watchedAppsPath = [...samplingPath, "watched_apps"];
 
   // Text inputs share "" as their unset sentinel. The fetched prop is
   // also defaulted to "" when the JSON key is absent so the React
@@ -117,6 +124,10 @@ export default function DisplaySamplingEditor({
   // stream_mode uses null as its "unset" sentinel; the select value
   // mapping below coerces it to "" for the <select> element.
   const currentStreamMode = effective(store, streamModePath, sampling?.stream_mode ?? null, null);
+  // watched_apps defaults to an empty array; the empty/cleaned state
+  // disables the app-visibility check entirely (back-compat with
+  // displays that pre-date #232).
+  const currentWatchedApps = effective(store, watchedAppsPath, sampling?.watched_apps ?? [], []);
 
   const streamModeSelectValue: string = currentStreamMode ?? "";
 
@@ -150,6 +161,23 @@ export default function DisplaySamplingEditor({
       emitRemove(streamModePath);
     } else {
       emitEdit(streamModePath, value);
+    }
+  }
+
+  /**
+   * Emit a watched_apps change. The StringListField's onEdit fires with
+   * `(path, value)` — the patch store wants a `(path, value)` pair via
+   * `emitEdit`, so we ignore the path arg (it equals `watchedAppsPath`)
+   * and forward the typed value. An empty array promotes to a
+   * `remove` patch so the operator can express "disable the
+   * app-visibility check" without leaving phantom entries behind.
+   */
+  function emitWatchedApps(_ignoredPath: string[], next: unknown) {
+    const list = Array.isArray(next) ? (next as string[]) : [];
+    if (list.length === 0) {
+      emitRemove(watchedAppsPath);
+    } else {
+      emitEdit(watchedAppsPath, list);
     }
   }
 
@@ -215,6 +243,17 @@ export default function DisplaySamplingEditor({
             <span className="cf-field__error">{fieldErrors[streamModePath.join(".")]}</span>
           )}
         </div>
+
+        <StringListField
+          path={watchedAppsPath}
+          label="watched_apps"
+          value={currentWatchedApps}
+          locked={store.isLocked(watchedAppsPath, redactedPaths)}
+          onEdit={emitWatchedApps}
+          error={fieldErrors[watchedAppsPath.join(".")]}
+          placeholder="111299001912"
+          help="Tizen app ids the active-sampling source gate probes for screen ownership via port 8001. A positive visible result forces the gate to mismatched even when expected_source matches — apps own the panel without flipping inputSourceControl. The key is opt-out: when the field is absent the gate inherits the daemon-shipped seed (defaults::WEAR_SAMPLING_DEFAULT_WATCHED_APPS — Netflix, YouTube, Prime Video, etc.) so a stock TV config gets app detection out of the box. Add an entry to declare an explicit list (overrides the seed); remove all entries to apply the empty-array opt-out (pure input-only gate, no app probe). Operators should extend this list for their installed app set because current Tizen firmware has no reliable enumeration endpoint."
+        />
       </div>
     </div>
   );

@@ -811,6 +811,40 @@ pub struct DisplaySamplingConfig {
     /// section's `active_sampling.stream_mode` for global consistency.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_mode: Option<StreamMode>,
+
+    /// Tizen app ids the source gate polls for screen ownership. Each id
+    /// is probed on every source-poll cycle via the unauthenticated
+    /// `GET http://<host>:8001/api/v2/applications/<id>` endpoint; a
+    /// `visible: true` response forces the gate to `mismatched` even when
+    /// `expected_source` matches. The daemon ships a minimal
+    /// community-maintained seed list (`Netflix`, `YouTube`, `Prime Video`,
+    /// `Disney+`, etc. — see `defaults::WEAR_SAMPLING_DEFAULT_WATCHED_APPS`).
+    /// When `watched_apps` is **absent** from the `[sampling]` table the
+    /// gate inherits that seed — the fail-safe direction for #232: a stock
+    /// TV config suspends spatial attribution under any installed streaming
+    /// app without the operator having to enumerate their installed set.
+    /// When `watched_apps` is set to an **empty array** the gate runs in
+    /// pure input-only mode (the pre-#232 behavior); this is the
+    /// operator's opt-out when the seeded catalog is unsuitable for their
+    /// hardware. Operators should still extend `watched_apps` for their
+    /// installed set — see issue #232 for the enumeration gap on current
+    /// Tizen firmware that motivates the user-extensible catalog.
+    #[serde(
+        default = "watched_apps_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub watched_apps: Vec<String>,
+}
+
+/// Seeded default for [`DisplaySamplingConfig::watched_apps`] — the
+/// serde `default` fn only applies to ABSENT keys, so an explicit
+/// `watched_apps = []` opts out. Returns owned `String`s so the result
+/// owns its data without borrowing from the const slice.
+fn watched_apps_default() -> Vec<String> {
+    defaults::WEAR_SAMPLING_DEFAULT_WATCHED_APPS
+        .iter()
+        .map(|app_id| (*app_id).to_owned())
+        .collect()
 }
 
 impl Default for WearConfig {
@@ -3227,6 +3261,79 @@ source_poll_interval = "30s"
         let cfg: Config = toml::from_str(toml_str).unwrap();
         let sampling = cfg.displays["tv"].sampling.as_ref().unwrap();
         assert_eq!(sampling.source_poll_interval, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn sampling_watched_apps_default_seeds_when_key_absent() {
+        // Fail-safe direction (issue #232): a stock config — operator
+        // declares the sampling table but omits `watched_apps` — must
+        // get the seeded catalog from `defaults::WEAR_SAMPLING_DEFAULT_WATCHED_APPS`
+        // so a Samsung TV running an installed streaming app is detected
+        // out of the box. Before the serde-default-fn wiring this test
+        // would see an empty Vec; after, it must see the seed.
+        let toml_str = r#"
+config_version = 1
+[displays.tv]
+controllers = ["samsung-tizen"]
+[displays.tv.sampling]
+expected_source = "HDMI4"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        let sampling = cfg.displays["tv"].sampling.as_ref().unwrap();
+        assert_eq!(
+            sampling.watched_apps,
+            defaults::WEAR_SAMPLING_DEFAULT_WATCHED_APPS
+                .iter()
+                .map(|app_id| (*app_id).to_owned())
+                .collect::<Vec<_>>(),
+            "unset watched_apps must seed the default catalog (fail-safe direction)"
+        );
+    }
+
+    #[test]
+    fn sampling_watched_apps_explicit_empty_array_disables_app_probe() {
+        // Opt-out: explicit `watched_apps = []` is the operator's
+        // signal that they want the input-only gate (the pre-#232
+        // behavior). The serde default fn only applies to ABSENT keys;
+        // an empty array deserializes verbatim to an empty Vec. This
+        // negative case guards the round-trip so a future refactor of
+        // the default fn can't silently flip the opt-out.
+        let toml_str = r#"
+config_version = 1
+[displays.tv]
+controllers = ["samsung-tizen"]
+[displays.tv.sampling]
+expected_source = "HDMI4"
+watched_apps = []
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        let sampling = cfg.displays["tv"].sampling.as_ref().unwrap();
+        assert!(
+            sampling.watched_apps.is_empty(),
+            "explicit [] must stay empty — only absent keys fall back to the default catalog"
+        );
+    }
+
+    #[test]
+    fn sampling_watched_apps_explicit_list_overrides_default() {
+        // Explicit list takes precedence over the seeded default — the
+        // serde default fn only fires when the key is missing. The
+        // operator's catalog is the source of truth once they declare
+        // one.
+        let toml_str = r#"
+config_version = 1
+[displays.tv]
+controllers = ["samsung-tizen"]
+[displays.tv.sampling]
+expected_source = "HDMI4"
+watched_apps = ["111299001912", "999999999999"]
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        let sampling = cfg.displays["tv"].sampling.as_ref().unwrap();
+        assert_eq!(
+            sampling.watched_apps,
+            vec!["111299001912".to_owned(), "999999999999".to_owned()]
+        );
     }
 
     #[test]

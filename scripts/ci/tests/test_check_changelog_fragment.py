@@ -206,5 +206,20 @@ class TitleDetectionTests(unittest.TestCase):
         self.assertTrue(check_changelog_fragment._is_title_feat_or_fix("FEAT: add widget"))
 
 
+class RangeArgumentTests(unittest.TestCase):
+    def test_default_range_is_origin_dev_dotdot_head(self):
+        args = check_changelog_fragment.build_parser().parse_args([])
+        self.assertEqual(args.revision_range, "origin/dev..HEAD")
+
+    def test_explicit_range_overrides_default(self):
+        args = check_changelog_fragment.build_parser().parse_args(["--range", "main..feature"])
+        self.assertEqual(args.revision_range, "main..feature")
+
+    def test_other_defaults_preserved(self):
+        args = check_changelog_fragment.build_parser().parse_args([])
+        self.assertIsNone(args.pr_title)
+        self.assertFalse(args.skip_label)
+
+
 if __name__ == "__main__":
     unittest.main()

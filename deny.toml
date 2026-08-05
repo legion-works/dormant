@@ -27,6 +27,9 @@ allow = [
 # overrides the manifest expression with the valid SPDX id (the deprecated
 # LGPL-2.1 maps to LGPL-2.1-only; the +/or-later postfix was separate),
 # and the exception permits it for these crates only.
+# NOTE: the license-files hash pins the upstream LICENSE bytes — a future
+# libmpv2/libmpv2-sys bump that ships a changed LICENSE fails cargo-deny
+# hard (deliberate fail-closed tripwire); recompute with `xxhsum -H0` then.
 [[licenses.clarify]]
 crate = "libmpv2"
 expression = "LGPL-2.1-only"

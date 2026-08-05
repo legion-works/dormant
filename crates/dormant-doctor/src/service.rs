@@ -210,6 +210,9 @@ async fn run_inner(
             checks.push(probe_result_to_check(&result));
         }
     } else {
+        // Reachable only on non-Linux hosts or pre-per-display daemons: a modern
+        // Linux daemon always supplies `sampler_statuses_rx` (see `app.rs`), so a
+        // plural `sampled_displays` config never reaches this singular fallback.
         let sampler_status = sampler_status_rx.as_ref().map(|rx| rx.borrow().clone());
         let sampler_result = crate::probes::wear_sampling::probe_wear_sampling(
             &cfg.wear,

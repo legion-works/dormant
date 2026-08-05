@@ -40,9 +40,14 @@ pub fn probe_wear_sampling(
     }
 
     #[cfg(target_os = "linux")]
-    classify_one_status("wear-sampling", config, display_bound, status, |result| {
-        result
-    })
+    classify_one_status(
+        "wear-sampling",
+        config,
+        display_bound,
+        None,
+        status,
+        |result| result,
+    )
 }
 
 /// Per-display redacted active-sampling probe (issue #185 cycle B).
@@ -110,10 +115,14 @@ pub fn probe_wear_sampling_per_display(
         .map(|display| {
             let status = statuses.get(display);
             let display_bound = live_display_ids.iter().any(|id| id == display);
-            let mut result =
-                classify_one_status("wear-sampling", config, display_bound, status, |result| {
-                    result
-                });
+            let mut result = classify_one_status(
+                "wear-sampling",
+                config,
+                display_bound,
+                Some(display),
+                status,
+                |result| result,
+            );
             result.subject = Some(display.clone());
             result.category = Some("platform".into());
             result
@@ -125,11 +134,24 @@ pub fn probe_wear_sampling_per_display(
 /// pre-decorating the result with a subject.  The closure exists only
 /// to let the singular probe keep the current no-subject shape while
 /// the per-display probe injects `subject = Some(display)` post-hoc.
+///
+/// `subject` is the display id this status entry belongs to (the
+/// per-display map key / probe subject).  The consent binding check
+/// compares `status.bound_display` against THAT id, never against the
+/// singular selector — `first_sampled_display()` returns `None` under a
+/// plural config, so comparing against it would falsely mismatch every
+/// bound display.  When `subject` is `None` (the singular probe, which
+/// carries no per-display subject) the check falls back to
+/// `first_sampled_display()`, legitimate only because the singular
+/// probe is reached solely under a singular config; if even that is
+/// `None` (plural config misrouted into the singular probe) no mismatch
+/// is asserted — fail-safe presence, never a false positive.
 #[cfg(target_os = "linux")]
 fn classify_one_status(
     name: &'static str,
     config: &WearConfig,
     display_bound: bool,
+    subject: Option<&str>,
     status: Option<&WearSamplingStatus>,
     mut decorate: impl FnMut(ProbeResult) -> ProbeResult,
 ) -> ProbeResult {
@@ -145,11 +167,16 @@ fn classify_one_status(
 
     let result = match status.state {
         WearSamplingState::Streaming => {
-            if status
-                .bound_display
-                .as_deref()
-                .is_some_and(|b| Some(b) != config.active_sampling.first_sampled_display())
-            {
+            let expected_display =
+                subject.or_else(|| config.active_sampling.first_sampled_display());
+            let binding_mismatch = match (status.bound_display.as_deref(), expected_display) {
+                (Some(bound), Some(expected)) => bound != expected,
+                // No bound display, or no expected id to compare against
+                // (plural config misrouted into the singular probe): do not
+                // assert a mismatch — fail-safe presence, never false-positive.
+                _ => false,
+            };
+            if binding_mismatch {
                 ProbeResult::fail(
                     name,
                     "consent record display binding does not match configuration",
@@ -446,5 +473,86 @@ mod tests {
         );
         assert_eq!(results.len(), 2, "got {}", results.len());
         assert!(results.iter().all(|r| r.status == ProbeStatus::Skip));
+    }
+
+    /// Plural config: each display's status bound to its OWN id MUST be
+    /// healthy.  Regression for the singular-era binding check that
+    /// compared every per-display status against
+    /// `first_sampled_display()` — which returns `None` under a plural
+    /// config, falsely mismatching every bound display.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn per_display_streaming_bound_to_own_display_is_healthy() {
+        let statuses: BTreeMap<String, WearSamplingStatus> = [
+            (
+                "desk".to_owned(),
+                status_for("desk", WearSamplingState::Streaming),
+            ),
+            (
+                "tv".to_owned(),
+                status_for("tv", WearSamplingState::Streaming),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let results = probe_wear_sampling_per_display(
+            &two_display_config(),
+            &["desk".to_owned(), "tv".to_owned()],
+            &["desk".to_owned(), "tv".to_owned()],
+            &statuses,
+        );
+        assert_eq!(results.len(), 2);
+        for r in &results {
+            assert_eq!(
+                r.status,
+                ProbeStatus::Pass,
+                "display {:?} should be healthy, got {:?}: {}",
+                r.subject,
+                r.status,
+                r.detail,
+            );
+        }
+    }
+
+    /// Plural config: a status genuinely bound to the WRONG display
+    /// (its `bound_display` names a sibling, not the entry's own id)
+    /// MUST still fail.  Guards against the fix becoming permissive.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn per_display_streaming_bound_to_wrong_display_fails() {
+        let statuses: BTreeMap<String, WearSamplingStatus> = [
+            // desk's consent record is bound to "tv" — a sibling, not desk.
+            (
+                "desk".to_owned(),
+                status_for("tv", WearSamplingState::Streaming),
+            ),
+            (
+                "tv".to_owned(),
+                status_for("tv", WearSamplingState::Streaming),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let results = probe_wear_sampling_per_display(
+            &two_display_config(),
+            &["desk".to_owned(), "tv".to_owned()],
+            &["desk".to_owned(), "tv".to_owned()],
+            &statuses,
+        );
+        let desk = results
+            .iter()
+            .find(|r| r.subject.as_deref() == Some("desk"))
+            .expect("desk result present");
+        assert_eq!(
+            desk.status,
+            ProbeStatus::Fail,
+            "desk bound to tv must fail: {}",
+            desk.detail,
+        );
+        assert!(
+            desk.detail.contains("binding"),
+            "expected binding-mismatch detail, got: {}",
+            desk.detail,
+        );
     }
 }

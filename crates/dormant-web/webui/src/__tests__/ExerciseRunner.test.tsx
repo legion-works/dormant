@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import ExerciseRunner, { aggregateExerciseVerdict } from "../app/components/ExerciseRunner";
+import ExerciseRunner from "../app/components/ExerciseRunner";
+import { aggregateExerciseVerdict } from "../app/components/exerciseVerdict";
 import type { OperationsStatus } from "../api/types";
 
 const api = vi.hoisted(() => ({

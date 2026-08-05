@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useRef } from "react";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { SectionRail } from "../app/config/SectionRail";
-import { SectionRailProvider, useRegisterSection } from "../app/config/SectionRailContext";
+import { SectionRailProvider } from "../app/config/SectionRailContext";
+import { useRegisterSection } from "../app/config/sectionRail";
 
 function RegisteredSections() {
   const anchor = useRef<HTMLDivElement>(null);

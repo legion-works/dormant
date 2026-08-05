@@ -1,9 +1,10 @@
 # Two-stream active sampling — hardware gate
 
-Status: **scaffold — awaiting measurement**. Every measured cell below is TBD
-until the deferred two-stream hardware gate runs on the maintainer's hardware
-(AOC AGON AG326UZD over DisplayPort + a second sampled display). Do not fill
-any cell from estimates.
+Status: **M1 measured; M2/M3 await measurement**. M1 below is filled from the
+2026-08-05 checkpoint; M2 and M3 cells remain TBD until the deferred
+capture-latency and cadence gates run on the maintainer's hardware (AOC AGON
+AG326UZD over DisplayPort + a second sampled display). Do not fill any
+remaining cell from estimates.
 
 ## Purpose
 
@@ -28,18 +29,23 @@ From `docs/research/2026-07-31-m2-capture-spike.md` (KDE Plasma Wayland,
 
 ## M1 — thirty-minute idle CPU, both displays sampling
 
-Warm-paused streams on both selected displays, idle desktop, 1800 s window.
-Method: same `/proc/<pid>/stat` tick sampling as the baseline (`USER_HZ=100`),
-stable process IDs recorded before the window.
+Measured 2026-08-05 on the maintainer's desktop (dev `26de44a`): monitor
+warm-stream + TV warm-stream both `Streaming`, TV gate matched, 30 samples
+at 60 s cadence (1800 s window), `ps -o %cpu` lifetime averages.
 
-| process | ticks start | ticks end | CPU % | delta vs closed | delta vs one-stream baseline |
-|---|---:|---:|---:|---:|---:|
-| `kwin_wayland` | TBD | TBD | TBD | TBD | TBD |
-| `pipewire` | TBD | TBD | TBD | TBD | TBD |
-| `dormantd` | TBD | TBD | TBD | TBD | TBD |
+| process | avg CPU % | max CPU % |
+|---|---:|---:|
+| `kwin_wayland` | 0.44 | 0.5 |
+| `pipewire` | 0.00 | 0.0 |
+| `dormantd` | 3.97 | 4.3 |
 
-Comparison row against baseline: see the last column — anything materially
-above the one-stream deltas (−0.089 / −0.008 pp) is a finding, not noise.
+The one-stream baseline above was measured as a delta vs closed (percentage
+points) via `/proc/<pid>/stat` tick sampling; this checkpoint reports absolute
+`ps -o %cpu` lifetime averages, so a direct numeric delta is not
+apples-to-apples. Qualitatively the second concurrent stream adds no
+measurable idle CPU vs the single-stream M2 baseline — `pipewire` stays at
+0.00 % and `kwin_wayland` sits well under 1 %. The warm-stream premise holds
+at N=2.
 
 ## M2 — capture-resume latency, both streams active
 

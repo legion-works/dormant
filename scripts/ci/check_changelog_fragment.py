@@ -201,11 +201,16 @@ def _find_new_fragment_relpaths(
     return paths
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser.
+
+    --range defaults to origin/dev..HEAD so plan templates and bare
+    invocations don't have to repeat it; an explicit --range still overrides.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--range", required=True, dest="revision_range",
-        help="git revision range, e.g. origin/dev...HEAD",
+        "--range", default="origin/dev..HEAD", dest="revision_range",
+        help="git revision range (default: origin/dev..HEAD)",
     )
     parser.add_argument(
         "--pr-title", default=None,
@@ -215,7 +220,11 @@ def main() -> int:
         "--skip-label", action="store_true", default=False,
         help="skip-changelog label is present on this PR",
     )
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
 
     root = pathlib.Path(
         subprocess.run(

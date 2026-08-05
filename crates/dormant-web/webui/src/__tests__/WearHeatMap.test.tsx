@@ -1,7 +1,8 @@
 /** Wear heat map colour and interaction regression tests. */
 import { afterEach, describe, expect, it } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { heatColor, normalizeWearGrid, WearHeatMap } from "../app/components/WearHeatMap";
+import { heatColor, normalizeWearGrid } from "../app/components/wearHeatMapGrid";
+import { WearHeatMap } from "../app/components/WearHeatMap";
 import type { WearDetail } from "../api/types";
 
 afterEach(() => cleanup());

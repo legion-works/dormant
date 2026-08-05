@@ -42,7 +42,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiError, postExercise } from "../../api/client";
 import { useLiveState } from "../hooks/useLiveState";
 import { useConfirmDialog } from "./useConfirmDialog";
-import type { ExerciseReport, ExerciseStep, ExerciseVerdict, PanelState } from "../../api/types";
+import { aggregateExerciseVerdict } from "./exerciseVerdict";
+import type { ExerciseReport, PanelState } from "../../api/types";
 import "./ExerciseRunner.css";
 
 export interface ExerciseRunnerProps {
@@ -51,16 +52,6 @@ export interface ExerciseRunnerProps {
 }
 
 type ExerciseUiState = "idle" | "pending" | "uncertain";
-
-/** Aggregate a step list into a single verdict: failed takes precedence
- * over unconfirmable, which takes precedence over confirmed. An empty
- * step list (never run) is `"not_run"` — distinct from any real verdict. */
-export function aggregateExerciseVerdict(steps: ExerciseStep[]): ExerciseVerdict | "not_run" {
-  if (steps.length === 0) return "not_run";
-  if (steps.some((step) => step.verdict === "failed")) return "failed";
-  if (steps.some((step) => step.verdict === "unconfirmable")) return "unconfirmable";
-  return "confirmed";
-}
 
 /** Format a `PanelState` honestly: only render fields the wire actually
  * sent. `power` alone, `brightness N` alone, `power · brightness N` when

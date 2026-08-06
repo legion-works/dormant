@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 use crate::active_sampler::{
     ActiveSamplerHandle, SamplerCommand, SamplerError, SamplingState, SharedSamplerRegistry,
 };
-use crate::direct_switch::{DirectSwitchHandle, SwitchReason};
+use crate::direct_switch::{DirectSwitchHandle, SwitchReason, switch_outcome_label};
 
 /// Maximum line length for IPC requests/responses (1 MB).
 const MAX_LINE_BYTES: usize = 1_048_576;
@@ -291,12 +291,12 @@ async fn handle_connection(
                 let resp = handle_exercise(&ctl_tx, &display).await;
                 let _ = write_json(&mut writer, &resp).await;
             }
-            IpcRequest::SwitchToLocal { display } => {
-                let resp = handle_switch_local(&direct_switch, &display).await;
+            IpcRequest::SwitchToLocal { display, force } => {
+                let resp = handle_switch_local(&direct_switch, &display, force).await;
                 let _ = write_json(&mut writer, &resp).await;
             }
-            IpcRequest::SwitchToPeer { display } => {
-                let resp = handle_switch_peer(&direct_switch, &display).await;
+            IpcRequest::SwitchToPeer { display, force } => {
+                let resp = handle_switch_peer(&direct_switch, &display, force).await;
                 let _ = write_json(&mut writer, &resp).await;
             }
             IpcRequest::WearSamplingEnable => {
@@ -768,22 +768,32 @@ async fn request_snapshot(ctl_tx: &mpsc::Sender<ControlMsg>) -> Option<StateSnap
 }
 
 /// Handle a direct local switch — write the local input code.
-async fn handle_switch_local(direct_switch: &DirectSwitchHandle, display: &str) -> IpcResponse {
+async fn handle_switch_local(
+    direct_switch: &DirectSwitchHandle,
+    display: &str,
+    force: bool,
+) -> IpcResponse {
     let outcome = direct_switch
         .pull(
             dormant_core::types::DisplayId(display.to_string()),
             SwitchReason::Cli,
+            force,
         )
         .await;
     switch_outcome_to_response(outcome, display)
 }
 
 /// Handle a direct peer switch — write the peer input code.
-async fn handle_switch_peer(direct_switch: &DirectSwitchHandle, display: &str) -> IpcResponse {
+async fn handle_switch_peer(
+    direct_switch: &DirectSwitchHandle,
+    display: &str,
+    force: bool,
+) -> IpcResponse {
     let outcome = direct_switch
         .push(
             dormant_core::types::DisplayId(display.to_string()),
             SwitchReason::Cli,
+            force,
         )
         .await;
     switch_outcome_to_response(outcome, display)
@@ -792,27 +802,50 @@ async fn handle_switch_peer(direct_switch: &DirectSwitchHandle, display: &str) -
 /// Map a [`SwitchOutcome`] to an [`IpcResponse`], with specific errors for
 /// each failure mode so the operator can distinguish "no such display" from
 /// "this display isn't shared" from "the write failed."
+///
+/// Every variant now carries the stable [`switch_outcome_label`] on the
+/// wire so the CLI can distinguish `Switched` from the idempotent
+/// `AlreadyLocal` / `AlreadyPeer` no-ops (issue #246).  Success-class
+/// outcomes (`Switched`, `AlreadyLocal`, `AlreadyPeer`) keep `ok = true`;
+/// the rest map to a specific error string and `ok = false`.  The
+/// `switch_outcome` field is the canonical string the CLI greps; the
+/// legacy `error` field stays unchanged for backward-compatible tooling.
 fn switch_outcome_to_response(
     outcome: crate::direct_switch::SwitchOutcome,
     display: &str,
 ) -> IpcResponse {
+    let label = switch_outcome_label(&outcome);
     match outcome {
-        crate::direct_switch::SwitchOutcome::Switched => IpcResponse::ok(None),
-        crate::direct_switch::SwitchOutcome::NotConfigured => IpcResponse::error(format!(
-            "display '{display}' is shared but peer input write code is not configured"
-        )),
-        crate::direct_switch::SwitchOutcome::Unsupported => IpcResponse::error(format!(
-            "display '{display}' is not shared or has no input code configured"
-        )),
+        crate::direct_switch::SwitchOutcome::Switched
+        | crate::direct_switch::SwitchOutcome::AlreadyLocal
+        | crate::direct_switch::SwitchOutcome::AlreadyPeer => {
+            IpcResponse::switch(label, true, None)
+        }
+        crate::direct_switch::SwitchOutcome::NotConfigured => IpcResponse::switch(
+            label,
+            false,
+            Some(format!(
+                "display '{display}' is shared but peer input write code is not configured"
+            )),
+        ),
+        crate::direct_switch::SwitchOutcome::Unsupported => IpcResponse::switch(
+            label,
+            false,
+            Some(format!(
+                "display '{display}' is not shared or has no input code configured"
+            )),
+        ),
         crate::direct_switch::SwitchOutcome::HookAborted { reason } => {
-            IpcResponse::error(format!("switch hook aborted: {reason}"))
+            IpcResponse::switch(label, false, Some(format!("switch hook aborted: {reason}")))
         }
         crate::direct_switch::SwitchOutcome::WriteFailed { error } => {
-            IpcResponse::error(format!("write failed: {error}"))
+            IpcResponse::switch(label, false, Some(format!("write failed: {error}")))
         }
-        crate::direct_switch::SwitchOutcome::Cooldown => {
-            IpcResponse::error("switch suppressed by activity cooldown")
-        }
+        crate::direct_switch::SwitchOutcome::Cooldown => IpcResponse::switch(
+            label,
+            false,
+            Some("switch suppressed by activity cooldown".into()),
+        ),
     }
 }
 
@@ -1125,9 +1158,11 @@ mod tests {
     }
 
     /// Every [`SwitchOutcome`] variant must map to a consistent IPC response —
-    /// `Switched` → success, everything else → error.  This test is the
-    /// exhaustive exit-code contract: a new variant that silently maps to
-    /// `ok: true` would mask a failure as success.
+    /// success-class outcomes (`Switched`, `AlreadyLocal`, `AlreadyPeer`)
+    /// return `ok: true`; everything else returns `ok: false` with a
+    /// specific error string.  This test is the exhaustive exit-code
+    /// contract: a new variant that silently maps to `ok: true` would
+    /// mask a failure as success.
     #[test]
     fn every_switch_outcome_has_consistent_response() {
         let outcomes = [
@@ -1147,6 +1182,8 @@ mod tests {
                 false,
             ),
             (SwitchOutcome::Cooldown, false),
+            (SwitchOutcome::AlreadyLocal, true),
+            (SwitchOutcome::AlreadyPeer, true),
         ];
         for (outcome, expected_ok) in outcomes {
             let resp = switch_outcome_to_response(outcome, "monitor");
@@ -1154,7 +1191,30 @@ mod tests {
                 resp.ok, expected_ok,
                 "SwitchOutcome variant must consistently map ok={expected_ok}"
             );
+            assert!(
+                resp.switch_outcome.is_some(),
+                "every switch response must carry a switch_outcome label"
+            );
         }
+    }
+
+    /// Issue #246 — every success-class outcome must carry the literal
+    /// label the CLI greps for.  `AlreadyLocal` and `AlreadyPeer` are the
+    /// new success-class variants the idempotency guard introduces; the
+    /// CLI prints `"already local — no action"` / `"already peer — no
+    /// action"` only when those labels reach it.
+    #[test]
+    fn already_outcomes_carry_stable_labels() {
+        let resp = switch_outcome_to_response(SwitchOutcome::AlreadyLocal, "monitor");
+        assert!(resp.ok);
+        assert_eq!(resp.switch_outcome.as_deref(), Some("already_local"));
+
+        let resp = switch_outcome_to_response(SwitchOutcome::AlreadyPeer, "monitor");
+        assert!(resp.ok);
+        assert_eq!(resp.switch_outcome.as_deref(), Some("already_peer"));
+
+        let resp = switch_outcome_to_response(SwitchOutcome::Switched, "monitor");
+        assert_eq!(resp.switch_outcome.as_deref(), Some("switched"));
     }
 
     // ── Blank soft/hard routing (issue #124) ─────────────────────────────

@@ -77,6 +77,34 @@ pub enum SwitchOutcome {
     /// activity-driven write was already issued within the
     /// [`dormant_core::config::CoordinationConfig::cooldown`] window for this display.
     Cooldown,
+    /// Pull was skipped because the daemon already owns the panel and a
+    /// recent debounced observation confirms the local input code is
+    /// active (issue #246).  Zero DDC writes, zero hook executions.
+    AlreadyLocal,
+    /// Push was skipped because the panel is currently showing the peer
+    /// input (debounced observation agrees; cached verdict is not-owned).
+    /// Symmetric counterpart of [`SwitchOutcome::AlreadyLocal`].
+    AlreadyPeer,
+}
+
+/// Wire-form outcome string for [`SwitchOutcome`].
+///
+/// Used on the IPC response so callers (CLI, web) can distinguish
+/// "switched" from "already here" without re-running a snapshot.  Every
+/// variant has a stable literal — the CLI greps these names, so the
+/// wire shape is part of the contract (issue #246).
+#[must_use]
+pub fn switch_outcome_label(outcome: &SwitchOutcome) -> &'static str {
+    match outcome {
+        SwitchOutcome::Switched => "switched",
+        SwitchOutcome::NotConfigured => "not_configured",
+        SwitchOutcome::HookAborted { .. } => "hook_aborted",
+        SwitchOutcome::WriteFailed { .. } => "write_failed",
+        SwitchOutcome::Unsupported => "unsupported",
+        SwitchOutcome::Cooldown => "cooldown",
+        SwitchOutcome::AlreadyLocal => "already_local",
+        SwitchOutcome::AlreadyPeer => "already_peer",
+    }
 }
 
 // ── Suppression guard ─────────────────────────────────────────────────────────
@@ -215,7 +243,19 @@ impl DirectSwitchHandle {
     /// `before_acquire` hooks (blocking), writes the input-source
     /// command, clears claim suppression on every exit, and runs
     /// `after_acquire` only on success.
-    pub async fn pull(&self, display: DisplayId, reason: SwitchReason) -> SwitchOutcome {
+    ///
+    /// `force` bypasses the idempotency guard: when `false` (the
+    /// default for every call site except the operator `--force`
+    /// escape hatch), a pull on an already-owned panel whose recent
+    /// debounced observation confirms the local input code is active
+    /// returns [`SwitchOutcome::AlreadyLocal`] without writing or
+    /// firing any hooks (issue #246).
+    pub async fn pull(
+        &self,
+        display: DisplayId,
+        reason: SwitchReason,
+        force: bool,
+    ) -> SwitchOutcome {
         let Some((dc, target)) = self.resolve_local_target(&display) else {
             return SwitchOutcome::Unsupported;
         };
@@ -223,6 +263,34 @@ impl DirectSwitchHandle {
         let Some(executor) = self.resolve_executor(&display) else {
             return SwitchOutcome::Unsupported;
         };
+
+        // Idempotency guard (issue #246): when the daemon already owns the
+        // panel and the most recent debounced observation agrees the local
+        // input code is active, the pull is a no-op — no DDC write, no hook
+        // execution, no ownership event.  Retained MQTT topics, replayed
+        // reverse-edge messages, and doubled hotkey presses all hit this
+        // path; without it every duplicate re-asserts the write and the
+        // panel flashes.  `force=true` (operator `--force`) bypasses the
+        // guard for the genuine re-assert case (e.g. the monitor OSD
+        // changed input behind our back within the observation window).
+        let Some(local_code) = dc.shared_input_code else {
+            // resolve_local_target would already have returned None in
+            // this case, but the type system can't see that through the
+            // Some((dc, _)) binding — guard explicitly so the
+            // observation-agrees check has a u8 to compare against.
+            return SwitchOutcome::Unsupported;
+        };
+
+        if !force && self.observation_agrees_local(&display, local_code) {
+            let display_name = display.0.clone();
+            tracing::debug!(
+                event = "switch_noop_already_local",
+                display_name = %display_name,
+                cause = reason.as_str(),
+                "pull suppressed: panel already on local input"
+            );
+            return SwitchOutcome::AlreadyLocal;
+        }
 
         // Cooldown gate for activity-driven pulls — prevents the two-host
         // ping-pong that the convergence test proves impossible.  Only
@@ -353,7 +421,17 @@ impl DirectSwitchHandle {
     /// degrades to `DifferentFrom(local_read)` with an emitted WARN
     /// `kvm_push_verification_degraded` when the peer read alias is
     /// absent.
-    pub async fn push(&self, display: DisplayId, reason: SwitchReason) -> SwitchOutcome {
+    ///
+    /// `force` bypasses the idempotency guard: when `false` (default),
+    /// a push when the panel already shows the peer input returns
+    /// [`SwitchOutcome::AlreadyPeer`] without writing or firing any
+    /// hooks.  Symmetric to [`Self::pull`]'s `AlreadyLocal` (issue #246).
+    pub async fn push(
+        &self,
+        display: DisplayId,
+        reason: SwitchReason,
+        force: bool,
+    ) -> SwitchOutcome {
         let (dc, target) = match self.resolve_peer_target(&display) {
             Ok(pair) => pair,
             Err(outcome) => return outcome,
@@ -362,6 +440,26 @@ impl DirectSwitchHandle {
         let Some(executor) = self.resolve_executor(&display) else {
             return SwitchOutcome::Unsupported;
         };
+
+        // Symmetric idempotency guard (issue #246): when the panel is
+        // currently showing the peer input (debounced verdict not-owned,
+        // last observation matches the peer read alias), the push is a
+        // no-op.  Without the peer read alias configured (degraded push
+        // path) the panel's last observation cannot prove the peer is
+        // active, so the guard cannot fire — always proceed.
+        if !force
+            && let Some(peer_code) = dc.shared_peer_input_code
+            && self.observation_agrees_peer(&display, peer_code)
+        {
+            let display_name = display.0.clone();
+            tracing::debug!(
+                event = "switch_noop_already_peer",
+                display_name = %display_name,
+                cause = reason.as_str(),
+                "push suppressed: panel already on peer input"
+            );
+            return SwitchOutcome::AlreadyPeer;
+        }
 
         // Determine whether verification is degraded before the write.
         let degraded = matches!(
@@ -529,6 +627,52 @@ impl DirectSwitchHandle {
     fn resolve_executor(&self, display: &DisplayId) -> Option<Arc<dyn CommandSink>> {
         let executors = self.executors.borrow().clone();
         executors.get(display).cloned()
+    }
+
+    /// Whether the coordination cache currently agrees that `local_code`
+    /// is the active input on `display` (issue #246).
+    ///
+    /// Freshness is derived entirely from what [`CoordRecord`] already
+    /// tracks — `owned`, `has_successful_input_read`,
+    /// `consecutive_failures`, and `last_observed_code`.  No new clock is
+    /// introduced: the cache's pending-transition state already enforces that
+    /// `last_observed_code` only stays equal to the verdict's input while
+    /// the cached verdict remains stable, so the two together suffice.
+    /// Returns `false` when no coordination handle is wired (tests, or a
+    /// daemon built without a poll path) so the guard never starves a
+    /// fresh install or a unit test.
+    fn observation_agrees_local(&self, display: &DisplayId, local_code: u8) -> bool {
+        let Some(coord) = self.coordination.as_ref() else {
+            return false;
+        };
+        let snapshot = coord.snapshot();
+        let Some(record) = snapshot.get(display) else {
+            return false;
+        };
+        let failure_threshold = self.config.borrow().coordination.loss_confirmations;
+        // A full loss-debounce window of failed reads makes the last good code
+        // too stale to suppress a wake-adjacent pull. Reusing this threshold
+        // avoids a second freshness policy knob.
+        record.owned
+            && record.has_successful_input_read
+            && record.consecutive_failures < failure_threshold
+            && record.last_observed_code == Some(local_code)
+    }
+
+    /// Symmetric counterpart of [`Self::observation_agrees_local`]:
+    /// returns `true` only when the cached verdict is not-owned and the
+    /// most recent observation matches the configured peer read alias.
+    fn observation_agrees_peer(&self, display: &DisplayId, peer_code: u8) -> bool {
+        let Some(coord) = self.coordination.as_ref() else {
+            return false;
+        };
+        let snapshot = coord.snapshot();
+        let Some(record) = snapshot.get(display) else {
+            return false;
+        };
+        !record.owned
+            && record.has_successful_input_read
+            && record.last_observed_code == Some(peer_code)
     }
 
     /// Run one hook slot and return the abort reason, if any.
@@ -837,7 +981,9 @@ mod tests {
         let (tx, _rx) = mpsc::channel(8);
         let handle = build_handle(display_config(), sink.clone(), noop_hook_engine(), tx);
 
-        let outcome = handle.pull(display_id(), SwitchReason::Activity).await;
+        let outcome = handle
+            .pull(display_id(), SwitchReason::Activity, false)
+            .await;
 
         assert_eq!(outcome, SwitchOutcome::Switched);
         assert_eq!(sink.write_calls(), 1);
@@ -858,7 +1004,9 @@ mod tests {
         let (tx, _rx) = mpsc::channel(8);
         let handle = build_handle(dc, sink.clone(), noop_hook_engine(), tx);
 
-        let outcome = handle.pull(display_id(), SwitchReason::Activity).await;
+        let outcome = handle
+            .pull(display_id(), SwitchReason::Activity, false)
+            .await;
 
         assert_eq!(outcome, SwitchOutcome::Switched);
         let target = sink.last_target().unwrap();
@@ -883,7 +1031,9 @@ mod tests {
         let (tx, _rx) = mpsc::channel(8);
         let handle = build_handle(dc, sink.clone(), hook_engine, tx);
 
-        let outcome = handle.pull(display_id(), SwitchReason::Activity).await;
+        let outcome = handle
+            .pull(display_id(), SwitchReason::Activity, false)
+            .await;
 
         assert!(
             matches!(outcome, SwitchOutcome::HookAborted { .. }),
@@ -906,7 +1056,9 @@ mod tests {
         let (tx, _rx) = mpsc::channel(8);
         let handle = build_handle(display_config(), sink, noop_hook_engine(), tx);
 
-        let outcome = handle.pull(display_id(), SwitchReason::Activity).await;
+        let outcome = handle
+            .pull(display_id(), SwitchReason::Activity, false)
+            .await;
 
         assert!(
             matches!(outcome, SwitchOutcome::WriteFailed { .. }),
@@ -922,7 +1074,9 @@ mod tests {
         let (tx, _rx) = mpsc::channel(8);
         let handle = build_handle(dc, sink.clone(), noop_hook_engine(), tx);
 
-        let outcome = handle.pull(display_id(), SwitchReason::Activity).await;
+        let outcome = handle
+            .pull(display_id(), SwitchReason::Activity, false)
+            .await;
 
         assert_eq!(outcome, SwitchOutcome::Unsupported);
         assert_eq!(sink.write_calls(), 0);
@@ -936,7 +1090,9 @@ mod tests {
         let (tx, _rx) = mpsc::channel(8);
         let handle = build_handle(dc, sink.clone(), noop_hook_engine(), tx);
 
-        let outcome = handle.pull(display_id(), SwitchReason::Activity).await;
+        let outcome = handle
+            .pull(display_id(), SwitchReason::Activity, false)
+            .await;
 
         assert_eq!(outcome, SwitchOutcome::Unsupported);
         assert_eq!(sink.write_calls(), 0);
@@ -953,7 +1109,9 @@ mod tests {
         let (tx, _rx) = mpsc::channel(8);
         let handle = build_handle(display_config(), sink.clone(), noop_hook_engine(), tx);
 
-        let outcome = handle.push(display_id(), SwitchReason::Release).await;
+        let outcome = handle
+            .push(display_id(), SwitchReason::Release, false)
+            .await;
 
         assert_eq!(outcome, SwitchOutcome::NotConfigured);
         assert_eq!(sink.write_calls(), 0);
@@ -969,7 +1127,9 @@ mod tests {
         let (tx, _rx) = mpsc::channel(8);
         let handle = build_handle(dc, sink.clone(), noop_hook_engine(), tx);
 
-        let outcome = handle.push(display_id(), SwitchReason::Release).await;
+        let outcome = handle
+            .push(display_id(), SwitchReason::Release, false)
+            .await;
 
         assert_eq!(outcome, SwitchOutcome::Switched);
         assert_eq!(sink.write_calls(), 1);
@@ -992,7 +1152,9 @@ mod tests {
         let (tx, _rx) = mpsc::channel(8);
         let handle = build_handle(dc, sink.clone(), noop_hook_engine(), tx);
 
-        let outcome = handle.push(display_id(), SwitchReason::Release).await;
+        let outcome = handle
+            .push(display_id(), SwitchReason::Release, false)
+            .await;
 
         assert_eq!(outcome, SwitchOutcome::Switched);
         assert_eq!(sink.write_calls(), 1);
@@ -1020,7 +1182,9 @@ mod tests {
         let (tx, _rx) = mpsc::channel(8);
         let handle = build_handle(dc, sink.clone(), hook_engine, tx);
 
-        let outcome = handle.push(display_id(), SwitchReason::Release).await;
+        let outcome = handle
+            .push(display_id(), SwitchReason::Release, false)
+            .await;
 
         assert!(
             matches!(outcome, SwitchOutcome::HookAborted { .. }),
@@ -1044,7 +1208,9 @@ mod tests {
         let (tx, _rx) = mpsc::channel(8);
         let handle = build_handle(dc, sink, noop_hook_engine(), tx);
 
-        let outcome = handle.push(display_id(), SwitchReason::Release).await;
+        let outcome = handle
+            .push(display_id(), SwitchReason::Release, false)
+            .await;
 
         assert!(
             matches!(outcome, SwitchOutcome::WriteFailed { .. }),
@@ -1083,7 +1249,9 @@ mod tests {
         }
         assert!(!coord.snapshot()[&display_id()].owned);
 
-        let outcome = handle.pull(display_id(), SwitchReason::Activity).await;
+        let outcome = handle
+            .pull(display_id(), SwitchReason::Activity, false)
+            .await;
         assert_eq!(outcome, SwitchOutcome::Switched);
 
         // After a successful pull, the coordination handle must show owned.
@@ -1145,6 +1313,258 @@ mod tests {
             coordination,
             last_activity_pull: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn idempotency_display_config() -> cs::DisplayConfig {
+        cs::DisplayConfig {
+            shared_peer_input_code: Some(PEER_READ),
+            shared_peer_input_write_code: Some(PEER_WRITE),
+            hooks: cs::HookSlots {
+                before_acquire: vec![cs::HookAction {
+                    command: Some(vec!["echo".into(), "before_acquire".into()]),
+                    mqtt: None,
+                    timeout: Duration::from_secs(1),
+                    blocking: Some(true),
+                    abort_on_failure: false,
+                }],
+                after_acquire: vec![cs::HookAction {
+                    command: Some(vec!["echo".into(), "after_acquire".into()]),
+                    mqtt: None,
+                    timeout: Duration::from_secs(1),
+                    blocking: Some(false),
+                    abort_on_failure: false,
+                }],
+                before_release: vec![cs::HookAction {
+                    command: Some(vec!["echo".into(), "before_release".into()]),
+                    mqtt: None,
+                    timeout: Duration::from_secs(1),
+                    blocking: Some(true),
+                    abort_on_failure: false,
+                }],
+                after_release: vec![cs::HookAction {
+                    command: Some(vec!["echo".into(), "after_release".into()]),
+                    mqtt: None,
+                    timeout: Duration::from_secs(1),
+                    blocking: Some(false),
+                    abort_on_failure: false,
+                }],
+                ..cs::HookSlots::default()
+            },
+            ..display_config()
+        }
+    }
+
+    fn idempotency_aliases() -> dormant_core::coordination::InputCodeAliases {
+        dormant_core::coordination::InputCodeAliases {
+            local_read: LOCAL_READ,
+            local_write: LOCAL_WRITE,
+            peer_read: Some(PEER_READ),
+            peer_write: Some(PEER_WRITE),
+        }
+    }
+
+    fn record_observation(coordination: &dormant_core::coordination::CoordinationHandle, code: u8) {
+        let _ = coordination.record_input_observation(
+            &display_id(),
+            code,
+            &idempotency_aliases(),
+            1,
+            None,
+        );
+    }
+
+    #[tokio::test]
+    async fn second_fresh_agreeing_pull_skips_hooks_and_write() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        let runner = Arc::new(CountingHookRunner::new());
+        let (front_ctl_tx, _front_ctl_rx) = mpsc::channel(16);
+        let coordination = dormant_core::coordination::CoordinationHandle::new([display_id()]);
+        let handle = build_handle_with_coordination(
+            idempotency_display_config(),
+            sink.clone(),
+            Arc::new(HookEngine::with_runner(runner.clone())),
+            front_ctl_tx,
+            Some(coordination.clone()),
+        );
+
+        assert_eq!(
+            handle.pull(display_id(), SwitchReason::Cli, false).await,
+            SwitchOutcome::Switched
+        );
+        record_observation(&coordination, LOCAL_READ);
+        let writes_before = sink.write_calls();
+        let hooks_before = runner.command_count();
+
+        assert_eq!(
+            handle.pull(display_id(), SwitchReason::Cli, false).await,
+            SwitchOutcome::AlreadyLocal
+        );
+        assert_eq!(
+            sink.write_calls(),
+            writes_before,
+            "second pull must not write"
+        );
+        assert_eq!(
+            runner.command_count(),
+            hooks_before,
+            "second pull must not run hooks"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_failure_streak_opens_pull_guard() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        let runner = Arc::new(CountingHookRunner::new());
+        let (front_ctl_tx, _front_ctl_rx) = mpsc::channel(16);
+        let coordination = dormant_core::coordination::CoordinationHandle::new([display_id()]);
+        let handle = build_handle_with_coordination(
+            idempotency_display_config(),
+            sink.clone(),
+            Arc::new(HookEngine::with_runner(runner.clone())),
+            front_ctl_tx,
+            Some(coordination.clone()),
+        );
+        let failure_threshold = handle.config.borrow().coordination.loss_confirmations;
+
+        record_observation(&coordination, LOCAL_READ);
+        for _ in 0..failure_threshold {
+            coordination.record_failure(&display_id());
+        }
+
+        assert_eq!(
+            handle.pull(display_id(), SwitchReason::Cli, false).await,
+            SwitchOutcome::Switched
+        );
+        assert_eq!(sink.write_calls(), 1);
+        assert_eq!(runner.command_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn successful_read_after_failure_streak_recloses_pull_guard() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        let runner = Arc::new(CountingHookRunner::new());
+        let (front_ctl_tx, _front_ctl_rx) = mpsc::channel(16);
+        let coordination = dormant_core::coordination::CoordinationHandle::new([display_id()]);
+        let handle = build_handle_with_coordination(
+            idempotency_display_config(),
+            sink.clone(),
+            Arc::new(HookEngine::with_runner(runner.clone())),
+            front_ctl_tx,
+            Some(coordination.clone()),
+        );
+        let failure_threshold = handle.config.borrow().coordination.loss_confirmations;
+
+        record_observation(&coordination, LOCAL_READ);
+        for _ in 0..failure_threshold {
+            coordination.record_failure(&display_id());
+        }
+        assert_eq!(
+            handle.pull(display_id(), SwitchReason::Cli, false).await,
+            SwitchOutcome::Switched
+        );
+
+        record_observation(&coordination, LOCAL_READ);
+        let writes_before = sink.write_calls();
+        let hooks_before = runner.command_count();
+        assert_eq!(
+            handle.pull(display_id(), SwitchReason::Cli, false).await,
+            SwitchOutcome::AlreadyLocal
+        );
+        assert_eq!(sink.write_calls(), writes_before);
+        assert_eq!(runner.command_count(), hooks_before);
+    }
+
+    #[tokio::test]
+    async fn disagreeing_observation_allows_pull_to_proceed() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        let runner = Arc::new(CountingHookRunner::new());
+        let (front_ctl_tx, _front_ctl_rx) = mpsc::channel(16);
+        let coordination = dormant_core::coordination::CoordinationHandle::new([display_id()]);
+        let handle = build_handle_with_coordination(
+            idempotency_display_config(),
+            sink.clone(),
+            Arc::new(HookEngine::with_runner(runner.clone())),
+            front_ctl_tx,
+            Some(coordination.clone()),
+        );
+
+        record_observation(&coordination, PEER_READ);
+
+        assert_eq!(
+            handle.pull(display_id(), SwitchReason::Cli, false).await,
+            SwitchOutcome::Switched
+        );
+        assert_eq!(sink.write_calls(), 1);
+        assert_eq!(runner.command_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn forced_pull_bypasses_fresh_agreeing_observation() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        let runner = Arc::new(CountingHookRunner::new());
+        let (front_ctl_tx, _front_ctl_rx) = mpsc::channel(16);
+        let coordination = dormant_core::coordination::CoordinationHandle::new([display_id()]);
+        record_observation(&coordination, LOCAL_READ);
+        let handle = build_handle_with_coordination(
+            idempotency_display_config(),
+            sink.clone(),
+            Arc::new(HookEngine::with_runner(runner.clone())),
+            front_ctl_tx,
+            Some(coordination),
+        );
+
+        assert_eq!(
+            handle.pull(display_id(), SwitchReason::Cli, true).await,
+            SwitchOutcome::Switched
+        );
+        assert_eq!(sink.write_calls(), 1);
+        assert_eq!(runner.command_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn fresh_agreeing_push_skips_hooks_and_write() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        let runner = Arc::new(CountingHookRunner::new());
+        let (front_ctl_tx, _front_ctl_rx) = mpsc::channel(16);
+        let coordination = dormant_core::coordination::CoordinationHandle::new([display_id()]);
+        record_observation(&coordination, PEER_READ);
+        let handle = build_handle_with_coordination(
+            idempotency_display_config(),
+            sink.clone(),
+            Arc::new(HookEngine::with_runner(runner.clone())),
+            front_ctl_tx,
+            Some(coordination),
+        );
+
+        assert_eq!(
+            handle.push(display_id(), SwitchReason::Cli, false).await,
+            SwitchOutcome::AlreadyPeer
+        );
+        assert_eq!(sink.write_calls(), 0);
+        assert_eq!(runner.command_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn forced_push_bypasses_fresh_agreeing_observation() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        let runner = Arc::new(CountingHookRunner::new());
+        let (front_ctl_tx, _front_ctl_rx) = mpsc::channel(16);
+        let coordination = dormant_core::coordination::CoordinationHandle::new([display_id()]);
+        record_observation(&coordination, PEER_READ);
+        let handle = build_handle_with_coordination(
+            idempotency_display_config(),
+            sink.clone(),
+            Arc::new(HookEngine::with_runner(runner.clone())),
+            front_ctl_tx,
+            Some(coordination),
+        );
+
+        assert_eq!(
+            handle.push(display_id(), SwitchReason::Cli, true).await,
+            SwitchOutcome::Switched
+        );
+        assert_eq!(sink.write_calls(), 1);
+        assert_eq!(runner.command_count(), 1);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -1239,8 +1659,11 @@ mod tests {
         let handle = build_handle(dc, sink, hook_engine, front_ctl_tx);
 
         // Subscribe BEFORE the call so no message is missed.
-        let pull_handle =
-            tokio::spawn(async move { handle.pull(display_id(), SwitchReason::Activity).await });
+        let pull_handle = tokio::spawn(async move {
+            handle
+                .pull(display_id(), SwitchReason::Activity, false)
+                .await
+        });
 
         // First message: set.
         let msg1 = front_ctl_rx
@@ -1301,7 +1724,9 @@ mod tests {
         let (front_ctl_tx, mut front_ctl_rx) = mpsc::channel(8);
         let handle = build_handle(dc, sink, hook_engine, front_ctl_tx);
 
-        let outcome = handle.pull(display_id(), SwitchReason::Activity).await;
+        let outcome = handle
+            .pull(display_id(), SwitchReason::Activity, false)
+            .await;
         assert!(matches!(outcome, SwitchOutcome::HookAborted { .. }));
 
         let msgs = drain_suppression(&mut front_ctl_rx);
@@ -1321,7 +1746,9 @@ mod tests {
         let (front_ctl_tx, mut front_ctl_rx) = mpsc::channel(8);
         let handle = build_handle(display_config(), sink, noop_hook_engine(), front_ctl_tx);
 
-        let outcome = handle.pull(display_id(), SwitchReason::Activity).await;
+        let outcome = handle
+            .pull(display_id(), SwitchReason::Activity, false)
+            .await;
         assert!(matches!(outcome, SwitchOutcome::WriteFailed { .. }));
 
         let msgs = drain_suppression(&mut front_ctl_rx);
@@ -1545,8 +1972,8 @@ mod tests {
         // ── t=0: Simultaneous activity edges ─────────────────────────
         // Both hosts pull — neither has a cooldown record yet.
         let (res_a, res_b) = tokio::join!(
-            handle_a.pull(display_id(), SwitchReason::Activity),
-            handle_b.pull(display_id(), SwitchReason::Activity),
+            handle_a.pull(display_id(), SwitchReason::Activity, false),
+            handle_b.pull(display_id(), SwitchReason::Activity, false),
         );
 
         assert_eq!(res_a, SwitchOutcome::Switched, "host A first pull");
@@ -1635,8 +2062,8 @@ mod tests {
         tokio::time::advance(Duration::from_secs(5)).await;
 
         let (pulla2, pullb2) = tokio::join!(
-            handle_a.pull(display_id(), SwitchReason::Activity),
-            handle_b.pull(display_id(), SwitchReason::Activity),
+            handle_a.pull(display_id(), SwitchReason::Activity, false),
+            handle_b.pull(display_id(), SwitchReason::Activity, false),
         );
 
         assert_eq!(
@@ -1671,8 +2098,12 @@ mod tests {
         // Advance only 1s — still within the 3s cooldown.
         tokio::time::advance(Duration::from_secs(1)).await;
 
-        let suppressed_a = handle_a.pull(display_id(), SwitchReason::Activity).await;
-        let suppressed_b = handle_b.pull(display_id(), SwitchReason::Activity).await;
+        let suppressed_a = handle_a
+            .pull(display_id(), SwitchReason::Activity, false)
+            .await;
+        let suppressed_b = handle_b
+            .pull(display_id(), SwitchReason::Activity, false)
+            .await;
 
         assert_eq!(
             suppressed_a,
@@ -1849,7 +2280,9 @@ mod tests {
         let (front_ctl_tx, _front_ctl_rx) = mpsc::channel(8);
         let handle = build_handle(dc, Arc::clone(&sink), hook_engine, front_ctl_tx);
 
-        let outcome = handle.pull(display_id(), SwitchReason::Activity).await;
+        let outcome = handle
+            .pull(display_id(), SwitchReason::Activity, false)
+            .await;
         assert!(
             matches!(outcome, SwitchOutcome::HookAborted { .. }),
             "aborted before_acquire must prevent write"
@@ -1884,7 +2317,9 @@ mod tests {
             front_ctl_tx,
         );
 
-        let outcome = handle.pull(display_id(), SwitchReason::Activity).await;
+        let outcome = handle
+            .pull(display_id(), SwitchReason::Activity, false)
+            .await;
         assert_eq!(outcome, SwitchOutcome::Switched);
 
         // Collect all non-suppression events from the channel.
@@ -1931,7 +2366,9 @@ mod tests {
         let (front_ctl_tx, mut front_ctl_rx) = mpsc::channel(8);
         let handle = build_handle(display_config(), sink, noop_hook_engine(), front_ctl_tx);
 
-        let outcome = handle.pull(display_id(), SwitchReason::Activity).await;
+        let outcome = handle
+            .pull(display_id(), SwitchReason::Activity, false)
+            .await;
         assert!(matches!(outcome, SwitchOutcome::WriteFailed { .. }));
 
         let events = drain_events(&mut front_ctl_rx);
@@ -1961,7 +2398,9 @@ mod tests {
         let (front_ctl_tx, mut front_ctl_rx) = mpsc::channel(8);
         let handle = build_handle(dc, sink.clone(), noop_hook_engine(), front_ctl_tx);
 
-        let outcome = handle.push(display_id(), SwitchReason::Release).await;
+        let outcome = handle
+            .push(display_id(), SwitchReason::Release, false)
+            .await;
         assert_eq!(outcome, SwitchOutcome::Switched);
 
         let events = drain_events(&mut front_ctl_rx);

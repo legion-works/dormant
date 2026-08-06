@@ -134,12 +134,23 @@ enum Command {
     /// Write the local input code to pull a shared display to this
     /// machine.  Use `--to-peer` to push the display away by writing
     /// the peer input code (requires `shared_peer_input_write_code`).
+    ///
+    /// The daemon is idempotent: when it already owns the panel and the
+    /// last debounced observation agrees the input is ours, it returns
+    /// `already local — no action` instead of re-asserting the DDC write
+    /// (issue #246).  Pass `--force` to bypass the guard for the genuine
+    /// re-assert case (e.g. the monitor OSD changed input behind the
+    /// daemon's back within the observation window).
     Switch {
         /// Shared display id.
         display: String,
         /// Write the peer input code instead of the local one.
         #[arg(long)]
         to_peer: bool,
+        /// Bypass the daemon's idempotency guard (issue #246).  Forces
+        /// the DDC write even when the cached verdict already agrees.
+        #[arg(long)]
+        force: bool,
     },
     /// Trigger a config reload.
     Reload,
@@ -258,11 +269,15 @@ fn main() -> ExitCode {
             cmd_blank::run_blank(&socket_path, &display, hard, yes)
         }
         Command::Wake { display } => cmd_blank::run_wake(&socket_path, &display),
-        Command::Switch { display, to_peer } => {
+        Command::Switch {
+            display,
+            to_peer,
+            force,
+        } => {
             if to_peer {
-                cmd_switch::run_peer(&socket_path, &display)
+                cmd_switch::run_peer(&socket_path, &display, force)
             } else {
-                cmd_switch::run(&socket_path, &display)
+                cmd_switch::run(&socket_path, &display, force)
             }
         }
         Command::Reload => {
@@ -577,7 +592,11 @@ mod tests {
         let cli = Cli::try_parse_from(["dormantctl", "switch", "monitor", "--to-peer"]).unwrap();
         assert!(matches!(
             cli.command,
-            Command::Switch { display, to_peer: true } if display == "monitor"
+            Command::Switch {
+                display,
+                to_peer: true,
+                force: false
+            } if display == "monitor"
         ));
     }
 
@@ -586,7 +605,27 @@ mod tests {
         let cli = Cli::try_parse_from(["dormantctl", "switch", "monitor"]).unwrap();
         assert!(matches!(
             cli.command,
-            Command::Switch { display, to_peer: false } if display == "monitor"
+            Command::Switch {
+                display,
+                to_peer: false,
+                force: false
+            } if display == "monitor"
+        ));
+    }
+
+    /// `--force` is the operator override that bypasses the daemon's
+    /// idempotency guard (issue #246).  Pin the parsing so the flag
+    /// doesn't quietly regress.
+    #[test]
+    fn parse_switch_force_flag() {
+        let cli = Cli::try_parse_from(["dormantctl", "switch", "monitor", "--force"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Switch {
+                display,
+                to_peer: false,
+                force: true
+            } if display == "monitor"
         ));
     }
 }

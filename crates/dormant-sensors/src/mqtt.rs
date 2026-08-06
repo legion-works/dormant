@@ -88,6 +88,52 @@ struct SensorBinding {
 /// every sensor subscribed to that topic (each with its own field pointer).
 type TopicMap = HashMap<String, Vec<SensorBinding>>;
 
+#[async_trait]
+trait MqttEventLoop: Send {
+    async fn poll(&mut self) -> anyhow::Result<Event>;
+    async fn subscribe(&mut self, topic: &str, qos: QoS) -> anyhow::Result<()>;
+    async fn disconnect(&mut self) -> anyhow::Result<()>;
+    async fn reconnect(&mut self) -> anyhow::Result<()>;
+}
+
+struct RumqttEventLoop {
+    client: AsyncClient,
+    eventloop: EventLoop,
+    broker_url: String,
+    client_id: String,
+    credential: Option<MqttCredential>,
+    topic_count: usize,
+}
+
+#[async_trait]
+impl MqttEventLoop for RumqttEventLoop {
+    async fn poll(&mut self) -> anyhow::Result<Event> {
+        self.eventloop.poll().await.map_err(Into::into)
+    }
+
+    async fn subscribe(&mut self, topic: &str, qos: QoS) -> anyhow::Result<()> {
+        self.client.subscribe(topic, qos).await.map_err(Into::into)
+    }
+
+    async fn disconnect(&mut self) -> anyhow::Result<()> {
+        self.client.disconnect().await.map_err(Into::into)
+    }
+
+    async fn reconnect(&mut self) -> anyhow::Result<()> {
+        let (host, port) = parse_broker_url(&self.broker_url)
+            .map_err(|e| anyhow::anyhow!("invalid mqtt broker_url {:?}: {e}", self.broker_url))?;
+        let mut mqttopts = MqttOptions::new(&self.client_id, host, port);
+        mqttopts.set_clean_session(true);
+        if let Some(cred) = &self.credential {
+            mqttopts.set_credentials(cred.username.clone(), cred.password.clone());
+        }
+        let (client, eventloop) = AsyncClient::new(mqttopts, self.topic_count + CAP_HEADROOM);
+        self.client = client;
+        self.eventloop = eventloop;
+        Ok(())
+    }
+}
+
 /// Connection observations exposed only to external integration tests.
 ///
 /// All variants are constructed only inside `#[cfg(feature = "test-util")]` blocks,
@@ -236,13 +282,13 @@ impl MqttSource {
     /// Queue subscriptions for every topic and return the number accepted by
     /// the client request channel.
     async fn subscribe_topics(
-        client: &AsyncClient,
+        eventloop: &mut dyn MqttEventLoop,
         topics: &[String],
         #[allow(unused_variables)] lifecycle_tx: Option<&mpsc::UnboundedSender<MqttLifecycle>>,
     ) -> usize {
         let mut queued = 0;
         for topic in topics {
-            match client.subscribe(topic, QoS::AtLeastOnce).await {
+            match eventloop.subscribe(topic, QoS::AtLeastOnce).await {
                 Ok(()) => queued += 1,
                 Err(e) => warn!("mqtt: initial subscribe failed for '{topic}': {e}"),
             }
@@ -260,7 +306,7 @@ impl MqttSource {
             .all(|code| matches!(code, SubscribeReasonCode::Success(_)))
     }
 
-    /// Create a fresh MQTT connection and return the client and event loop.
+    /// Create a fresh MQTT connection behind the event-loop seam.
     ///
     /// `broker_url` is expected in the form `host:port` (e.g. `localhost:1883`)
     /// or `tcp://host:port`. A malformed URL surfaces as an `anyhow::Error`
@@ -273,7 +319,7 @@ impl MqttSource {
         client_id: &str,
         topic_count: usize,
         credential: Option<&MqttCredential>,
-    ) -> anyhow::Result<(AsyncClient, EventLoop)> {
+    ) -> anyhow::Result<Box<dyn MqttEventLoop>> {
         let (host, port) = parse_broker_url(broker_url)
             .map_err(|e| anyhow::anyhow!("invalid mqtt broker_url {broker_url:?}: {e}"))?;
         let mut mqttopts = MqttOptions::new(client_id, host, port);
@@ -283,7 +329,14 @@ impl MqttSource {
         }
         let cap = topic_count + CAP_HEADROOM;
         let (client, eventloop) = AsyncClient::new(mqttopts, cap);
-        Ok((client, eventloop))
+        Ok(Box::new(RumqttEventLoop {
+            client,
+            eventloop,
+            broker_url: broker_url.to_owned(),
+            client_id: client_id.to_owned(),
+            credential: credential.cloned(),
+            topic_count,
+        }))
     }
 
     /// Dispatch a publish on a sensor topic: parse each matching binding's
@@ -386,20 +439,32 @@ impl MqttSource {
     }
 }
 
-#[async_trait]
 #[allow(clippy::too_many_lines)]
-impl SensorSource for MqttSource {
-    fn source_id(&self) -> &str {
-        &self.broker_url
-    }
-
-    async fn run(
+impl MqttSource {
+    async fn run_source(
         self: Box<Self>,
         tx: mpsc::Sender<PresenceEvent>,
         ctl_tx: mpsc::Sender<ControlMsg>,
         cancel: CancellationToken,
     ) -> anyhow::Result<()> {
         let client_id = Self::client_id();
+        let eventloop = Self::connect(
+            &self.broker_url,
+            &client_id,
+            self.topics.len(),
+            self.credential.as_ref(),
+        )?;
+        self.run_with_event_loop(eventloop, tx, ctl_tx, cancel)
+            .await
+    }
+
+    async fn run_with_event_loop(
+        self: Box<Self>,
+        mut eventloop: Box<dyn MqttEventLoop>,
+        tx: mpsc::Sender<PresenceEvent>,
+        ctl_tx: mpsc::Sender<ControlMsg>,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<()> {
         let topics = self.topics.clone();
 
         // ── Outer reconnect loop ───────────────────────────────────────────
@@ -408,14 +473,6 @@ impl SensorSource for MqttSource {
         let mut warned_availability: HashSet<(String, String)> = HashSet::new();
         let mut outage_reported = false;
 
-        // We hold the current client+eventloop pair in these variables.
-        // On reconnect we drop both and create a fresh pair.
-        let (mut client, mut eventloop) = Self::connect(
-            &self.broker_url,
-            &client_id,
-            topics.len(),
-            self.credential.as_ref(),
-        )?;
         let mut pending_subacks: HashMap<u16, String> = HashMap::new();
         let mut acknowledged_subscriptions = 0;
         let mut outgoing_subscriptions = 0;
@@ -425,7 +482,7 @@ impl SensorSource for MqttSource {
             tokio::select! {
                 () = cancel.cancelled() => {
                     info!("mqtt source '{}' cancelled, disconnecting", self.broker_url);
-                    let _ = client.disconnect().await;
+                    let _ = eventloop.disconnect().await;
                     return Ok(());
                 }
                 event = eventloop.poll() => {
@@ -463,16 +520,13 @@ impl SensorSource for MqttSource {
                             if let Some(lifecycle_tx) = &self.lifecycle_tx {
                                 let _ = lifecycle_tx.send(MqttLifecycle::Connected);
                             }
-                            // Subscriptions are issued on every ConnAck (first and reconnect)
-                            // because clean_session = true — the broker stores no session state.
-                            // connect() only constructs the client/eventloop; it does NOT subscribe.
                             info!("mqtt: connected to '{}', subscribing", self.broker_url);
                             #[cfg(feature = "test-util")]
                             let lifecycle = self.lifecycle_tx.as_ref();
                             #[cfg(not(feature = "test-util"))]
                             let lifecycle: Option<&mpsc::UnboundedSender<MqttLifecycle>> = None;
                             queued_subscriptions =
-                                Self::subscribe_topics(&client, &topics, lifecycle).await;
+                                Self::subscribe_topics(eventloop.as_mut(), &topics, lifecycle).await;
                             backoff = BACKOFF_MIN;
                             outage_reported = false;
                         }
@@ -503,38 +557,25 @@ impl SensorSource for MqttSource {
                         Ok(Event::Incoming(Packet::Disconnect)) => {
                             debug!("mqtt: broker-initiated disconnect from '{}'", self.broker_url);
                         }
-                        Ok(_) => {
-                            // Other packets we do not process (PingResp, PubAck, PubRec, PubRel, PubComp).
-                        }
+                        // Other packets (PingResp, PubAck, PubRec, PubRel, PubComp, ...) need no handling.
+                        Ok(_) => {}
                         Err(e) => {
-                            warn!(
-                                "mqtt: connection error on '{}': {e}",
-                                self.broker_url,
-                            );
+                            warn!("mqtt: connection error on '{}': {e}", self.broker_url);
                             if !outage_reported {
                                 self.emit_unavailable_all(&tx).await;
                                 outage_reported = true;
                             }
-                            // Cancel-aware backoff sleep.
                             let sleep_fut = sleep(backoff);
                             tokio::select! {
                                 () = cancel.cancelled() => {
                                     info!("mqtt source '{}' cancelled during backoff", self.broker_url);
-                                    let _ = client.disconnect().await;
+                                    let _ = eventloop.disconnect().await;
                                     return Ok(());
                                 }
                                 () = sleep_fut => {}
                             }
                             backoff = backoff::next_backoff(backoff, BACKOFF_MIN, BACKOFF_MAX, JITTER_FRACTION);
-                            // Reconnect: drop old pair, create new.
-                            let (new_client, new_eventloop) = Self::connect(
-                                &self.broker_url,
-                                &client_id,
-                                topics.len(),
-                                self.credential.as_ref(),
-                            )?;
-                            client = new_client;
-                            eventloop = new_eventloop;
+                            eventloop.reconnect().await?;
                             pending_subacks.clear();
                             acknowledged_subscriptions = 0;
                             outgoing_subscriptions = 0;
@@ -544,6 +585,22 @@ impl SensorSource for MqttSource {
                 }
             }
         }
+    }
+}
+
+#[async_trait]
+impl SensorSource for MqttSource {
+    fn source_id(&self) -> &str {
+        &self.broker_url
+    }
+
+    async fn run(
+        self: Box<Self>,
+        tx: mpsc::Sender<PresenceEvent>,
+        ctl_tx: mpsc::Sender<ControlMsg>,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<()> {
+        self.run_source(tx, ctl_tx, cancel).await
     }
 }
 
@@ -677,7 +734,57 @@ pub fn availability_topic(topic: &str) -> String {
 mod tests {
     use super::*;
     use dormant_core::config::schema::SensorKind;
+    use rumqttc::ConnectReturnCode;
     use rumqttc::mqttbytes::v4::SubscribeReasonCode;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct ScriptedEventLoop {
+        events: Arc<Mutex<VecDeque<Event>>>,
+        subscriptions: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ScriptedEventLoop {
+        fn new(events: impl IntoIterator<Item = Event>) -> Self {
+            Self {
+                events: Arc::new(Mutex::new(events.into_iter().collect())),
+                subscriptions: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn subscribe_count(&self) -> usize {
+            self.subscriptions.lock().expect("script lock").len()
+        }
+    }
+
+    #[async_trait]
+    impl MqttEventLoop for ScriptedEventLoop {
+        async fn poll(&mut self) -> anyhow::Result<Event> {
+            loop {
+                if let Some(event) = self.events.lock().expect("script lock").pop_front() {
+                    return Ok(event);
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+
+        async fn subscribe(&mut self, topic: &str, _qos: QoS) -> anyhow::Result<()> {
+            self.subscriptions
+                .lock()
+                .expect("script lock")
+                .push(topic.to_owned());
+            Ok(())
+        }
+
+        async fn disconnect(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn reconnect(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
 
     // ── Fixture helpers ────────────────────────────────────────────────────
 
@@ -1461,5 +1568,170 @@ mod tests {
             SubscribeReasonCode::Success(QoS::AtMostOnce),
             SubscribeReasonCode::Failure,
         ]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scripted_connack_queues_one_batch_and_no_batch_before_connack() {
+        let source = MqttSource::new(
+            "tcp://localhost:1883".into(),
+            vec![(SensorId("desk".into()), make_cfg("/occupancy"))],
+            None,
+        );
+        let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel();
+        let fake = ScriptedEventLoop::new([
+            Event::Incoming(Packet::ConnAck(rumqttc::ConnAck {
+                session_present: false,
+                code: ConnectReturnCode::Success,
+            })),
+            Event::Outgoing(Outgoing::Subscribe(1)),
+            Event::Outgoing(Outgoing::Subscribe(2)),
+            Event::Incoming(Packet::SubAck(rumqttc::SubAck {
+                pkid: 1,
+                return_codes: vec![SubscribeReasonCode::Success(QoS::AtLeastOnce)],
+            })),
+            Event::Incoming(Packet::SubAck(rumqttc::SubAck {
+                pkid: 2,
+                return_codes: vec![SubscribeReasonCode::Success(QoS::AtLeastOnce)],
+            })),
+        ]);
+        let (tx, _rx) = mpsc::channel(4);
+        let (ctl_tx, _ctl_rx) = mpsc::channel(4);
+        let cancel = CancellationToken::new();
+        let run = tokio::spawn(
+            Box::new(source.with_lifecycle_sender(lifecycle_tx)).run_with_event_loop(
+                Box::new(fake.clone()),
+                tx,
+                ctl_tx,
+                cancel.clone(),
+            ),
+        );
+        let mut lifecycle = Vec::new();
+        while lifecycle.len() < 3 {
+            lifecycle.push(
+                tokio::time::timeout(Duration::from_secs(1), lifecycle_rx.recv())
+                    .await
+                    .expect("lifecycle event timeout")
+                    .expect("lifecycle event"),
+            );
+        }
+        assert_eq!(fake.subscribe_count(), 2);
+        assert_eq!(lifecycle[0], MqttLifecycle::Connected);
+        assert_eq!(lifecycle[1], MqttLifecycle::SubscribeQueued { count: 2 });
+        assert_eq!(lifecycle[2], MqttLifecycle::Subscribed);
+        cancel.cancel();
+        run.await.expect("source task").expect("source run");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scripted_reconnack_resubscribes_and_resets_ack_counters() {
+        let source = MqttSource::new(
+            "tcp://localhost:1883".into(),
+            vec![(SensorId("desk".into()), make_cfg("/occupancy"))],
+            None,
+        );
+        let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel();
+        let fake = ScriptedEventLoop::new([
+            Event::Incoming(Packet::ConnAck(rumqttc::ConnAck {
+                session_present: false,
+                code: ConnectReturnCode::Success,
+            })),
+            Event::Outgoing(Outgoing::Subscribe(1)),
+            Event::Outgoing(Outgoing::Subscribe(2)),
+            Event::Incoming(Packet::SubAck(rumqttc::SubAck {
+                pkid: 1,
+                return_codes: vec![SubscribeReasonCode::Success(QoS::AtLeastOnce)],
+            })),
+            Event::Incoming(Packet::SubAck(rumqttc::SubAck {
+                pkid: 2,
+                return_codes: vec![SubscribeReasonCode::Success(QoS::AtLeastOnce)],
+            })),
+            Event::Incoming(Packet::ConnAck(rumqttc::ConnAck {
+                session_present: false,
+                code: ConnectReturnCode::Success,
+            })),
+            Event::Outgoing(Outgoing::Subscribe(3)),
+            Event::Outgoing(Outgoing::Subscribe(4)),
+            Event::Incoming(Packet::SubAck(rumqttc::SubAck {
+                pkid: 3,
+                return_codes: vec![SubscribeReasonCode::Success(QoS::AtLeastOnce)],
+            })),
+            Event::Incoming(Packet::SubAck(rumqttc::SubAck {
+                pkid: 4,
+                return_codes: vec![SubscribeReasonCode::Success(QoS::AtLeastOnce)],
+            })),
+        ]);
+        let (tx, _rx) = mpsc::channel(4);
+        let (ctl_tx, _ctl_rx) = mpsc::channel(4);
+        let cancel = CancellationToken::new();
+        let run = tokio::spawn(
+            Box::new(source.with_lifecycle_sender(lifecycle_tx)).run_with_event_loop(
+                Box::new(fake.clone()),
+                tx,
+                ctl_tx,
+                cancel.clone(),
+            ),
+        );
+        let mut subscribed = 0;
+        while subscribed < 2 {
+            if tokio::time::timeout(Duration::from_secs(1), lifecycle_rx.recv())
+                .await
+                .expect("lifecycle event timeout")
+                == Some(MqttLifecycle::Subscribed)
+            {
+                subscribed += 1;
+            }
+        }
+        assert_eq!(fake.subscribe_count(), 4);
+        cancel.cancel();
+        run.await.expect("source task").expect("source run");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scripted_rejected_suback_does_not_emit_subscribed() {
+        let source = MqttSource::new(
+            "tcp://localhost:1883".into(),
+            vec![(SensorId("desk".into()), make_cfg("/occupancy"))],
+            None,
+        );
+        let (lifecycle_tx, mut lifecycle_rx) = mpsc::unbounded_channel();
+        let fake = ScriptedEventLoop::new([
+            Event::Incoming(Packet::ConnAck(rumqttc::ConnAck {
+                session_present: false,
+                code: ConnectReturnCode::Success,
+            })),
+            Event::Outgoing(Outgoing::Subscribe(1)),
+            Event::Outgoing(Outgoing::Subscribe(2)),
+            Event::Incoming(Packet::SubAck(rumqttc::SubAck {
+                pkid: 1,
+                return_codes: vec![SubscribeReasonCode::Failure],
+            })),
+            Event::Incoming(Packet::SubAck(rumqttc::SubAck {
+                pkid: 2,
+                return_codes: vec![SubscribeReasonCode::Success(QoS::AtLeastOnce)],
+            })),
+        ]);
+        let (tx, _rx) = mpsc::channel(4);
+        let (ctl_tx, _ctl_rx) = mpsc::channel(4);
+        let cancel = CancellationToken::new();
+        let run = tokio::spawn(
+            Box::new(source.with_lifecycle_sender(lifecycle_tx)).run_with_event_loop(
+                Box::new(fake),
+                tx,
+                ctl_tx,
+                cancel.clone(),
+            ),
+        );
+        assert_eq!(lifecycle_rx.recv().await, Some(MqttLifecycle::Connected));
+        assert_eq!(
+            lifecycle_rx.recv().await,
+            Some(MqttLifecycle::SubscribeQueued { count: 2 })
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), lifecycle_rx.recv())
+                .await
+                .is_err()
+        );
+        cancel.cancel();
+        run.await.expect("source task").expect("source run");
     }
 }

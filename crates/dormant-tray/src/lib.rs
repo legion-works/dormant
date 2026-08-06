@@ -78,6 +78,9 @@ pub const DEFAULT_WEB_PORT: u16 = 8137;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod ipc_loop;
+/// Linux tray-menu refresh consumption decoupled from the D-Bus service.
+#[cfg(target_os = "linux")]
+pub mod menu_refresh;
 #[cfg(target_os = "linux")]
 pub mod tray;
 #[cfg(target_os = "macos")]

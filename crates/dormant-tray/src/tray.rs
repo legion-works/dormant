@@ -7,7 +7,7 @@
 //! lives in the platform-neutral modules; this file is the thin
 //! glue that hands the data to `ksni` and dispatches menu actions.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use dormant_core::rules::StateSnapshot;
 use ksni::menu::{MenuItem, StandardItem, SubMenu};
@@ -27,6 +27,8 @@ use crate::tray_state::TrayState;
 pub struct DormantTray {
     /// Shared state the ksni callbacks read.
     pub state: Arc<Mutex<TrayState>>,
+    /// Last complete state observed by a synchronous ksni callback.
+    view_cache: StdMutex<TrayView>,
     /// Pre-baked pixmaps at every tray size × state variant.
     pub icons: IconSet,
     /// Port for the "Open web UI" menu entry.
@@ -38,6 +40,11 @@ impl DormantTray {
     pub fn new(state: Arc<Mutex<TrayState>>, web_port: u16) -> Self {
         Self {
             state,
+            view_cache: StdMutex::new(TrayView {
+                snapshot: None,
+                unreachable: true,
+                icon_state: IconState::Unreachable,
+            }),
             icons: IconSet::load(),
             web_port,
         }
@@ -46,25 +53,34 @@ impl DormantTray {
     /// Snapshot a view of the shared state for synchronous menu / icon
     /// building.  Returns the cached values without awaiting.
     fn view(&self) -> TrayView {
-        // `try_lock` keeps the ksni callback off the await path; on
-        // contention (the IPC loop is mid-write) we return whatever was
-        // there at the start of the callback — visually a no-op refresh.
+        // ksni invokes this callback synchronously inside the runtime, so it
+        // cannot await the IPC mutex. Contention only means an IPC update is
+        // mid-publication; reuse the last complete IPC-observed view rather
+        // than treating it as a daemon connectivity change.
         let s = self.state.try_lock();
         match s {
-            Ok(s) => TrayView {
-                snapshot: s.snapshot.clone(),
-                unreachable: s.unreachable,
-                icon_state: s.icon_state,
-            },
-            Err(_) => TrayView {
-                snapshot: None,
-                unreachable: true,
-                icon_state: IconState::Unreachable,
-            },
+            Ok(s) => {
+                let view = TrayView {
+                    snapshot: s.snapshot.clone(),
+                    unreachable: s.unreachable,
+                    icon_state: s.icon_state,
+                };
+                *self
+                    .view_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = view.clone();
+                view
+            }
+            Err(_) => self
+                .view_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
         }
     }
 }
 
+#[derive(Clone)]
 struct TrayView {
     snapshot: Option<StateSnapshot>,
     unreachable: bool,
@@ -276,4 +292,164 @@ pub async fn spawn(state: Arc<Mutex<TrayState>>, web_port: u16) -> ksni::Handle<
         "icon set size mismatch — check build.rs SIZES constant"
     );
     tray.spawn().await.expect("ksni spawn failed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dormant_core::rules::DisplaySnapshot;
+
+    fn disp(id: &str, phase: &str) -> (String, DisplaySnapshot) {
+        (
+            id.into(),
+            DisplaySnapshot {
+                phase: phase.into(),
+                inhibited: false,
+                paused: false,
+                cmd_gen: 0,
+                scope: dormant_core::config::DisplayScope::Private,
+                owned: true,
+                observed_input_code: None,
+                panel_state: None,
+                controllers: vec![],
+                wake_attempts: 0,
+                last_blank_failed: false,
+                stage: None,
+            },
+        )
+    }
+
+    fn snap(displays: Vec<(String, DisplaySnapshot)>) -> StateSnapshot {
+        StateSnapshot {
+            sensors: vec![],
+            zones: vec![],
+            displays,
+            pending_reload: None,
+            rollback: None,
+            kvm: None,
+            wear_sampling_status: None,
+        }
+    }
+
+    async fn reachable_tray() -> (DormantTray, Arc<Mutex<TrayState>>) {
+        let state = Arc::new(Mutex::new(TrayState::new("/tmp/dormant.sock".into())));
+        {
+            let mut current = state.lock().await;
+            current.snapshot = Some(snap(vec![disp("monitor", "active")]));
+            current.unreachable = false;
+            current.icon_state = IconState::Normal;
+        }
+        (DormantTray::new(state.clone(), 8137), state)
+    }
+
+    #[tokio::test]
+    async fn menu_contention_keeps_cached_display_submenu_and_enabled_mutations() {
+        let (tray, state) = reachable_tray().await;
+        let _ = Tray::menu(&tray);
+
+        let guard = state.lock().await;
+        let menu = Tray::menu(&tray);
+        drop(guard);
+
+        let submenu = menu
+            .iter()
+            .find_map(|entry| match entry {
+                MenuItem::SubMenu(submenu) if submenu.label == "● monitor — active" => {
+                    Some(submenu)
+                }
+                _ => None,
+            })
+            .expect("cached monitor submenu");
+        assert!(
+            submenu.submenu.iter().any(|entry| {
+                matches!(entry, MenuItem::Standard(item) if item.label == "Force blank now" && item.enabled)
+            }),
+            "cached submenu should enable Force blank now"
+        );
+        assert!(
+            submenu.submenu.iter().any(|entry| {
+                matches!(entry, MenuItem::Standard(item) if item.label == "Wake now" && item.enabled)
+            }),
+            "cached submenu should enable Wake now"
+        );
+    }
+
+    #[tokio::test]
+    async fn icon_name_contention_keeps_cached_icon_state() {
+        let (tray, state) = reachable_tray().await;
+        assert_eq!(Tray::icon_name(&tray), "dormant");
+
+        let guard = state.lock().await;
+        let icon_name = Tray::icon_name(&tray);
+        drop(guard);
+
+        assert_eq!(icon_name, "dormant");
+    }
+
+    #[tokio::test]
+    async fn tooltip_contention_keeps_cached_display_details() {
+        let (tray, state) = reachable_tray().await;
+        let _ = Tray::tool_tip(&tray);
+
+        let guard = state.lock().await;
+        let tooltip = Tray::tool_tip(&tray);
+        drop(guard);
+
+        assert_eq!(tooltip.title, "dormant — 1 display");
+        assert!(
+            tooltip.description.contains("monitor: active"),
+            "cached tooltip should retain display details: {tooltip:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_callback_under_contention_keeps_genuine_startup_unreachable_state() {
+        let state = Arc::new(Mutex::new(TrayState::new("/tmp/dormant.sock".into())));
+        let tray = DormantTray::new(state.clone(), 8137);
+
+        let guard = state.lock().await;
+        let menu = Tray::menu(&tray);
+        drop(guard);
+
+        assert!(
+            !menu
+                .iter()
+                .any(|entry| matches!(entry, MenuItem::SubMenu(_))),
+            "startup state should not invent displays"
+        );
+        assert!(
+            menu.iter().any(|entry| {
+                matches!(entry, MenuItem::Standard(item) if item.label == "Pause 30m" && !item.enabled)
+            }),
+            "startup unreachable state should disable mutations"
+        );
+    }
+
+    // The unreachable end state matches the cache's initial value, so replacement is covered by contention tests instead.
+    #[tokio::test]
+    async fn uncontended_read_renders_a_real_unreachable_state() {
+        let (tray, state) = reachable_tray().await;
+        let _ = Tray::menu(&tray);
+        {
+            let mut current = state.lock().await;
+            current.snapshot = None;
+            current.unreachable = true;
+            current.icon_state = IconState::Unreachable;
+        }
+
+        let menu = Tray::menu(&tray);
+
+        assert!(
+            !menu
+                .iter()
+                .any(|entry| matches!(entry, MenuItem::SubMenu(_))),
+            "a real unreachable state should remove display submenus"
+        );
+        assert!(
+            menu.iter().any(|entry| {
+                matches!(entry, MenuItem::Standard(item) if item.label == "Force blank all…" && !item.enabled)
+            }),
+            "a real unreachable state should disable mutations"
+        );
+    }
 }

@@ -24,6 +24,8 @@ use dormant_tray::hotkey_linux;
 #[cfg(target_os = "linux")]
 use dormant_tray::ipc_loop;
 #[cfg(target_os = "linux")]
+use dormant_tray::menu_refresh::{self, MenuRefresher};
+#[cfg(target_os = "linux")]
 use dormant_tray::tray;
 #[cfg(target_os = "linux")]
 use dormant_tray::tray_state::TrayState;
@@ -89,6 +91,18 @@ impl dormant_tray::hotkey::Notifier for DesktopNotifier {
 }
 
 #[cfg(target_os = "linux")]
+struct KsniMenuRefresher {
+    handle: ksni::Handle<tray::DormantTray>,
+}
+
+#[cfg(target_os = "linux")]
+impl MenuRefresher for KsniMenuRefresher {
+    async fn refresh_menu(&mut self) -> bool {
+        self.handle.update(|_| ()).await.is_some()
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn run_linux() -> anyhow::Result<()> {
     // Build a tokio runtime — ksni + the IPC loop both expect one.
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -115,28 +129,18 @@ fn run_linux() -> anyhow::Result<()> {
         ipc_loop::run(ipc_socket, ipc_state, ipc_cancel, refresh).await;
     });
 
-    // Fan-out the IPC refresh channel so the hotkey manager can
-    // subscribe to snapshot publications.  The ksni tray already
-    // consumes refresh_rx; we create a watch→broadcast fan-out
-    // so both the tray and the hotkey manager can independently
-    // react to snapshot changes.
-    // Create a new watch channel for the hotkey manager.
+    // `ksni` only rebuilds its menu layout after `Handle::update`; its D-Bus
+    // getters alone cannot make a new snapshot visible in the next menu open.
     let (hotkey_refresh_tx, hotkey_refresh_rx) = tokio::sync::watch::channel(());
-    // Fan-out: forward refresh_rx changes to both the tray (via the
-    // ksni handle's internal notification) and the hotkey watch.
     let fanout_cancel = cancel.clone();
+    let menu_refresher = KsniMenuRefresher {
+        handle: tray_handle.clone(),
+    };
     handle.spawn(async move {
-        let mut rx = refresh_rx;
-        loop {
-            tokio::select! {
-                () = fanout_cancel.cancelled() => return,
-                result = rx.changed() => {
-                    if result.is_err() { return; }
-                    // Mirror to the hotkey manager's watch channel.
-                    let _ = hotkey_refresh_tx.send(());
-                }
-            }
-        }
+        menu_refresh::consume_refresh(refresh_rx, fanout_cancel, menu_refresher, move || {
+            let _ = hotkey_refresh_tx.send(());
+        })
+        .await;
     });
 
     // Hotkey manager: watches snapshot publications and registers /

@@ -3,7 +3,7 @@ import { useRef } from "react";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { SectionRail } from "../app/config/SectionRail";
 import { SectionRailProvider } from "../app/config/SectionRailContext";
-import { useRegisterSection } from "../app/config/sectionRail";
+import { useRegisterSection } from "../app/config/sectionRailShared";
 
 function RegisteredSections() {
   const anchor = useRef<HTMLDivElement>(null);

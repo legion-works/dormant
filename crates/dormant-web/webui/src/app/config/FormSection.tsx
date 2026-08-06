@@ -4,7 +4,7 @@
  */
 import { useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { useRegisterSection } from "./sectionRail";
+import { useRegisterSection } from "./sectionRailShared";
 
 interface FormSectionProps {
   id: string;

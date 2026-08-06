@@ -2,7 +2,7 @@ import { StrictMode } from "react";
 import { afterEach, describe, expect, it } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 import { SectionRailProvider } from "../app/config/SectionRailContext";
-import { useRegisterSection, useRegisteredSections } from "../app/config/sectionRail";
+import { useRegisterSection, useRegisteredSections } from "../app/config/sectionRailShared";
 
 function Section({ id, title }: { id: string; title: string }) {
   useRegisterSection(id, title, null);

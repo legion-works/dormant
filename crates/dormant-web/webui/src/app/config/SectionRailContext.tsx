@@ -1,7 +1,7 @@
 /** SectionRailProvider — owns the registration map and exposes it via the
- * section-rail context defined in sectionRail.ts. */
+ * section-rail context defined in sectionRailShared.ts. */
 import { useCallback, useMemo, useRef, useState, type ReactNode } from "react";
-import { SectionRailContext, type SectionRegistration } from "./sectionRail";
+import { SectionRailContext, type SectionRegistration } from "./sectionRailShared";
 
 export function SectionRailProvider({ tab, children }: { tab: string; children: ReactNode }) {
   const registrations = useRef(new Map<string, SectionRegistration>());

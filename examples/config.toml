@@ -59,7 +59,7 @@ config_version = 1
 #
 # Optional: last-known-good (LKG) config snapshotting, boot-time rollback on
 # a bad config or a crash/wedge loop, and systemd watchdog pings (Type=notify
-# unit only — see crates/dormantd/systemd/dormant.service). See
+# unit only — see crates/dormantd/systemd/app-dormant.service). See
 # docs/src/watchdog-rollback.md. Enabled by default; every key below shows
 # its default, so this section can be omitted entirely. WatchdogSec and ping
 # cadence are NOT config here — they come from systemd's own environment.

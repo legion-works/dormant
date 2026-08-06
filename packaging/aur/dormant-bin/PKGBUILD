@@ -14,7 +14,7 @@ source=(
   "dormantd-${pkgver}-x86_64-unknown-linux-gnu.tar.xz::https://github.com/legion-works/dormant/releases/download/v${pkgver}/dormantd-x86_64-unknown-linux-gnu.tar.xz"
   "dormantctl-${pkgver}-x86_64-unknown-linux-gnu.tar.xz::https://github.com/legion-works/dormant/releases/download/v${pkgver}/dormantctl-x86_64-unknown-linux-gnu.tar.xz"
   "dormant-tray-${pkgver}-x86_64-unknown-linux-gnu.tar.xz::https://github.com/legion-works/dormant/releases/download/v${pkgver}/dormant-tray-x86_64-unknown-linux-gnu.tar.xz"
-  "dormant.service::https://raw.githubusercontent.com/legion-works/dormant/v${pkgver}/crates/dormantd/systemd/dormant.service"
+  "app-dormant.service::https://raw.githubusercontent.com/legion-works/dormant/v${pkgver}/crates/dormantd/systemd/app-dormant.service"
   "dormant-tray.service::https://raw.githubusercontent.com/legion-works/dormant/v${pkgver}/crates/dormant-tray/systemd/dormant-tray.service"
 )
 
@@ -34,8 +34,12 @@ package() {
 
   # Systemd user units — sourced from raw.githubusercontent.com because the
   # v0.3.1 tarballs predate systemd-unit packaging (added in a later commit).
-  install -Dm644 dormant.service "${pkgdir}/usr/lib/systemd/user/dormant.service"
+  install -Dm644 app-dormant.service "${pkgdir}/usr/lib/systemd/user/app-dormant.service"
   install -Dm644 dormant-tray.service "${pkgdir}/usr/lib/systemd/user/dormant-tray.service"
+
+  # Portal application identity metadata.
+  install -Dm644 dormantd-x86_64-unknown-linux-gnu/dormant.desktop \
+    "${pkgdir}/usr/share/applications/dormant.desktop"
 
   # Licenses (dual MIT / Apache-2.0)
   install -Dm644 dormantd-x86_64-unknown-linux-gnu/LICENSE-MIT "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE-MIT"

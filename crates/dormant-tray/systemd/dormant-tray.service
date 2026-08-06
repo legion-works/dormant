@@ -1,7 +1,7 @@
 [Unit]
 Description=dormant tray — StatusNotifierItem indicator for dormantd
 Documentation=https://github.com/legion-works/dormant
-After=graphical-session.target dormant.service
+After=graphical-session.target app-dormant.service
 PartOf=graphical-session.target
 
 [Service]

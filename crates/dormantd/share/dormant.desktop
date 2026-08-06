@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=dormant
+Comment=Proximity-driven display blanking daemon
+Exec=dormantd
+TryExec=dormantd
+NoDisplay=true
+Terminal=false
+Categories=Utility;

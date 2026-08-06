@@ -212,11 +212,11 @@ source buffer until KWin changes its output-source size advertisement.
 
 ### 2026-08-01 M2 active-sampling daemon-identity premise gate — **PASS**
 
-`dormant.service` was verified as the active graphical-user service before the probe: its unit
-file was `/home/icetea/.config/systemd/user/dormant.service`, its `ExecStart` was
+`app-dormant.service` was verified as the active graphical-user service before the probe: its unit
+file was `/home/icetea/.config/systemd/user/app-dormant.service`, its `ExecStart` was
 `/home/icetea/.local/bin/dormantd`, and the unit was active under the operator's user manager.
 The temporary probe was built into that exact executable, installed at that exact path, and run
-only through `systemctl --user restart dormant.service`.
+only through `systemctl --user restart app-dormant.service`.
 
 The first corrected start minted a restore token after one consent dialog. Restarting the same unit
 then logged `token_reattached`, `restore_token_saved`, and `pipewire_remote_opened` without another

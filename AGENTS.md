@@ -30,7 +30,7 @@ crates/dormant-displays/   # one file per controller: command.rs, ddcci.rs, kwin
 crates/dormant-doctor/     # offline + live coalesced hardware/connectivity probes (config, mqtt, ha, usb, ddcci, samsung)
 crates/dormant-render/     # Wayland layer-shell render sink: black overlay + libmpv screensaver; Linux-only I/O, non-Linux stub exposes the same surface
 crates/dormant-web/        # loopback-only axum HTTP/WS bridge + SPA (crates/dormant-web/webui/) — gated behind the `web-ui` feature of dormantd
-crates/dormantd/           # daemon binary: App, event loop, IPC server, single-instance flock, inhibit-activity, reload watcher, optional web UI spawn, logging + systemd/dormant.service
+crates/dormantd/           # daemon binary: App, event loop, IPC server, single-instance flock, inhibit-activity, reload watcher, optional web UI spawn, logging + systemd/app-dormant.service
 crates/dormantctl/         # CLI binary + library (re-exports the IPC client for dormant-tray and other out-of-process consumers)
 crates/dormant-tray/       # Desktop tray applet: KDE StatusNotifierItem (Linux) + native AppKit NSStatusItem (macOS), shared state + IPC loop; systemd and launchd service definitions
 ```

@@ -208,8 +208,8 @@ Run it as a user service:
 
 ```bash
 mkdir -p ~/.config/systemd/user
-cp crates/dormantd/systemd/dormant.service ~/.config/systemd/user/
-systemctl --user enable --now dormant
+cp crates/dormantd/systemd/app-dormant.service ~/.config/systemd/user/
+systemctl --user enable --now app-dormant.service
 ```
 
 ## Documentation

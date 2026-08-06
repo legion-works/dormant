@@ -25,7 +25,7 @@ Direction for `dormant` — the OLED-preserving presence daemon. Grouped by stat
 
 - **Homebrew tap** — `legion-works/homebrew-tap` publishes versioned `dormantd`, `dormantctl`, and `dormant-tray` formulae on every release.
 - **Arch Linux package** — the `dormant-bin` AUR package ships pre-built x86_64 binaries and installs the systemd user units under `/usr/lib/systemd/user/`.
-- **Release systemd units** — Linux release tarballs include `dormant.service` and `dormant-tray.service`.
+- **Release systemd units** — Linux release tarballs include `app-dormant.service` and `dormant-tray.service`.
 - **Doctor-assisted issue drafting** — `dormantctl doctor --report-issue` / `--draft-feature` runs the full offline probe set and writes a ready-to-file bug report or feature request draft, with known config and credential values redacted.
 
 - **Daemon core** — config schema + strict validation (unknown-key rejection, cross-reference checks), zone fusion engine (`any`/`all`/`quorum`/`weighted`), rules engine, per-display state machine, hot reload with phase carry-over, single-instance `flock` guard. Fail-safe presence throughout: data loss makes a sensor `unavailable`, never `absent` — a room you can't see is never blanked blind.

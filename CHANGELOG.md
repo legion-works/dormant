@@ -4,6 +4,14 @@ All notable changes to `dormant` are recorded here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims at [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.1] - 2026-08-06
+
+### Fixed
+
+- Repeated shared-display switch requests are now idempotent: hooks are not re-run and an already-active input is not re-written; `dormantctl switch --force` reasserts the input when needed, and poll-failure streaks fail open ([#246](https://github.com/legion-works/dormant/issues/246), [#249](https://github.com/legion-works/dormant/pull/249)).
+- MQTT hook publishes retry once with a fresh connection when an idle cached connection has gone stale; this is retry-once behavior, not exactly-once delivery ([#247](https://github.com/legion-works/dormant/issues/247), [#248](https://github.com/legion-works/dormant/pull/248)).
+- The web UI no longer contains a case-insensitive filename collision that broke macOS release builds ([#245](https://github.com/legion-works/dormant/issues/245)).
+
 ## [0.12.0] - 2026-08-06
 
 ### Breaking

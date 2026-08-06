@@ -203,3 +203,6 @@ Both need to be proven to fail, not only to pass:
   before release. The release sequence is `--write` → `--delete-fragments`;
   `--write` verifies the exact inserted entry, and deletion verifies coverage
   before consuming fragments.
+- After `--write`, do not hand-edit compiled wording: `--delete-fragments` will
+  refuse because coverage matches the compiled text. Improve wording in the
+  fragment, then re-run `--write`.

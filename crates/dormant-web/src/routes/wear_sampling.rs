@@ -20,6 +20,7 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use dormant_core::ipc_proto::{IpcRequest, IpcResponse, WearSamplingStatus};
+use tokio::sync::oneshot;
 
 use crate::WebState;
 use crate::error::WebError;
@@ -42,6 +43,10 @@ fn status(response: IpcResponse) -> Result<WearSamplingStatus, WebError> {
         .ok_or(WebError::CoordinationUnavailable)
 }
 
+// WearCard's per-display polling loop corrects a daemon rejection that arrives
+// after this optimistic response window.
+const ENABLE_FAST_RESULT_WINDOW: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// `POST /api/wear/sampling/enable?display=<id>` — start consent without
 /// waiting for its portal window. The optional `display` query parameter
 /// routes to `WearSamplingEnableFor { display }` when present; absence
@@ -50,28 +55,35 @@ pub(crate) async fn post_enable(
     State(state): State<WebState>,
     Query(query): Query<DisplayQuery>,
 ) -> Result<(StatusCode, Json<WearSamplingStatus>), WebError> {
-    let Ok(guard) = std::sync::Arc::clone(&state.inner.wear_sampling_lock).try_lock_owned() else {
-        return Ok((
-            StatusCode::CONFLICT,
-            Json(WearSamplingStatus::Error(
-                "wear_sampling_in_progress".to_owned(),
-            )),
-        ));
-    };
     let request = match query.display.as_deref() {
         Some(display) => IpcRequest::WearSamplingEnableFor {
             display: display.to_owned(),
         },
         None => IpcRequest::WearSamplingEnable,
     };
+    let (result_tx, result_rx) = oneshot::channel();
+    let state_for_request = state.clone();
     tokio::spawn(async move {
-        let _guard = guard;
-        let _ = request_daemon_ipc(&state, request).await;
+        let _ = result_tx.send(request_daemon_ipc(&state_for_request, request).await);
     });
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(WearSamplingStatus::AwaitingConsent),
-    ))
+    match tokio::time::timeout(ENABLE_FAST_RESULT_WINDOW, result_rx).await {
+        Ok(Ok(Ok(response))) => {
+            let sampling = status(response)?;
+            let status_code = match sampling {
+                WearSamplingStatus::AwaitingConsent => StatusCode::ACCEPTED,
+                WearSamplingStatus::Error(_) => StatusCode::CONFLICT,
+                WearSamplingStatus::Granted
+                | WearSamplingStatus::Denied
+                | WearSamplingStatus::TimedOut => StatusCode::OK,
+            };
+            Ok((status_code, Json(sampling)))
+        }
+        Ok(Ok(Err(error))) => Err(error),
+        Ok(Err(_)) | Err(_) => Ok((
+            StatusCode::ACCEPTED,
+            Json(WearSamplingStatus::AwaitingConsent),
+        )),
+    }
 }
 
 /// `GET /api/wear/sampling?display=<id>` — poll the daemon-owned consent
@@ -306,29 +318,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_enable_returns_the_exact_single_flight_status_body() {
+    async fn duplicate_enable_does_not_apply_a_web_scoped_single_flight_guard() {
         let fake = Arc::new(FakeIpc {
             requests: Mutex::new(Vec::new()),
             responses: Mutex::new(VecDeque::new()),
             enable_started: Notify::new(),
-            hold_enable: true,
+            hold_enable: false,
         });
         let state = test_state(fake.clone());
         let _ = post_enable(State(state.clone()), Query(DisplayQuery::default()))
             .await
             .unwrap();
-        fake.enable_started.notified().await;
         let (code, Json(body)) = post_enable(State(state), Query(DisplayQuery::default()))
             .await
             .unwrap();
-        assert_eq!(code, StatusCode::CONFLICT);
-        assert_eq!(
-            body,
-            WearSamplingStatus::Error("wear_sampling_in_progress".to_owned())
-        );
+        assert_eq!(code, StatusCode::ACCEPTED);
+        assert_eq!(body, WearSamplingStatus::AwaitingConsent);
+        tokio::task::yield_now().await;
         assert_eq!(
             *fake.requests.lock().await,
-            vec![IpcRequest::WearSamplingEnable]
+            vec![
+                IpcRequest::WearSamplingEnable,
+                IpcRequest::WearSamplingEnable
+            ]
         );
     }
 

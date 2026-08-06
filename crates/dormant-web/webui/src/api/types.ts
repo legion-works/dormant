@@ -951,6 +951,7 @@ export interface WearSamplingLifecycleStatus {
   state: "disabled" | "needs_consent" | "consent_pending" | "connecting" | "streaming" | "suspended" | "cooldown";
   last_capture_age_s?: number | null;
   uniform_reason?: string | null;
+  compositor_output?: string | null;
   bound_display?: string | null;
   granted_at_epoch_s?: number | null;
 }

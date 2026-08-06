@@ -28,13 +28,19 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// the Enable that follows will be rejected with `FlowAlreadyActive`. Lying
 /// about a silent reattach would mislead the operator — we tell them the
 /// dialog is up and how to recover instead.
-fn consent_hint(state: Option<WearSamplingState>) -> &'static str {
+fn consent_hint(state: Option<WearSamplingState>, target: Option<(&str, Option<&str>)>) -> String {
     match state {
-        Some(WearSamplingState::NeedsConsent) | None => {
-            "waiting for consent dialog — up to 5 minutes"
-        }
+        Some(WearSamplingState::NeedsConsent) | None => match target {
+            Some((display, Some(compositor_output))) => format!(
+                "waiting for consent dialog — pick the tile for display '{display}' ({compositor_output}) — up to 5 minutes"
+            ),
+            Some((display, None)) => format!(
+                "waiting for consent dialog — pick the tile for display '{display}' — up to 5 minutes"
+            ),
+            None => "waiting for consent dialog — up to 5 minutes".to_owned(),
+        },
         Some(WearSamplingState::ConsentPending) => {
-            "a consent dialog is already open — answer it or run disable-sampling first"
+            "a consent dialog is already open — answer it or run disable-sampling first".to_owned()
         }
         Some(
             WearSamplingState::Connecting
@@ -42,7 +48,7 @@ fn consent_hint(state: Option<WearSamplingState>) -> &'static str {
             | WearSamplingState::Suspended
             | WearSamplingState::Cooldown
             | WearSamplingState::Disabled,
-        ) => "reattaching using saved consent",
+        ) => "reattaching using saved consent".to_owned(),
     }
 }
 
@@ -58,16 +64,20 @@ fn consent_hint(state: Option<WearSamplingState>) -> &'static str {
 /// Returns an error when IPC fails or the daemon reports a non-success status.
 pub fn run_enable(socket: &Path, display: Option<&str>) -> Result<()> {
     let statuses = query_sampler_statuses(socket)?;
-    let (hint_state, selected, source_gate) = classify_sampling(&statuses, display)?;
-    println!("{}", consent_hint(hint_state));
-    if let Some(gate) = source_gate {
+    let selection = classify_sampling(&statuses, display)?;
+    let target = selection
+        .selected
+        .display_id()
+        .map(|display| (display, selection.compositor_output.as_deref()));
+    println!("{}", consent_hint(selection.hint_state, target));
+    if let Some(gate) = selection.source_gate {
         println!("source: {gate}");
     }
-    let request = match &selected {
+    let request = match &selection.selected {
         SelectedDisplay::Explicit(id) => IpcRequest::WearSamplingEnableFor {
             display: id.clone(),
         },
-        SelectedDisplay::SoleUnit | SelectedDisplay::Legacy => IpcRequest::WearSamplingEnable,
+        SelectedDisplay::SoleUnit(_) | SelectedDisplay::Legacy => IpcRequest::WearSamplingEnable,
     };
     let response = send_request_timeout(socket, request, ENABLE_TIMEOUT)?;
     print_status(response.wear_sampling)
@@ -83,16 +93,16 @@ pub fn run_enable(socket: &Path, display: Option<&str>) -> Result<()> {
 /// Returns an error when IPC fails or the daemon reports a non-success status.
 pub fn run_disable(socket: &Path, forget: bool, display: Option<&str>) -> Result<()> {
     let statuses = query_sampler_statuses(socket)?;
-    let (_hint_state, selected, source_gate) = classify_sampling(&statuses, display)?;
-    if let Some(gate) = source_gate {
+    let selection = classify_sampling(&statuses, display)?;
+    if let Some(gate) = selection.source_gate {
         println!("source: {gate}");
     }
-    let request = match &selected {
+    let request = match &selection.selected {
         SelectedDisplay::Explicit(id) => IpcRequest::WearSamplingDisableFor {
             display: id.clone(),
             forget,
         },
-        SelectedDisplay::SoleUnit | SelectedDisplay::Legacy => {
+        SelectedDisplay::SoleUnit(_) | SelectedDisplay::Legacy => {
             IpcRequest::WearSamplingDisable { forget }
         }
     };
@@ -110,9 +120,27 @@ enum SelectedDisplay {
     /// The operator omitted `--display` and the daemon has exactly one
     /// selected display. Preserves the legacy unit-variant wire tag for
     /// backward compatibility with single-display operator scripts.
-    SoleUnit,
+    SoleUnit(String),
     /// Legacy fallback (zero displays selected, no display selector to send).
     Legacy,
+}
+
+impl SelectedDisplay {
+    fn display_id(&self) -> Option<&str> {
+        match self {
+            Self::Explicit(display) | Self::SoleUnit(display) => Some(display),
+            Self::Legacy => None,
+        }
+    }
+}
+
+/// Pure per-display data used to build a sampling IPC request and hint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SamplingSelection {
+    hint_state: Option<WearSamplingState>,
+    selected: SelectedDisplay,
+    source_gate: Option<String>,
+    compositor_output: Option<String>,
 }
 
 /// Read the daemon's per-display aggregate status map.
@@ -141,11 +169,16 @@ fn query_sampler_statuses(
 fn classify_sampling(
     statuses: &std::collections::BTreeMap<String, WearSamplingStatusMapEntry>,
     display: Option<&str>,
-) -> Result<(Option<WearSamplingState>, SelectedDisplay, Option<String>)> {
+) -> Result<SamplingSelection> {
     let mut keys: Vec<&String> = statuses.keys().collect();
     keys.sort();
     match keys.len() {
-        0 => Ok((None, SelectedDisplay::Legacy, None)),
+        0 => Ok(SamplingSelection {
+            hint_state: None,
+            selected: SelectedDisplay::Legacy,
+            source_gate: None,
+            compositor_output: None,
+        }),
         1 => {
             let sole = keys[0].clone();
             // First (and only) entry's lifecycle state and gate for the
@@ -153,16 +186,23 @@ fn classify_sampling(
             let entry = statuses.get(&sole);
             let hint = entry.map(|e| Some(e.state));
             let gate = entry.and_then(|e| e.source_gate.clone());
+            let compositor_output = entry.and_then(|e| e.compositor_output.clone());
             match display {
-                Some(id) if id == sole => Ok((
-                    hint.flatten(),
-                    SelectedDisplay::Explicit(id.to_owned()),
-                    gate,
-                )),
+                Some(id) if id == sole => Ok(SamplingSelection {
+                    hint_state: hint.flatten(),
+                    selected: SelectedDisplay::Explicit(id.to_owned()),
+                    source_gate: gate,
+                    compositor_output,
+                }),
                 Some(id) if id != sole => Err(anyhow!(
                     "display '{id}' is not a selected wear-sampling display"
                 )),
-                Some(_) | None => Ok((hint.flatten(), SelectedDisplay::SoleUnit, gate)),
+                Some(_) | None => Ok(SamplingSelection {
+                    hint_state: hint.flatten(),
+                    selected: SelectedDisplay::SoleUnit(sole.clone()),
+                    source_gate: gate,
+                    compositor_output,
+                }),
             }
         }
         _ => match display {
@@ -175,11 +215,13 @@ fn classify_sampling(
                 let entry = statuses.get(id);
                 let hint = entry.map(|e| Some(e.state));
                 let gate = entry.and_then(|e| e.source_gate.clone());
-                Ok((
-                    hint.flatten(),
-                    SelectedDisplay::Explicit(id.to_owned()),
-                    gate,
-                ))
+                let compositor_output = entry.and_then(|e| e.compositor_output.clone());
+                Ok(SamplingSelection {
+                    hint_state: hint.flatten(),
+                    selected: SelectedDisplay::Explicit(id.to_owned()),
+                    source_gate: gate,
+                    compositor_output,
+                })
             }
             None => Err(anyhow!(
                 "multiple displays configured — pass --display to pick one"
@@ -258,10 +300,76 @@ mod tests {
 
     #[test]
     fn hint_for_needs_consent_mentions_dialog() {
-        let hint = consent_hint(Some(WearSamplingState::NeedsConsent));
+        let hint = consent_hint(Some(WearSamplingState::NeedsConsent), None);
         assert!(
             hint.contains(DIALOG_HINT_PHRASE),
             "NeedsConsent must mention the dialog: {hint}"
+        );
+    }
+
+    #[test]
+    fn hint_for_needs_consent_names_display_and_compositor_output() {
+        let hint = consent_hint(
+            Some(WearSamplingState::NeedsConsent),
+            Some(("tv", Some("HDMI-A-1"))),
+        );
+
+        assert_eq!(
+            hint,
+            "waiting for consent dialog — pick the tile for display 'tv' (HDMI-A-1) — up to 5 minutes"
+        );
+    }
+
+    #[test]
+    fn hint_for_needs_consent_degrades_to_display_id_without_compositor_output() {
+        let hint = consent_hint(Some(WearSamplingState::NeedsConsent), Some(("tv", None)));
+
+        assert_eq!(
+            hint,
+            "waiting for consent dialog — pick the tile for display 'tv' — up to 5 minutes"
+        );
+    }
+
+    #[test]
+    fn non_dialog_hints_do_not_name_the_target() {
+        for state in [
+            WearSamplingState::Connecting,
+            WearSamplingState::Streaming,
+            WearSamplingState::Suspended,
+            WearSamplingState::Cooldown,
+            WearSamplingState::Disabled,
+        ] {
+            let hint = consent_hint(Some(state), Some(("tv", Some("HDMI-A-1"))));
+            assert_eq!(hint, "reattaching using saved consent", "state={state:?}");
+        }
+    }
+
+    #[test]
+    fn sole_unit_selection_keeps_its_target_name_for_the_hint() {
+        let statuses = std::collections::BTreeMap::from([(
+            "tv".to_owned(),
+            WearSamplingStatusMapEntry {
+                state: WearSamplingState::NeedsConsent,
+                uniform_reason: None,
+                compositor_output: Some("HDMI-A-1".to_owned()),
+                source_gate: None,
+            },
+        )]);
+
+        let selection = classify_sampling(&statuses, None).expect("sole selection is valid");
+        assert_eq!(
+            selection.selected,
+            SelectedDisplay::SoleUnit("tv".to_owned())
+        );
+        assert_eq!(
+            consent_hint(
+                selection.hint_state,
+                selection
+                    .selected
+                    .display_id()
+                    .map(|display| (display, selection.compositor_output.as_deref()))
+            ),
+            "waiting for consent dialog — pick the tile for display 'tv' (HDMI-A-1) — up to 5 minutes"
         );
     }
 
@@ -270,7 +378,7 @@ mod tests {
         // Legacy daemons (no wear_sampling_status field) cannot tell us
         // anything — fall back to the dialog hint so we never silently skip
         // a real consent flow.
-        let hint = consent_hint(None);
+        let hint = consent_hint(None, None);
         assert!(
             hint.contains(DIALOG_HINT_PHRASE),
             "absent state must default to the dialog hint: {hint}"
@@ -279,7 +387,7 @@ mod tests {
 
     #[test]
     fn hint_for_connecting_mentions_reattach_not_dialog() {
-        let hint = consent_hint(Some(WearSamplingState::Connecting));
+        let hint = consent_hint(Some(WearSamplingState::Connecting), None);
         assert!(
             !hint.contains(DIALOG_HINT_PHRASE),
             "Connecting means saved-consent reattach — must not promise a dialog: {hint}"
@@ -292,7 +400,7 @@ mod tests {
 
     #[test]
     fn hint_for_streaming_mentions_reattach_not_dialog() {
-        let hint = consent_hint(Some(WearSamplingState::Streaming));
+        let hint = consent_hint(Some(WearSamplingState::Streaming), None);
         assert!(!hint.contains(DIALOG_HINT_PHRASE), "hint: {hint}");
     }
 
@@ -303,27 +411,27 @@ mod tests {
         // with `FlowAlreadyActive`; the hint must therefore NOT lie about a
         // silent reattach, and must steer the operator toward either
         // answering the open dialog or disabling first.
-        let hint = consent_hint(Some(WearSamplingState::ConsentPending));
+        let hint = consent_hint(Some(WearSamplingState::ConsentPending), None);
         assert!(
             hint.contains(DIALOG_HINT_PHRASE),
             "ConsentPending = dialog open — hint must say so: {hint}"
         );
         assert_ne!(
             hint,
-            consent_hint(Some(WearSamplingState::NeedsConsent)),
+            consent_hint(Some(WearSamplingState::NeedsConsent), None),
             "ConsentPending must NOT share the fresh-consent hint string"
         );
     }
 
     #[test]
     fn hint_for_suspended_mentions_reattach_not_dialog() {
-        let hint = consent_hint(Some(WearSamplingState::Suspended));
+        let hint = consent_hint(Some(WearSamplingState::Suspended), None);
         assert!(!hint.contains(DIALOG_HINT_PHRASE), "hint: {hint}");
     }
 
     #[test]
     fn hint_for_cooldown_mentions_reattach_not_dialog() {
-        let hint = consent_hint(Some(WearSamplingState::Cooldown));
+        let hint = consent_hint(Some(WearSamplingState::Cooldown), None);
         assert!(!hint.contains(DIALOG_HINT_PHRASE), "hint: {hint}");
     }
 
@@ -331,7 +439,7 @@ mod tests {
     fn hint_for_disabled_mentions_reattach_not_dialog() {
         // Disabled is a config error case; the daemon will refuse Enable
         // immediately. No dialog either way.
-        let hint = consent_hint(Some(WearSamplingState::Disabled));
+        let hint = consent_hint(Some(WearSamplingState::Disabled), None);
         assert!(!hint.contains(DIALOG_HINT_PHRASE), "hint: {hint}");
     }
 
@@ -423,6 +531,7 @@ mod tests {
                 WearSamplingStatusMapEntry {
                     state: *state,
                     uniform_reason: None,
+                    compositor_output: None,
                     source_gate: None,
                 },
             );
@@ -434,6 +543,7 @@ mod tests {
                     last_capture_age_s: None,
                     uniform_reason: None,
                     bound_display: Some((*id).to_owned()),
+                    compositor_output: None,
                     granted_at_epoch_s: None,
                     source_gate: None,
                 });
@@ -750,6 +860,7 @@ mod tests {
             WearSamplingStatusMapEntry {
                 state: WearSamplingState::Streaming,
                 uniform_reason: None,
+                compositor_output: None,
                 source_gate: Some("matched".to_owned()),
             },
         );
@@ -758,13 +869,15 @@ mod tests {
             WearSamplingStatusMapEntry {
                 state: WearSamplingState::Streaming,
                 uniform_reason: None,
+                compositor_output: None,
                 source_gate: Some("mismatched".to_owned()),
             },
         );
 
         // Selecting the monitor surfaces monitor's gate, NOT tv's.
-        let (_state, _selected, gate_monitor) =
-            classify_sampling(&map, Some("monitor")).expect("monitor is a selected display");
+        let gate_monitor = classify_sampling(&map, Some("monitor"))
+            .expect("monitor is a selected display")
+            .source_gate;
         assert_eq!(
             gate_monitor.as_deref(),
             Some("mismatched"),
@@ -781,8 +894,9 @@ mod tests {
         );
 
         // Selecting the TV surfaces the TV's gate, NOT the monitor's.
-        let (_state, _selected, gate_tv) =
-            classify_sampling(&map, Some("tv")).expect("tv is a selected display");
+        let gate_tv = classify_sampling(&map, Some("tv"))
+            .expect("tv is a selected display")
+            .source_gate;
         assert_eq!(gate_tv.as_deref(), Some("matched"));
         assert_ne!(gate_tv.as_deref(), Some("mismatched"));
 
@@ -794,11 +908,13 @@ mod tests {
             WearSamplingStatusMapEntry {
                 state: WearSamplingState::NeedsConsent,
                 uniform_reason: None,
+                compositor_output: None,
                 source_gate: Some("unknown".to_owned()),
             },
         );
-        let (_state, _selected, gate_solo) =
-            classify_sampling(&solo, None).expect("sole selection is valid");
+        let gate_solo = classify_sampling(&solo, None)
+            .expect("sole selection is valid")
+            .source_gate;
         assert_eq!(gate_solo.as_deref(), Some("unknown"));
 
         // A display with no gate configuration (render-only monitor)
@@ -812,11 +928,13 @@ mod tests {
             WearSamplingStatusMapEntry {
                 state: WearSamplingState::NeedsConsent,
                 uniform_reason: None,
+                compositor_output: None,
                 source_gate: None,
             },
         );
-        let (_state, _selected, gate_absent) =
-            classify_sampling(&no_gate, Some("monitor")).expect("monitor is a selected display");
+        let gate_absent = classify_sampling(&no_gate, Some("monitor"))
+            .expect("monitor is a selected display")
+            .source_gate;
         assert!(
             gate_absent.is_none(),
             "absent gate configuration must surface as None, not a synthesized string"
@@ -838,6 +956,7 @@ mod tests {
             WearSamplingStatusMapEntry {
                 state: WearSamplingState::NeedsConsent,
                 uniform_reason: None,
+                compositor_output: None,
                 source_gate: Some("matched".to_owned()),
             },
         );
@@ -846,6 +965,7 @@ mod tests {
             WearSamplingStatusMapEntry {
                 state: WearSamplingState::NeedsConsent,
                 uniform_reason: None,
+                compositor_output: None,
                 source_gate: Some("mismatched".to_owned()),
             },
         );

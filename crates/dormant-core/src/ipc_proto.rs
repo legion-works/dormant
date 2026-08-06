@@ -218,6 +218,9 @@ pub struct WearSamplingStatusMapEntry {
     /// Stable reason for uniform attribution while sampling is degraded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uniform_reason: Option<String>,
+    /// Configured compositor output for the display targeted by this sampler.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compositor_output: Option<String>,
     /// Stable, redacted source-gate state for this display: one of
     /// `"matched"`, `"mismatched"`, or `"unknown"`. `None` means the
     /// display carries no gate configuration.
@@ -1056,6 +1059,7 @@ mod tests {
             WearSamplingStatusMapEntry {
                 state: WearSamplingState::Streaming,
                 uniform_reason: None,
+                compositor_output: None,
                 source_gate: None,
             },
         );
@@ -1064,6 +1068,7 @@ mod tests {
             WearSamplingStatusMapEntry {
                 state: WearSamplingState::NeedsConsent,
                 uniform_reason: Some("wear_sampling_no_consent".to_owned()),
+                compositor_output: None,
                 source_gate: None,
             },
         );
@@ -1129,6 +1134,7 @@ mod tests {
             last_capture_age_s: Some(61),
             uniform_reason: None,
             bound_display: Some("desk".to_owned()),
+            compositor_output: None,
             granted_at_epoch_s: Some(1_700_000_000),
             source_gate: None,
         });

@@ -78,6 +78,8 @@ pub struct SamplerStatus {
     pub uniform_reason: Option<&'static str>,
     /// Configured display bound to the current consent record.
     pub bound_display: Option<String>,
+    /// Configured compositor output for the display targeted by this sampler.
+    pub compositor_output: Option<String>,
     /// Grant wall-clock timestamp, exposed without any portal identifiers.
     pub granted_at: Option<OffsetDateTime>,
     /// Latest source-gate observation for this display. `None` means the
@@ -114,6 +116,7 @@ impl SamplerStatus {
                 .map(|capture| now.0.saturating_duration_since(capture.0).as_secs()),
             uniform_reason: self.uniform_reason.map(str::to_owned),
             bound_display: self.bound_display.clone(),
+            compositor_output: self.compositor_output.clone(),
             granted_at_epoch_s: self.granted_at.map(OffsetDateTime::unix_timestamp),
             source_gate: source_gate.map(str::to_owned),
         }
@@ -342,6 +345,20 @@ impl ActiveSamplerHandle {
             .await
             .map_err(|_| SamplerError::CommandChannelClosed)
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_handle() -> (Self, mpsc::Receiver<SamplerCommand>) {
+        let (handle, command_rx, _status_tx) = Self::new(SamplerStatus {
+            state: SamplingState::NeedsConsent,
+            last_capture: None,
+            uniform_reason: Some(WEAR_SAMPLING_NEEDS_CONSENT),
+            bound_display: None,
+            compositor_output: None,
+            granted_at: None,
+            source_gate: None,
+        });
+        (handle, command_rx)
+    }
 }
 
 impl fmt::Display for SamplerError {
@@ -401,6 +418,7 @@ fn initial_status(config: &Config) -> SamplerStatus {
         last_capture: None,
         uniform_reason: enabled.then_some(WEAR_SAMPLING_NEEDS_CONSENT),
         bound_display: config.wear.active_sampling.sampled_display.clone(),
+        compositor_output: None,
         granted_at: None,
         source_gate: None,
     }
@@ -1143,6 +1161,11 @@ fn publish_status(
             .record
             .as_ref()
             .map(|record| record.record().sampled_display.clone()),
+        compositor_output: runtime
+            .display
+            .display
+            .as_ref()
+            .and_then(|display| display.compositor_output.clone()),
         granted_at: runtime
             .record
             .as_ref()
@@ -3291,6 +3314,7 @@ mod tests {
             last_capture: None,
             uniform_reason: None,
             bound_display: None,
+            compositor_output: None,
             granted_at: None,
             source_gate: None,
         });
@@ -5726,6 +5750,11 @@ mod tests {
                 .record
                 .as_ref()
                 .map(|record| record.record().sampled_display.clone()),
+            compositor_output: runtime
+                .display
+                .display
+                .as_ref()
+                .and_then(|display| display.compositor_output.clone()),
             granted_at: runtime
                 .record
                 .as_ref()

@@ -353,6 +353,7 @@ mod tests {
             last_capture_age_s: Some(5),
             uniform_reason: None,
             bound_display: Some("desk".to_owned()),
+            compositor_output: None,
             granted_at_epoch_s: Some(1_700_000_000),
             source_gate: None,
         };
@@ -739,6 +740,7 @@ mod tests {
             last_capture_age_s: Some(5),
             uniform_reason: Some("source_mismatch".to_owned()),
             bound_display: Some("tv".to_owned()),
+            compositor_output: None,
             granted_at_epoch_s: Some(1_700_000_000),
             source_gate: Some("mismatched".to_owned()),
         }
@@ -751,6 +753,7 @@ mod tests {
             last_capture_age_s: Some(5),
             uniform_reason: None,
             bound_display: Some("monitor".to_owned()),
+            compositor_output: None,
             granted_at_epoch_s: Some(1_700_000_000),
             source_gate: Some("matched".to_owned()),
         }
@@ -963,6 +966,7 @@ mod tests {
             last_capture_age_s: Some(5),
             uniform_reason: Some("source_mismatch".to_owned()),
             bound_display: Some("orphan".to_owned()),
+            compositor_output: None,
             granted_at_epoch_s: Some(1_700_000_000),
             source_gate: Some("mismatched".to_owned()),
         };

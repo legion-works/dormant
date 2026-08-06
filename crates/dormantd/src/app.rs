@@ -1106,6 +1106,7 @@ mod active_sampler_reload_tests {
             last_capture: None,
             uniform_reason: None,
             bound_display: Some(display.to_owned()),
+            compositor_output: None,
             granted_at: None,
             source_gate,
         }
@@ -3147,6 +3148,16 @@ impl App {
                     config_rx.borrow().wear.active_sampling.selected_displays()
                 }) as std::sync::Arc<dyn Fn() -> Vec<String> + Send + Sync>
             };
+            let compositor_output_closure = {
+                let config_rx = config_rx.clone();
+                std::sync::Arc::new(move |display: &str| {
+                    config_rx
+                        .borrow()
+                        .displays
+                        .get(display)
+                        .and_then(|config| config.compositor_output.clone())
+                }) as std::sync::Arc<dyn Fn(&str) -> Option<String> + Send + Sync>
+            };
             Some(
                 crate::ipc::spawn(
                     &socket_path,
@@ -3157,6 +3168,7 @@ impl App {
                     sampler_registry.clone(),
                     root.clone(),
                     selected_displays_closure,
+                    compositor_output_closure,
                 )
                 .context("spawn IPC server")?,
             )

@@ -240,6 +240,7 @@ mod tests {
             last_capture_age_s: age,
             uniform_reason: None,
             bound_display: Some("oled".into()),
+            compositor_output: None,
             granted_at_epoch_s: None,
             source_gate: None,
         }
@@ -357,6 +358,7 @@ mod tests {
             last_capture_age_s: Some(2),
             uniform_reason: None,
             bound_display: Some(display.to_owned()),
+            compositor_output: None,
             granted_at_epoch_s: None,
             source_gate: None,
         }

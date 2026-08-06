@@ -2339,6 +2339,7 @@ mod tests {
             last_capture: None,
             uniform_reason: Some(crate::active_sampler::WEAR_SAMPLING_SUSPENDED),
             bound_display: Some(display.0.clone()),
+            compositor_output: None,
             granted_at: None,
             source_gate: None,
         }));
@@ -2395,6 +2396,7 @@ mod tests {
             last_capture: None,
             uniform_reason: None,
             bound_display: Some(display.0.clone()),
+            compositor_output: None,
             granted_at: None,
             source_gate: gate,
         };
@@ -2477,6 +2479,7 @@ mod tests {
             last_capture: None,
             uniform_reason: Some(crate::active_sampler::WEAR_SAMPLING_SUSPENDED),
             bound_display: Some(display.0.clone()),
+            compositor_output: None,
             granted_at: None,
             source_gate: Some(SourceGate::Mismatched {
                 observed: "hdmi2".into(),

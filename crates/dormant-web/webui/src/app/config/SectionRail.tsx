@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { useRegisteredSections } from "./sectionRail";
+import { useRegisteredSections } from "./sectionRailShared";
 
 export function SectionRail() {
   const sections = useRegisteredSections();

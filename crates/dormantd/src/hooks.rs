@@ -766,9 +766,10 @@ fn env_home() -> Option<OsString> {
 /// Thin daemon-owned MQTT publisher for hook actions.
 ///
 /// Separate from the sensor-plane `MqttSource` (spec §6 / #105). The
-/// publisher caches its `AsyncClient` across calls (connect-once, reuse
-/// while the broker connection is alive), drops the cache on failure, and
-/// bounds the *entire* publish operation (connect + publish + ack) by the
+/// publisher caches its connection across calls (connect-once, reuse while
+/// the broker connection is alive), retries one cached-connection failure
+/// with a fresh connection, drops the cache on failure, and bounds the
+/// *entire* publish operation (connect + publish + ack) by the
 /// caller-supplied per-hook timeout. The per-entry timeout prevents a down
 /// broker from blocking claim transitions indefinitely — a blocking MQTT
 /// hook fails within its configured timeout like a command hook does, and
@@ -777,14 +778,69 @@ pub struct MqttPublisher {
     broker_url: String,
     credential: Option<MqttCredential>,
     client_id: String,
+    transport: Arc<dyn MqttHookTransport>,
     state: AsyncMutex<PublisherState>,
+}
+
+#[async_trait]
+pub(crate) trait MqttHookConnection: Send {
+    async fn publish(
+        self: Box<Self>,
+        topic: &str,
+        payload: &str,
+    ) -> Result<Box<dyn MqttHookConnection>, MqttPublishError>;
+}
+
+#[async_trait]
+pub(crate) trait MqttHookTransport: Send + Sync {
+    async fn connect(
+        &self,
+        broker_url: &str,
+        client_id: &str,
+        credential: Option<&MqttCredential>,
+    ) -> Result<Box<dyn MqttHookConnection>, MqttPublishError>;
+}
+
+struct RealMqttHookTransport;
+
+struct RealMqttHookConnection {
+    client: AsyncClient,
+    eventloop: EventLoop,
+}
+
+#[async_trait]
+impl MqttHookConnection for RealMqttHookConnection {
+    async fn publish(
+        self: Box<Self>,
+        topic: &str,
+        payload: &str,
+    ) -> Result<Box<dyn MqttHookConnection>, MqttPublishError> {
+        let Self { client, eventloop } = *self;
+        publish_qos1_keepalive(client, eventloop, topic, payload)
+            .await
+            .map(|(client, eventloop)| {
+                Box::new(Self { client, eventloop }) as Box<dyn MqttHookConnection>
+            })
+    }
+}
+
+#[async_trait]
+impl MqttHookTransport for RealMqttHookTransport {
+    async fn connect(
+        &self,
+        broker_url: &str,
+        client_id: &str,
+        credential: Option<&MqttCredential>,
+    ) -> Result<Box<dyn MqttHookConnection>, MqttPublishError> {
+        let (client, eventloop) = connect_with_backoff(broker_url, client_id, credential).await?;
+        Ok(Box::new(RealMqttHookConnection { client, eventloop }))
+    }
 }
 
 /// Cached MQTT client (the broker side of the connection is owned by the
 /// eventloop; the client is the publish handle).
 struct CachedClient {
-    client: AsyncClient,
-    eventloop: EventLoop,
+    connection: Box<dyn MqttHookConnection>,
 }
 
 struct PublisherState {
@@ -806,8 +862,20 @@ impl MqttPublisher {
             broker_url,
             credential,
             client_id,
+            transport: Arc::new(RealMqttHookTransport),
             state: AsyncMutex::new(PublisherState { client: None }),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_transport(
+        broker_url: String,
+        credential: Option<MqttCredential>,
+        transport: Arc<dyn MqttHookTransport>,
+    ) -> Self {
+        let mut publisher = Self::new(broker_url, credential);
+        publisher.transport = transport;
+        publisher
     }
 
     fn config(&self) -> (String, Option<MqttCredential>) {
@@ -818,8 +886,10 @@ impl MqttPublisher {
     ///
     /// On the first call (or after a failure cleared the cache) this
     /// connects, bounded by `timeout_`. Subsequent calls reuse the cached
-    /// client and eventloop. On success the cache is repopulated; on
-    /// failure the cache stays empty so the next call reconnects.
+    /// connection. If that cached connection fails, one fresh connection is
+    /// attempted inside the same timeout budget. On success the cache is
+    /// repopulated; on failure the cache stays empty so the next call
+    /// reconnects.
     ///
     /// The *entire* operation runs under `timeout_` — connect + publish +
     /// ack all share the same budget. A down broker therefore fails
@@ -844,27 +914,44 @@ impl MqttPublisher {
         // cannot both grab the client — but it does NOT hold during I/O.
         let (broker_url, credential, cached) = {
             let mut state = self.state.lock().await;
-            let cached = state.client.take().map(|c| (c.client, c.eventloop));
+            let cached = state.client.take().map(|c| c.connection);
             (self.broker_url.clone(), self.credential.clone(), cached)
         };
 
         // Bound the entire connect+publish+ack by timeout_.
         let result = tokio::time::timeout(timeout_, async {
-            let (client, eventloop) = match cached {
-                Some((c, e)) => (c, e),
-                None => {
-                    connect_with_backoff(&broker_url, &self.client_id, credential.as_ref()).await?
-                }
+            let (connection, came_from_cache) = match cached {
+                Some(connection) => (connection, true),
+                None => (
+                    self.transport
+                        .connect(&broker_url, &self.client_id, credential.as_ref())
+                        .await?,
+                    false,
+                ),
             };
-            publish_qos1_keepalive(client, eventloop, topic, payload).await
+            match connection.publish(topic, payload).await {
+                Ok(connection) => Ok(connection),
+                // NOT exactly-once: the failed cached attempt may have partially
+                // left (enqueued/TCP-written pre-PubAck), so this retry can produce
+                // a QoS1 duplicate on the broker. Hook consumers must tolerate
+                // duplicate payloads (the usb-target ESP handler no-ops on same-state).
+                Err(_cached_error) if came_from_cache => {
+                    let connection = self
+                        .transport
+                        .connect(&broker_url, &self.client_id, credential.as_ref())
+                        .await?;
+                    connection.publish(topic, payload).await
+                }
+                Err(error) => Err(error),
+            }
         })
         .await;
 
         match result {
-            Ok(Ok((client, eventloop))) => {
+            Ok(Ok(connection)) => {
                 // Success — repopulate the cache for the next call.
                 let mut state = self.state.lock().await;
-                state.client = Some(CachedClient { client, eventloop });
+                state.client = Some(CachedClient { connection });
                 Ok(())
             }
             Ok(Err(e)) => {
@@ -1175,6 +1262,72 @@ mod tests {
     use super::*;
     use dormant_core::config::schema::HookMqtt;
     use std::time::Instant;
+
+    type ScriptedPublishes = Vec<Result<(), String>>;
+    type ScriptedConnect = Result<ScriptedPublishes, MqttPublishError>;
+
+    struct ScriptedMqttTransport {
+        connects: Arc<Mutex<VecDeque<ScriptedConnect>>>,
+        connect_count: Arc<Mutex<usize>>,
+    }
+
+    struct ScriptedMqttConnection {
+        publishes: VecDeque<Result<(), MqttPublishError>>,
+    }
+
+    #[async_trait]
+    impl MqttHookTransport for ScriptedMqttTransport {
+        async fn connect(
+            &self,
+            _broker_url: &str,
+            _client_id: &str,
+            _credential: Option<&MqttCredential>,
+        ) -> Result<Box<dyn MqttHookConnection>, MqttPublishError> {
+            *self.connect_count.lock().unwrap() += 1;
+            let result = self
+                .connects
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("scripted connect response");
+            result.map(|publishes| {
+                Box::new(ScriptedMqttConnection {
+                    publishes: publishes
+                        .into_iter()
+                        .map(|result| result.map_err(MqttPublishError::Io))
+                        .collect(),
+                }) as Box<dyn MqttHookConnection>
+            })
+        }
+    }
+
+    #[async_trait]
+    impl MqttHookConnection for ScriptedMqttConnection {
+        async fn publish(
+            self: Box<Self>,
+            _topic: &str,
+            _payload: &str,
+        ) -> Result<Box<dyn MqttHookConnection>, MqttPublishError> {
+            let Self { mut publishes } = *self;
+            publishes
+                .pop_front()
+                .expect("scripted publish response")
+                .map(|()| Box::new(Self { publishes }) as Box<dyn MqttHookConnection>)
+        }
+    }
+
+    impl ScriptedMqttTransport {
+        fn new(connects: Vec<ScriptedConnect>) -> Self {
+            Self {
+                connects: Arc::new(Mutex::new(connects.into_iter().collect())),
+                connect_count: Arc::new(Mutex::new(0)),
+            }
+        }
+
+        fn connect_count(&self) -> usize {
+            *self.connect_count.lock().unwrap()
+        }
+    }
 
     fn make_command_action(
         argv: Vec<String>,
@@ -1755,6 +1908,57 @@ mod tests {
             state.client.is_none(),
             "failure must clear the cache so the next call reconnects"
         );
+    }
+
+    #[tokio::test]
+    async fn mqtt_publisher_retries_cached_failure_with_fresh_connection_and_keeps_cache() {
+        let transport = Arc::new(ScriptedMqttTransport::new(vec![
+            Ok(vec![Ok(()), Err("stale".to_string())]),
+            Ok(vec![Ok(()), Ok(())]),
+        ]));
+        let publisher = MqttPublisher::with_transport(
+            "mqtt://broker:1883".to_string(),
+            None,
+            transport.clone(),
+        );
+
+        publisher
+            .publish("test/topic", "first", Duration::from_secs(1))
+            .await
+            .expect("initial publish succeeds");
+        publisher
+            .publish("test/topic", "second", Duration::from_secs(1))
+            .await
+            .expect("stale cached connection is retried");
+        publisher
+            .publish("test/topic", "third", Duration::from_secs(1))
+            .await
+            .expect("successful retry remains cached");
+
+        assert_eq!(
+            transport.connect_count(),
+            2,
+            "one reconnect after stale cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn mqtt_publisher_fresh_connect_failure_is_returned() {
+        let transport = Arc::new(ScriptedMqttTransport::new(vec![Err(MqttPublishError::Io(
+            "broker down".to_string(),
+        ))]));
+        let publisher = MqttPublisher::with_transport(
+            "mqtt://broker:1883".to_string(),
+            None,
+            transport.clone(),
+        );
+
+        let result = publisher
+            .publish("test/topic", "payload", Duration::from_secs(1))
+            .await;
+
+        assert!(matches!(result, Err(MqttPublishError::Io(message)) if message == "broker down"));
+        assert_eq!(transport.connect_count(), 1);
     }
 
     #[test]

@@ -53,6 +53,18 @@ fn blank_mode_is_soft_default_value(m: &BlankRequestMode) -> bool {
     matches!(m, BlankRequestMode::Soft)
 }
 
+/// `true` when a boolean flag carries its `false` default and should be
+/// elided from the wire (issue #246).  Used by additive optional flags on
+/// `IpcRequest` so a pre-fix client talking to a post-fix daemon
+/// (and vice versa) sees the same frame shape it always did.
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if requires a function pointer; the copy is a single byte"
+)]
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 /// A request from `dormantctl` to `dormantd`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "req", rename_all = "snake_case")]
@@ -120,6 +132,14 @@ pub enum IpcRequest {
     SwitchToLocal {
         /// Display id (matches a `[displays.<id>]` key).
         display: String,
+        /// Bypass the idempotency guard (issue #246).  When `true` the
+        /// daemon re-asserts the input code even if the cached
+        /// coordination verdict already agrees we own the panel and the
+        /// last observation matches our read alias.  Defaults to `false`
+        /// and is elided from the wire when absent so pre-fix
+        /// `dormantctl` clients keep working byte-for-byte.
+        #[serde(default, skip_serializing_if = "is_false")]
+        force: bool,
     },
     /// Write the peer input code to push the display away.
     /// Configuration-gated on `shared_peer_input_write_code`;
@@ -128,6 +148,10 @@ pub enum IpcRequest {
         /// Display id (matches a `[displays.<id>]` key with
         /// `scope = "shared"`).
         display: String,
+        /// Bypass the idempotency guard (issue #246); symmetric
+        /// counterpart of [`Self::SwitchToLocal::force`].
+        #[serde(default, skip_serializing_if = "is_false")]
+        force: bool,
     },
     /// Start the explicit active-sampling consent flow.
     WearSamplingEnable,
@@ -242,6 +266,12 @@ pub struct IpcResponse {
     /// consumers can iterate without re-sorting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wear_sampling_statuses: Option<WearSamplingStatusMap>,
+    /// Stable outcome label for `SwitchToLocal` / `SwitchToPeer` responses
+    /// (issue #246).  Examples: `"switched"`, `"already_local"`,
+    /// `"already_peer"`, `"write_failed"`.  Elided from every non-switch
+    /// response so the wire shape of pre-fix consumers stays unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch_outcome: Option<String>,
 }
 
 impl IpcResponse {
@@ -258,6 +288,7 @@ impl IpcResponse {
             wear_sampling: None,
             wear_sampling_status: None,
             wear_sampling_statuses: None,
+            switch_outcome: None,
         }
     }
 
@@ -274,6 +305,7 @@ impl IpcResponse {
             wear_sampling: None,
             wear_sampling_status: None,
             wear_sampling_statuses: None,
+            switch_outcome: None,
         }
     }
 
@@ -290,6 +322,7 @@ impl IpcResponse {
             wear_sampling: None,
             wear_sampling_status: None,
             wear_sampling_statuses: None,
+            switch_outcome: None,
         }
     }
 
@@ -306,6 +339,7 @@ impl IpcResponse {
             wear_sampling: None,
             wear_sampling_status: None,
             wear_sampling_statuses: None,
+            switch_outcome: None,
         }
     }
 
@@ -322,6 +356,7 @@ impl IpcResponse {
             wear_sampling: None,
             wear_sampling_status: None,
             wear_sampling_statuses: None,
+            switch_outcome: None,
         }
     }
 
@@ -338,6 +373,30 @@ impl IpcResponse {
             wear_sampling: Some(status),
             wear_sampling_status: None,
             wear_sampling_statuses: None,
+            switch_outcome: None,
+        }
+    }
+
+    /// Build a response carrying the stable outcome label of a direct
+    /// switch attempt (issue #246).  The label is one of the literal
+    /// strings returned by [`crate::ipc_proto` callers'] mapping of
+    /// `direct_switch::SwitchOutcome` (e.g. `"switched"`,
+    /// `"already_local"`, `"write_failed"`).  `ok` mirrors the outcome:
+    /// success-class outcomes return `true`; failures return `false` and
+    /// also set `error`.
+    #[must_use]
+    pub fn switch(outcome_label: impl Into<String>, ok: bool, error: Option<String>) -> Self {
+        Self {
+            ok,
+            error,
+            snapshot: None,
+            doctor_report: None,
+            emergency_report: None,
+            exercise_report: None,
+            wear_sampling: None,
+            wear_sampling_status: None,
+            wear_sampling_statuses: None,
+            switch_outcome: Some(outcome_label.into()),
         }
     }
 }
@@ -589,12 +648,61 @@ mod tests {
     fn request_switch_to_local_serde() {
         let req = IpcRequest::SwitchToLocal {
             display: "desk".into(),
+            force: false,
         };
         let json = serde_json::to_string(&req).unwrap();
+        // force=false is elided so pre-fix clients see the same wire
+        // shape (issue #246).
         assert_eq!(json, r#"{"req":"switch_to_local","display":"desk"}"#);
         let back: IpcRequest = serde_json::from_str(&json).unwrap();
         match back {
-            IpcRequest::SwitchToLocal { display } => assert_eq!(display, "desk"),
+            IpcRequest::SwitchToLocal { display, force } => {
+                assert_eq!(display, "desk");
+                assert!(!force, "missing force field must default to false");
+            }
+            _ => panic!("expected SwitchToLocal"),
+        }
+    }
+
+    /// `force=true` must round-trip on the wire so a post-fix CLI can
+    /// signal the daemon to bypass the idempotency guard (issue #246).
+    #[test]
+    fn request_switch_to_local_force_round_trips() {
+        let req = IpcRequest::SwitchToLocal {
+            display: "desk".into(),
+            force: true,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("\"force\":true"),
+            "force=true must serialize, got: {json}"
+        );
+        let back: IpcRequest = serde_json::from_str(&json).unwrap();
+        match back {
+            IpcRequest::SwitchToLocal { display, force } => {
+                assert_eq!(display, "desk");
+                assert!(force);
+            }
+            _ => panic!("expected SwitchToLocal"),
+        }
+    }
+
+    /// Legacy clients (pre-fix) send `{"req":"switch_to_local","display":...}`
+    /// with no `force` field — the daemon must default to `false` and
+    /// keep the legacy idempotency behaviour.  This is the wire-compat
+    /// anchor for the issue #246 contract.
+    #[test]
+    fn request_switch_to_local_legacy_no_force_defaults_to_false() {
+        let back: IpcRequest =
+            serde_json::from_str(r#"{"req":"switch_to_local","display":"x"}"#).unwrap();
+        match back {
+            IpcRequest::SwitchToLocal { display, force } => {
+                assert_eq!(display, "x");
+                assert!(
+                    !force,
+                    "legacy no-force frame must default to false (issue #246)"
+                );
+            }
             _ => panic!("expected SwitchToLocal"),
         }
     }
@@ -603,14 +711,70 @@ mod tests {
     fn request_switch_to_peer_serde() {
         let req = IpcRequest::SwitchToPeer {
             display: "tv".into(),
+            force: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert_eq!(json, r#"{"req":"switch_to_peer","display":"tv"}"#);
         let back: IpcRequest = serde_json::from_str(&json).unwrap();
         match back {
-            IpcRequest::SwitchToPeer { display } => assert_eq!(display, "tv"),
+            IpcRequest::SwitchToPeer { display, force } => {
+                assert_eq!(display, "tv");
+                assert!(!force);
+            }
             _ => panic!("expected SwitchToPeer"),
         }
+    }
+
+    /// `IpcResponse::switch_outcome` must be elided for non-switch
+    /// responses so the wire shape of every other variant stays
+    /// byte-identical for pre-fix consumers (issue #246).
+    #[test]
+    fn response_switch_outcome_field_is_optional_and_elided() {
+        let ok = IpcResponse::ok(None);
+        let json = serde_json::to_string(&ok).unwrap();
+        assert_eq!(
+            json, r#"{"ok":true}"#,
+            "ok response must NOT carry switch_outcome, got: {json}"
+        );
+        let err = IpcResponse::error("nope");
+        let json = serde_json::to_string(&err).unwrap();
+        assert!(
+            !json.contains("switch_outcome"),
+            "error response must NOT carry switch_outcome, got: {json}"
+        );
+    }
+
+    /// The new `switch_outcome` builder must round-trip on the wire so
+    /// CLI / web consumers can read the literal label the daemon
+    /// published (issue #246).
+    #[test]
+    fn response_switch_round_trips_label() {
+        let resp = IpcResponse::switch("already_local", true, None);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert_eq!(
+            json, r#"{"ok":true,"switch_outcome":"already_local"}"#,
+            "got: {json}"
+        );
+        let back: IpcResponse = serde_json::from_str(&json).unwrap();
+        assert!(back.ok);
+        assert_eq!(back.switch_outcome.as_deref(), Some("already_local"));
+
+        let err = IpcResponse::switch("write_failed", false, Some("E_DISPLAY_IO".into()));
+        let json = serde_json::to_string(&err).unwrap();
+        assert_eq!(
+            json,
+            r#"{"ok":false,"error":"E_DISPLAY_IO","switch_outcome":"write_failed"}"#
+        );
+    }
+
+    /// A pre-fix daemon's switch response has no `switch_outcome` key;
+    /// the post-fix client must still parse it (wire-compat, issue #246).
+    #[test]
+    fn response_switch_outcome_back_compat_legacy_daemon() {
+        let json = r#"{"ok":true}"#;
+        let resp: IpcResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.ok);
+        assert!(resp.switch_outcome.is_none());
     }
 
     // ── IpcResponse serde round-trips ──────────────────────────────────────

@@ -714,6 +714,7 @@ async fn switch_to_local_unsupported_display_returns_error() {
         &socket_path,
         &IpcRequest::SwitchToLocal {
             display: "nonexistent".into(),
+            force: false,
         },
     )
     .await;
@@ -736,6 +737,7 @@ async fn switch_to_peer_not_configured_returns_error() {
         &socket_path,
         &IpcRequest::SwitchToPeer {
             display: "tv".into(),
+            force: false,
         },
     )
     .await;
@@ -794,6 +796,7 @@ async fn switch_to_local_on_configured_shared_display_succeeds() {
         &socket_path,
         &IpcRequest::SwitchToLocal {
             display: "desk".into(),
+            force: false,
         },
     )
     .await;
@@ -813,6 +816,7 @@ async fn switch_to_peer_configured_succeeds() {
         &socket_path,
         &IpcRequest::SwitchToPeer {
             display: "desk".into(),
+            force: false,
         },
     )
     .await;

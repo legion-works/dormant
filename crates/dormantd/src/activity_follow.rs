@@ -209,8 +209,14 @@ async fn activity_follow_loop(deps: ActivityFollowDeps, mut filtered_rx: Filtere
                     }
                 } else if let Some(ref direct_switch) = deps.direct_switch {
                     for display_id in &*deps.display_ids {
+                        // Activity edges honour the idempotency guard
+                        // (issue #246): duplicate triggers fall through to
+                        // `AlreadyLocal` rather than re-asserting the DDC
+                        // write.  Operator-driven `--force` is the only
+                        // path that bypasses the guard; it does not apply
+                        // here.
                         let _ = direct_switch
-                            .pull(display_id.clone(), SwitchReason::Activity)
+                            .pull(display_id.clone(), SwitchReason::Activity, false)
                             .await;
                     }
                 }

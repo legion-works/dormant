@@ -176,6 +176,9 @@ pub async fn execute_plan(
             let socket_clone = socket.clone();
             let request = IpcRequest::SwitchToLocal {
                 display: display_id.clone(),
+                // Tray never forces — the operator override is a CLI /
+                // web affordance, not a tray action.
+                force: false,
             };
             tokio::task::spawn_blocking(move || capabilities.send_ipc(&socket_clone, &request))
                 .await??;

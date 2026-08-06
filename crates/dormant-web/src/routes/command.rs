@@ -50,6 +50,11 @@ pub(crate) struct WakeBody {
 #[derive(Deserialize, Debug)]
 pub(crate) struct SwitchBody {
     pub(crate) display: String,
+    /// Bypass the daemon's idempotency guard (issue #246).  Wire-additive
+    /// — missing or `false` keeps the legacy behaviour; `true` forces
+    /// the DDC write even when the cached verdict already agrees.
+    #[serde(default)]
+    pub(crate) force: bool,
 }
 
 #[derive(Deserialize, Debug)]
@@ -74,6 +79,7 @@ pub(crate) async fn post_switch(
     validate_display_exists(&state.inner.ctl_tx, &body.display).await?;
     let request = dormant_core::ipc_proto::IpcRequest::SwitchToLocal {
         display: body.display,
+        force: body.force,
     };
     let response = crate::request_daemon_ipc(&state, request).await?;
     if !response.ok {
@@ -83,7 +89,15 @@ pub(crate) async fn post_switch(
                 .unwrap_or_else(|| "switch failed".to_string()),
         ));
     }
-    Ok(Json(serde_json::json!({ "status": "ok" })))
+    // Surface the daemon's outcome label (issue #246) so callers can
+    // tell `"switched"` from `"already_local"`.  Falls back to
+    // `"switched"` when the field is absent (legacy daemon).
+    let outcome = response
+        .switch_outcome
+        .unwrap_or_else(|| "switched".to_string());
+    Ok(Json(
+        serde_json::json!({ "status": "ok", "outcome": outcome }),
+    ))
 }
 
 /// `POST /api/push` — write the peer input code to push the display away.
@@ -94,6 +108,7 @@ pub(crate) async fn post_push(
     validate_display_exists(&state.inner.ctl_tx, &body.display).await?;
     let request = dormant_core::ipc_proto::IpcRequest::SwitchToPeer {
         display: body.display,
+        force: body.force,
     };
     let response = crate::request_daemon_ipc(&state, request).await?;
     if !response.ok {
@@ -101,7 +116,12 @@ pub(crate) async fn post_push(
             response.error.unwrap_or_else(|| "push failed".to_string()),
         ));
     }
-    Ok(Json(serde_json::json!({ "status": "ok" })))
+    let outcome = response
+        .switch_outcome
+        .unwrap_or_else(|| "switched".to_string());
+    Ok(Json(
+        serde_json::json!({ "status": "ok", "outcome": outcome }),
+    ))
 }
 
 /// `POST /api/blank` — validate display exists, then dispatch soft or hard

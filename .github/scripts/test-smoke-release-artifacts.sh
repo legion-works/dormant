@@ -42,8 +42,8 @@ for app in dormantd dormantctl dormant-tray; do
 done
 cp crates/dormantd/share/com.legionworks.dormant.plist \
     "$PAYLOADS/dormantd-$TRIPLE/com.legionworks.dormant.plist"
-cp crates/dormantd/systemd/dormant.service \
-    "$PAYLOADS/dormantd-$TRIPLE/dormant.service"
+cp crates/dormantd/systemd/app-dormant.service \
+    "$PAYLOADS/dormantd-$TRIPLE/app-dormant.service"
 cp crates/dormantd/share/dormant.desktop \
     "$PAYLOADS/dormantd-$TRIPLE/dormant.desktop"
 cp crates/dormant-tray/share/com.legionworks.dormant-tray.plist \
@@ -64,7 +64,7 @@ cat > "$ROOT/manifest.json" <<JSON
       "assets": [
         {"kind": "executable", "name": "dormantd", "path": "dormantd"},
         {"kind": "extra", "name": "com.legionworks.dormant.plist", "path": "com.legionworks.dormant.plist"},
-        {"kind": "extra", "name": "dormant.service", "path": "dormant.service"},
+        {"kind": "extra", "name": "app-dormant.service", "path": "app-dormant.service"},
         {"kind": "extra", "name": "dormant.desktop", "path": "dormant.desktop"}
       ]
     },

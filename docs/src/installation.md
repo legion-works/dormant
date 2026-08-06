@@ -94,9 +94,9 @@ sha256sum -c dormantctl-x86_64-unknown-linux-gnu.tar.xz.sha256
 ## Systemd user unit
 
 dormant runs as a user service — it does not need root. The unit file
-(`dormant.service`) is in the release tarball (under
-`dormantd-<triple>/systemd/dormant.service`) and in the source tree at
-`crates/dormantd/systemd/dormant.service`.
+(`app-dormant.service`) is in the release tarball (under
+`dormantd-<triple>/app-dormant.service`) and in the source tree at
+`crates/dormantd/systemd/app-dormant.service`.
 
 The AUR package installs the unit under `/usr/lib/systemd/user/` already. Use
 the manual paths below for source builds and release tarballs.
@@ -107,25 +107,41 @@ Install it:
 mkdir -p ~/.config/systemd/user
 
 # From source:
-cp crates/dormantd/systemd/dormant.service ~/.config/systemd/user/
+cp crates/dormantd/systemd/app-dormant.service ~/.config/systemd/user/
 
 # From a release tarball:
 tar -xf dormantd-x86_64-unknown-linux-gnu.tar.xz \
-    dormantd-x86_64-unknown-linux-gnu/systemd/dormant.service
-mv dormantd-x86_64-unknown-linux-gnu/systemd/dormant.service \
-    ~/.config/systemd/user/dormant.service
+    dormantd-x86_64-unknown-linux-gnu/app-dormant.service
+mv dormantd-x86_64-unknown-linux-gnu/app-dormant.service \
+    ~/.config/systemd/user/app-dormant.service
 
 # Then enable and start:
 systemctl --user daemon-reload
-systemctl --user enable --now dormant
+systemctl --user enable --now app-dormant.service
 ```
 
 Check status:
 
 ```bash
-systemctl --user status dormant
-journalctl --user -u dormant -f
+systemctl --user status app-dormant.service
+journalctl --user -u app-dormant.service -f
 ```
+
+### Upgrading from dormant.service (dormant ≤0.11)
+
+The unit was renamed to `app-dormant.service` because KDE's portal casting
+identity lookup requires the `app-<ApplicationID>-…` systemd unit convention.
+On an existing installation, migrate it explicitly:
+
+```bash
+systemctl --user disable --now dormant.service
+cp crates/dormantd/systemd/app-dormant.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now app-dormant.service
+```
+
+The old `dormant.service` name continues to run the daemon if retained, but
+portal casting indicators may remain unnamed under that unit name.
 
 ### Portal casting identity
 
@@ -151,21 +167,19 @@ The entry is marked `NoDisplay=true`; it is identity metadata, not a launcher
 or an autostart entry. Refresh the desktop application database or log in
 again if the portal backend cached the old application list.
 
-Portal implementations that require the systemd application-unit convention
-(`app-<ApplicationID>-…`) may still need that unit naming in addition to the
-desktop entry. dormant keeps the shipped `dormant.service` name for upgrade
-compatibility, so this entry does not rename or replace the existing user
-service.
+The `app-dormant.service` name supplies the systemd application-unit identity;
+the desktop entry supplies its display name and icon. Both are required for
+portal casting indicators to show `dormant` consistently.
 
-The unit runs as `Type=notify`, restarts on failure, and uses a 150-second engine-liveness watchdog. Reload with `systemctl --user reload dormant`. To stop:
+The unit runs as `Type=notify`, restarts on failure, and uses a 150-second engine-liveness watchdog. Reload with `systemctl --user reload app-dormant.service`. To stop:
 
 ```bash
-systemctl --user stop dormant
+systemctl --user stop app-dormant.service
 ```
 
 When upgrading from a unit that used `Type=simple`, install the new
 `dormantd` binary before copying or reloading the new unit. Then run
-`systemctl --user daemon-reload` and `systemctl --user restart dormant`.
+`systemctl --user daemon-reload` and `systemctl --user restart app-dormant.service`.
 See [Watchdog + last-known-good rollback](./watchdog-rollback.md).
 
 ## Configuration file location
@@ -217,7 +231,7 @@ systemctl --user enable --now dormant-tray
 
 The unit uses `ExecStart=%h/.local/bin/dormant-tray`, so systemd expands
 the path from your home directory at launch — no reliance on `PATH`. It
-starts after `dormant.service` and restarts on failure. A plain XDG
+starts after `app-dormant.service` and restarts on failure. A plain XDG
 `.desktop` autostart does not work here: the systemd autostart generator
 resolves a relative `Exec=` against a minimal boot `PATH` that excludes
 `~/.local/bin`, so no unit gets generated.

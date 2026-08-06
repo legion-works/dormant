@@ -86,7 +86,7 @@ dist = true
 include = [
   "share/com.legionworks.dormant.plist",
   "share/dormant.desktop",
-  "systemd/dormant.service",
+  "systemd/app-dormant.service",
 ]
 # Printed by the shell installer on success. Tells operators the next step
 # without running anything on their behalf: neither `dormantctl launchd

@@ -207,10 +207,10 @@ DAEMON_PLIST_NAME="com.legionworks.dormant.plist"
 STAGED_DAEMON_PLIST="$WORKDIR/$DAEMON_PLIST_NAME"
 stage_file "dormantd" "$DAEMON_PLIST_NAME" "$STAGED_DAEMON_PLIST"
 
-# Systemd user unit — dormant.service ships in dormantd's archive on every target
+# Systemd user unit — app-dormant.service ships in dormantd's archive on every target
 # (it's a harmless 2 KB text file on macOS).
-STAGED_SERVICE="$WORKDIR/dormant.service"
-stage_file "dormantd" "dormant.service" "$STAGED_SERVICE"
+STAGED_SERVICE="$WORKDIR/app-dormant.service"
+stage_file "dormantd" "app-dormant.service" "$STAGED_SERVICE"
 STAGED_DESKTOP="$WORKDIR/dormant.desktop"
 stage_file "dormantd" "dormant.desktop" "$STAGED_DESKTOP"
 grep -q '^Name=dormant$' "$STAGED_DESKTOP" \
@@ -240,7 +240,7 @@ case "$TARGET_TRIPLE" in
         # is meaningless on the release runner (the target binary does not
         # exist there), and systemd-analyze verify requires the binary on disk.
         grep -q 'ExecStart=' "$STAGED_SERVICE" \
-            || die "dormant.service missing ExecStart="
+            || die "app-dormant.service missing ExecStart="
         grep -q 'ExecStart=' "$STAGED_TRAY_SERVICE" \
             || die "dormant-tray.service missing ExecStart="
         ;;

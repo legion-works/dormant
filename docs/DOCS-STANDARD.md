@@ -172,6 +172,10 @@ derived obligations of one declared fact.
 The `skip-changelog` label bypasses it. The pull request description must say
 why; a pattern of use is a review trigger.
 
+Same-SHA reruns are rejected by default. Apply `ci-infra-rerun` only after an
+infrastructure failure where no job body ran; a test flake still needs a new
+commit and a `.github/flake-ledger.toml` entry.
+
 **At release** — `scripts/release-prep.py` compiles fragments into the changelog
 entry and refuses to proceed when:
 

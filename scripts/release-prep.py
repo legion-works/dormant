@@ -3,14 +3,16 @@
 
 Reads every fragment under changelog.d/, assembles the compiled entry,
 and — when --check is given — refuses to proceed if a declared surface
-was not updated.  The compiled entry is printed to stdout; no file is
-mutated unless --delete-fragments is passed.
+was not updated.  Release modes verify the entry against the newest
+CHANGELOG section before writing or consuming fragments.
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime
 import pathlib
+import re
 import subprocess
 import sys
 from typing import Any
@@ -128,9 +130,9 @@ def _compile_entry(
             # Body is the migration sentence; use it as the breaking bullet.
             migration = body.strip()
             if migration:
-                breaking.append(migration)
+                breaking.append(_with_citations(migration, fm))
             if detail:
-                removed.append(detail)
+                removed.append(_with_citations(detail, fm))
 
         elif kind == "capability":
             user_line = _extract_user_can_now(body)
@@ -145,22 +147,30 @@ def _compile_entry(
                 if chapter and readme_bullet.startswith("**"):
                     name = readme_bullet[2:].split("**", 1)[0]
                     prose += f" See [the {name} chapter](./docs/src/{chapter})."
-                highlights.append(f"{readme_bullet} {prose}".strip())
+                if readme_bullet and _highlight_text_is_redundant(readme_bullet, prose):
+                    highlight = readme_bullet
+                    if chapter and readme_bullet.startswith("**"):
+                        name = readme_bullet[2:].split("**", 1)[0]
+                        highlight += f" See [the {name} chapter](./docs/src/{chapter})."
+                else:
+                    highlight = f"{readme_bullet} {prose}".strip()
+                highlights.append(_with_citations(highlight, fm))
             if detail:
-                added.append(detail)
+                added.append(_with_citations(detail, fm))
 
         elif kind == "improvement":
             if detail:
-                changed.append(detail)
+                changed.append(_with_citations(detail, fm))
 
         elif kind == "fix":
             if detail:
-                fixed.append(detail)
+                fixed.append(_with_citations(detail, fm))
 
     parts: list[str] = []
 
     if breaking:
         parts.append("### Breaking")
+        parts.append("")
         for item in breaking:
             parts.append(f"- {item}")
         parts.append("")
@@ -168,6 +178,7 @@ def _compile_entry(
     has_highlights = bool(highlights)
     if has_highlights:
         parts.append("### Highlights")
+        parts.append("")
         for index, item in enumerate(highlights):
             parts.append(item)
             if index < len(highlights) - 1:
@@ -176,29 +187,129 @@ def _compile_entry(
 
     if added:
         parts.append("### Added")
+        parts.append("")
         for item in added:
             parts.append(f"- {item}")
         parts.append("")
 
     if changed:
         parts.append("### Changed")
+        parts.append("")
         for item in changed:
             parts.append(f"- {item}")
         parts.append("")
 
     if fixed:
         parts.append("### Fixed")
+        parts.append("")
         for item in fixed:
             parts.append(f"- {item}")
         parts.append("")
 
     if removed:
         parts.append("### Removed")
+        parts.append("")
         for item in removed:
             parts.append(f"- {item}")
         parts.append("")
 
     return "\n".join(parts).rstrip() + "\n"
+
+
+def _with_citations(text: str, fm: dict[str, Any]) -> str:
+    """Append optional issue and pull-request links without changing old output."""
+    issues = fm.get("issues", [])
+    prs = fm.get("prs", [])
+    if not isinstance(issues, list):
+        issues = []
+    if not isinstance(prs, list):
+        prs = []
+
+    links = [
+        f"[#{number}](https://github.com/legion-works/dormant/issues/{number})"
+        for number in issues
+    ] + [
+        f"[#{number}](https://github.com/legion-works/dormant/pull/{number})"
+        for number in prs
+    ]
+    if not links:
+        return text
+    sentence = text if text.endswith(".") else f"{text}."
+    return f"{sentence} ({', '.join(links)})"
+
+
+def _highlight_text_is_redundant(readme_bullet: str, user_prose: str) -> bool:
+    """Return whether the two capability sentences describe the same text.
+
+    Markdown punctuation is ignored.  A sentence is redundant when one
+    normalized sentence contains the other, or when the two sentences have
+    at least 90 percent Jaccard overlap across their unique tokens.
+    """
+    normalize = lambda text: re.sub(r"[^a-z0-9 ]", " ", text.casefold())
+    readme_tokens = normalize(readme_bullet).split()
+    prose_tokens = normalize(user_prose).split()
+    if not readme_tokens or not prose_tokens:
+        return False
+    readme_normalized = " ".join(readme_tokens)
+    prose_normalized = " ".join(prose_tokens)
+    if (
+        min(len(readme_tokens), len(prose_tokens)) >= 2
+        and (readme_normalized in prose_normalized or prose_normalized in readme_normalized)
+    ):
+        return True
+    readme_set = set(readme_tokens)
+    prose_set = set(prose_tokens)
+    overlap = len(readme_set & prose_set)
+    union = len(readme_set | prose_set)
+    return union > 0 and overlap / union >= 0.9
+
+
+_MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]*\)")
+_TRAILING_CITATIONS_RE = re.compile(r"\s+\((?:\s*#\d+\s*,?)+\)\s*$")
+_VERSION_HEADING_RE = re.compile(r"^## \[([^\]]+)\]", re.MULTILINE)
+
+
+def _normalize_coverage_text(text: str) -> str:
+    """Normalize markdown links, citation groups, and whitespace for matching."""
+    text = _MARKDOWN_LINK_RE.sub(r"\1", text)
+    text = _TRAILING_CITATIONS_RE.sub("", text)
+    return re.sub(r"\s+", " ", text).strip().casefold()
+
+
+def _emitted_items(entry: str) -> list[str]:
+    """Return every bullet and highlight paragraph emitted in *entry*."""
+    items: list[str] = []
+    section = ""
+    for line in entry.splitlines():
+        if line.startswith("### "):
+            section = line[4:].strip()
+        elif line.startswith("- "):
+            items.append(line[2:].strip())
+        elif section == "Highlights" and line.strip():
+            items.append(line.strip())
+    return items
+
+
+def _extract_newest_version_section(changelog: str) -> str:
+    """Return the first version section, excluding the following version heading."""
+    first = _VERSION_HEADING_RE.search(changelog)
+    if first is None:
+        return ""
+    following = _VERSION_HEADING_RE.search(changelog, first.end())
+    end = following.start() if following else len(changelog)
+    return changelog[first.start():end]
+
+
+def _coverage_errors(entry: str, changelog_section: str) -> list[str]:
+    """Return one actionable error for each emitted item absent from the section."""
+    normalized_section = _normalize_coverage_text(changelog_section)
+    errors: list[str] = []
+    for item in _emitted_items(entry):
+        normalized_item = _normalize_coverage_text(item)
+        if normalized_item and normalized_item not in normalized_section:
+            preview = " ".join(item.split())[:80]
+            errors.append(f"missing compiled changelog entry: {preview}")
+    return errors
 
 
 # Recognized marker labels that open a fragment-body paragraph. Lowercased
@@ -298,6 +409,47 @@ def _highlights_present(entry: str) -> bool:
     return "### Highlights" in entry
 
 
+def _workspace_version(root: pathlib.Path) -> str:
+    """Read the root workspace package version from Cargo.toml."""
+    cargo = (root / "Cargo.toml").read_text(encoding="utf-8")
+    marker = "[workspace.package]"
+    if marker not in cargo:
+        raise ValueError("workspace package section is missing from Cargo.toml")
+    workspace = cargo.split(marker, 1)[1]
+    match = re.search(r'^version\s*=\s*"([^"]+)"', workspace, re.MULTILINE)
+    if match is None:
+        raise ValueError("workspace package version is missing from Cargo.toml")
+    return match.group(1)
+
+
+def _write_entry(
+    changelog_path: pathlib.Path,
+    entry: str,
+    version: str,
+) -> None:
+    """Insert a new version section before the existing newest section."""
+    changelog = changelog_path.read_text(encoding="utf-8")
+    version_heading = re.compile(
+        rf"^## \[{re.escape(version)}\](?:\s|$)", re.MULTILINE,
+    )
+    if version_heading.search(changelog):
+        raise ValueError(f"changelog section for version {version} already exists")
+    newest = _VERSION_HEADING_RE.search(changelog)
+    if newest is None:
+        raise ValueError("CHANGELOG.md has no version section anchor")
+    date = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+    section = f"## [{version}] - {date}\n\n{entry}\n"
+    updated = changelog[:newest.start()] + section + changelog[newest.start():]
+    changelog_path.write_text(updated, encoding="utf-8")
+
+
+def _write_integrity_errors(entry: str, changelog_section: str) -> list[str]:
+    """Verify that the extracted newest section ends with the exact entry written."""
+    if changelog_section.endswith(entry + "\n"):
+        return []
+    return ["the extracted newest section does not contain the exact compiled entry"]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -311,6 +463,14 @@ def main() -> int:
     parser.add_argument(
         "--delete-fragments", action="store_true", default=False,
         help="delete fragment files after compiling (release-commit action)",
+    )
+    parser.add_argument(
+        "--changelog", type=pathlib.Path, default=None,
+        help="CHANGELOG.md path used for release coverage checks",
+    )
+    parser.add_argument(
+        "--write", action="store_true", default=False,
+        help="insert the compiled entry as a new version section",
     )
     args = parser.parse_args()
 
@@ -364,11 +524,62 @@ def main() -> int:
         )
         return 1
 
+    changelog_path = (root / (args.changelog or pathlib.Path("CHANGELOG.md"))).resolve()
+    coverage_required = args.delete_fragments or (args.check and args.changelog is not None)
+
+    if args.write:
+        # The new section is the compiled entry by construction; this check
+        # verifies the writer and section extractor preserved it byte-for-byte.
+        try:
+            version = _workspace_version(root)
+            original_changelog = changelog_path.read_text(encoding="utf-8")
+            _write_entry(changelog_path, entry, version)
+        except (OSError, ValueError) as exc:
+            print(f"release-prep: cannot write changelog: {exc}", file=sys.stderr)
+            return 1
+    else:
+        original_changelog = ""
+
+    if args.write:
+        try:
+            changelog = changelog_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            changelog_path.write_text(original_changelog, encoding="utf-8")
+            print(f"release-prep: cannot verify changelog write: {exc}", file=sys.stderr)
+            return 1
+        integrity_errors = _write_integrity_errors(
+            entry, _extract_newest_version_section(changelog),
+        )
+        if integrity_errors:
+            changelog_path.write_text(original_changelog, encoding="utf-8")
+            print("release-prep: changelog write integrity failed:", file=sys.stderr)
+            for error in integrity_errors:
+                print(f"- {error}", file=sys.stderr)
+            return 1
+
+    if coverage_required:
+        try:
+            changelog = changelog_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"release-prep: cannot read changelog {changelog_path}: {exc}", file=sys.stderr)
+            return 1
+        coverage_errors = _coverage_errors(
+            entry, _extract_newest_version_section(changelog),
+        )
+        if coverage_errors:
+            print("release-prep: changelog coverage failed:", file=sys.stderr)
+            for error in coverage_errors:
+                print(f"- {error}", file=sys.stderr)
+            return 1
+
     if args.check:
         print("release-prep: all checks passed")
         return 0
 
-    print(entry, end="")
+    if not args.write:
+        print(entry, end="")
+    else:
+        print(f"release-prep: wrote {changelog_path}", file=sys.stderr)
 
     if args.delete_fragments:
         for fp, _fm, _body in parsed:

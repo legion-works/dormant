@@ -18,6 +18,8 @@ PR          add changelog.d/<slug>.md
 CI          fragment present and schema-valid
 release     scripts/release-prep.py compiles fragments into the changelog entry
             and refuses to proceed if a declared surface was not updated
+            --write inserts the entry and verifies write integrity
+            --delete-fragments re-checks coverage before consuming fragments
 ```
 
 CI cannot judge whether a change is user-facing. It can judge whether a file
@@ -178,6 +180,11 @@ entry and refuses to proceed when:
 - a fragment declares `surfaces: [chapter]` and no file under `docs/src/`
   changed since the previous tag
 - a `capability` fragment exists and the compiled entry has no `Highlights`
+- `--write` inserts a new version section and verifies write integrity
+- `--delete-fragments` refuses to consume fragments when any emitted bullet or
+  highlight is absent from the newest changelog section
+- `issues: [123]` and `prs: [456]` append issue and pull-request citations to
+  compiled entries
 
 ### Verifying the gates
 
@@ -187,3 +194,12 @@ Both need to be proven to fail, not only to pass:
   it must pass.
 - Run `release-prep.py` against a fragment set containing one `capability` with
   `surfaces: [readme]` and an untouched README; it must refuse.
+- Bare `release-prep.py --check` validates surfaces only, never coverage,
+  because fragments legitimately outrun the changelog between releases — it
+  runs in the release pipeline's `release-changelog-gate` job, where the
+  changelog section does not exist yet. Do not make coverage unconditional
+  there; it would fail every release before the section is written.
+- Run `release-prep.py --check --changelog CHANGELOG.md` to verify coverage
+  before release. The release sequence is `--write` → `--delete-fragments`;
+  `--write` verifies the exact inserted entry, and deletion verifies coverage
+  before consuming fragments.

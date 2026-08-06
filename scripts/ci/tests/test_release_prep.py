@@ -1,5 +1,6 @@
 import importlib.util
 import pathlib
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -12,19 +13,48 @@ _spec = importlib.util.spec_from_file_location("release_prep", _RELEASE_PREP_PAT
 release_prep = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(release_prep)
 
+_FIXTURE_ROOT = pathlib.Path(__file__).parent / "fixtures" / "release_prep"
+
 
 def _fragment_dict(
     kind: str = "capability",
     surfaces: list[str] | None = None,
     readme_bullet: str | None = None,
     body: str = "",
+    issues: list[int] | None = None,
+    prs: list[int] | None = None,
 ) -> tuple[dict, str]:
     fm: dict = {"kind": kind}
     if surfaces is not None:
         fm["surfaces"] = surfaces
     if readme_bullet is not None:
         fm["readme_bullet"] = readme_bullet
+    if issues is not None:
+        fm["issues"] = issues
+    if prs is not None:
+        fm["prs"] = prs
     return fm, body
+
+
+def _fixture_fragments(name: str) -> list[tuple[pathlib.Path, dict, str]]:
+    fragments = []
+    for path in sorted((_FIXTURE_ROOT / name).glob("*.md")):
+        fm, body = release_prep.parse_front_matter(path.read_text(encoding="utf-8"))
+        fragments.append((path, fm, body))
+    return fragments
+
+
+def _fixture_text(name: str) -> str:
+    return (_FIXTURE_ROOT / name).read_text(encoding="utf-8")
+
+
+def _run_release_prep(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(_RELEASE_PREP_PATH), *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
 
 
 class CompileEntryTests(unittest.TestCase):
@@ -76,9 +106,32 @@ class CompileEntryTests(unittest.TestCase):
         entry = release_prep._compile_entry([(pathlib.Path("a.md"), fm, body)])
 
         self.assertIn(
-            "**Config rail** — jump to any section. Jump to any section.", entry,
+            "**Config rail** — jump to any section.", entry,
         )
+        self.assertNotIn("Jump to any section. Jump to any section.", entry)
         self.assertNotIn("See [", entry)
+
+    def test_redundant_highlight_prose_is_emitted_once(self):
+        fm, body = _fragment_dict(
+            "capability", ["readme"],
+            readme_bullet="Users can export reports",
+            body="User can now: users can export reports.\n",
+        )
+
+        entry = release_prep._compile_entry([(pathlib.Path("a.md"), fm, body)])
+
+        self.assertEqual(entry.count("Users can export reports."), 1)
+
+    def test_different_highlight_prose_is_kept(self):
+        fm, body = _fragment_dict(
+            "capability", ["readme"],
+            readme_bullet="**Reports** — export reports",
+            body="User can now: monitor report delivery.\n",
+        )
+
+        entry = release_prep._compile_entry([(pathlib.Path("a.md"), fm, body)])
+
+        self.assertIn("**Reports** — export reports. Monitor report delivery.", entry)
 
     def test_capability_highlights_are_separate_paragraphs_in_sort_order(self):
         first_fm, first_body = _fragment_dict(
@@ -280,6 +333,247 @@ class ExtractTests(unittest.TestCase):
     def test_extract_detail_not_present(self):
         body = "User can now: do X\n"
         self.assertEqual(release_prep._extract_detail(body), "")
+
+
+class CoverageGateTests(unittest.TestCase):
+    def test_v012_truncated_section_reports_every_missing_emitted_entry(self):
+        fragments = _fixture_fragments("v0_12_0")
+        entry = release_prep._compile_entry(fragments)
+
+        errors = release_prep._coverage_errors(
+            entry, _fixture_text("v0_12_0_truncated_section.md"),
+        )
+
+        self.assertEqual(len(errors), 8)
+        self.assertTrue(any("Add an injectable MQTT event-loop seam" in e for e in errors))
+        self.assertTrue(any("Fix a false alarm in the wear heat map" in e for e in errors))
+
+    def test_v012_reordered_linked_section_passes_normalized_coverage(self):
+        fragments = _fixture_fragments("v0_12_0")
+        entry = release_prep._compile_entry(fragments)
+
+        errors = release_prep._coverage_errors(
+            entry, _fixture_text("v0_12_0_linked_reordered_section.md"),
+        )
+
+        self.assertEqual(errors, [])
+
+    def test_hand_curated_v012_repair_was_still_lossy(self):
+        fragments = _fixture_fragments("v0_12_0")
+        entry = release_prep._compile_entry(fragments)
+
+        errors = release_prep._coverage_errors(
+            entry, _fixture_text("v0_12_0_curated_section.md"),
+        )
+
+        self.assertTrue(any("Add an injectable MQTT event-loop seam" in e for e in errors))
+        self.assertTrue(any("NoDisplay=true" in e for e in errors))
+
+    def test_extracts_newest_version_section(self):
+        body = "intro\n\n## [1.2.3] - 2026-08-06\nnew\n\n## [1.2.2] - 2026-08-05\nold\n"
+
+        self.assertEqual(
+            release_prep._extract_newest_version_section(body),
+            "## [1.2.3] - 2026-08-06\nnew\n\n",
+        )
+
+    def test_delete_refuses_and_preserves_fragments_when_coverage_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            fragment_dir = root / "fragments"
+            fragment_dir.mkdir()
+            fragment = fragment_dir / "fix.md"
+            fragment.write_text(
+                "---\nkind: fix\nsurfaces: []\n---\nDetail: must remain\n",
+                encoding="utf-8",
+            )
+            changelog = root / "CHANGELOG.md"
+            changelog.write_text("## [0.12.0] - 2026-08-06\n\n", encoding="utf-8")
+
+            result = _run_release_prep(
+                "--fragment-dir", str(fragment_dir),
+                "--changelog", str(changelog),
+                "--delete-fragments",
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(fragment.exists())
+            self.assertIn("coverage", result.stderr.lower())
+
+    def test_delete_succeeds_and_removes_fragments_when_coverage_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            fragment_dir = root / "fragments"
+            fragment_dir.mkdir()
+            fragment = fragment_dir / "fix.md"
+            fragment.write_text(
+                "---\nkind: fix\nsurfaces: []\n---\nDetail: fixed thing\n",
+                encoding="utf-8",
+            )
+            changelog = root / "CHANGELOG.md"
+            changelog.write_text(
+                "## [0.12.0] - 2026-08-06\n\n### Fixed\n\n- fixed thing ([#1](https://example.test/issues/1))\n",
+                encoding="utf-8",
+            )
+
+            result = _run_release_prep(
+                "--fragment-dir", str(fragment_dir),
+                "--changelog", str(changelog),
+                "--delete-fragments",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(fragment.exists())
+
+    def test_bare_check_ignores_coverage_so_pre_release_check_stays_green(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            fragment_dir = root / "fragments"
+            fragment_dir.mkdir()
+            (fragment_dir / "fix.md").write_text(
+                "---\nkind: fix\nsurfaces: []\n---\nDetail: not released yet\n",
+                encoding="utf-8",
+            )
+
+            result = _run_release_prep("--fragment-dir", str(fragment_dir), "--check")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class CitationTests(unittest.TestCase):
+    def test_issues_only_citation(self):
+        fm, body = _fragment_dict("fix", [], body="Detail: fixed thing\n", issues=[234, 216])
+        entry = release_prep._compile_entry([(pathlib.Path("a.md"), fm, body)])
+        self.assertIn(
+            "fixed thing. ([#234](https://github.com/legion-works/dormant/issues/234), "
+            "[#216](https://github.com/legion-works/dormant/issues/216))",
+            entry,
+        )
+
+    def test_prs_only_citation(self):
+        fm, body = _fragment_dict("fix", [], body="Detail: fixed thing\n", prs=[237])
+        entry = release_prep._compile_entry([(pathlib.Path("a.md"), fm, body)])
+        self.assertIn(
+            "fixed thing. ([#237](https://github.com/legion-works/dormant/pull/237))",
+            entry,
+        )
+
+    def test_both_citations_put_issues_before_prs(self):
+        fm, body = _fragment_dict(
+            "fix", [], body="Detail: fixed thing\n", issues=[234], prs=[237],
+        )
+        entry = release_prep._compile_entry([(pathlib.Path("a.md"), fm, body)])
+        self.assertIn(
+            "fixed thing. ([#234](https://github.com/legion-works/dormant/issues/234), "
+            "[#237](https://github.com/legion-works/dormant/pull/237))",
+            entry,
+        )
+
+    def test_absent_citations_preserve_previous_output(self):
+        old_fm, old_body = _fragment_dict("fix", [], body="Detail: fixed thing\n")
+        new_fm, new_body = _fragment_dict("fix", [], body="Detail: fixed thing\n", issues=[])
+        old_entry = release_prep._compile_entry([(pathlib.Path("a.md"), old_fm, old_body)])
+        new_entry = release_prep._compile_entry([(pathlib.Path("a.md"), new_fm, new_body)])
+        self.assertEqual(old_entry, new_entry)
+
+
+class WriteModeTests(unittest.TestCase):
+    def test_write_preserves_exact_changelog_spacing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            fragment_dir = root / "fragments"
+            fragment_dir.mkdir()
+            (fragment_dir / "fix.md").write_text(
+                "---\nkind: fix\nsurfaces: []\n---\nDetail: fixed thing\n",
+                encoding="utf-8",
+            )
+            changelog = root / "CHANGELOG.md"
+            changelog.write_text(
+                _fixture_text("changelog_format.md"), encoding="utf-8",
+            )
+
+            result = _run_release_prep(
+                "--fragment-dir", str(fragment_dir),
+                "--changelog", str(changelog),
+                "--write",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                changelog.read_text(encoding="utf-8"),
+                "# Changelog\n\n"
+                "All notable changes to `dormant` are recorded here.\n\n"
+                "The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), "
+                "and the project aims at [Semantic Versioning](https://semver.org/spec/v2.0.0.html).\n\n"
+                "## [0.12.1] - 2026-08-06\n\n"
+                "### Fixed\n\n"
+                "- fixed thing\n\n"
+                "## [0.12.0] - 2026-08-06\n\n"
+                "### Fixed\n\n"
+                "- old\n",
+            )
+
+    def test_write_inserts_versioned_entry_at_changelog_anchor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            fragment_dir = root / "fragments"
+            fragment_dir.mkdir()
+            (fragment_dir / "fix.md").write_text(
+                "---\nkind: fix\nsurfaces: []\n---\nDetail: fixed thing\n",
+                encoding="utf-8",
+            )
+            changelog = root / "CHANGELOG.md"
+            changelog.write_text(
+                "# Changelog\n\n"
+                "The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), "
+                "and the project aims at [Semantic Versioning](https://semver.org/spec/v2.0.0.html).\n\n"
+                "## [0.12.0] - 2026-08-06\n\n### Fixed\n- old\n",
+                encoding="utf-8",
+            )
+
+            result = _run_release_prep(
+                "--fragment-dir", str(fragment_dir),
+                "--changelog", str(changelog),
+                "--write",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            content = changelog.read_text(encoding="utf-8")
+            self.assertIn("## [0.12.1] - 2026-08-06", content)
+            self.assertLess(content.index("## [0.12.1]"), content.index("## [0.12.0]"))
+            self.assertIn("- fixed thing", content)
+
+    def test_write_refuses_duplicate_version(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            fragment_dir = root / "fragments"
+            fragment_dir.mkdir()
+            (fragment_dir / "fix.md").write_text(
+                "---\nkind: fix\nsurfaces: []\n---\nDetail: fixed thing\n",
+                encoding="utf-8",
+            )
+            changelog = root / "CHANGELOG.md"
+            changelog.write_text("## [0.12.1] - 2026-08-06\n\n", encoding="utf-8")
+
+            result = _run_release_prep(
+                "--fragment-dir", str(fragment_dir),
+                "--changelog", str(changelog),
+                "--write",
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("already exists", result.stderr)
+            self.assertTrue((fragment_dir / "fix.md").exists())
+
+
+class WorkspaceVersionTests(unittest.TestCase):
+    def test_missing_workspace_package_section_has_actionable_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "Cargo.toml").write_text("[workspace]\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "workspace package section is missing"):
+                release_prep._workspace_version(root)
 
 
 if __name__ == "__main__":

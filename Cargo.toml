@@ -26,7 +26,7 @@ repository = "https://github.com/legion-works/dormant"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+toml = "1"
 toml_edit = "0.25"
 thiserror = "2"
 anyhow = "1"
@@ -45,7 +45,6 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 zbus = "5"
 pipewire = "0.10"
 indexmap = { version = "2", features = ["serde"] }
-tokio-stream = "0.1"
 proptest = "1"
 # `default-features = false` drops rumqttc's `use-rustls` default, which pulled
 # a second, older TLS stack (rustls 0.22 / rustls-webpki 0.102) purely as dead
@@ -61,18 +60,11 @@ ddc-hi = "0.4"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 notify = "7"
-sha2 = "=0.10.9"
+sha2 = "0.10"
 tempfile = "3"
 rand = "0.8"
 base64 = "=0.22.1"
-ed25519-dalek = { version = "=3.0.0", features = ["zeroize"] }
-hmac = "=0.12.1"
-mdns-sd = "=0.20.2"
-rand_core = "=0.10.1"
-getrandom = { version = "=0.4.3", features = ["sys_rng"] }
-spake2 = "=0.4.0"
 time = { version = "=0.3.53", features = ["formatting"] }
-zeroize = "=1.9.0"
 test-case = "3"
 image = { version = "0.25", default-features = false, features = [
   "jpeg",

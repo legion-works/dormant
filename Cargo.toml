@@ -47,7 +47,14 @@ pipewire = "0.10"
 indexmap = { version = "2", features = ["serde"] }
 tokio-stream = "0.1"
 proptest = "1"
-rumqttc = "0.24"
+# `default-features = false` drops rumqttc's `use-rustls` default, which pulled
+# a second, older TLS stack (rustls 0.22 / rustls-webpki 0.102) purely as dead
+# weight: `parse_broker_url` accepts only `tcp://`, `mqtt://`, or a bare
+# host:port, so dormant cannot open a TLS broker connection at all. That older
+# webpki carried RUSTSEC-2026-0049/0098/0099/0104, which deny.toml had to
+# suppress. Re-enabling this feature reintroduces all four — add `mqtts://`
+# support to parse_broker_url first, and pin a webpki >= 0.103.13.
+rumqttc = { version = "0.24", default-features = false }
 futures-util = "0.3"
 tokio-serial = "5"
 ddc-hi = "0.4"

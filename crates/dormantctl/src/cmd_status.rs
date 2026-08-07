@@ -335,6 +335,7 @@ mod tests {
             last_capture_age_s: Some(95),
             uniform_reason: None,
             bound_display: Some("desk".to_owned()),
+            compositor_output: None,
             granted_at_epoch_s: Some(1_700_000_000),
             source_gate: None,
         };
@@ -350,6 +351,7 @@ mod tests {
             last_capture_age_s: None,
             uniform_reason: None,
             bound_display: Some("desk".to_owned()),
+            compositor_output: None,
             granted_at_epoch_s: Some(1_700_000_000),
             source_gate: None,
         };
@@ -365,6 +367,7 @@ mod tests {
             last_capture_age_s: Some(7),
             uniform_reason: Some("wear_sampling_suspended".to_owned()),
             bound_display: Some("desk".to_owned()),
+            compositor_output: None,
             granted_at_epoch_s: None,
             source_gate: None,
         };
@@ -383,6 +386,7 @@ mod tests {
             last_capture_age_s: Some(95),
             uniform_reason: None,
             bound_display: Some("tv".to_owned()),
+            compositor_output: None,
             granted_at_epoch_s: Some(1_700_000_000),
             source_gate: Some("mismatched".to_owned()),
         };

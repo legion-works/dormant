@@ -73,6 +73,9 @@ pub struct WearSamplingStatus {
     /// Configured display to which the current consent grant is bound.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bound_display: Option<String>,
+    /// Configured compositor output for the display targeted by this sampler.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compositor_output: Option<String>,
     /// Epoch seconds at which the active consent grant was made.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub granted_at_epoch_s: Option<i64>,
@@ -1063,6 +1066,7 @@ mod tests {
             last_capture_age_s: Some(5),
             uniform_reason: None,
             bound_display: None,
+            compositor_output: None,
             granted_at_epoch_s: None,
             source_gate: None,
         };
@@ -1079,6 +1083,7 @@ mod tests {
                 last_capture_age_s: None,
                 uniform_reason: None,
                 bound_display: None,
+                compositor_output: None,
                 granted_at_epoch_s: None,
                 source_gate: Some(gate.to_owned()),
             };

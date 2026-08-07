@@ -7,7 +7,7 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -31,6 +31,63 @@ use crate::direct_switch::{DirectSwitchHandle, SwitchReason, switch_outcome_labe
 
 /// Maximum line length for IPC requests/responses (1 MB).
 const MAX_LINE_BYTES: usize = 1_048_576;
+const WEAR_SAMPLING_CONSENT_BUSY: &str = "wear_sampling_consent_busy";
+type SelectedDisplays = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+type CompositorOutputResolver = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
+#[derive(Clone)]
+struct WearSamplingControls {
+    sampler_registry: SharedSamplerRegistry,
+    selected_displays: SelectedDisplays,
+    compositor_output: CompositorOutputResolver,
+    consent_gate: ConsentGate,
+}
+
+/// Daemon-wide ownership of the one portal consent dialog the operator can
+/// meaningfully distinguish at a time.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ConsentGate {
+    holder: Arc<Mutex<Option<String>>>,
+}
+
+impl ConsentGate {
+    pub(crate) fn try_acquire(&self, display: &str) -> Result<ConsentGateLease, String> {
+        let mut holder = self
+            .holder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(current) = holder.as_deref() {
+            Err(current.to_owned())
+        } else {
+            *holder = Some(display.to_owned());
+            Ok(ConsentGateLease {
+                gate: self.clone(),
+                display: display.to_owned(),
+            })
+        }
+    }
+}
+
+/// Releases the daemon-wide gate when the waiting IPC request reaches any
+/// terminal result, including a dropped sampler reply during reload.
+#[derive(Debug)]
+pub(crate) struct ConsentGateLease {
+    gate: ConsentGate,
+    display: String,
+}
+
+impl Drop for ConsentGateLease {
+    fn drop(&mut self) {
+        let mut holder = self
+            .gate
+            .holder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if holder.as_deref() == Some(self.display.as_str()) {
+            *holder = None;
+        }
+    }
+}
 
 /// Spawn the IPC server on a background task.
 ///
@@ -63,7 +120,8 @@ pub fn spawn(
     direct_switch: Arc<DirectSwitchHandle>,
     sampler_registry: SharedSamplerRegistry,
     cancel: CancellationToken,
-    selected_displays: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    selected_displays: SelectedDisplays,
+    compositor_output: CompositorOutputResolver,
 ) -> Result<JoinHandle<()>> {
     // Stale-socket recovery: connect-test before bind so we never silently
     // replace a live daemon's socket.
@@ -138,6 +196,12 @@ pub fn spawn(
     tracing::info!(event = "ipc_listening", socket = %socket_path.display());
 
     let socket_owned = socket_path.to_path_buf();
+    let wear_sampling = WearSamplingControls {
+        sampler_registry,
+        selected_displays,
+        compositor_output,
+        consent_gate: ConsentGate::default(),
+    };
     let handle = tokio::spawn(async move {
         run(
             listener,
@@ -145,10 +209,9 @@ pub fn spawn(
             reload_requester,
             doctor_service,
             direct_switch,
-            sampler_registry,
             cancel,
             &socket_owned,
-            selected_displays,
+            wear_sampling,
         )
         .await;
     });
@@ -167,10 +230,9 @@ async fn run(
     reload_requester: ReloadRequester,
     doctor_service: DoctorService,
     direct_switch: Arc<DirectSwitchHandle>,
-    sampler_registry: SharedSamplerRegistry,
     cancel: CancellationToken,
     socket_path: &std::path::Path,
-    selected_displays: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    wear_sampling: WearSamplingControls,
 ) {
     loop {
         tokio::select! {
@@ -187,9 +249,8 @@ async fn run(
                         let reload = reload_requester.clone();
                         let doctor = doctor_service.clone();
                         let ds = direct_switch.clone();
-                        let samplers = sampler_registry.clone();
-                        let selected = selected_displays.clone();
-                        tokio::spawn(handle_connection(stream, ctl, reload, doctor, ds, samplers, selected));
+                        let wear_sampling = wear_sampling.clone();
+                        tokio::spawn(handle_connection(stream, ctl, reload, doctor, ds, wear_sampling));
                         let _ = addr; // Unix socket peer address (debug).
                     }
                     Err(e) => {
@@ -214,11 +275,16 @@ async fn handle_connection(
     reload_requester: ReloadRequester,
     doctor_service: DoctorService,
     direct_switch: Arc<DirectSwitchHandle>,
-    sampler_registry: SharedSamplerRegistry,
-    selected_displays: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    wear_sampling: WearSamplingControls,
 ) {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
+    let WearSamplingControls {
+        sampler_registry,
+        selected_displays,
+        compositor_output,
+        consent_gate,
+    } = wear_sampling;
 
     loop {
         let line = match read_line_bounded(&mut reader).await {
@@ -300,7 +366,13 @@ async fn handle_connection(
                 let _ = write_json(&mut writer, &resp).await;
             }
             IpcRequest::WearSamplingEnable => {
-                let resp = handle_wear_enable_unit(&sampler_registry, &selected_displays).await;
+                let resp = handle_wear_enable_unit(
+                    &sampler_registry,
+                    &selected_displays,
+                    &compositor_output,
+                    &consent_gate,
+                )
+                .await;
                 let _ = write_json(&mut writer, &resp).await;
             }
             IpcRequest::WearSamplingStatus => {
@@ -313,8 +385,14 @@ async fn handle_connection(
                 let _ = write_json(&mut writer, &resp).await;
             }
             IpcRequest::WearSamplingEnableFor { display } => {
-                let resp =
-                    handle_wear_enable_for(&sampler_registry, &display, &selected_displays).await;
+                let resp = handle_wear_enable_for(
+                    &sampler_registry,
+                    &display,
+                    &selected_displays,
+                    &compositor_output,
+                    &consent_gate,
+                )
+                .await;
                 let _ = write_json(&mut writer, &resp).await;
             }
             IpcRequest::WearSamplingStatusFor { display } => {
@@ -355,6 +433,8 @@ fn unsupported_sampling_response() -> IpcResponse {
 async fn handle_wear_enable_unit(
     sampler_registry: &SharedSamplerRegistry,
     selected_displays: &Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    compositor_output: &CompositorOutputResolver,
+    consent_gate: &ConsentGate,
 ) -> IpcResponse {
     let selected = selected_displays();
     if selected.len() > 1 {
@@ -365,7 +445,14 @@ async fn handle_wear_enable_unit(
     let Some(display) = selected.first() else {
         return unsupported_sampling_response();
     };
-    handle_wear_enable_for(sampler_registry, display, selected_displays).await
+    handle_wear_enable_for(
+        sampler_registry,
+        display,
+        selected_displays,
+        compositor_output,
+        consent_gate,
+    )
+    .await
 }
 
 fn handle_wear_status_unit(
@@ -401,10 +488,12 @@ async fn handle_wear_disable_unit(
     handle_wear_disable_for(sampler_registry, display, forget, selected_displays).await
 }
 
-async fn handle_wear_enable_for(
+pub(crate) async fn handle_wear_enable_for(
     sampler_registry: &SharedSamplerRegistry,
     display: &str,
     selected_displays: &Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    compositor_output: &CompositorOutputResolver,
+    consent_gate: &ConsentGate,
 ) -> IpcResponse {
     if !selected_displays()
         .iter()
@@ -417,6 +506,22 @@ async fn handle_wear_enable_for(
     let Some(active_sampler) = sampler_for_display(sampler_registry, display) else {
         return unsupported_sampling_response();
     };
+    let consent_lease = match consent_gate.try_acquire(display) {
+        Ok(lease) => lease,
+        Err(holder) => {
+            return IpcResponse::wear_sampling(WearSamplingStatus::Error(format!(
+                "{WEAR_SAMPLING_CONSENT_BUSY}: {holder}"
+            )));
+        }
+    };
+    if active_sampler.status().borrow().state == SamplingState::NeedsConsent {
+        let target_display = display;
+        tracing::info!(
+            event = "wear_sampling_consent_target",
+            display = %target_display,
+            compositor_output = ?compositor_output(target_display),
+        );
+    }
     let (reply_tx, reply_rx) = oneshot::channel();
     if let Err(error) = active_sampler
         .send(SamplerCommand::Enable { reply: reply_tx })
@@ -428,6 +533,7 @@ async fn handle_wear_enable_for(
         Ok(status) => status.into_ipc_status(),
         Err(_) => WearSamplingStatus::Error("wear_sampling_command_closed".to_owned()),
     };
+    drop(consent_lease);
     IpcResponse::wear_sampling(status)
 }
 
@@ -535,6 +641,7 @@ fn sampler_status_views(
             WearSamplingStatusMapEntry {
                 state: wire.state,
                 uniform_reason: wire.uniform_reason.clone(),
+                compositor_output: wire.compositor_output.clone(),
                 source_gate: wire.source_gate.clone(),
             },
         );
@@ -933,15 +1040,303 @@ mod tests {
     use indexmap::IndexMap;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
-    use tokio::sync::{mpsc, watch};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::{mpsc, oneshot, watch};
     use tokio_util::sync::CancellationToken;
 
     use dormant_core::config::schema::{Config, Credentials, DaemonConfig};
     use dormant_doctor::DoctorService;
 
     use super::DirectSwitchHandle;
-    use super::{sampler_status_views, switch_outcome_to_response};
+    use super::{
+        CompositorOutputResolver, ConsentGate, handle_wear_enable_for, sampler_status_views,
+        switch_outcome_to_response,
+    };
     use crate::direct_switch::SwitchOutcome;
+
+    #[test]
+    fn consent_gate_rejects_a_different_display_and_names_the_holder() {
+        let gate = super::ConsentGate::default();
+        let first = gate.try_acquire("oled-a").expect("first display acquires");
+
+        assert_eq!(
+            gate.try_acquire("oled-b")
+                .expect_err("second display is busy"),
+            "oled-a"
+        );
+        drop(first);
+        assert!(
+            gate.try_acquire("oled-b").is_ok(),
+            "the released holder must not block a different display"
+        );
+    }
+
+    #[test]
+    fn consent_gate_releases_after_the_terminal_flow_guard_drops() {
+        let gate = super::ConsentGate::default();
+        let first = gate.try_acquire("oled-a").expect("first display acquires");
+        assert_eq!(
+            gate.try_acquire("oled-b")
+                .expect_err("different display is blocked until release"),
+            "oled-a"
+        );
+        drop(first);
+
+        assert!(
+            gate.try_acquire("oled-b").is_ok(),
+            "a terminal flow must not wedge consent for another display"
+        );
+    }
+
+    fn consent_test_registry() -> (
+        crate::active_sampler::SharedSamplerRegistry,
+        mpsc::Receiver<crate::active_sampler::SamplerCommand>,
+        mpsc::Receiver<crate::active_sampler::SamplerCommand>,
+    ) {
+        let (oled_a, oled_a_rx) = crate::active_sampler::ActiveSamplerHandle::test_handle();
+        let (tv, tv_rx) = crate::active_sampler::ActiveSamplerHandle::test_handle();
+        let registry = Arc::new(std::sync::RwLock::new(std::collections::BTreeMap::from([
+            (dormant_core::types::DisplayId("oled-a".to_owned()), oled_a),
+            (dormant_core::types::DisplayId("tv".to_owned()), tv),
+        ])));
+        (registry, oled_a_rx, tv_rx)
+    }
+
+    fn selected_consent_displays() -> Arc<dyn Fn() -> Vec<String> + Send + Sync> {
+        Arc::new(|| vec!["oled-a".to_owned(), "tv".to_owned()])
+    }
+
+    fn consent_outputs() -> CompositorOutputResolver {
+        Arc::new(|display| (display == "tv").then(|| "HDMI-A-1".to_owned()))
+    }
+
+    #[tokio::test]
+    async fn concurrent_different_display_enable_rejects_busy_before_second_portal_request() {
+        let (registry, mut oled_a_rx, mut tv_rx) = consent_test_registry();
+        let selected = selected_consent_displays();
+        let outputs = consent_outputs();
+        let gate = ConsentGate::default();
+        let requests_a = Arc::new(AtomicUsize::new(0));
+        let requests_b = Arc::new(AtomicUsize::new(0));
+        let (opened_tx, opened_rx) = oneshot::channel();
+        let (resolve_tx, resolve_rx) = oneshot::channel();
+        let first_request_count = requests_a.clone();
+        tokio::spawn(async move {
+            let Some(crate::active_sampler::SamplerCommand::Enable { reply }) =
+                oled_a_rx.recv().await
+            else {
+                panic!("oled-a sampler must receive the first enable");
+            };
+            first_request_count.fetch_add(1, Ordering::SeqCst);
+            let _ = opened_tx.send(());
+            let _ = reply.send(resolve_rx.await.expect("resolve first portal flow"));
+        });
+        let second_request_count = requests_b.clone();
+        let tv_task = tokio::spawn(async move {
+            if let Some(crate::active_sampler::SamplerCommand::Enable { reply }) =
+                tv_rx.recv().await
+            {
+                second_request_count.fetch_add(1, Ordering::SeqCst);
+                let _ = reply.send(crate::active_sampler::ConsentFlowStatus::Granted);
+            }
+        });
+
+        let first_registry = registry.clone();
+        let first_selected = selected.clone();
+        let first_outputs = outputs.clone();
+        let first_gate = gate.clone();
+        let first = tokio::spawn(async move {
+            handle_wear_enable_for(
+                &first_registry,
+                "oled-a",
+                &first_selected,
+                &first_outputs,
+                &first_gate,
+            )
+            .await
+        });
+        opened_rx
+            .await
+            .expect("first portal request entered fake source");
+
+        let second = handle_wear_enable_for(&registry, "tv", &selected, &outputs, &gate).await;
+        assert_eq!(
+            second.wear_sampling,
+            Some(dormant_core::ipc_proto::WearSamplingStatus::Error(
+                "wear_sampling_consent_busy: oled-a".to_owned()
+            ))
+        );
+        assert_eq!(requests_a.load(Ordering::SeqCst), 1);
+        assert_eq!(requests_b.load(Ordering::SeqCst), 0);
+
+        let _ = resolve_tx.send(crate::active_sampler::ConsentFlowStatus::Granted);
+        assert_eq!(
+            first.await.expect("first IPC task").wear_sampling,
+            Some(dormant_core::ipc_proto::WearSamplingStatus::Granted)
+        );
+        let second = handle_wear_enable_for(&registry, "tv", &selected, &outputs, &gate).await;
+        assert_eq!(
+            second.wear_sampling,
+            Some(dormant_core::ipc_proto::WearSamplingStatus::Granted)
+        );
+        assert_eq!(requests_b.load(Ordering::SeqCst), 1);
+        tv_task.await.expect("tv sampler task");
+    }
+
+    #[tokio::test]
+    async fn terminal_consent_outcomes_release_the_gate_for_another_display() {
+        for terminal in [
+            crate::active_sampler::ConsentFlowStatus::Granted,
+            crate::active_sampler::ConsentFlowStatus::Denied,
+            crate::active_sampler::ConsentFlowStatus::TimedOut,
+        ] {
+            let (registry, mut oled_a_rx, mut tv_rx) = consent_test_registry();
+            let selected = selected_consent_displays();
+            let outputs = consent_outputs();
+            let gate = ConsentGate::default();
+            let requests_a = Arc::new(AtomicUsize::new(0));
+            let requests_b = Arc::new(AtomicUsize::new(0));
+            let (opened_tx, opened_rx) = oneshot::channel();
+            let (resolve_tx, resolve_rx) = oneshot::channel();
+            let first_request_count = requests_a.clone();
+            let terminal_result = terminal.clone();
+            tokio::spawn(async move {
+                let Some(crate::active_sampler::SamplerCommand::Enable { reply }) =
+                    oled_a_rx.recv().await
+                else {
+                    panic!("oled-a sampler must receive first enable");
+                };
+                first_request_count.fetch_add(1, Ordering::SeqCst);
+                let _ = opened_tx.send(());
+                let _ = reply.send(resolve_rx.await.unwrap_or(terminal_result));
+            });
+            let second_request_count = requests_b.clone();
+            tokio::spawn(async move {
+                let Some(crate::active_sampler::SamplerCommand::Enable { reply }) =
+                    tv_rx.recv().await
+                else {
+                    panic!("tv sampler must receive second enable");
+                };
+                second_request_count.fetch_add(1, Ordering::SeqCst);
+                let _ = reply.send(crate::active_sampler::ConsentFlowStatus::Granted);
+            });
+
+            let first_registry = registry.clone();
+            let first_selected = selected.clone();
+            let first_outputs = outputs.clone();
+            let first_gate = gate.clone();
+            let first = tokio::spawn(async move {
+                handle_wear_enable_for(
+                    &first_registry,
+                    "oled-a",
+                    &first_selected,
+                    &first_outputs,
+                    &first_gate,
+                )
+                .await
+            });
+            opened_rx
+                .await
+                .expect("first portal request entered fake source");
+            let busy = handle_wear_enable_for(&registry, "tv", &selected, &outputs, &gate).await;
+            assert_eq!(
+                busy.wear_sampling,
+                Some(dormant_core::ipc_proto::WearSamplingStatus::Error(
+                    "wear_sampling_consent_busy: oled-a".to_owned()
+                )),
+                "terminal={terminal:?} must reject while the first portal flow is open"
+            );
+            let _ = resolve_tx.send(terminal.clone());
+            assert!(
+                first.await.expect("first IPC task").wear_sampling.is_some(),
+                "terminal flow must return to the IPC caller"
+            );
+            let second = handle_wear_enable_for(&registry, "tv", &selected, &outputs, &gate).await;
+            assert_eq!(
+                second.wear_sampling,
+                Some(dormant_core::ipc_proto::WearSamplingStatus::Granted),
+                "terminal={terminal:?} must release the next display"
+            );
+            assert_eq!(
+                requests_a.load(Ordering::SeqCst),
+                1,
+                "terminal={terminal:?}"
+            );
+            assert_eq!(
+                requests_b.load(Ordering::SeqCst),
+                1,
+                "terminal={terminal:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dropped_sampler_reply_during_reload_releases_the_gate() {
+        let (registry, mut oled_a_rx, mut tv_rx) = consent_test_registry();
+        let selected = selected_consent_displays();
+        let outputs = consent_outputs();
+        let gate = ConsentGate::default();
+        let (opened_tx, opened_rx) = oneshot::channel();
+        let (drop_reply_tx, drop_reply_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let Some(crate::active_sampler::SamplerCommand::Enable { reply }) =
+                oled_a_rx.recv().await
+            else {
+                panic!("oled-a sampler must receive reload-interrupted enable");
+            };
+            let _ = opened_tx.send(());
+            let _ = drop_reply_rx.await;
+            drop(reply);
+        });
+        tokio::spawn(async move {
+            let Some(crate::active_sampler::SamplerCommand::Enable { reply }) = tv_rx.recv().await
+            else {
+                panic!("tv sampler must receive enable after reload");
+            };
+            let _ = reply.send(crate::active_sampler::ConsentFlowStatus::Granted);
+        });
+
+        let first_registry = registry.clone();
+        let first_selected = selected.clone();
+        let first_outputs = outputs.clone();
+        let first_gate = gate.clone();
+        let first = tokio::spawn(async move {
+            handle_wear_enable_for(
+                &first_registry,
+                "oled-a",
+                &first_selected,
+                &first_outputs,
+                &first_gate,
+            )
+            .await
+        });
+        opened_rx
+            .await
+            .expect("first portal request entered fake source");
+        let busy = handle_wear_enable_for(&registry, "tv", &selected, &outputs, &gate).await;
+        assert_eq!(
+            busy.wear_sampling,
+            Some(dormant_core::ipc_proto::WearSamplingStatus::Error(
+                "wear_sampling_consent_busy: oled-a".to_owned()
+            ))
+        );
+        let _ = drop_reply_tx.send(());
+        assert_eq!(
+            first
+                .await
+                .expect("reload-interrupted IPC task")
+                .wear_sampling,
+            Some(dormant_core::ipc_proto::WearSamplingStatus::Error(
+                "wear_sampling_command_closed".to_owned()
+            ))
+        );
+
+        let second = handle_wear_enable_for(&registry, "tv", &selected, &outputs, &gate).await;
+        assert_eq!(
+            second.wear_sampling,
+            Some(dormant_core::ipc_proto::WearSamplingStatus::Granted)
+        );
+    }
 
     #[test]
     fn sampler_status_views_keep_two_display_lifecycles_independent() {
@@ -954,6 +1349,7 @@ mod tests {
                     last_capture: Some(now),
                     uniform_reason: None,
                     bound_display: Some("oled-a".to_owned()),
+                    compositor_output: Some("DP-1".to_owned()),
                     granted_at: None,
                     source_gate: None,
                 },
@@ -965,6 +1361,7 @@ mod tests {
                     last_capture: None,
                     uniform_reason: Some(crate::active_sampler::WEAR_SAMPLING_CAPTURE_FAILED),
                     bound_display: Some("oled-b".to_owned()),
+                    compositor_output: Some("HDMI-A-1".to_owned()),
                     granted_at: None,
                     source_gate: None,
                 },
@@ -1099,6 +1496,7 @@ mod tests {
             Arc::new(std::sync::RwLock::new(std::collections::BTreeMap::default())),
             cancel,
             std::sync::Arc::new(Vec::new),
+            std::sync::Arc::new(|_| None),
         );
         assert!(result.is_err(), "group-writable parent should be rejected");
         let err = format!("{}", result.unwrap_err());
@@ -1127,6 +1525,7 @@ mod tests {
             Arc::new(std::sync::RwLock::new(std::collections::BTreeMap::default())),
             cancel.clone(),
             std::sync::Arc::new(Vec::new),
+            std::sync::Arc::new(|_| None),
         );
         assert!(
             result.is_ok(),

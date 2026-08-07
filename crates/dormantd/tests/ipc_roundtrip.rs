@@ -296,6 +296,7 @@ async fn setup_server() -> (
         Arc::new(std::sync::RwLock::new(BTreeMap::default())),
         cancel.clone(),
         std::sync::Arc::new(Vec::new),
+        std::sync::Arc::new(|_| None),
     )
     .unwrap();
 
@@ -603,6 +604,7 @@ async fn socket_file_permissions_0600() {
         Arc::new(std::sync::RwLock::new(BTreeMap::default())),
         cancel.clone(),
         std::sync::Arc::new(Vec::new),
+        std::sync::Arc::new(|_| None),
     )
     .unwrap();
 
@@ -644,6 +646,7 @@ async fn stale_socket_replacement() {
         Arc::new(std::sync::RwLock::new(BTreeMap::default())),
         cancel.clone(),
         std::sync::Arc::new(Vec::new),
+        std::sync::Arc::new(|_| None),
     );
     assert!(result.is_ok(), "should replace stale socket: {result:?}");
 
@@ -775,6 +778,7 @@ async fn setup_server_with_display(
         Arc::new(std::sync::RwLock::new(BTreeMap::default())),
         cancel.clone(),
         std::sync::Arc::new(Vec::new),
+        std::sync::Arc::new(|_| None),
     )
     .unwrap();
 

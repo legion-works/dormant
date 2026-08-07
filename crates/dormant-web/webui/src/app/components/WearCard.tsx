@@ -70,6 +70,21 @@ interface WearRowProps {
   dismissingNudge: boolean;
 }
 
+function samplingErrorMessage(error: unknown): string {
+  const reason =
+    typeof error === "object" && error !== null && "body" in error
+      ? (error as { body?: { reason?: unknown } }).body?.reason
+      : undefined;
+  const busyPrefix = "wear_sampling_consent_busy: ";
+  if (typeof reason === "string" && reason.startsWith(busyPrefix)) {
+    const holder = reason.slice(busyPrefix.length);
+    if (holder.length > 0) {
+      return `Consent is already open for display '${holder}'. Finish or cancel that dialog first.`;
+    }
+  }
+  return error instanceof Error ? error.message : "Unable to start active sampling";
+}
+
 function WearRow({
   summary,
   tone,
@@ -375,11 +390,11 @@ export default function WearCard() {
         setPerDisplayStatus((prev) => ({ ...prev, [displayName]: status }));
         setPerDisplayPending((prev) => ({ ...prev, [displayName]: false }));
       })
-      .catch((err: unknown) => {
-        setPerDisplayErrors((prev) => ({
-          ...prev,
-          [displayName]: err instanceof Error ? err.message : "Unable to start active sampling",
-        }));
+          .catch((err: unknown) => {
+            setPerDisplayErrors((prev) => ({
+              ...prev,
+              [displayName]: samplingErrorMessage(err),
+            }));
         setPerDisplayPending((prev) => ({ ...prev, [displayName]: false }));
       });
   };

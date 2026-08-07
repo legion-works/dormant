@@ -174,6 +174,22 @@ describe("WearCard", () => {
     expect(screen.queryByRole("button", { name: "Enable active sampling" })).not.toBeInTheDocument();
   });
 
+  it("names the display holding portal consent when another display is busy", async () => {
+    mocks.getConfig.mockResolvedValue({ inventory: { wear: { active_sampling: { enabled: true } } } });
+    mocks.getWearSamplingStatusFor.mockResolvedValue({ status: "error", reason: "wear_sampling_needs_consent" });
+    mocks.postWearSamplingEnableFor.mockRejectedValue({
+      body: { status: "error", reason: "wear_sampling_consent_busy: tv" },
+    });
+    setState({ wear: { displays: [summary({ config_display_id: "desk", display_name: "desk" })] } });
+
+    render(<WearCard />);
+
+    await screen.findByRole("button", { name: "Enable active sampling" });
+    fireEvent.click(screen.getByRole("button", { name: "Enable active sampling" }));
+
+    expect(await screen.findByText("Consent is already open for display 'tv'. Finish or cancel that dialog first.")).toBeInTheDocument();
+  });
+
   it("renders the title, honesty-rule caption (no spatial attribution), and per-display summary", () => {
     setState({ wear: { displays: [summary()] } });
 

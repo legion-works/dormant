@@ -24,8 +24,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 **TV app-overlay gating** — pause spatial attribution when a watched Tizen app owns the panel even though the TV still reports the configured HDMI input. Configure `watched_apps` per display; a visible app degrades the interval to uniform attribution ([#232](https://github.com/legion-works/dormant/issues/232)).
 
+### Added
+
+- A declared compositor output and persisted portal position bind active-sampling consent to the intended panel. Samsung IP Control source polling falls back to tagged uniform attribution whenever the configured HDMI source is not visible or cannot be read ([#231](https://github.com/legion-works/dormant/pull/231)).
+
 ### Fixed
 
+- Ship a `NoDisplay=true` desktop entry and rename the Linux user unit to `app-dormant.service`, so portal casting indicators label an active wear-sampling session as `dormant` rather than as a generic screen share. See Breaking above for the upgrade step ([#233](https://github.com/legion-works/dormant/issues/233), [#241](https://github.com/legion-works/dormant/pull/241)).
 - `dormantctl doctor` no longer fails every display's wear-sampling probe when the active-sampling config lists more than one display. The probe compared each display's consent binding against `first_sampled_display()`, which returns nothing under a plural config, so every bound display read as a mismatch and reported a binding error even while sampling worked correctly ([#234](https://github.com/legion-works/dormant/issues/234)).
 - Fix a false alarm in the wear heat map: a panel with mean exposure below 1 h no longer renders a full-red hotspot for a +20% relative deviation. Below the 1-hour floor the map renders a neutral colour and displays an "insufficient wear data (<1h mean)" caption instead ([#216](https://github.com/legion-works/dormant/issues/216), [#237](https://github.com/legion-works/dormant/pull/237)).
 - MQTT hook actions now publish through the configured sensor-plane broker and credentials, including after configuration reloads ([#230](https://github.com/legion-works/dormant/issues/230), [#238](https://github.com/legion-works/dormant/pull/238)).

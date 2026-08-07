@@ -9,6 +9,7 @@ import unittest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 # release-prep.py uses a hyphen — import it by path.
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 _RELEASE_PREP_PATH = pathlib.Path(__file__).resolve().parents[2] / "release-prep.py"
 _spec = importlib.util.spec_from_file_location("release_prep", _RELEASE_PREP_PATH)
 release_prep = importlib.util.module_from_spec(_spec)
@@ -512,6 +513,12 @@ class WriteModeTests(unittest.TestCase):
     # permanently.
     TODAY = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
 
+    # Same hazard on the other axis: the version comes from the live
+    # workspace Cargo.toml, so a literal version here passes only until the
+    # next release bump. These three tests broke on the 0.12.1 -> 0.12.2 bump
+    # for exactly that reason.
+    VERSION = release_prep._workspace_version(_REPO_ROOT)
+
     def test_write_preserves_exact_changelog_spacing(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
@@ -539,7 +546,7 @@ class WriteModeTests(unittest.TestCase):
                 "All notable changes to `dormant` are recorded here.\n\n"
                 "The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), "
                 "and the project aims at [Semantic Versioning](https://semver.org/spec/v2.0.0.html).\n\n"
-                f"## [0.12.1] - {self.TODAY}\n\n"
+                f"## [{self.VERSION}] - {self.TODAY}\n\n"
                 "### Fixed\n\n"
                 "- fixed thing\n\n"
                 "## [0.12.0] - 2026-08-06\n\n"
@@ -573,8 +580,10 @@ class WriteModeTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             content = changelog.read_text(encoding="utf-8")
-            self.assertIn(f"## [0.12.1] - {self.TODAY}", content)
-            self.assertLess(content.index("## [0.12.1]"), content.index("## [0.12.0]"))
+            self.assertIn(f"## [{self.VERSION}] - {self.TODAY}", content)
+            self.assertLess(
+                content.index(f"## [{self.VERSION}]"), content.index("## [0.12.0]")
+            )
             self.assertIn("- fixed thing", content)
 
     def test_write_output_with_citations_round_trips_coverage(self):
@@ -617,8 +626,12 @@ class WriteModeTests(unittest.TestCase):
                 "---\nkind: fix\nsurfaces: []\n---\nDetail: fixed thing\n",
                 encoding="utf-8",
             )
+            # Seed the changelog with the version --write is about to emit,
+            # so the duplicate-refusal path is what gets exercised.
             changelog = root / "CHANGELOG.md"
-            changelog.write_text("## [0.12.1] - 2026-08-06\n\n", encoding="utf-8")
+            changelog.write_text(
+                f"## [{self.VERSION}] - 2026-08-06\n\n", encoding="utf-8"
+            )
 
             result = _run_release_prep(
                 "--fragment-dir", str(fragment_dir),

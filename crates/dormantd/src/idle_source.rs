@@ -20,10 +20,13 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use crate::idle_observation::{IdleObservation, IdleObservationTx};
+#[cfg(target_os = "linux")]
+use crate::idle_observation::IdleObservation;
+use crate::idle_observation::IdleObservationTx;
 use dormant_core::config::IdleTimeUnit;
 use dormant_core::rules::{ControlMsg, InhibitorKind};
 use dormant_core::types::RuleId;
+#[cfg(target_os = "linux")]
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;

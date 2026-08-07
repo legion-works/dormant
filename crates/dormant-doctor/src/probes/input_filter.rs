@@ -214,17 +214,6 @@ fn probe_event_nodes(globs: &[String], _enumerator: EventEnumerator) -> ProbeRes
     )
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn probe_node_list(globs: &[String], _nodes: &NodeList) -> ProbeResult {
-    ProbeResult::not_supported(
-        "input-filter",
-        format!(
-            "evdev enumeration is Linux-only — ignore list {globs:?} is configured but \
-             this platform does not support /dev/input/event* probing",
-        ),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

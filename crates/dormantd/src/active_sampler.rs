@@ -146,6 +146,10 @@ pub enum ConsentFlowStatus {
 }
 
 impl ConsentFlowStatus {
+    // Sole caller is `ipc.rs`, which is `#[cfg(unix)]` at the module
+    // declaration — matching that cfg keeps this equal-or-wider than its
+    // only consumer (project rule #2584) instead of dead on Windows.
+    #[cfg(unix)]
     pub(crate) fn into_ipc_status(self) -> WearSamplingStatus {
         match self {
             Self::AwaitingConsent => {
@@ -244,6 +248,11 @@ pub struct ActiveSamplerDeps {
     pub event_tx: Option<mpsc::Sender<ControlMsg>>,
 }
 
+// Sole caller is `app.rs`'s `spawn_active_sampler_runtime`, which is
+// `#[cfg(target_os = "linux")]` — active sampling has no non-Linux
+// implementation. Matching that cfg keeps this equal-or-wider than its only
+// consumer (project rule #2584) instead of dead on other targets.
+#[cfg(target_os = "linux")]
 pub(crate) fn production_env_reader(name: &str) -> Option<String> {
     std::env::var(name).ok()
 }

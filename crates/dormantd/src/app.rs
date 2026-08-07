@@ -40,9 +40,14 @@
 //! (above) covers the physically-dark-but-Active gap. Removed-display verified
 //! wake is fully implemented.
 
+// Widest consumer is the `#[cfg(unix)]` sampler-registry construction in
+// `start` (project rule #2584: an import must be equal-or-wider than every
+// consumer). Linux-only would compile here and break the macOS build.
+#[cfg(unix)]
+use std::collections::BTreeMap;
 #[cfg(target_os = "linux")]
 use std::collections::BTreeSet;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 #[cfg(any(test, feature = "test-util"))]
 use std::sync::OnceLock;
@@ -52,8 +57,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use serde::Serialize;
 
+#[cfg(target_os = "linux")]
+use dormant_core::config::schema::DisplayConfig;
 use dormant_core::config::schema::{
-    Config, Credentials, DisplayConfig, DisplayScope, MqttCredential, RuleConfig, SensorConfig,
+    Config, Credentials, DisplayScope, MqttCredential, RuleConfig, SensorConfig,
 };
 use dormant_core::config::{
     Strictness, ValidationError, Warning, load_config, load_config_from_bytes, load_credentials,
@@ -106,6 +113,7 @@ use crate::inhibit_audio::{self, AudioRule};
 use crate::macos_idle;
 use crate::notifier::{self, NotifierDeps, NotifySink, NotifyState};
 use crate::reload;
+#[cfg(target_os = "linux")]
 use crate::screencast_consent;
 use crate::sd_notify::{self, SdNotify};
 use crate::watchdog_schedule::WatchdogSchedule;
@@ -2774,8 +2782,6 @@ impl App {
 
         let (cfg, creds) = load_cfg_creds(&self.config_path, &self.creds_path, self.strictness)?;
         let applied_revision = runtime_revision_from_paths(&self.config_path, &self.creds_path)?;
-        let socket_path =
-            dormant_core::paths::resolve_socket_path(cfg.daemon.socket_path.as_deref());
 
         // The daemon's ONE process-wide panel-lock registry (spec §4.3) AND
         // (macOS-only) gamma-hold-registry/breadcrumb (Task 8), bundled into
@@ -3030,7 +3036,7 @@ impl App {
                 std::collections::BTreeMap<String, dormant_core::wear::WearSamplingStatus>,
             >(std::collections::BTreeMap::default());
         #[cfg(not(target_os = "linux"))]
-        let per_display_statuses_rx: Option<
+        let _per_display_statuses_rx: Option<
             watch::Receiver<
                 std::collections::BTreeMap<String, dormant_core::wear::WearSamplingStatus>,
             >,
@@ -3136,6 +3142,10 @@ impl App {
         let ipc_handle = if self.disable_ipc {
             None
         } else {
+            // `cfg` was moved into `assemble_static` above; `cfg_clone` is the
+            // surviving copy kept for exactly this kind of late read.
+            let socket_path =
+                dormant_core::paths::resolve_socket_path(cfg_clone.daemon.socket_path.as_deref());
             // The IPC alias strategy: the unit wear-sampling variants
             // resolve to the single configured display and error when
             // >1 is selected, so the handler needs the current selection

@@ -543,6 +543,7 @@ pub fn forget(path: &Path) -> Result<(), ConsentError> {
     }
 }
 
+#[cfg_attr(not(unix), allow(unused_variables))]
 fn check_permissions(path: &Path, metadata: &std::fs::Metadata) -> Result<(), ConsentError> {
     #[cfg(unix)]
     {
@@ -559,6 +560,7 @@ fn check_permissions(path: &Path, metadata: &std::fs::Metadata) -> Result<(), Co
     Ok(())
 }
 
+#[cfg_attr(not(unix), allow(unused_variables))]
 fn set_mode(path: &Path, mode: u32) -> Result<(), ConsentError> {
     #[cfg(unix)]
     {

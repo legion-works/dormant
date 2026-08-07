@@ -324,6 +324,7 @@ mod tests {
     use crate::types::ProbeStatus;
     use dormant_displays::vcp_ops::VcpDisplayInfo;
     use std::collections::HashMap;
+    #[cfg(target_os = "linux")]
     use std::os::unix::fs::PermissionsExt;
 
     #[cfg(target_os = "linux")]
@@ -368,6 +369,7 @@ mod tests {
         }
 
         /// One display whose brightness read fails (ddc-hi side failure).
+        #[cfg(target_os = "linux")]
         fn single_failing(ident: &str) -> Self {
             let mut responses = HashMap::new();
             responses.insert(
@@ -388,6 +390,7 @@ mod tests {
 
         /// No displays at all (the pre-existing "no DDC/CI displays
         /// detected" fail path).
+        #[cfg(target_os = "linux")]
         fn none() -> Self {
             Self {
                 displays: Vec::new(),

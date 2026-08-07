@@ -296,7 +296,10 @@ pub fn capabilities() -> HashMap<String, Vec<BlankMode>> {
 /// Controller type names that can read a panel's active-input VCP.
 #[must_use]
 pub fn input_source_readers() -> HashSet<String> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let mut readers = HashSet::new();
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let readers = HashSet::new();
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     readers.insert("ddcci".to_string());
     readers
@@ -339,6 +342,10 @@ pub fn claim_identity_providers() -> HashSet<String> {
 /// it; every other controller type ignores it (no shared physical bus or
 /// daemon-lifetime state to serialize).
 #[allow(clippy::too_many_lines)]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos")),
+    allow(unused_variables)
+)]
 pub fn build_controllers(
     display_name: &str,
     cfg: &DisplayConfig,

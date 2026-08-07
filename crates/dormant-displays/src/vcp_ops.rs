@@ -115,11 +115,15 @@
 //! by [`crate::ddcci::DdcciController`]'s
 //! [`read_state`](dormant_core::traits::DisplayController::read_state)).
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::sync::PoisonError;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -936,6 +940,13 @@ pub(crate) struct FakeVcp {
     /// the ground truth the relational wake-latency pin test compares
     /// against.
     last_get_elapsed: StdMutex<Option<std::time::Duration>>,
+    /// Callers currently inside the panel-lock guard, and the high-water
+    /// mark of that count. Mutual exclusion is the property the panel lock
+    /// exists for, so tests assert the high-water mark directly instead of
+    /// inferring it from elapsed time — a wall-clock bound on a shared CI
+    /// runner measures the scheduler as much as the lock.
+    in_lock: Arc<std::sync::atomic::AtomicUsize>,
+    max_in_lock: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// A single scripted `get_vcp` response.
@@ -966,7 +977,15 @@ impl FakeVcp {
             set_calls: StdMutex::new(Vec::new()),
             call_log: StdMutex::new(Vec::new()),
             last_get_elapsed: StdMutex::new(None),
+            in_lock: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max_in_lock: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// Highest number of callers observed inside the panel-lock guard at
+    /// once. `1` proves mutual exclusion held; `2` proves it did not.
+    pub fn max_concurrent_in_lock(&self) -> usize {
+        self.max_in_lock.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Add a scripted `get_vcp` response.
@@ -1113,6 +1132,8 @@ impl VcpOps for FakeVcp {
         let delay = self.get_delay.lock().unwrap().get(&key).copied();
         let should_panic = self.get_panic.lock().unwrap().remove(&key);
         let lock = Arc::clone(lock);
+        let in_lock = Arc::clone(&self.in_lock);
+        let max_in_lock = Arc::clone(&self.max_in_lock);
 
         let (result, elapsed) = tokio::task::spawn_blocking(move || {
             // Panel-lock guard acquired FIRST, exactly like `RealVcp` — the
@@ -1123,6 +1144,13 @@ impl VcpOps for FakeVcp {
                 Ok(g) => g,
                 Err(e) => return (Err(e), std::time::Duration::ZERO),
             };
+            // Occupancy is tracked inside the guard so the high-water mark
+            // is only ever >1 if two callers genuinely held the lock at the
+            // same instant. Recorded before the scripted delay and released
+            // after, so a delayed transaction covers the whole window a
+            // second caller could collide with.
+            let depth = in_lock.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            max_in_lock.fetch_max(depth, std::sync::atomic::Ordering::SeqCst);
             let start = std::time::Instant::now();
             let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 if let Some(d) = delay {
@@ -1135,6 +1163,7 @@ impl VcpOps for FakeVcp {
                 scripted
             }))
             .unwrap_or_else(|_| Err(VCP_PANIC.to_string()));
+            in_lock.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             (out, start.elapsed())
         })
         .await
@@ -1543,9 +1572,22 @@ mod tests {
     /// T5 pin test 6(a) (mechanics half): two command-priority
     /// transactions against the SAME panel lock never overlap — the
     /// second one's op only starts after the first one's guard is
-    /// dropped. Proven by an elapsed-time bound, not a bare sleep-and-hope:
-    /// if the two ran concurrently, `total` would be ≈ the longer of the
-    /// two delays rather than their sum.
+    /// dropped.
+    ///
+    /// Proven by the fake's in-guard occupancy high-water mark rather than
+    /// by a wall-clock bound. The earlier form asserted
+    /// `t2_elapsed >= 40ms` after a 15ms stagger into a 60ms delay, leaving
+    /// a ~5ms margin against scheduler jitter; it failed twice on shared
+    /// macOS runners (`FLAKE-2026-08-05-VCP-COMMAND-PRIORITY`, once at
+    /// 38.4ms) while the lock was working correctly. Its companion
+    /// `total >= 60ms` assertion did not discriminate at all: t1 sleeps
+    /// 60ms whether or not the two serialize, so concurrent and serialized
+    /// runs both satisfy it.
+    ///
+    /// `max_concurrent_in_lock()` is the direct measurement of the property
+    /// the panel lock exists for — `1` means mutual exclusion held, `2`
+    /// means it did not — and it does not depend on how the OS scheduled
+    /// the two tasks.
     #[tokio::test]
     async fn command_priority_serializes_two_concurrent_transactions() {
         let fake = Arc::new(single_display_fake());
@@ -1558,34 +1600,31 @@ mod tests {
 
         let fake1 = Arc::clone(&fake);
         let task_lock = Arc::clone(&lock);
-        let start = Instant::now();
         let t1 = tokio::spawn(async move {
             fake1
                 .get_vcp(IDENT, 0x10, &task_lock, VcpPriority::Command)
                 .await
         });
         // Give t1 a chance to acquire the lock and enter its 60ms delay
-        // before t2 arrives.
+        // before t2 arrives. A short stagger is still needed to make the
+        // overlap *possible* — but no assertion depends on its precision:
+        // if the stagger is late and t1 has already finished, the two never
+        // contend and the high-water mark is 1 for the trivial reason,
+        // which is a weaker pass rather than a false failure.
         tokio::time::sleep(Duration::from_millis(15)).await;
-        let t2_start = Instant::now();
         let v2 = fake
             .get_vcp(IDENT, 0x11, &lock, VcpPriority::Command)
             .await
             .unwrap();
-        let t2_elapsed = t2_start.elapsed();
-        t1.await.unwrap().unwrap();
-        let total = start.elapsed();
+        let v1 = t1.await.unwrap().unwrap();
 
+        assert_eq!(v1, 1);
         assert_eq!(v2, 2);
-        assert!(
-            t2_elapsed >= Duration::from_millis(40),
-            "t2 (0x11) must have waited for t1's (0x10) in-flight transaction \
-             to release the shared panel lock; t2_elapsed={t2_elapsed:?}"
-        );
-        assert!(
-            total >= Duration::from_millis(60),
-            "combined wall-clock must be at least the full 60ms delay — \
-             proves the two transactions were serialized, not concurrent: {total:?}"
+        assert_eq!(
+            fake.max_concurrent_in_lock(),
+            1,
+            "two command-priority transactions on the same panel must never \
+             hold the lock at the same time"
         );
     }
 

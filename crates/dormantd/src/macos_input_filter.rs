@@ -537,11 +537,15 @@ type CFStringRef = *mut c_void;
 type CFTypeRef = *mut c_void;
 type CFIndex = i64;
 
+// Parameter names in a fn-pointer type alias are documentation only — they
+// bind nothing, and `#[allow(non_snake_case)]` is not honoured in this
+// position, so the Apple spelling `userInfo` is carried in this comment
+// rather than in the signature. Source: `<CGEventTypes.h>` CGEventTapCallBack.
 type CGEventTapCallBack = unsafe extern "C" fn(
     proxy: CGEventTapProxy,
     type_: CGEventType,
     event: CGEventRef,
-    #[allow(non_snake_case)] userInfo: *mut c_void,
+    user_info: *mut c_void,
 ) -> CGEventRef;
 
 // ── Constants ──────────────────────────────────────────────────────────────

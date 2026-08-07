@@ -6,14 +6,18 @@ id = "FLAKE-2026-08-05-VCP-COMMAND-PRIORITY"
 test = "vcp_ops::tests::command_priority_serializes_two_concurrent_transactions"
 signature = "sha256:37b6ea4ad3dfa105a37cd62771b9148262549ea9d2f241a6af378577705ddb2c"
 first_run_url = "https://github.com/legion-works/dormant/actions/runs/31033439943"
-last_run_url = "https://github.com/legion-works/dormant/actions/runs/31135976767"
-mechanism = "real-clock threshold under CPU contention on shared CI runners: t1 is expected to acquire the shared panel lock and enter a 60ms fake VCP delay before t2 arrives after a 15ms scheduler sleep, so t2 should wait at least the remaining 40ms; scheduler latency can delay t1's lock acquisition or distort the sleep and leave t2 below that bound even though the lock implementation is correct, while the separate 60ms combined wall-clock assertion still captures serialization"
+last_run_url = "https://github.com/legion-works/dormant/actions/runs/31162098104"
+mechanism = "real-clock threshold under CPU contention on shared CI runners: t1 is expected to acquire the shared panel lock and enter a 60ms fake VCP delay before t2 arrives after a 15ms scheduler sleep, so t2 should wait at least the remaining 40ms; scheduler latency can delay t1's lock acquisition or distort the sleep and leave t2 below that bound even though the lock implementation is correct. The companion 60ms combined wall-clock assertion did NOT capture serialization as originally claimed: t1 sleeps 60ms whether or not the two overlap, so concurrent and serialized runs both satisfy it, leaving the flaky 40ms bound as the only discriminating assertion."
 reproduction = "cargo nextest run -p dormant-displays --lib --stress-count 100 --retries 0 --flaky-result fail -E 'test(command_priority_serializes_two_concurrent_transactions)'"
-root_cause = ""
-fix_pr = ""
-proving_test = ""
-soak_evidence = []
-status = "open"
+root_cause = "The assertion measured the scheduler, not the lock. A 15ms stagger into a 60ms delay left roughly 5ms of margin before the 40ms bound; on a shared macOS runner the stagger and t1's lock acquisition drift enough to close it (observed 38.365208ms in run 31135976767, and again in 31162098104). The panel lock was correct in both failures."
+fix_pr = "https://github.com/legion-works/dormant/pull/261"
+proving_test = "vcp_ops::tests::command_priority_serializes_two_concurrent_transactions"
+soak_evidence = ["https://github.com/legion-works/dormant/pull/261"]
+status = "fixed"
+# The classifier signature is not a usable recurrence key for this incident:
+# it hashes the panic message, which embeds the measured elapsed time, so every
+# occurrence produced a different hash (37b6ea4a..., c20ede0b...).
+# Recurrence was identified by test name and mechanism instead.
 
 [[incident]]
 id = "FLAKE-0009"

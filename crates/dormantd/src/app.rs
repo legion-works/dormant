@@ -40,7 +40,10 @@
 //! (above) covers the physically-dark-but-Active gap. Removed-display verified
 //! wake is fully implemented.
 
-#[cfg(target_os = "linux")]
+// Widest consumer is the `#[cfg(unix)]` sampler-registry construction in
+// `start` (project rule #2584: an import must be equal-or-wider than every
+// consumer). Linux-only would compile here and break the macOS build.
+#[cfg(unix)]
 use std::collections::BTreeMap;
 #[cfg(target_os = "linux")]
 use std::collections::BTreeSet;

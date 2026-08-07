@@ -10,7 +10,9 @@
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+#[cfg(unix)]
+use anyhow::Context;
+use anyhow::Result;
 use dormant_core::ipc_proto::{IpcRequest, IpcResponse};
 use dormant_core::rules::DaemonEvent;
 #[cfg(unix)]
@@ -19,6 +21,7 @@ use std::io::BufReader;
 use std::time::Duration;
 
 /// Maximum line length for IPC frames (1 MB).  Must match the server's limit.
+#[cfg(unix)]
 const MAX_LINE_BYTES: usize = 1_048_576;
 
 /// Maximum wait for the daemon's per-connection event-stream readiness frame.

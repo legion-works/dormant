@@ -95,7 +95,7 @@ pub fn probe_wear_sampling_per_display(
     // Off-Linux: one "not supported" row per configured display.
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = statuses;
+        let _ = (live_display_ids, statuses);
         return configured_display_ids
             .iter()
             .map(|display| {
@@ -338,6 +338,7 @@ mod tests {
 
     // ── #185 Task 24b cycle B — per-display probe ────────────────────────
 
+    #[cfg(target_os = "linux")]
     fn two_display_config() -> WearConfig {
         WearConfig {
             sample_interval: std::time::Duration::from_secs(30),

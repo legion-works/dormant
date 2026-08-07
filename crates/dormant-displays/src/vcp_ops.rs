@@ -115,11 +115,15 @@
 //! by [`crate::ddcci::DdcciController`]'s
 //! [`read_state`](dormant_core::traits::DisplayController::read_state)).
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::sync::PoisonError;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;

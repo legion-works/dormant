@@ -17,6 +17,7 @@ use std::io::Write;
 
 use std::path::Path;
 
+#[cfg(unix)]
 use anyhow::Context;
 
 /// RAII guard holding an exclusive advisory lock on the per-user-session lock

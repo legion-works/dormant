@@ -681,8 +681,8 @@ pub(crate) async fn run_argv_command(
         }
         Err(_) => {
             // Timeout — kill the whole process group, then reap.
+            #[cfg(unix)]
             if let Some(pid) = child.id() {
-                #[cfg(unix)]
                 unsafe {
                     // Negative pid → signal sent to the process group whose
                     // pgid equals |pid|. setsid() above placed the child in

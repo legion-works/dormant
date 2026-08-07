@@ -238,9 +238,10 @@ mod tests {
             opts.credentials().is_some(),
             "MqttOptions should carry credentials"
         );
-        let (user, pwd) = opts.credentials().unwrap();
-        assert_eq!(user, "icetea");
-        assert_eq!(pwd, "secret");
+        // rumqttc 0.25 returns a `Login` struct here; 0.24 returned a tuple.
+        let login = opts.credentials().unwrap();
+        assert_eq!(login.username, "icetea");
+        assert_eq!(login.password, "secret");
     }
 
     #[test]

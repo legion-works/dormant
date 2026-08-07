@@ -14,7 +14,7 @@ dormant-core = { path = "../dormant-core" }
 # See the workspace Cargo.toml for why the default `use-rustls` feature is
 # off: dormant has no TLS broker path, and the feature pulled a
 # vulnerable second webpki.
-rumqttc = { version = "0.24", default-features = false }
+rumqttc = { version = "0.25", default-features = false }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tokio-tungstenite = { workspace = true }

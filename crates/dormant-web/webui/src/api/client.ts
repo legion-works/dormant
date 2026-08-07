@@ -295,7 +295,7 @@ export function postEmergencyWake(): Promise<EmergencyWakeReport> {
   return postJsonReport<EmergencyWakeReport>("/emergency-wake");
 }
 
-  /** POST /api/doctor/exercise/{display} — run the real blank/read/wake/read/restore sequence. */
+/** POST /api/doctor/exercise/{display} — run the real blank/read/wake/read/restore sequence. */
 export function postExercise(display: string): Promise<ExerciseReport> {
   return postJsonReport<ExerciseReport>(`/doctor/exercise/${encodeURIComponent(display)}`);
 }

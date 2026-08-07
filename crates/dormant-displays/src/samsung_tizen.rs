@@ -514,7 +514,7 @@ impl RealTvTransport {
                     match guard
                         .as_mut()
                         .expect("just checked")
-                        .send(Message::Text(payload.to_string()))
+                        .send(Message::Text(payload.to_string().into()))
                         .await
                     {
                         Ok(()) => return Ok(()),
@@ -538,7 +538,7 @@ impl RealTvTransport {
         let mut guard = self.ws.lock().await;
         match guard.as_mut() {
             Some(sink) => sink
-                .send(Message::Text(payload.to_string()))
+                .send(Message::Text(payload.to_string().into()))
                 .await
                 .map_err(|e| format!("WS send after reconnect failed: {e}")),
             None => Err("WS connection lost after reconnect".to_string()),

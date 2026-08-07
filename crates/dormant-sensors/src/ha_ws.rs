@@ -141,7 +141,7 @@ impl SensorSource for HaWsSource {
                                         Action::SendText(out) => {
                                             debug!("ha-ws: sending: {out}");
                                             if write
-                                                .send(Message::Text(out))
+                                                .send(Message::Text(out.into()))
                                                 .await
                                                 .is_err()
                                             {

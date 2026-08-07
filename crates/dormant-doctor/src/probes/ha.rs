@@ -64,7 +64,7 @@ pub(crate) async fn probe_ha_one(id: &str, cfg: &HaSensorCfg, creds: &Credential
                 for action in actions {
                     match action {
                         Action::SendText(out) => {
-                            if write.send(Message::Text(out)).await.is_err() {
+                            if write.send(Message::Text(out.into())).await.is_err() {
                                 return ProbeResult::fail(
                                     name,
                                     "WebSocket write failed".to_string(),

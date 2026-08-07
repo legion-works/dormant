@@ -211,7 +211,7 @@ export interface ExerciseStep {
 
 /**
  * rust: rules.rs ExerciseReport — response body of
-       * `POST /api/doctor/exercise/{display}`.
+ * `POST /api/doctor/exercise/{display}`.
  * serde: `paused_rules` is `#[serde(default, skip_serializing_if = "Vec::is_empty")]`.
  */
 export interface ExerciseReport {

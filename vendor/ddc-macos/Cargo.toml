@@ -22,7 +22,7 @@ io-kit-sys = "0.4"
 # hard-linking them. See README.dormant.md.
 libc = "0.2"
 mach2 = "0.4"
-thiserror = "1.0"
+thiserror = "2.0"
 
 [badges]
 maintenance = { status = "actively-developed" }

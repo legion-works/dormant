@@ -41,7 +41,7 @@ reqwest = { version = "0.12", default-features = false, features = [
   "json",
   "rustls-tls",
 ] }
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
 zbus = "5"
 pipewire = "0.10"
 indexmap = { version = "2", features = ["serde"] }
@@ -53,7 +53,7 @@ proptest = "1"
 # webpki carried RUSTSEC-2026-0049/0098/0099/0104, which deny.toml had to
 # suppress. Re-enabling this feature reintroduces all four — add `mqtts://`
 # support to parse_broker_url first, and pin a webpki >= 0.103.13.
-rumqttc = { version = "0.24", default-features = false }
+rumqttc = { version = "0.25", default-features = false }
 futures-util = "0.3"
 tokio-serial = "5"
 ddc-hi = "0.4"
@@ -62,7 +62,7 @@ libc = "0.2"
 notify = "7"
 sha2 = "0.10"
 tempfile = "3"
-rand = "0.8"
+rand = "0.9"
 base64 = "=0.22.1"
 time = { version = "=0.3.53", features = ["formatting"] }
 test-case = "3"

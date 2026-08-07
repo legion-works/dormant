@@ -131,7 +131,7 @@ async fn stream_events(socket: WebSocket, state: &WebState) -> Result<(), Error>
                     match event {
                         Ok(ev) => {
                             let text = serde_json::to_string(&ev).unwrap_or_default();
-                            if tx.send(Message::Text(text)).await.is_err() {
+                            if tx.send(Message::Text(text.into())).await.is_err() {
                                 return Ok(());
                             }
                         }
@@ -141,7 +141,7 @@ async fn stream_events(socket: WebSocket, state: &WebState) -> Result<(), Error>
                                 "skipped": n,
                             });
                             let text = serde_json::to_string(&lagged).unwrap_or_default();
-                            if tx.send(Message::Text(text)).await.is_err() {
+                            if tx.send(Message::Text(text.into())).await.is_err() {
                                 return Ok(());
                             }
                         }
@@ -171,7 +171,7 @@ async fn stream_events(socket: WebSocket, state: &WebState) -> Result<(), Error>
                             // canonical teardown signal lands first).
                             let frame = serde_json::to_string(&DaemonEvent::ConfigReloaded)
                                 .unwrap_or_default();
-                            let _ = tx.send(Message::Text(frame)).await;
+                            let _ = tx.send(Message::Text(frame.into())).await;
                         }
                         ReloadOutcome::Rejected(detail) => {
                             // Emit a rejected frame so the frontend can
@@ -185,7 +185,7 @@ async fn stream_events(socket: WebSocket, state: &WebState) -> Result<(), Error>
                             });
                             let text =
                                 serde_json::to_string(&frame).unwrap_or_default();
-                            let _ = tx.send(Message::Text(text)).await;
+                            let _ = tx.send(Message::Text(text.into())).await;
                         }
                         },
                         Ok(_) => {}
@@ -215,7 +215,7 @@ async fn stream_events(socket: WebSocket, state: &WebState) -> Result<(), Error>
                         ReloadOutcome::Reloaded => {
                             let frame = serde_json::to_string(&DaemonEvent::ConfigReloaded)
                                 .unwrap_or_default();
-                            let _ = tx.send(Message::Text(frame)).await;
+                            let _ = tx.send(Message::Text(frame.into())).await;
                             events = resubscribe_events(&ctl_tx).await.ok();
                         }
                         ReloadOutcome::Rejected(detail) => {
@@ -228,7 +228,7 @@ async fn stream_events(socket: WebSocket, state: &WebState) -> Result<(), Error>
                             });
                             let text =
                                 serde_json::to_string(&frame).unwrap_or_default();
-                            let _ = tx.send(Message::Text(text)).await;
+                            let _ = tx.send(Message::Text(text.into())).await;
                             // Events channel is already closed — try
                             // subscribing to whatever generation is
                             // currently running.

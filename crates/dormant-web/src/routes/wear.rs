@@ -1,4 +1,4 @@
-//! `GET /api/wear` + `GET /api/wear/:display` — panel-exposure (wear) view.
+//! `GET /api/wear` + `GET /api/wear/{display}` — panel-exposure (wear) view.
 //!
 //! Reads directly from the shared [`dormant_core::wear::WearHandle`] the
 //! wear tracker (`dormantd::wear_tracker`) populates — this route does NOT
@@ -93,7 +93,7 @@ pub(crate) struct WearListResponse {
     pub(crate) displays: Vec<WearSummary>,
 }
 
-/// `GET /api/wear/:display` response — summary plus the per-cell grid.
+/// `GET /api/wear/{display}` response — summary plus the per-cell grid.
 #[derive(serde::Serialize, Debug)]
 pub(crate) struct WearDetail {
     #[serde(flatten)]
@@ -253,7 +253,7 @@ pub(crate) async fn get_wear(State(state): State<WebState>) -> Json<WearListResp
     Json(WearListResponse { displays })
 }
 
-/// `GET /api/wear/:display` — one display's summary plus its wear grid.
+/// `GET /api/wear/{display}` — one display's summary plus its wear grid.
 ///
 /// # Errors
 ///
@@ -642,7 +642,7 @@ mod tests {
         assert!(resp.displays.is_empty());
     }
 
-    // ── GET /api/wear/:display — detail + 404 ──────────────────────────────
+    // ── GET /api/wear/{display} — detail + 404 ──────────────────────────────
 
     #[tokio::test]
     async fn get_wear_detail_returns_cells_and_heat_matching_grid_dims() {

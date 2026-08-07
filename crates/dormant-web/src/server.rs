@@ -149,7 +149,7 @@ pub(crate) fn build_router(state: WebState) -> Router {
     );
     let api = route_post!(
         api,
-        "/doctor/exercise/:display",
+        "/doctor/exercise/{display}",
         post(doctor::post_exercise)
     );
     let api = api
@@ -158,9 +158,9 @@ pub(crate) fn build_router(state: WebState) -> Router {
         .route("/operations", get(operations::get_operations))
         .route("/daemon", get(daemon::get_daemon))
         .route("/wear", get(wear::get_wear))
-        .route("/wear/:display", get(wear::get_wear_detail))
+        .route("/wear/{display}", get(wear::get_wear_detail))
         .route("/wear/sampling", get(wear_sampling::get_status))
-        .route("/pair/samsung/:id", get(pair::get_pair_samsung))
+        .route("/pair/samsung/{id}", get(pair::get_pair_samsung))
         // API miss → 404, never the SPA fallback.
         .fallback(api_not_found)
         .with_state(state.clone());
@@ -428,7 +428,7 @@ mod tests {
             "/api/reload",
             "/api/doctor",
             "/api/emergency-wake",
-            "/api/doctor/exercise/:display",
+            "/api/doctor/exercise/{display}",
         ];
         for known in known_post_routes {
             assert!(
@@ -663,7 +663,7 @@ mod tests {
         );
     }
 
-    /// Exercises `POST /api/doctor/exercise/:display` through the real
+    /// Exercises `POST /api/doctor/exercise/{display}` through the real
     /// `build_router` (not a bare test mount) — full production wiring:
     /// engine channel, security guard, dynamic path segment, wire-shape
     /// response.

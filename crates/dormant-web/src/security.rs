@@ -74,7 +74,7 @@ pub(crate) const ACKNOWLEDGED_WEAK_ROUTES: &[&str] = &[
     "/api/reload",
     "/api/doctor",
     "/api/emergency-wake",
-    "/api/doctor/exercise/:display",
+    "/api/doctor/exercise/{display}",
     "/api/wear/sampling/enable",
     "/api/wear/sampling/disable",
     "/api/wear/sampling/nudge/dismiss",
@@ -712,8 +712,8 @@ mod tests {
 
     #[test]
     fn exercise_is_explicitly_acknowledged_weak() {
-        assert!(ACKNOWLEDGED_WEAK_ROUTES.contains(&"/api/doctor/exercise/:display"));
-        assert!(!STRICT_ORIGIN_PATHS.contains(&"/api/doctor/exercise/:display"));
+        assert!(ACKNOWLEDGED_WEAK_ROUTES.contains(&"/api/doctor/exercise/{display}"));
+        assert!(!STRICT_ORIGIN_PATHS.contains(&"/api/doctor/exercise/{display}"));
     }
 
     #[test]

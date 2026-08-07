@@ -28,7 +28,7 @@ pub(crate) async fn post_doctor(State(state): State<WebState>) -> Json<DoctorRep
 /// dependency edge for this constant.
 const EXERCISE_WEB_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// `POST /api/doctor/exercise/:display` — run the engine-owned control-path exercise.
+/// `POST /api/doctor/exercise/{display}` — run the engine-owned control-path exercise.
 ///
 /// The engine pauses and resumes affected rules around the exercise. The route
 /// must not add resume logic: timing out the HTTP adapter does not transfer
@@ -226,7 +226,7 @@ mod tests {
         let ctl_tx = spawn_fake_engine(snapshot_with_display(None));
         let state = test_web_state(ctl_tx);
         let app = Router::new()
-            .route("/doctor/exercise/:display", post(post_exercise))
+            .route("/doctor/exercise/{display}", post(post_exercise))
             .with_state(state);
 
         let response = app
@@ -287,7 +287,7 @@ mod tests {
         });
 
         let app = Router::new()
-            .route("/doctor/exercise/:display", post(post_exercise))
+            .route("/doctor/exercise/{display}", post(post_exercise))
             .with_state(test_web_state(ctl_tx));
         let response = app
             .oneshot(
@@ -340,7 +340,7 @@ mod tests {
         });
 
         let app = Router::new()
-            .route("/doctor/exercise/:display", post(post_exercise))
+            .route("/doctor/exercise/{display}", post(post_exercise))
             .with_state(test_web_state(ctl_tx));
         let response = app
             .oneshot(
@@ -403,7 +403,7 @@ mod tests {
             }
         });
         let response = Router::new()
-            .route("/doctor/exercise/:display", post(post_exercise))
+            .route("/doctor/exercise/{display}", post(post_exercise))
             .with_state(test_web_state(ctl_tx))
             .oneshot(
                 Request::post("/doctor/exercise/main")

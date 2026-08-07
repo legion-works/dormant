@@ -1,3 +1,4 @@
+import datetime
 import importlib.util
 import pathlib
 import subprocess
@@ -336,6 +337,32 @@ class ExtractTests(unittest.TestCase):
 
 
 class CoverageGateTests(unittest.TestCase):
+    def test_normalizer_preserves_period_after_linked_citations(self):
+        # CHANGELOG.md uses `text (#refs).` 26 times and `text. (#refs)` zero times.
+        cited_before_period = (
+            "MQTT hook actions now publish through the configured sensor-plane broker "
+            "and credentials, including after configuration reloads "
+            "([#230](https://example.test/230), [#238](https://example.test/238))."
+        )
+        cited_after_period = (
+            "MQTT hook actions now publish through the configured sensor-plane broker "
+            "and credentials, including after configuration reloads. "
+            "([#230](https://example.test/230), [#238](https://example.test/238))"
+        )
+        uncited = (
+            "MQTT hook actions now publish through the configured sensor-plane broker "
+            "and credentials, including after configuration reloads."
+        )
+
+        self.assertEqual(
+            release_prep._normalize_coverage_text(cited_before_period),
+            release_prep._normalize_coverage_text(uncited),
+        )
+        self.assertEqual(
+            release_prep._normalize_coverage_text(cited_after_period),
+            release_prep._normalize_coverage_text(uncited),
+        )
+
     def test_v012_truncated_section_reports_every_missing_emitted_entry(self):
         fragments = _fixture_fragments("v0_12_0")
         entry = release_prep._compile_entry(fragments)
@@ -362,6 +389,7 @@ class CoverageGateTests(unittest.TestCase):
         fragments = _fixture_fragments("v0_12_0")
         entry = release_prep._compile_entry(fragments)
 
+        # The historical repair dropped entries and reworded prose; strict coverage rejects both.
         errors = release_prep._coverage_errors(
             entry, _fixture_text("v0_12_0_curated_section.md"),
         )
@@ -478,6 +506,12 @@ class CitationTests(unittest.TestCase):
 
 
 class WriteModeTests(unittest.TestCase):
+    # `--write` stamps the entry with today's UTC date, so the expected text
+    # has to be built from the same clock the script reads. A literal date
+    # here passes until the day it was written rolls over, then fails
+    # permanently.
+    TODAY = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+
     def test_write_preserves_exact_changelog_spacing(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
@@ -505,7 +539,7 @@ class WriteModeTests(unittest.TestCase):
                 "All notable changes to `dormant` are recorded here.\n\n"
                 "The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), "
                 "and the project aims at [Semantic Versioning](https://semver.org/spec/v2.0.0.html).\n\n"
-                "## [0.12.1] - 2026-08-06\n\n"
+                f"## [0.12.1] - {self.TODAY}\n\n"
                 "### Fixed\n\n"
                 "- fixed thing\n\n"
                 "## [0.12.0] - 2026-08-06\n\n"
@@ -539,9 +573,40 @@ class WriteModeTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             content = changelog.read_text(encoding="utf-8")
-            self.assertIn("## [0.12.1] - 2026-08-06", content)
+            self.assertIn(f"## [0.12.1] - {self.TODAY}", content)
             self.assertLess(content.index("## [0.12.1]"), content.index("## [0.12.0]"))
             self.assertIn("- fixed thing", content)
+
+    def test_write_output_with_citations_round_trips_coverage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            fragment_dir = root / "fragments"
+            fragment_dir.mkdir()
+            fragment = fragment_dir / "fix.md"
+            fragment.write_text(
+                "---\nkind: fix\nsurfaces: []\nissues: [1]\n---\nDetail: fixed thing\n",
+                encoding="utf-8",
+            )
+            changelog = root / "CHANGELOG.md"
+            changelog.write_text(
+                "# Changelog\n\n"
+                "The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), "
+                "and the project aims at [Semantic Versioning](https://semver.org/spec/v2.0.0.html).\n\n"
+                "## [0.12.0] - 2026-08-06\n\n### Fixed\n- old\n",
+                encoding="utf-8",
+            )
+
+            result = _run_release_prep(
+                "--fragment-dir", str(fragment_dir), "--changelog", str(changelog), "--write",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            fm, body = release_prep.parse_front_matter(fragment.read_text(encoding="utf-8"))
+            entry = release_prep._compile_entry([(fragment, fm, body)])
+            section = release_prep._extract_newest_version_section(
+                changelog.read_text(encoding="utf-8"),
+            )
+            self.assertEqual(release_prep._coverage_errors(entry, section), [])
 
     def test_write_refuses_duplicate_version(self):
         with tempfile.TemporaryDirectory() as tmp:

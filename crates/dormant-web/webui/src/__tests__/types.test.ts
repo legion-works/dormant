@@ -52,6 +52,7 @@ describe("enum arrays match Rust serde wire strings", () => {
       "sensor_changed",
       "zone_changed",
       "display_phase",
+      "pause_changed",
       "config_reloaded",
       "wake_retry",
       "config_reload_rejected",

@@ -590,6 +590,15 @@ pub enum DaemonEvent {
         /// The literal cause of the transition.
         cause: String,
     },
+    /// Manual or scheduled pause state changed for a display.
+    PauseChanged {
+        /// The display whose pause state changed.
+        display: DisplayId,
+        /// Whether blanking is currently paused.
+        paused: bool,
+        /// Rule scope of the pause; `None` denotes a global pause.
+        rule: Option<RuleId>,
+    },
     /// Configuration has been (re)loaded.
     ConfigReloaded,
     /// A wake command failed and a retry was scheduled.
@@ -1156,6 +1165,8 @@ pub struct RulesEngine {
     zone_rules: HashMap<ZoneId, Vec<RuleId>>,
     /// Sensors that are currently paused at the rule level (skip blanking).
     paused_rules: HashSet<RuleId>,
+    /// Pause source scope retained so auto-resume events identify their rule.
+    paused_scopes: HashMap<DisplayId, Option<RuleId>>,
     /// Per-rule inhibitor bookkeeping (kind → engaged, plus the OR-derived
     /// effective bit). A rule absent from this map has never received a
     /// [`ControlMsg::SetInhibited`] — equivalent to an all-`false`
@@ -1345,6 +1356,7 @@ impl RulesEngine {
             rule_displays,
             zone_rules,
             paused_rules: HashSet::new(),
+            paused_scopes: HashMap::new(),
             inhibitor_state: HashMap::new(),
             holds,
             wake_attempts: HashMap::new(),
@@ -1910,6 +1922,9 @@ impl RulesEngine {
         }
         let until_tick = until.and_then(map_timestamp_to_tick);
         for d in targets {
+            if self.machines.contains_key(&d) {
+                self.paused_scopes.insert(d.clone(), rule.cloned());
+            }
             self.step_one(&d, Input::Pause { until: until_tick });
         }
     }
@@ -2286,13 +2301,30 @@ impl RulesEngine {
         let Some(machine) = self.machines.get_mut(display) else {
             return;
         };
+        let was_paused = machine.overlays().paused.is_some();
         let (effects, transition) = machine.step_with_transition(input, now);
+        let is_paused = machine.overlays().paused.is_some();
         if let Some((old_phase, new_phase)) = transition {
             self.emit_phase_transition(display, old_phase, new_phase);
+        }
+        if was_paused != is_paused {
+            let rule = self.paused_scopes.get(display).cloned().flatten();
+            self.emit_pause_changed(display, is_paused, rule);
+            if !is_paused {
+                self.paused_scopes.remove(display);
+            }
         }
         for effect in effects {
             self.process_effect(display, effect);
         }
+    }
+
+    fn emit_pause_changed(&self, display: &DisplayId, paused: bool, rule: Option<RuleId>) {
+        let _ = self.event_tx.send(DaemonEvent::PauseChanged {
+            display: display.clone(),
+            paused,
+            rule,
+        });
     }
 
     fn emit_phase_transition(
@@ -4928,6 +4960,216 @@ mod tests {
         }
     }
 
+    fn subscribed_manual_engine(
+        display: DisplayId,
+    ) -> (RulesEngine, broadcast::Receiver<DaemonEvent>) {
+        let mut engine = manual_display_engine(
+            display,
+            HashMap::new(),
+            Arc::new(crate::ownership::AlwaysOwned),
+        );
+        let (sub_tx, mut sub_rx) = oneshot::channel();
+        engine.handle_control(ControlMsg::SubscribeEvents(sub_tx));
+        (
+            engine,
+            sub_rx.try_recv().expect("subscription reply sent inline"),
+        )
+    }
+
+    #[test]
+    fn pause_changed_active_display_emits_paused_true() {
+        let display = DisplayId("mon".into());
+        let (mut engine, mut events) = subscribed_manual_engine(display.clone());
+        assert!(
+            engine.machines.contains_key(&display),
+            "pause target display exists"
+        );
+
+        engine.step_machine(&display, Input::Pause { until: None }, Tick::now());
+        assert!(matches!(
+            events.try_recv(),
+            Ok(DaemonEvent::PauseChanged {
+                paused: true,
+                rule: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn pause_changed_explicit_resume_emits_paused_false() {
+        let display = DisplayId("mon".into());
+        let (mut engine, mut events) = subscribed_manual_engine(display.clone());
+        assert!(
+            engine.machines.contains_key(&display),
+            "resume target display exists"
+        );
+        let now = Tick::now();
+
+        engine.step_machine(&display, Input::Pause { until: None }, now);
+        let _ = events
+            .try_recv()
+            .expect("pause path reached and emitted setup event");
+        engine.step_machine(&display, Input::Resume, now);
+        assert!(matches!(
+            events.try_recv(),
+            Ok(DaemonEvent::PauseChanged {
+                paused: false,
+                rule: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn pause_changed_auto_resume_expiry_emits_paused_false() {
+        let display = DisplayId("mon".into());
+        let (mut engine, mut events) = subscribed_manual_engine(display.clone());
+        assert!(
+            engine.machines.contains_key(&display),
+            "expiry target display exists"
+        );
+        let now = Tick::now();
+        let deadline = Tick(now.0 + Duration::from_secs(1));
+
+        engine.step_machine(
+            &display,
+            Input::Pause {
+                until: Some(deadline),
+            },
+            now,
+        );
+        let _ = events
+            .try_recv()
+            .expect("pause path reached and emitted setup event");
+        engine.step_machine(&display, Input::Tick, deadline);
+        assert!(matches!(
+            events.try_recv(),
+            Ok(DaemonEvent::PauseChanged {
+                paused: false,
+                rule: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn pause_changed_repeated_pause_emits_nothing() {
+        let display = DisplayId("mon".into());
+        let (mut engine, mut events) = subscribed_manual_engine(display.clone());
+        assert!(
+            engine.machines.contains_key(&display),
+            "pause target display exists"
+        );
+        let now = Tick::now();
+
+        engine.step_machine(&display, Input::Pause { until: None }, now);
+        let _ = events
+            .try_recv()
+            .expect("pause path reached and emitted setup event");
+        engine.step_machine(&display, Input::Pause { until: None }, now);
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn pause_changed_repeated_resume_emits_nothing() {
+        let display = DisplayId("mon".into());
+        let (mut engine, mut events) = subscribed_manual_engine(display.clone());
+        assert!(
+            engine.machines.contains_key(&display),
+            "resume target display exists"
+        );
+        let now = Tick::now();
+
+        engine.step_machine(&display, Input::Pause { until: None }, now);
+        let _ = events
+            .try_recv()
+            .expect("pause path reached and emitted setup event");
+        engine.step_machine(&display, Input::Resume, now);
+        let _ = events
+            .try_recv()
+            .expect("resume path reached and emitted setup event");
+        engine.step_machine(&display, Input::Resume, now);
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn pause_changed_per_rule_targets_only_that_rule_and_global_is_unscoped() {
+        let first = DisplayId("first".into());
+        let second = DisplayId("second".into());
+        let (mut engine, mut events) = subscribed_manual_engine(first.clone());
+        let timings = DisplayRuntimeCfg::manual_defaults(Duration::ZERO);
+        let ladder = vec![LadderStage {
+            kind: StageKind::Controller(BlankMode::PowerOff),
+            dwell: None,
+        }];
+        let machine = DisplayStateMachine::new(timings, ladder, Tick::now());
+        engine.machines.insert(second.clone(), machine);
+        engine.cfg.displays.push(DisplayRuntimeCfg {
+            display: second.clone(),
+            blank_mode: BlankMode::PowerOff,
+            ladder: vec![LadderStage {
+                kind: StageKind::Controller(BlankMode::PowerOff),
+                dwell: None,
+            }],
+            timings: DisplayRuntimeCfg::manual_defaults(Duration::ZERO),
+        });
+        let rule_a = RuleId("rule-a".into());
+        let rule_b = RuleId("rule-b".into());
+        engine
+            .rule_displays
+            .insert(rule_a.clone(), vec![first.clone()]);
+        engine.rule_displays.insert(rule_b, vec![second.clone()]);
+        assert!(
+            engine.machines.contains_key(&second),
+            "other rule display exists"
+        );
+
+        engine.handle_pause(Some(&rule_a), None);
+        assert!(matches!(
+            events.try_recv(),
+            Ok(DaemonEvent::PauseChanged { display, paused: true, rule: Some(rule) })
+                if display == first && rule == rule_a
+        ));
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        engine.handle_pause(None, None);
+        let global_event = events
+            .try_recv()
+            .expect("global pause reached other display");
+        assert!(
+            matches!(
+                global_event,
+                DaemonEvent::PauseChanged { ref display, paused: true, rule: None }
+                    if *display == second
+            ),
+            "unexpected global event: {global_event:?}"
+        );
+    }
+
+    #[test]
+    fn pause_changed_wire_tag_and_unknown_are_forward_compatible() {
+        let event = DaemonEvent::PauseChanged {
+            display: DisplayId("mon".into()),
+            paused: true,
+            rule: None,
+        };
+        let json = serde_json::to_value(&event).expect("event serializes");
+        assert_eq!(json["event"], "pause_changed");
+        let unknown: DaemonEvent =
+            serde_json::from_str(r#"{"event":"future_event"}"#).expect("unknown event tolerated");
+        assert!(matches!(unknown, DaemonEvent::Unknown));
+    }
+
     #[test]
     fn old_wear_snapshot_without_attribution_mode_deserializes_as_uniform() {
         let old =
@@ -5264,6 +5506,7 @@ fn install_restored_machine_replaces_phase_and_queues_effects() {
         rule_displays: HashMap::new(),
         zone_rules: HashMap::new(),
         paused_rules: HashSet::new(),
+        paused_scopes: HashMap::new(),
         inhibitor_state: HashMap::new(),
         holds: HashMap::new(),
         wake_attempts: HashMap::new(),
@@ -5371,6 +5614,7 @@ fn install_restored_never_owned_refeed_not_dropped() {
         rule_displays: HashMap::new(),
         zone_rules: HashMap::new(),
         paused_rules: HashSet::new(),
+        paused_scopes: HashMap::new(),
         inhibitor_state: HashMap::new(),
         holds: HashMap::new(),
         wake_attempts: HashMap::new(),

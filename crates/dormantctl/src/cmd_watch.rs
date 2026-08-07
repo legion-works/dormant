@@ -62,6 +62,17 @@ fn fmt_event(event: &DaemonEvent) -> String {
         } => {
             format!("display {display}: {phase} ({cause})")
         }
+        DaemonEvent::PauseChanged {
+            display,
+            paused,
+            rule,
+        } => {
+            format!(
+                "display {display}: {} (rule: {})",
+                if *paused { "paused" } else { "resumed" },
+                rule.as_ref().map_or("global", |r| r.0.as_str()),
+            )
+        }
         DaemonEvent::ConfigReloaded => "config reloaded".to_string(),
         DaemonEvent::WakeRetry { display, attempt } => {
             format!("display {display}: wake retry #{attempt}")

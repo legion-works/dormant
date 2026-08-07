@@ -265,14 +265,16 @@ def _highlight_text_is_redundant(readme_bullet: str, user_prose: str) -> bool:
 
 
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]*\)")
-_TRAILING_CITATIONS_RE = re.compile(r"\s+\((?:\s*#\d+\s*,?)+\)\s*$")
+_TRAILING_CITATIONS_RE = re.compile(
+    r"\s+\((?:\s*#\d+\s*,?)+\)(?P<period>\.)?\s*$", re.MULTILINE,
+)
 _VERSION_HEADING_RE = re.compile(r"^## \[([^\]]+)\]", re.MULTILINE)
 
 
 def _normalize_coverage_text(text: str) -> str:
     """Normalize markdown links, citation groups, and whitespace for matching."""
     text = _MARKDOWN_LINK_RE.sub(r"\1", text)
-    text = _TRAILING_CITATIONS_RE.sub("", text)
+    text = _TRAILING_CITATIONS_RE.sub(r"\g<period>", text)
     return re.sub(r"\s+", " ", text).strip().casefold()
 
 

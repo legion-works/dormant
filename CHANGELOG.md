@@ -4,6 +4,20 @@ All notable changes to `dormant` are recorded here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims at [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.2] - 2026-08-07
+
+### Changed
+
+- The CI rerun guard now accepts an explicitly labelled infrastructure rerun.
+
+### Fixed
+
+- Active-sampling consent requests now open one portal dialog at a time and identify the target display and compositor output before selection. ([#240](https://github.com/legion-works/dormant/issues/240))
+- The changelog coverage gate now recognizes complete entries whose citations appear before final punctuation. ([#244](https://github.com/legion-works/dormant/issues/244))
+- Release notes can no longer silently omit a consumed changelog fragment. ([#244](https://github.com/legion-works/dormant/issues/244))
+- The Linux tray menu now refreshes after daemon state changes instead of staying frozen until a click, and no longer fabricates an unreachable view when the shared tray state is briefly contended. ([#253](https://github.com/legion-works/dormant/issues/253))
+- Pausing or resuming blanking now reaches the tray and web UI immediately. Pause changes no display phase, so it previously emitted no daemon event and left every event-stream consumer showing the stale unpaused state. ([#254](https://github.com/legion-works/dormant/issues/254))
+
 ## [0.12.1] - 2026-08-06
 
 ### Fixed

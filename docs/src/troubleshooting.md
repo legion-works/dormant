@@ -197,7 +197,7 @@ daemon-independent path:
   a queued blank write *after* the fallback restore already fixed the
   display — re-blanking it. If you see the display go black again shortly
   after an emergency wake, stop `dormantd` (or `launchctl kickstart -k` /
-  `systemctl --user restart dormant` it) before rerunning
+   `systemctl --user restart app-dormant` it) before rerunning
   `emergency-wake`.
 
 ## Control-path verification — `dormantctl doctor exercise <display>`
@@ -240,7 +240,7 @@ notification appears.
 limited by `notifications.cooldown`. Desktop notices may also be disabled.
 
 ```bash
-journalctl --user -u dormant -f
+journalctl --user -u app-dormant -f
 ```
 
 Check `notifications.enabled`, the session D-Bus, and `notify_suppressed` /
@@ -290,5 +290,5 @@ Key log events to search for:
 Logs are written to stderr by default. When running under systemd, view them with:
 
 ```bash
-journalctl --user -u dormant -f
+journalctl --user -u app-dormant -f
 ```

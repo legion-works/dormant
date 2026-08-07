@@ -299,7 +299,27 @@ panel:
   side is absent — older records, or older compositors that omit the `position`
   field — the position check is skipped and the dimension check alone remains
   binding. Older on-disk records deserialize with both new fields as `None`, so
-  no migration is required.
+   no migration is required.
+
+### One dialog at a time
+
+The daemon serializes portal consent across all displays and entry points
+(CLI, web UI, and tray). While one dialog is open, an enable for another
+display fails with `wear_sampling_consent_busy: <holder-display>`; finish or
+dismiss the named dialog, then retry.
+
+The portal owns the dialog and cannot identify its target, so two simultaneous
+dialogs have the same title and tile list. Serializing them and naming the
+target makes a grant unambiguous. Before the dialog opens, `dormantctl wear
+enable-sampling` prints `waiting for consent dialog — pick the tile for display
+'tv' (HDMI-A-1) — up to 5 minutes`; the parenthesized name is the display's
+`compositor_output`, and is omitted when that key is unset. The
+`wear_sampling_consent_target` log event carries the same `display` and
+`compositor_output` for a non-interactive record.
+
+`wear_sampling_wrong_monitor` still rejects a crossed grant after it happens;
+the serialized flow makes that crossed grant less likely rather than replacing
+the guard.
 
 Disable in the configuration to close the session while retaining the record:
 

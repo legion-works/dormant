@@ -106,7 +106,7 @@ nothing: the daemon keeps running from the LKG, the banner and crash-loop
 state stay exactly as they were, and no LKG candidate is armed from the
 still-broken bytes.
 
-Restarting the daemon (`systemctl --user restart dormant`) still works and
+Restarting the daemon (`systemctl --user restart app-dormant`) still works and
 remains a safe fallback — for example if the file watcher isn't running for
 some other reason — but it is no longer the required recovery step.
 
@@ -151,7 +151,7 @@ Install the new `dormantd` binary before reloading a unit that changes from
 ```bash
 install -Dm755 target/release/dormantd ~/.local/bin/dormantd
 systemctl --user daemon-reload
-systemctl --user restart dormant
+systemctl --user restart app-dormant
 ```
 
 Reloading the new unit while an old binary is still installed makes systemd

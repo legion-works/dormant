@@ -1535,6 +1535,7 @@ pub fn event_records(cfg: &Config, event: &DaemonEvent, instance: &str) -> Vec<P
         | DaemonEvent::BlankRecovered { .. }
         | DaemonEvent::WakeRecovered { .. }
         | DaemonEvent::Ownership { .. }
+        | DaemonEvent::PauseChanged { .. }
         | DaemonEvent::Unknown => Vec::new(),
     }
 }

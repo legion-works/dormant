@@ -49,6 +49,7 @@ export const DAEMON_EVENT_TAGS = [
   "sensor_changed",
   "zone_changed",
   "display_phase",
+  "pause_changed",
   "config_reloaded",
   "wake_retry",
   "config_reload_rejected",
@@ -292,6 +293,7 @@ export type DaemonEvent =
   | SensorChangedEvent
   | ZoneChangedEvent
   | DisplayPhaseEvent
+  | PauseChangedEvent
   | ConfigReloadedEvent
   | ConfigReloadRejectedEvent
   | WakeRetryEvent
@@ -324,6 +326,14 @@ export interface DisplayPhaseEvent {
   display: string;
   phase: string;
   cause: string;
+}
+
+export interface PauseChangedEvent {
+  /** rust: rules.rs DaemonEvent::PauseChanged */
+  event: "pause_changed";
+  display: string;
+  paused: boolean;
+  rule: string | null;
 }
 
 export interface ConfigReloadedEvent {

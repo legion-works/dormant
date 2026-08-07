@@ -1,3 +1,4 @@
+import datetime
 import importlib.util
 import pathlib
 import subprocess
@@ -505,6 +506,12 @@ class CitationTests(unittest.TestCase):
 
 
 class WriteModeTests(unittest.TestCase):
+    # `--write` stamps the entry with today's UTC date, so the expected text
+    # has to be built from the same clock the script reads. A literal date
+    # here passes until the day it was written rolls over, then fails
+    # permanently.
+    TODAY = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+
     def test_write_preserves_exact_changelog_spacing(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
@@ -532,7 +539,7 @@ class WriteModeTests(unittest.TestCase):
                 "All notable changes to `dormant` are recorded here.\n\n"
                 "The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), "
                 "and the project aims at [Semantic Versioning](https://semver.org/spec/v2.0.0.html).\n\n"
-                "## [0.12.1] - 2026-08-06\n\n"
+                f"## [0.12.1] - {self.TODAY}\n\n"
                 "### Fixed\n\n"
                 "- fixed thing\n\n"
                 "## [0.12.0] - 2026-08-06\n\n"
@@ -566,7 +573,7 @@ class WriteModeTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             content = changelog.read_text(encoding="utf-8")
-            self.assertIn("## [0.12.1] - 2026-08-06", content)
+            self.assertIn(f"## [0.12.1] - {self.TODAY}", content)
             self.assertLess(content.index("## [0.12.1]"), content.index("## [0.12.0]"))
             self.assertIn("- fixed thing", content)
 

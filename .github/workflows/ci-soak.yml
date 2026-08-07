@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
@@ -67,14 +67,14 @@ jobs:
         run: python3 scripts/ci/update_flake_issue.py --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" --os-image ubuntu-24.04 --commit-sha "${{ github.sha }}" < target/soak-linux-daemon/classifications.jsonl
       - name: Upload soak JUnit
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: soak-linux-daemon-junit
           path: target/nextest/soak/junit.xml
           if-no-files-found: warn
       - name: Upload soak command output
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: soak-linux-daemon-output
           path: target/soak-linux-daemon
@@ -85,7 +85,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
@@ -129,14 +129,14 @@ jobs:
         run: python3 scripts/ci/update_flake_issue.py --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" --os-image ubuntu-24.04 --commit-sha "${{ github.sha }}" < target/soak-linux-mqtt/classifications.jsonl
       - name: Upload soak JUnit
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: soak-linux-mqtt-junit
           path: target/nextest/soak/junit.xml
           if-no-files-found: warn
       - name: Upload soak command output
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: soak-linux-mqtt-output
           path: target/soak-linux-mqtt
@@ -147,7 +147,7 @@ jobs:
     runs-on: macos-14
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
@@ -195,14 +195,14 @@ jobs:
         run: python3 scripts/ci/update_flake_issue.py --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" --os-image macos-14 --commit-sha "${{ github.sha }}" < target/soak-macos-fixed/classifications.jsonl
       - name: Upload soak JUnit
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: soak-macos-fixed-junit
           path: target/nextest/soak/junit.xml
           if-no-files-found: warn
       - name: Upload soak command output
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: soak-macos-fixed-output
           path: target/soak-macos-fixed
@@ -214,7 +214,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
@@ -262,14 +262,14 @@ jobs:
         run: python3 scripts/ci/update_flake_issue.py --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" --os-image macos-latest --commit-sha "${{ github.sha }}" < target/soak-macos-latest/classifications.jsonl
       - name: Upload soak JUnit
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: soak-macos-latest-junit
           path: target/nextest/soak/junit.xml
           if-no-files-found: warn
       - name: Upload soak command output
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: soak-macos-latest-output
           path: target/soak-macos-latest
@@ -280,7 +280,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
@@ -291,14 +291,14 @@ jobs:
         run: bash scripts/ci/run-hermeticity-stress.sh --platform Linux --stress-count 100
       - name: Upload first hermeticity process artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: hermeticity-stress-ubuntu-process-one
           path: target/hermeticity-stress/process-one
           if-no-files-found: warn
       - name: Upload second hermeticity process artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: hermeticity-stress-ubuntu-process-two
           path: target/hermeticity-stress/process-two
@@ -309,7 +309,7 @@ jobs:
     runs-on: macos-14
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
@@ -319,14 +319,14 @@ jobs:
         run: bash scripts/ci/run-hermeticity-stress.sh --platform Darwin --stress-count 100
       - name: Upload first hermeticity process artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: hermeticity-stress-macos-process-one
           path: target/hermeticity-stress/process-one
           if-no-files-found: warn
       - name: Upload second hermeticity process artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: hermeticity-stress-macos-process-two
           path: target/hermeticity-stress/process-two

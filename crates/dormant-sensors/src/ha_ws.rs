@@ -1,5 +1,7 @@
 //! Home Assistant WebSocket sensor source — subscribes to entity state via the
-//! HA `subscribe_entities` API and maps state changes to [`PresenceEvent`]s.
+//! HA `subscribe_entities` API and maps state changes to [`PresenceEvent`]s. The
+//! event payload handles `a` (added entities), `c` (changed entities), and `r`
+//! (removed entity IDs).
 //!
 //! ## Architecture
 //!
@@ -377,7 +379,8 @@ impl HaProtocol {
     ///
     /// The event payload contains `a` (add — full state) and `c` (change —
     /// partial state) maps.  Each key is an `entity_id`, and the value contains
-    /// an `"s"` field with the state string.
+    /// an `"s"` field with the state string.  The `r` (remove) payload is a list
+    /// of removed `entity_id` strings.
     fn handle_event(&mut self, value: &serde_json::Value) -> Vec<Action> {
         let Some(event) = value.get("event") else {
             return vec![Action::Nothing];
@@ -401,7 +404,42 @@ impl HaProtocol {
             }
         }
 
+        // Process "r" (remove — a list of entity IDs, not a map).
+        if let Some(removals) = event.get("r").and_then(|v| v.as_array()) {
+            for entity_id in removals.iter().filter_map(serde_json::Value::as_str) {
+                self.process_entity_removal(entity_id, &mut actions);
+            }
+        }
+
         actions
+    }
+
+    /// Mark every sensor watching a removed entity as unavailable.
+    fn process_entity_removal(&self, entity_id: &str, actions: &mut Vec<Action>) {
+        let sensor_ids: Vec<SensorId> = self
+            .entities
+            .iter()
+            .filter(|(_, e)| e == entity_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        if sensor_ids.is_empty() {
+            return;
+        }
+
+        warn!(
+            "ha-ws: entity '{entity_id}' was removed by Home Assistant; marking sensors unavailable"
+        );
+
+        // Unavailable is fail-safe: the zone engine treats it as present, so a
+        // deleted entity cannot make the room blank while its state is unknown.
+        for sensor_id in sensor_ids {
+            actions.push(Action::Emit(PresenceEvent::new(
+                sensor_id,
+                SensorState::Unavailable,
+                Timestamp::now(),
+            )));
+        }
     }
 
     /// Map an entity state value to actions.
@@ -775,6 +813,144 @@ mod tests {
             .collect();
         sensor_ids.sort_unstable();
         assert_eq!(sensor_ids, vec!["motion_a", "motion_b"]);
+    }
+
+    #[test]
+    fn removal_event_maps_to_unavailable() {
+        let mut proto = make_protocol();
+
+        let _ = proto.handle_message(r#"{"type":"auth_required"}"#);
+        let _ = proto.handle_message(r#"{"type":"auth_ok"}"#);
+
+        let actions =
+            proto.handle_message(r#"{"type":"event","event":{"r":["binary_sensor.test_motion"]}}"#);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            Action::Emit(event) => {
+                assert_eq!(event.sensor_id, SensorId("motion".into()));
+                assert_eq!(event.state, SensorState::Unavailable);
+            }
+            other => panic!("expected Emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn removal_event_fans_out_to_two_sensors() {
+        let mut proto = HaProtocol::new(
+            "tok".into(),
+            vec![
+                (SensorId("motion_a".into()), "binary_sensor.shared".into()),
+                (SensorId("motion_b".into()), "binary_sensor.shared".into()),
+            ],
+        );
+
+        let _ = proto.handle_message(r#"{"type":"auth_required"}"#);
+        let _ = proto.handle_message(r#"{"type":"auth_ok"}"#);
+
+        let actions =
+            proto.handle_message(r#"{"type":"event","event":{"r":["binary_sensor.shared"]}}"#);
+        assert_eq!(actions.len(), 2, "both sensors should receive removal");
+
+        let mut sensor_ids: Vec<&str> = actions
+            .iter()
+            .map(|a| match a {
+                Action::Emit(event) => {
+                    assert_eq!(event.state, SensorState::Unavailable);
+                    event.sensor_id.0.as_str()
+                }
+                _ => panic!("expected Emit"),
+            })
+            .collect();
+        sensor_ids.sort_unstable();
+        assert_eq!(sensor_ids, vec!["motion_a", "motion_b"]);
+    }
+
+    #[test]
+    fn removal_event_for_unknown_entity_is_ignored() {
+        let mut proto = make_protocol();
+
+        let _ = proto.handle_message(r#"{"type":"auth_required"}"#);
+        let _ = proto.handle_message(r#"{"type":"auth_ok"}"#);
+
+        // The frame names BOTH an unsubscribed entity and a subscribed one.
+        // Asserting only "the unknown produced nothing" would pass just as
+        // well if `r` were not handled at all, so the known entity's event is
+        // what proves the handler was actually reached.
+        let actions = proto.handle_message(
+            r#"{"type":"event","event":{"r":["binary_sensor.unknown","binary_sensor.test_motion"]}}"#,
+        );
+
+        assert_eq!(
+            actions.len(),
+            1,
+            "exactly the subscribed entity should emit: {actions:?}"
+        );
+        match &actions[0] {
+            Action::Emit(event) => {
+                assert_eq!(event.sensor_id.0, "motion");
+                assert_eq!(event.state, SensorState::Unavailable);
+            }
+            other => panic!("expected Emit for the subscribed entity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_removal_event_is_ignored() {
+        let mut proto = make_protocol();
+
+        let _ = proto.handle_message(r#"{"type":"auth_required"}"#);
+        let _ = proto.handle_message(r#"{"type":"auth_ok"}"#);
+
+        for raw in [
+            // `r` as a map rather than a list — the shape mistake that would
+            // silently skip the key.
+            r#"{"type":"event","event":{"r":{"binary_sensor.test_motion":"bad"}}}"#,
+            // `r` as a list of non-strings.
+            r#"{"type":"event","event":{"r":[42]}}"#,
+        ] {
+            let actions = proto.handle_message(raw);
+            assert!(actions.is_empty(), "malformed removal should be ignored");
+        }
+
+        // Control: a WELL-FORMED removal on the same protocol instance must
+        // still emit. Without this the assertions above pass unchanged when
+        // `r` is not handled at all — the malformed cases would be "ignored"
+        // for the wrong reason.
+        let actions =
+            proto.handle_message(r#"{"type":"event","event":{"r":["binary_sensor.test_motion"]}}"#);
+        assert_eq!(
+            actions.len(),
+            1,
+            "a well-formed removal must still emit after malformed ones: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn add_change_and_removal_events_coexist() {
+        let mut proto = make_protocol();
+
+        let _ = proto.handle_message(r#"{"type":"auth_required"}"#);
+        let _ = proto.handle_message(r#"{"type":"auth_ok"}"#);
+
+        let actions = proto.handle_message(
+            r#"{"type":"event","event":{"a":{"binary_sensor.test_motion":{"s":"on"}},"c":{"binary_sensor.test_motion":{"+":{"s":"off"}}},"r":["binary_sensor.test_motion"]}}"#,
+        );
+        assert_eq!(
+            actions.len(),
+            3,
+            "all three event sections should be processed"
+        );
+
+        let states: Vec<SensorState> = actions
+            .iter()
+            .map(|action| match action {
+                Action::Emit(event) => event.state,
+                _ => panic!("expected Emit"),
+            })
+            .collect();
+        assert!(states.contains(&SensorState::Present));
+        assert!(states.contains(&SensorState::Absent));
+        assert!(states.contains(&SensorState::Unavailable));
     }
 
     #[test]

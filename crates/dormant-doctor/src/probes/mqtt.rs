@@ -48,9 +48,10 @@ pub(crate) async fn probe_mqtt_one(
         return ProbeResult::fail(name, format!("subscribe failed: {e}"));
     }
 
-    // Wait up to 10s for a retained/live message.
+    // Wait up to 10s for a live message, retaining any parseable broker value
+    // so a retained-only topic is reported distinctly after the window.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    let mut found: Option<SensorState> = None;
+    let mut found: Option<(SensorState, bool)> = None;
     let mut broker_connected = false;
     // Track the credential lookup result for auth-failure detail.
     let credential_lookup = creds.mqtt.get(&cfg.broker_url);
@@ -63,8 +64,10 @@ pub(crate) async fn probe_mqtt_one(
             Ok(Ok(rumqttc::Event::Incoming(rumqttc::Packet::Publish(publish)))) => {
                 let state = parse_payload(cfg, &publish.payload);
                 if let Some(s) = state {
-                    found = Some(s);
-                    break;
+                    found = Some((s, publish.retain));
+                    if !publish.retain {
+                        break;
+                    }
                 }
             }
             Ok(Ok(rumqttc::Event::Incoming(rumqttc::Packet::ConnAck(_)))) => {
@@ -91,35 +94,53 @@ pub(crate) async fn probe_mqtt_one(
 
     let _ = client.disconnect().await;
 
-    match found {
-        Some(state) => {
-            let state_str = match state {
-                SensorState::Present => "present",
-                SensorState::Absent => "absent",
-                SensorState::Unavailable => "unavailable",
-            };
-            ProbeResult::pass(name, format!("topic '{}' reports {state_str}", cfg.topic))
-        }
-        None => {
-            if broker_connected {
-                ProbeResult::skip(
-                    name,
-                    format!(
-                        "no message in 10s on '{}' — on-change sensors are quiet when state is stable; not a failure",
-                        cfg.topic,
-                    ),
-                )
-            } else {
-                ProbeResult::fail(
-                    name,
-                    "broker connection failed (no CONNACK received)".to_string(),
-                )
-            }
-        }
-    }
+    classify(name, &cfg.topic, found, broker_connected)
 }
 
 // ── Pure helpers — testable without a broker ─────────────────────────────────────
+
+fn classify(
+    name: impl Into<String>,
+    topic: &str,
+    found: Option<(SensorState, bool)>,
+    broker_connected: bool,
+) -> ProbeResult {
+    let name = name.into();
+    match found {
+        Some((state, false)) => ProbeResult::pass(
+            name,
+            format!(
+                "topic '{topic}' reports {} (observed live)",
+                state_label(state)
+            ),
+        ),
+        Some((state, true)) => ProbeResult::skip(
+            name,
+            format!(
+                "topic '{topic}' has retained value '{}' but nothing was published during the 10s probe window — if this on-change sensor has no heartbeat, the daemon will mark it stale after stale_timeout; state may be stable",
+                state_label(state),
+            ),
+        ),
+        None if broker_connected => ProbeResult::skip(
+            name,
+            format!(
+                "no message in 10s on '{topic}' — on-change sensors are quiet when state is stable; not a failure"
+            ),
+        ),
+        None => ProbeResult::fail(
+            name,
+            "broker connection failed (no CONNACK received)".to_string(),
+        ),
+    }
+}
+
+fn state_label(state: SensorState) -> &'static str {
+    match state {
+        SensorState::Present => "present",
+        SensorState::Absent => "absent",
+        SensorState::Unavailable => "unavailable",
+    }
+}
 
 /// Build `MqttOptions` for a doctor probe, applying credentials when
 /// `creds.mqtt` has an entry keyed by the exact `cfg.broker_url`.
@@ -190,6 +211,69 @@ mod tests {
             availability_payload_online: "online".into(),
             availability_payload_offline: "offline".into(),
         }
+    }
+
+    // ── classify ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn classify_live_message_passes_as_observed_live() {
+        let result = classify(
+            "mqtt desk",
+            "sensors/desk",
+            Some((SensorState::Present, false)),
+            true,
+        );
+
+        assert_eq!(result.status, crate::types::ProbeStatus::Pass);
+        assert_eq!(
+            result.detail,
+            "topic 'sensors/desk' reports present (observed live)"
+        );
+    }
+
+    #[test]
+    fn classify_retained_only_message_skips_with_staleness_warning() {
+        let result = classify(
+            "mqtt desk",
+            "sensors/desk",
+            Some((SensorState::Absent, true)),
+            true,
+        );
+
+        assert_eq!(result.status, crate::types::ProbeStatus::Skip);
+        assert!(result.detail.contains("retained value 'absent'"));
+        assert!(
+            result
+                .detail
+                .contains("nothing was published during the 10s probe window")
+        );
+        assert!(
+            result
+                .detail
+                .contains("daemon will mark it stale after stale_timeout")
+        );
+    }
+
+    #[test]
+    fn classify_no_message_with_connected_broker_skips() {
+        let result = classify("mqtt desk", "sensors/desk", None, true);
+
+        assert_eq!(result.status, crate::types::ProbeStatus::Skip);
+        assert_eq!(
+            result.detail,
+            "no message in 10s on 'sensors/desk' — on-change sensors are quiet when state is stable; not a failure"
+        );
+    }
+
+    #[test]
+    fn classify_no_message_without_connected_broker_fails() {
+        let result = classify("mqtt desk", "sensors/desk", None, false);
+
+        assert_eq!(result.status, crate::types::ProbeStatus::Fail);
+        assert_eq!(
+            result.detail,
+            "broker connection failed (no CONNACK received)"
+        );
     }
 
     // ── parse_broker_url ──────────────────────────────────────────────────────

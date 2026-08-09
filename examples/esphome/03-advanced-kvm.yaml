@@ -1,9 +1,24 @@
-# Reference config — verify component options against your ESPHome version.
+# Tier 3 — advanced KVM integration for one keyboard and two machines.
 #
 # HLK-LD2410C 24GHz mmWave presence sensor on ESP32-C6 with WiFi + MQTT.
-# Publishes occupancy binary_sensors over MQTT; dormant consumes the
-# `desk_seated` topic (energy-gated) or `desk_near` (distance-gated)
-# via its MQTT sensor source.
+# Publishes occupancy binary_sensors over MQTT and the native ESPHome API;
+# dormant should consume the energy-gated `desk_seated` topic for the desk.
+# `desk_seated` is preferred over `desk_near`: close-range gate 0/1 presence
+# can read absent while still-energy remains a reliable occupied signal.
+# Shipped calibration defaults are near_cutoff 1.6 m and still_energy_floor 28.
+# They came from measuring still-energy per scenario (away/seated/standing) and
+# choosing a floor that splits the worst-present from the best-absent reading.
+#
+# KVM contract: dormant publishes `desktop` or `mac` to
+# `dormant/kvm/usb-target` from a display hook. The ESP pulses GPIO3 to press
+# the physical KVM button, then `usb_owner_one` reads the resulting owner on
+# GPIO2. A payload naming the current owner is a no-op. This requires physical
+# wiring: GPIO3 drives the KVM button input and GPIO2 reads its owner signal.
+# Matching dormant config on the host:
+#
+# [displays.<id>.hooks]
+# after_acquire = [{ mqtt = { topic = "dormant/kvm/usb-target", payload = "desktop" }, timeout = "5s", blocking = false }]
+# after_release = [{ mqtt = { topic = "dormant/kvm/usb-target", payload = "mac" },     timeout = "5s", blocking = false }]
 #
 # This is one of two supported topologies for the same radar (see
 # docs/src/sensors.md "Two ways to wire the LD2410C"): the ESP carries the
@@ -79,6 +94,15 @@ mqtt:
     topic: ${device_name}/status
     payload: offline
     retain: true
+  on_message:
+    - topic: dormant/kvm/usb-target
+      then:
+        - lambda: |-
+            const std::string want = x;
+            const bool desktop_owns = id(usb_owner_one).state;
+            if ((want == "desktop" && !desktop_owns) || (want == "mac" && desktop_owns)) {
+              id(usb_press).execute();
+            }
 
 uart:
   tx_pin: GPIO20
@@ -86,6 +110,44 @@ uart:
   baud_rate: 256000
 
 ld2410:
+
+output:
+  - platform: gpio
+    id: usb_press_pin
+    pin: GPIO3
+
+switch:
+  - platform: output
+    id: usb_press_raw
+    output: usb_press_pin
+    internal: true
+  - platform: template
+    id: usb_input_one
+    name: "USB Input One"
+    lambda: |-
+      return id(usb_owner_one).state;
+    turn_on_action:
+      - if:
+          condition:
+            lambda: |-
+              return !id(usb_owner_one).state;
+          then:
+            - script.execute: usb_press
+    turn_off_action:
+      - if:
+          condition:
+            lambda: |-
+              return id(usb_owner_one).state;
+          then:
+            - script.execute: usb_press
+
+script:
+  - id: usb_press
+    mode: single
+    then:
+      - switch.turn_on: usb_press_raw
+      - delay: 120ms
+      - switch.turn_off: usb_press_raw
 
 binary_sensor:
   - platform: ld2410
@@ -100,6 +162,14 @@ binary_sensor:
       name: "${friendly_name} Still"
       device_class: occupancy
 
+  - platform: gpio
+    id: usb_owner_one
+    name: "USB Owner One"
+    pin:
+      number: GPIO2
+      mode: { input: true, pulldown: true }
+    filters: [ { delayed_on: 50ms }, { delayed_off: 50ms } ]
+
   # 1D distance zones: a radial partition at a runtime-tunable cutoff. The
   # LD2410C reports one target along a single axis (distance), so it cannot do
   # 2D X/Y zones like an LD2450 — but near/far is most of the value for a desk.
@@ -113,6 +183,7 @@ binary_sensor:
       return id(det_dist).raw_state <= id(near_cutoff).state * 100.0f;
     filters:
       - delayed_off: 5s
+
   - platform: template
     name: "${friendly_name} Room Far"
     device_class: occupancy
@@ -122,6 +193,7 @@ binary_sensor:
       return id(det_dist).raw_state > id(near_cutoff).state * 100.0f;
     filters:
       - delayed_off: 5s
+
   # Energy-gated desk presence: the LD2410C's presence flags can read
   # absent at close range (gate 0/1 have no static sensitivity) and can
   # glitch on distance. This template bypasses both — if still-energy
@@ -145,6 +217,10 @@ binary_sensor:
     filters:
       - delayed_off: 5s
 
+# Temporary calibration aid (disabled): add per-gate `g0`–`g8` `move_energy`
+# and `still_energy` sensors under the ld2410 sensor platform while tuning.
+# Leaving those 18 entities enabled cost 81% of a Home Assistant recorder's
+# rows with nothing subscribing. Re-add only for a bounded calibration run.
 # Diagnostic/tuning sensors — throttled so MQTT traffic stays sane.
 sensor:
   - platform: ld2410

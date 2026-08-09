@@ -13,7 +13,9 @@ reproduction = "cargo nextest run -p dormant-displays --lib --stress-count 100 -
 root_cause = "The assertion measured the scheduler, not the lock. A 15ms stagger into a 60ms delay left roughly 5ms of margin before the 40ms bound; on a shared macOS runner the stagger and t1's lock acquisition drift enough to close it (observed 38.365208ms in run 31135976767, and again in 31162098104). The panel lock was correct in both failures."
 fix_pr = "https://github.com/legion-works/dormant/pull/261"
 proving_test = "vcp_ops::tests::command_priority_serializes_two_concurrent_transactions"
-soak_evidence = ["https://github.com/legion-works/dormant/pull/261"]
+soak_evidence = [
+  "https://github.com/legion-works/dormant/actions/runs/31309125912",
+]
 status = "fixed"
 # The classifier signature is not a usable recurrence key for this incident:
 # it hashes the panic message, which embeds the measured elapsed time, so every

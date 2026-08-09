@@ -293,3 +293,11 @@ interval:
           payload: !lambda |-
             return id(desk_seated).state ? std::string("ON") : std::string("OFF");
           retain: true
+      # Occupancy is heartbeaten too: a zone may use desk_seated while a
+      # second rule watches plain occupancy, and a topic without a heartbeat
+      # goes stale on its own schedule regardless of what the others do.
+      - mqtt.publish:
+          topic: ${device_name}/binary_sensor/desk_presence_occupancy/state
+          payload: !lambda |-
+            return id(has_tgt).state ? std::string("ON") : std::string("OFF");
+          retain: true

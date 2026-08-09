@@ -85,3 +85,26 @@ binary_sensor:
     has_still_target:
       name: "${friendly_name} Still"
       device_class: occupancy
+
+# ——— Active heartbeat ——————————————————————————————————————————
+# Not optional, even in the minimal tier. MQTT only publishes on CHANGE, so
+# an empty room produces one OFF and then silence — indistinguishable from a
+# dead device. dormant's default stale_timeout is 300s; past that the sensor
+# becomes unavailable, which the zone engine treats as PRESENT (fail-safe),
+# and the screen stops blanking until the device speaks again.
+#
+# Re-publishing every 5 minutes makes silence mean "device gone" rather than
+# "occupant still". Set dormant's stale_timeout a little over one heartbeat
+# (e.g. "6m").
+interval:
+  - interval: 5min
+    then:
+      - mqtt.publish:
+          # The path segment after binary_sensor/ is the snake_cased
+          # friendly_name plus the sensor name — update it if you change
+          # friendly_name above, or the heartbeat lands on a topic nothing
+          # is subscribed to.
+          topic: ${device_name}/binary_sensor/desk_presence_occupancy/state
+          payload: !lambda |-
+            return id(has_tgt).state ? std::string("ON") : std::string("OFF");
+          retain: true

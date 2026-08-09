@@ -427,6 +427,7 @@ jobs:
           tool: cargo-nextest@0.9.131
       - run: python3 scripts/ci/verify_nextest_policy.py --nextest-version 0.9.131
       - run: python3 scripts/ci/check_flake_ledger.py .github/flake-ledger.toml
+      - run: python3 scripts/ci/check_soak_parity.py
       - run: python3 scripts/ci/check_run_attempt_guards.py .github/workflows/ci.yml
       - run: python3 scripts/ci/check_gate_parity.py --ci .github/workflows/ci.yml --lefthook lefthook.yml --manifest scripts/gates/parity.txt
       - run: python3 -m unittest discover -s scripts/ci/tests -p 'test_*.py'

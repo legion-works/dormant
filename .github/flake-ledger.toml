@@ -4,6 +4,7 @@ schema_version = 1
 [[incident]]
 id = "FLAKE-2026-08-05-VCP-COMMAND-PRIORITY"
 test = "vcp_ops::tests::command_priority_serializes_two_concurrent_transactions"
+first_seen = "2026-08-05"
 signature = "sha256:37b6ea4ad3dfa105a37cd62771b9148262549ea9d2f241a6af378577705ddb2c"
 first_run_url = "https://github.com/legion-works/dormant/actions/runs/31033439943"
 last_run_url = "https://github.com/legion-works/dormant/actions/runs/31162098104"
@@ -12,7 +13,9 @@ reproduction = "cargo nextest run -p dormant-displays --lib --stress-count 100 -
 root_cause = "The assertion measured the scheduler, not the lock. A 15ms stagger into a 60ms delay left roughly 5ms of margin before the 40ms bound; on a shared macOS runner the stagger and t1's lock acquisition drift enough to close it (observed 38.365208ms in run 31135976767, and again in 31162098104). The panel lock was correct in both failures."
 fix_pr = "https://github.com/legion-works/dormant/pull/261"
 proving_test = "vcp_ops::tests::command_priority_serializes_two_concurrent_transactions"
-soak_evidence = ["https://github.com/legion-works/dormant/pull/261"]
+soak_evidence = [
+  "https://github.com/legion-works/dormant/actions/runs/31309125912",
+]
 status = "fixed"
 # The classifier signature is not a usable recurrence key for this incident:
 # it hashes the panic message, which embeds the measured elapsed time, so every
@@ -22,6 +25,7 @@ status = "fixed"
 [[incident]]
 id = "FLAKE-0009"
 test = "daemon_smoke::manual_only_display_full_lifecycle_across_reload"
+first_seen = "2026-07-19"
 signature = "sha256:af2735473577639aa28799efd8f8640f00d6b21f8747b134ac81fa4f0b317bb5"
 first_run_url = ""
 last_run_url = ""
@@ -36,6 +40,7 @@ status = "open"
 [[incident]]
 id = "FLAKE-0047"
 test = "boot_rollback::bad_config_with_lkg_immediate_rollback"
+first_seen = "2026-07-19"
 signature = "sha256:f184e0efb5599a8d44ec19f312cd6c967a0e6a0698874d1306739398dc8c3106"
 first_run_url = ""
 last_run_url = ""
@@ -50,6 +55,7 @@ status = "open"
 [[incident]]
 id = "FLAKE-0070"
 test = "audio_policy::tests::timing_policy_cases_are_deterministic"
+first_seen = "2026-07-19"
 signature = "sha256:967e52e38eb53014530ff660a1665a8c37977d3ed46cbfe166e7107b6f38da07"
 first_run_url = ""
 last_run_url = ""
@@ -64,6 +70,7 @@ status = "open"
 [[incident]]
 id = "FLAKE-0080"
 test = "daemon_smoke::wear_shutdown_persists_final_ledger"
+first_seen = "2026-07-19"
 signature = "sha256:94f35ab1c8c0965a66b098bee4e51f0105cb38e287fb84b646e7b941eecfa51d"
 first_run_url = ""
 last_run_url = ""
@@ -78,6 +85,7 @@ status = "open"
 [[incident]]
 id = "FLAKE-0086"
 test = "watchdog_schedule::tests::healthy_ticks_keep_a_fixed_cadence"
+first_seen = "2026-07-19"
 signature = "sha256:270ba6942a1967bf4792bc613c01b1d3c92644f312aaf9aa2a1927db6f76209f"
 first_run_url = ""
 last_run_url = ""
@@ -92,6 +100,7 @@ status = "open"
 [[incident]]
 id = "FLAKE-0092"
 test = "daemon_smoke::config_watch_updates_on_successful_reload_only"
+first_seen = "2026-07-19"
 signature = "sha256:528ebd736514efab11359cf2a267153e2d3f712fe78e600168bef75be170640c"
 first_run_url = ""
 last_run_url = ""
@@ -106,6 +115,7 @@ status = "open"
 [[incident]]
 id = "FLAKE-0094"
 test = "daemon_smoke::manual_only_display_no_defensive_wake_on_reload"
+first_seen = "2026-07-19"
 signature = "sha256:c89341cc0f4d657ec05d3b06c804309a07f2785f1f2d3edd469297190f79d845"
 first_run_url = ""
 last_run_url = ""
@@ -120,6 +130,7 @@ status = "open"
 [[incident]]
 id = "FLAKE-2026-07-18-WEAR-CORRUPT"
 test = "wear_tracker::tests::corrupt_rename_failure_logs_wear_ledger_corrupt_not_persist_failed"
+first_seen = "2026-07-19"
 signature = "sha256:28fc1067a28ff77488f407641ff792f872c9e97ded82592ea5fff9c0e0ddaf64"
 first_run_url = ""
 last_run_url = ""
@@ -134,6 +145,7 @@ status = "open"
 [[incident]]
 id = "FLAKE-2026-07-18-MPV-FIRSTFRAME"
 test = "screensaver::tests::mpv_render_context_created_with_advanced_control"
+first_seen = "2026-07-19"
 signature = "sha256:6c3c65304df27ffa40bf0088783c56e9adc175e97011ff2bbec3b3f7648ace3b"
 first_run_url = ""
 last_run_url = ""
@@ -148,6 +160,7 @@ status = "open"
 [[incident]]
 id = "FLAKE-2026-07-18-RENDER-FRAMES"
 test = "screensaver::tests::renders_non_zero_changing_frames"
+first_seen = "2026-07-19"
 signature = "sha256:5ad1de95466bf0815d42052c0c74653b176e3015c1c0cde9ef884e824b30ef14"
 first_run_url = ""
 last_run_url = ""
@@ -162,6 +175,7 @@ status = "open"
 [[incident]]
 id = "FLAKE-2026-07-23-TRAY-IPC-EVENT-ORDER"
 test = "ipc_roundtrip::ipc_status_and_events_roundtrip_via_dormantctl_client"
+first_seen = "2026-07-23"
 signature = "sha256:f2f4bd460f4e28af11b53d150070cd8c14b4896aeeeac2e8c0b3a10527775793"
 first_run_url = "https://github.com/legion-works/dormant/actions/runs/30028323908"
 last_run_url = "https://github.com/legion-works/dormant/actions/runs/30032324404"
@@ -178,6 +192,7 @@ status = "fixed"
 [[incident]]
 id = "FLAKE-2026-07-25-CLAIM-LISTENER-PORT-RACE"
 test = "coordination_claim::tests::ensure_and_release_provisional_obey_empty_peer_snapshot"
+first_seen = "2026-07-26"
 signature = "sha256:d5e74e97c5d35e1791e87caa5af2727c7fd44008aa2fe62c718849d12ab736d9"
 first_run_url = ""
 last_run_url = ""
@@ -187,11 +202,12 @@ root_cause = "tests probed OS kernel port-ownership rather than supervisor state
 fix_pr = ""
 proving_test = "coordination_claim::tests::parked_when_empty_and_binds_on_first_peer"
 soak_evidence = []
-status = "open"
+status = "obsolete"
 
 [[incident]]
 id = "FLAKE-2026-07-26-COORDINATOR-BATCH-WATCHER-RACE"
 test = "daemon_smoke::coordinator_batches_watcher_and_web_apply_for_one_revision"
+first_seen = "2026-07-26"
 signature = "sha256:1ef0f7a8190aac2fae141b7c70e2ce0df3cdac01c7edf8bb9f3eadfbd026f161"
 first_run_url = "https://github.com/legion-works/dormant/actions/runs/30206030529"
 last_run_url = "https://github.com/legion-works/dormant/actions/runs/30206030529"

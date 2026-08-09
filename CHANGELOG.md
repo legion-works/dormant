@@ -4,6 +4,15 @@ All notable changes to `dormant` are recorded here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims at [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.3] - 2026-08-09
+
+### Fixed
+
+- The MQTT client no longer builds in an unreachable TLS stack, removing four suppressed security advisories and ten duplicate crate versions. ([#235](https://github.com/legion-works/dormant/issues/235))
+- Eight unused dependency declarations and a duplicated TOML parser stack are gone, cutting duplicate crate versions by a quarter. ([#235](https://github.com/legion-works/dormant/issues/235))
+- The web dashboard now runs on axum 0.8, and one WebSocket implementation serves the dashboard, the Home Assistant sensor, and the Samsung TV controller instead of three. Duplicate crate versions drop from 18 to 17 and `thiserror` collapses to a single major. ([#235](https://github.com/legion-works/dormant/issues/235))
+- Deleting a subscribed Home Assistant entity now marks its sensor unavailable immediately. The removal frame was previously ignored, so the sensor kept its last reported state for five minutes and then went unavailable as though the connection had dropped — leaving the display unable to blank and the cause misattributed.
+
 ## [0.12.2] - 2026-08-07
 
 ### Changed

@@ -62,10 +62,14 @@ pub(crate) async fn probe_mqtt_one(
 
         match result {
             Ok(Ok(rumqttc::Event::Incoming(rumqttc::Packet::Publish(publish)))) => {
-                let state = parse_payload(cfg, &publish.payload);
-                if let Some(s) = state {
-                    found = Some((s, publish.retain));
-                    if !publish.retain {
+                if let Some(observed) = observe_publish(cfg, &publish) {
+                    let live = !observed.1;
+                    found = Some(observed);
+                    // A retained value arrives immediately on subscribe and
+                    // says nothing about whether the topic is still
+                    // publishing, so keep waiting for a live one; a live
+                    // message is conclusive and ends the window early.
+                    if live {
                         break;
                     }
                 }
@@ -98,6 +102,20 @@ pub(crate) async fn probe_mqtt_one(
 }
 
 // ── Pure helpers — testable without a broker ─────────────────────────────────────
+
+/// Map one incoming publish to `(state, was_retained)`.
+///
+/// Split out from the poll loop so a test can prove the `retain` flag is
+/// actually read off the wire. [`classify`] alone cannot: it is handed the
+/// flag, so a caller that hardcoded it would leave every classification test
+/// green while restoring the exact bug this probe was fixed for — a retained
+/// ghost reported as a healthy sensor.
+fn observe_publish(
+    cfg: &MqttSensorCfg,
+    publish: &rumqttc::mqttbytes::v4::Publish,
+) -> Option<(SensorState, bool)> {
+    parse_payload(cfg, &publish.payload).map(|state| (state, publish.retain))
+}
 
 fn classify(
     name: impl Into<String>,
@@ -214,6 +232,49 @@ mod tests {
     }
 
     // ── classify ───────────────────────────────────────────────────────────────
+
+    /// Build a `Publish` the way rumqttc hands one to the poll loop.
+    fn publish_with(payload: &str, retain: bool) -> rumqttc::mqttbytes::v4::Publish {
+        let mut publish = rumqttc::mqttbytes::v4::Publish::new(
+            "sensors/test",
+            rumqttc::QoS::AtLeastOnce,
+            payload.as_bytes().to_vec(),
+        );
+        publish.retain = retain;
+        publish
+    }
+
+    /// The wiring test `classify` cannot be: it proves the probe reads
+    /// `publish.retain` off the wire rather than assuming a value. Hardcoding
+    /// the flag at that call site leaves every `classify_*` test green while
+    /// restoring the original defect, so this is the assertion that pins it.
+    #[test]
+    fn observe_publish_reports_the_wire_retain_flag() {
+        let cfg = test_mqtt_cfg("mqtt://127.0.0.1:1883");
+
+        // test_mqtt_cfg leaves payload_on/off unset, so the probe is in JSON
+        // mode against the "/occupancy" pointer.
+        let retained = observe_publish(&cfg, &publish_with(r#"{"occupancy":"ON"}"#, true))
+            .expect("a parseable payload should be observed");
+        assert!(retained.1, "a retained publish must be reported retained");
+
+        let live = observe_publish(&cfg, &publish_with(r#"{"occupancy":"ON"}"#, false))
+            .expect("a parseable payload should be observed");
+        assert!(!live.1, "a live publish must be reported live");
+
+        assert_eq!(
+            retained.0, live.0,
+            "the retain flag must not change the parsed state"
+        );
+    }
+
+    #[test]
+    fn observe_publish_ignores_an_unparsable_payload() {
+        let cfg = test_mqtt_cfg("mqtt://127.0.0.1:1883");
+        assert!(observe_publish(&cfg, &publish_with(r#"{"occupancy":"maybe"}"#, false)).is_none());
+    }
+
+    // ── classify ──────────────────────────────────────────────────────────
 
     #[test]
     fn classify_live_message_passes_as_observed_live() {

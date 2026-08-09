@@ -1,0 +1,110 @@
+# Tier 1 — prove the hardware works first: simplest MQTT-only presence config.
+#
+# HLK-LD2410C 24GHz mmWave presence sensor on ESP32-C6 with WiFi + MQTT.
+# This is the MQTT-only topology: there is deliberately no `api:` block.
+# dormant consumes `<device>/binary_sensor/<name>_occupancy/state`.
+# Presence at close range can read absent on the radar's gate 0/1; use
+# 02-standard-desk.yaml for the calibrated energy-gated desk signal.
+#
+# Wiring (5 pins, JST 1.25mm on sensor side):
+#   Sensor VCC → board 5V     (NOT 3V3 — the radar browns out at 3.3V)
+#   Sensor GND → board GND
+#   Sensor TX  → board RX  (rx_pin below)
+#   Sensor RX  → board TX  (tx_pin below)
+#   Sensor OUT → unused (digital presence pin; UART carries richer data)
+#
+# UART pins vary by board — set rx_pin/tx_pin to the GPIOs you actually wired
+# and confirm they are free (not USB/strapping pins). This example uses the
+# ESP32-C6 SuperMini (GPIO19/GPIO20; native USB is GPIO12/13, BOOT is GPIO9).
+# The DevKitC-1 / DevKitM-1 commonly break out GPIO4/GPIO5 instead.
+
+substitutions:
+  device_name: ld2410c-desk
+  friendly_name: "Desk Presence"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  min_version: "2025.12.0"
+
+esp32:
+  board: esp32-c6-devkitm-1
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+  ap:
+    ssid: ${device_name}-fallback
+    password: !secret ap_password
+
+captive_portal:
+
+# MQTT-only topology: omit the native ESPHome API so MQTT discovery is the
+# sole Home Assistant transport.
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+mqtt:
+  broker: !secret mqtt_broker
+  port: !secret mqtt_port
+  username: !secret mqtt_username
+  password: !secret mqtt_password
+  discovery: true
+  birth_message:
+    topic: ${device_name}/status
+    payload: online
+    retain: true
+  will_message:
+    topic: ${device_name}/status
+    payload: offline
+    retain: true
+
+uart:
+  tx_pin: GPIO20
+  rx_pin: GPIO19
+  baud_rate: 256000
+
+ld2410:
+
+binary_sensor:
+  - platform: ld2410
+    has_target:
+      id: has_tgt
+      name: "${friendly_name} Occupancy"
+      device_class: occupancy
+    has_moving_target:
+      name: "${friendly_name} Moving"
+      device_class: motion
+    has_still_target:
+      name: "${friendly_name} Still"
+      device_class: occupancy
+
+# ——— Active heartbeat ——————————————————————————————————————————
+# Not optional, even in the minimal tier. MQTT only publishes on CHANGE, so
+# an empty room produces one OFF and then silence — indistinguishable from a
+# dead device. dormant's default stale_timeout is 300s; past that the sensor
+# becomes unavailable, which the zone engine treats as PRESENT (fail-safe),
+# and the screen stops blanking until the device speaks again.
+#
+# Re-publishing every 5 minutes makes silence mean "device gone" rather than
+# "occupant still". Set dormant's stale_timeout a little over one heartbeat
+# (e.g. "6m").
+interval:
+  - interval: 5min
+    then:
+      - mqtt.publish:
+          # The path segment after binary_sensor/ is the snake_cased
+          # friendly_name plus the sensor name — update it if you change
+          # friendly_name above, or the heartbeat lands on a topic nothing
+          # is subscribed to.
+          topic: ${device_name}/binary_sensor/desk_presence_occupancy/state
+          payload: !lambda |-
+            return id(has_tgt).state ? std::string("ON") : std::string("OFF");
+          retain: true

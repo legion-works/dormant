@@ -2,6 +2,7 @@ import pathlib
 import sys
 import tempfile
 import unittest
+from datetime import date
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
@@ -12,6 +13,7 @@ OPEN_INCIDENT = '''
 [[incident]]
 id = "FLAKE-0001"
 test = "module::tests::known_flake"
+first_seen = "2026-08-01"
 signature = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 first_run_url = ""
 last_run_url = ""
@@ -37,11 +39,11 @@ status = "fixed"
 
 
 class CheckFlakeLedgerTests(unittest.TestCase):
-    def validate(self, contents: str) -> list[str]:
+    def validate(self, contents: str, today: str = "2026-08-09") -> list[str]:
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / "flake-ledger.toml"
             path.write_text(contents)
-            return check_flake_ledger.validate_ledger(path)
+            return check_flake_ledger.validate_ledger(path, today=date.fromisoformat(today))
 
     def test_open_incident_permits_empty_evidence(self):
         errors = self.validate("schema_version = 1\n" + OPEN_INCIDENT)
@@ -100,6 +102,62 @@ class CheckFlakeLedgerTests(unittest.TestCase):
 
         self.assertTrue(any("schema_version" in error for error in errors))
         self.assertTrue(any("FLAKE-0001" in error and "signature" in error for error in errors))
+
+    def test_rejects_invalid_first_seen_date(self):
+        errors = self.validate("schema_version = 1\n" + OPEN_INCIDENT.replace('first_seen = "2026-08-01"', 'first_seen = "2026-13-45"'))
+
+        self.assertTrue(any("FLAKE-0001" in error and "first_seen" in error for error in errors))
+
+    def test_rejects_missing_first_seen(self):
+        errors = self.validate("schema_version = 1\n" + OPEN_INCIDENT.replace('first_seen = "2026-08-01"\n', ""))
+
+        self.assertTrue(any("FLAKE-0001" in error and "first_seen" in error for error in errors))
+
+    def test_rejects_past_triage_deferral(self):
+        deferred = OPEN_INCIDENT.replace('status = "open"', 'triage_deferred_until = "2026-08-08"\ntriage_deferred_reason = "waiting on upstream"\nstatus = "open"')
+
+        errors = self.validate("schema_version = 1\n" + deferred)
+
+        self.assertTrue(any("triage_deferred_until" in error and "past" in error for error in errors))
+
+    def test_rejects_triage_deferral_beyond_cap(self):
+        deferred = OPEN_INCIDENT.replace('status = "open"', 'triage_deferred_until = "2026-11-08"\ntriage_deferred_reason = "waiting on upstream"\nstatus = "open"')
+
+        errors = self.validate("schema_version = 1\n" + deferred)
+
+        self.assertTrue(any("90 days" in error for error in errors))
+
+    def test_rejects_partial_triage_deferral(self):
+        deferred = OPEN_INCIDENT.replace('status = "open"', 'triage_deferred_until = "2026-08-15"\nstatus = "open"')
+
+        errors = self.validate("schema_version = 1\n" + deferred)
+
+        self.assertTrue(any("both" in error and "triage" in error for error in errors))
+
+    def test_rejects_old_open_incident_without_diagnosis(self):
+        old = OPEN_INCIDENT.replace('first_seen = "2026-08-01"', 'first_seen = "2026-07-01"')
+        errors = self.validate("schema_version = 1\n" + old)
+
+        self.assertTrue(any("30 days" in error and "root_cause" in error for error in errors))
+
+    def test_accepts_old_open_incident_with_diagnosis(self):
+        diagnosed = OPEN_INCIDENT.replace('root_cause = ""', 'root_cause = "scheduler contention"')
+
+        self.assertEqual(self.validate("schema_version = 1\n" + diagnosed), [])
+
+    def test_rejects_soak_pull_request_url(self):
+        invalid = OPEN_INCIDENT.replace('soak_evidence = []', 'soak_evidence = ["https://github.com/legion-works/dormant/pull/261"]')
+
+        errors = self.validate("schema_version = 1\n" + invalid)
+
+        self.assertTrue(any("soak_evidence[1]" in error for error in errors))
+
+    def test_obsolete_incident_requires_root_cause(self):
+        obsolete = OPEN_INCIDENT.replace('root_cause = ""', 'root_cause = ""').replace('status = "open"', 'status = "obsolete"')
+
+        errors = self.validate("schema_version = 1\n" + obsolete)
+
+        self.assertTrue(any("obsolete" in error and "root_cause" in error for error in errors))
 
 
 if __name__ == "__main__":

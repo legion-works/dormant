@@ -48,9 +48,10 @@ pub(crate) async fn probe_mqtt_one(
         return ProbeResult::fail(name, format!("subscribe failed: {e}"));
     }
 
-    // Wait up to 10s for a retained/live message.
+    // Wait up to 10s for a live message, retaining any parseable broker value
+    // so a retained-only topic is reported distinctly after the window.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    let mut found: Option<SensorState> = None;
+    let mut found: Option<(SensorState, bool)> = None;
     let mut broker_connected = false;
     // Track the credential lookup result for auth-failure detail.
     let credential_lookup = creds.mqtt.get(&cfg.broker_url);
@@ -61,10 +62,16 @@ pub(crate) async fn probe_mqtt_one(
 
         match result {
             Ok(Ok(rumqttc::Event::Incoming(rumqttc::Packet::Publish(publish)))) => {
-                let state = parse_payload(cfg, &publish.payload);
-                if let Some(s) = state {
-                    found = Some(s);
-                    break;
+                if let Some(observed) = observe_publish(cfg, &publish) {
+                    let live = !observed.1;
+                    found = Some(observed);
+                    // A retained value arrives immediately on subscribe and
+                    // says nothing about whether the topic is still
+                    // publishing, so keep waiting for a live one; a live
+                    // message is conclusive and ends the window early.
+                    if live {
+                        break;
+                    }
                 }
             }
             Ok(Ok(rumqttc::Event::Incoming(rumqttc::Packet::ConnAck(_)))) => {
@@ -91,35 +98,67 @@ pub(crate) async fn probe_mqtt_one(
 
     let _ = client.disconnect().await;
 
-    match found {
-        Some(state) => {
-            let state_str = match state {
-                SensorState::Present => "present",
-                SensorState::Absent => "absent",
-                SensorState::Unavailable => "unavailable",
-            };
-            ProbeResult::pass(name, format!("topic '{}' reports {state_str}", cfg.topic))
-        }
-        None => {
-            if broker_connected {
-                ProbeResult::skip(
-                    name,
-                    format!(
-                        "no message in 10s on '{}' — on-change sensors are quiet when state is stable; not a failure",
-                        cfg.topic,
-                    ),
-                )
-            } else {
-                ProbeResult::fail(
-                    name,
-                    "broker connection failed (no CONNACK received)".to_string(),
-                )
-            }
-        }
-    }
+    classify(name, &cfg.topic, found, broker_connected)
 }
 
 // ── Pure helpers — testable without a broker ─────────────────────────────────────
+
+/// Map one incoming publish to `(state, was_retained)`.
+///
+/// Split out from the poll loop so a test can prove the `retain` flag is
+/// actually read off the wire. [`classify`] alone cannot: it is handed the
+/// flag, so a caller that hardcoded it would leave every classification test
+/// green while restoring the exact bug this probe was fixed for — a retained
+/// ghost reported as a healthy sensor.
+fn observe_publish(
+    cfg: &MqttSensorCfg,
+    publish: &rumqttc::mqttbytes::v4::Publish,
+) -> Option<(SensorState, bool)> {
+    parse_payload(cfg, &publish.payload).map(|state| (state, publish.retain))
+}
+
+fn classify(
+    name: impl Into<String>,
+    topic: &str,
+    found: Option<(SensorState, bool)>,
+    broker_connected: bool,
+) -> ProbeResult {
+    let name = name.into();
+    match found {
+        Some((state, false)) => ProbeResult::pass(
+            name,
+            format!(
+                "topic '{topic}' reports {} (observed live)",
+                state_label(state)
+            ),
+        ),
+        Some((state, true)) => ProbeResult::skip(
+            name,
+            format!(
+                "topic '{topic}' has retained value '{}' but nothing was published during the 10s probe window — if this on-change sensor has no heartbeat, the daemon will mark it stale after stale_timeout; state may be stable",
+                state_label(state),
+            ),
+        ),
+        None if broker_connected => ProbeResult::skip(
+            name,
+            format!(
+                "no message in 10s on '{topic}' — on-change sensors are quiet when state is stable; not a failure"
+            ),
+        ),
+        None => ProbeResult::fail(
+            name,
+            "broker connection failed (no CONNACK received)".to_string(),
+        ),
+    }
+}
+
+fn state_label(state: SensorState) -> &'static str {
+    match state {
+        SensorState::Present => "present",
+        SensorState::Absent => "absent",
+        SensorState::Unavailable => "unavailable",
+    }
+}
 
 /// Build `MqttOptions` for a doctor probe, applying credentials when
 /// `creds.mqtt` has an entry keyed by the exact `cfg.broker_url`.
@@ -190,6 +229,112 @@ mod tests {
             availability_payload_online: "online".into(),
             availability_payload_offline: "offline".into(),
         }
+    }
+
+    // ── classify ───────────────────────────────────────────────────────────────
+
+    /// Build a `Publish` the way rumqttc hands one to the poll loop.
+    fn publish_with(payload: &str, retain: bool) -> rumqttc::mqttbytes::v4::Publish {
+        let mut publish = rumqttc::mqttbytes::v4::Publish::new(
+            "sensors/test",
+            rumqttc::QoS::AtLeastOnce,
+            payload.as_bytes().to_vec(),
+        );
+        publish.retain = retain;
+        publish
+    }
+
+    /// The wiring test `classify` cannot be: it proves the probe reads
+    /// `publish.retain` off the wire rather than assuming a value. Hardcoding
+    /// the flag at that call site leaves every `classify_*` test green while
+    /// restoring the original defect, so this is the assertion that pins it.
+    #[test]
+    fn observe_publish_reports_the_wire_retain_flag() {
+        let cfg = test_mqtt_cfg("mqtt://127.0.0.1:1883");
+
+        // test_mqtt_cfg leaves payload_on/off unset, so the probe is in JSON
+        // mode against the "/occupancy" pointer.
+        let retained = observe_publish(&cfg, &publish_with(r#"{"occupancy":"ON"}"#, true))
+            .expect("a parseable payload should be observed");
+        assert!(retained.1, "a retained publish must be reported retained");
+
+        let live = observe_publish(&cfg, &publish_with(r#"{"occupancy":"ON"}"#, false))
+            .expect("a parseable payload should be observed");
+        assert!(!live.1, "a live publish must be reported live");
+
+        assert_eq!(
+            retained.0, live.0,
+            "the retain flag must not change the parsed state"
+        );
+    }
+
+    #[test]
+    fn observe_publish_ignores_an_unparsable_payload() {
+        let cfg = test_mqtt_cfg("mqtt://127.0.0.1:1883");
+        assert!(observe_publish(&cfg, &publish_with(r#"{"occupancy":"maybe"}"#, false)).is_none());
+    }
+
+    // ── classify ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn classify_live_message_passes_as_observed_live() {
+        let result = classify(
+            "mqtt desk",
+            "sensors/desk",
+            Some((SensorState::Present, false)),
+            true,
+        );
+
+        assert_eq!(result.status, crate::types::ProbeStatus::Pass);
+        assert_eq!(
+            result.detail,
+            "topic 'sensors/desk' reports present (observed live)"
+        );
+    }
+
+    #[test]
+    fn classify_retained_only_message_skips_with_staleness_warning() {
+        let result = classify(
+            "mqtt desk",
+            "sensors/desk",
+            Some((SensorState::Absent, true)),
+            true,
+        );
+
+        assert_eq!(result.status, crate::types::ProbeStatus::Skip);
+        assert!(result.detail.contains("retained value 'absent'"));
+        assert!(
+            result
+                .detail
+                .contains("nothing was published during the 10s probe window")
+        );
+        assert!(
+            result
+                .detail
+                .contains("daemon will mark it stale after stale_timeout")
+        );
+    }
+
+    #[test]
+    fn classify_no_message_with_connected_broker_skips() {
+        let result = classify("mqtt desk", "sensors/desk", None, true);
+
+        assert_eq!(result.status, crate::types::ProbeStatus::Skip);
+        assert_eq!(
+            result.detail,
+            "no message in 10s on 'sensors/desk' — on-change sensors are quiet when state is stable; not a failure"
+        );
+    }
+
+    #[test]
+    fn classify_no_message_without_connected_broker_fails() {
+        let result = classify("mqtt desk", "sensors/desk", None, false);
+
+        assert_eq!(result.status, crate::types::ProbeStatus::Fail);
+        assert_eq!(
+            result.detail,
+            "broker connection failed (no CONNACK received)"
+        );
     }
 
     // ── parse_broker_url ──────────────────────────────────────────────────────

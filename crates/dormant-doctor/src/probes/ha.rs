@@ -95,12 +95,7 @@ pub(crate) async fn probe_ha_one(id: &str, cfg: &HaSensorCfg, creds: &Credential
     }
 
     if let Some(state) = found_state {
-        let state_str = match state {
-            SensorState::Present => "present",
-            SensorState::Absent => "absent",
-            SensorState::Unavailable => "unavailable",
-        };
-        ProbeResult::pass(name, format!("entity '{}' reports {state_str}", cfg.entity))
+        classify_state(name, &cfg.entity, state)
     } else if let Some(reason) = auth_failure {
         if reason.contains(E_HA_AUTH) {
             ProbeResult::fail(name, format!("{reason} (check ha_token)"))
@@ -112,6 +107,24 @@ pub(crate) async fn probe_ha_one(id: &str, cfg: &HaSensorCfg, creds: &Credential
             name,
             format!("no state received from entity '{}' within 10s", cfg.entity),
         )
+    }
+}
+
+fn classify_state(name: impl Into<String>, entity: &str, state: SensorState) -> ProbeResult {
+    let name = name.into();
+    match state {
+        SensorState::Present | SensorState::Absent => {
+            let state_str = match state {
+                SensorState::Present => "present",
+                SensorState::Absent => "absent",
+                SensorState::Unavailable => unreachable!(),
+            };
+            ProbeResult::pass(name, format!("entity '{entity}' reports {state_str}"))
+        }
+        SensorState::Unavailable => ProbeResult::skip(
+            name,
+            format!("entity '{entity}' reports itself unavailable/unknown"),
+        ),
     }
 }
 
@@ -184,5 +197,20 @@ mod tests {
             }
             other => panic!("expected Fatal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn ha_probe_classifies_unavailable_as_skipped_but_present_as_pass() {
+        let unavailable = classify_state(
+            "ha motion",
+            "binary_sensor.motion",
+            SensorState::Unavailable,
+        );
+        assert_eq!(unavailable.status, crate::types::ProbeStatus::Skip);
+        assert!(unavailable.detail.contains("binary_sensor.motion"));
+        assert!(unavailable.detail.contains("unavailable"));
+
+        let present = classify_state("ha motion", "binary_sensor.motion", SensorState::Present);
+        assert_eq!(present.status, crate::types::ProbeStatus::Pass);
     }
 }

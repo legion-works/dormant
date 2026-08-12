@@ -135,6 +135,13 @@ impl FrameParser {
 
             let total_len = 4 + 2 + data_len + 4; // header + length + data + tail
 
+            if total_len > MAX_BUF_SIZE {
+                // A frame this large cannot fit in the bounded accumulator;
+                // discard the header byte so a valid frame behind it can be found.
+                self.buf.drain(..1);
+                continue;
+            }
+
             if self.buf.len() < total_len {
                 // Not enough data yet.
                 break;
@@ -529,6 +536,17 @@ mod tests {
             );
             assert_eq!(frames[0].target_state, 0x01);
         }
+    }
+
+    #[test]
+    fn corrupt_large_length_does_not_block_following_valid_frame() {
+        let mut corrupt = vec![0xF4, 0xF3, 0xF2, 0xF1];
+        corrupt.extend_from_slice(&u16::try_from(MAX_BUF_SIZE).unwrap().to_le_bytes());
+        corrupt.extend_from_slice(&make_frame(0x02));
+
+        let frames = FrameParser::new().push(&corrupt);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].target_state, 0x02);
     }
 
     #[test]

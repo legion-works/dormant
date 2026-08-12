@@ -339,10 +339,10 @@ pub fn run_bare_with_socket(args: &DoctorArgs, socket_path: &Path) -> Result<Doc
             }
             None => {
                 // `ok: true` with no report is a wire-shape bug on the
-                // daemon side. Fall through to the offline fallback so
-                // the operator still gets a report rather than a hard
-                // failure.
-                eprintln!("note: daemon returned ok but no doctor_report; falling back to offline");
+                // daemon side. The daemon is reachable, so do not reopen
+                // hardware through the cold probe set.
+                eprintln!("error: daemon returned ok but no doctor_report");
+                return Ok(DoctorOutcome::SomeFailed);
             }
         },
         client::IpcSendOutcome::Ok(resp) => {
@@ -1635,7 +1635,7 @@ mod tests {
     /// daemon to exit, then `join` to confirm clean shutdown.
     fn spawn_one_shot_doctor_daemon(
         socket_path: &Path,
-        reply_report: dormant_core::doctor::DoctorReport,
+        response: dormant_core::ipc_proto::IpcResponse,
     ) -> (
         std::sync::Arc<std::sync::Mutex<Vec<IpcRequest>>>,
         std::sync::mpsc::Sender<()>,
@@ -1680,9 +1680,7 @@ mod tests {
                             if let Ok(req) = serde_json::from_str::<IpcRequest>(buf.trim()) {
                                 captured_clone.lock().unwrap().push(req);
                             }
-                            let resp =
-                                dormant_core::ipc_proto::IpcResponse::doctor(reply_report.clone());
-                            if let Ok(line) = serde_json::to_string(&resp) {
+                            if let Ok(line) = serde_json::to_string(&response) {
                                 let mut s = stream;
                                 let _ = s
                                     .write_all(line.as_bytes())
@@ -1736,8 +1734,10 @@ mod tests {
     fn doctor_uses_live_daemon() {
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = dir.path().join("dormant.sock");
-        let (captured, stop_tx, daemon_handle) =
-            spawn_one_shot_doctor_daemon(&socket, fake_owned_usb_report());
+        let (captured, stop_tx, daemon_handle) = spawn_one_shot_doctor_daemon(
+            &socket,
+            dormant_core::ipc_proto::IpcResponse::doctor(fake_owned_usb_report()),
+        );
 
         // Snapshot the seam counter before — every other test in this
         // module that touches the bare path bumps it.
@@ -1927,6 +1927,35 @@ mod tests {
         // probe table.
         assert_eq!(outcome, super::DoctorOutcome::SomeFailed);
 
+        let _ = stop_tx.send(());
+        let _ = daemon_handle.join();
+    }
+
+    #[test]
+    fn doctor_does_not_fall_back_when_daemon_returns_ok_without_report() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("dormant.sock");
+        let (captured, stop_tx, daemon_handle) =
+            spawn_one_shot_doctor_daemon(&socket, dormant_core::ipc_proto::IpcResponse::ok(None));
+        let before =
+            super::BARE_DOCTOR_OFFLINE_INVOCATIONS.load(std::sync::atomic::Ordering::SeqCst);
+        let args = super::DoctorArgs {
+            config: None,
+            credentials: None,
+            report_issue: None,
+            draft_feature: None,
+            subcommand: None,
+        };
+
+        let outcome = super::run_bare_with_socket(&args, &socket).expect("doctor should return");
+        assert_eq!(outcome, super::DoctorOutcome::SomeFailed);
+        let after =
+            super::BARE_DOCTOR_OFFLINE_INVOCATIONS.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            after, before,
+            "ok-without-report must not reopen offline probes"
+        );
+        assert_eq!(captured.lock().unwrap().len(), 1);
         let _ = stop_tx.send(());
         let _ = daemon_handle.join();
     }

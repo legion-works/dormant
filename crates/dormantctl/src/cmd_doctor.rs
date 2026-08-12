@@ -331,20 +331,18 @@ pub fn run_bare_with_socket(args: &DoctorArgs, socket_path: &Path) -> Result<Doc
     //    daemon IS up and likely owns the port — reopening for the
     //    cold probe set re-introduces the #202 frame-steal.
     match client::send_request_typed(socket_path, &IpcRequest::Doctor) {
-        client::IpcSendOutcome::Ok(resp) if resp.ok => match &resp.doctor_report {
-            Some(report) => {
+        client::IpcSendOutcome::Ok(resp) if resp.ok => {
+            if let Some(report) = &resp.doctor_report {
                 let results = doctor_report_to_probe_results(report);
                 print_table(&results);
                 return Ok(outcome(&results));
             }
-            None => {
-                // `ok: true` with no report is a wire-shape bug on the
-                // daemon side. The daemon is reachable, so do not reopen
-                // hardware through the cold probe set.
-                eprintln!("error: daemon returned ok but no doctor_report");
-                return Ok(DoctorOutcome::SomeFailed);
-            }
-        },
+            // `ok: true` with no report is a wire-shape bug on the daemon
+            // side. The daemon is reachable, so do not reopen hardware
+            // through the cold probe set.
+            eprintln!("error: daemon returned ok but no doctor_report");
+            return Ok(DoctorOutcome::SomeFailed);
+        }
         client::IpcSendOutcome::Ok(resp) => {
             // Daemon reachable, but it rejected the request. Respect the
             // verdict — do NOT reopen the port.

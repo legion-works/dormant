@@ -490,13 +490,14 @@ pub(crate) async fn probe_and_wake_all(
     let mut handles = Vec::new();
     for (display_id, exec) in executors {
         let display_for_task = display_id.clone();
-        handles.push(tokio::spawn(async move {
-            (display_for_task, exec.wake_once().await)
-        }));
+        handles.push((
+            display_id,
+            tokio::spawn(async move { (display_for_task, exec.wake_once().await) }),
+        ));
     }
 
     let mut results: Vec<EmergencyWakeResult> = Vec::new();
-    for handle in handles {
+    for (display_id, handle) in handles {
         match handle.await {
             Ok((display_id, Ok(()))) => results.push(EmergencyWakeResult {
                 display: display_id,
@@ -516,6 +517,7 @@ pub(crate) async fn probe_and_wake_all(
             }
             Err(e) => {
                 eprintln!("warning: spawned wake task panicked: {e}");
+                results.push(panic_wake_result(display_id, &e));
             }
         }
     }
@@ -535,6 +537,14 @@ pub(crate) async fn probe_and_wake_all(
         operation_id: None,
         generation: None,
         displays: results,
+    }
+}
+
+fn panic_wake_result(display: DisplayId, panic: &tokio::task::JoinError) -> EmergencyWakeResult {
+    EmergencyWakeResult {
+        display,
+        ok: false,
+        error: Some(format!("spawned wake task panicked: {panic}")),
     }
 }
 
@@ -1031,6 +1041,18 @@ mod tests {
         // println!/eprintln! and cannot be redirected without refactoring
         // — we limit this test to a smoke check.)
         print_report("ipc", &report);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn panic_wake_result_keeps_display_in_failed_report() {
+        let display = DisplayId("panel".into());
+        let join_error = tokio::spawn(async { panic!("wake exploded") })
+            .await
+            .expect_err("task must panic");
+        let result = panic_wake_result(display.clone(), &join_error);
+        assert_eq!(result.display, display);
+        assert!(!result.ok);
+        assert!(result.error.as_deref().unwrap().contains("panicked"));
     }
 
     // ── probe-before-wake refactor tests ─────────────────────────────────────

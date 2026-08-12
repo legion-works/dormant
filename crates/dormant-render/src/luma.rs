@@ -149,11 +149,13 @@ impl LumaCache {
                             as u32;
                         let pixel = rgba.get_pixel(x, y).0;
                         let alpha = f32::from(pixel[3]) / 255.0;
+                        // Composite over black in linear light: convert the
+                        // encoded channels before applying coverage alpha.
                         sum += linear_luma([
-                            f32::from(pixel[0]) / 255.0 * alpha,
-                            f32::from(pixel[1]) / 255.0 * alpha,
-                            f32::from(pixel[2]) / 255.0 * alpha,
-                        ]);
+                            f32::from(pixel[0]) / 255.0,
+                            f32::from(pixel[1]) / 255.0,
+                            f32::from(pixel[2]) / 255.0,
+                        ]) * alpha;
                     }
                 }
                 cells.push(sum / 16.0);
@@ -227,6 +229,18 @@ mod tests {
         let composited = 128.0 / 255.0 * (128.0 / 255.0);
         let expected = linear_luma([composited; 3]);
         assert!(grid.cells.iter().all(|v| (*v - expected).abs() < 1e-5));
+    }
+
+    #[test]
+    fn scanner_composites_translucent_white_over_black_in_linear_light() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("translucent-white.png");
+        ImageBuffer::from_fn(16, 9, |_, _| Rgba([255_u8, 255, 255, 128]))
+            .save(&path)
+            .unwrap();
+
+        let grid = LumaCache::new().scan_path(&path).unwrap();
+        assert!(grid.cells.iter().all(|value| (*value - 0.5).abs() < 0.005));
     }
     #[test]
     fn scanner_stratified_samples_preserve_black_and_white_halves() {

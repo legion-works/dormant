@@ -229,9 +229,17 @@ async fn run(deps: StatePublisherDeps, transport_box: Option<Box<dyn PublisherTr
         return;
     };
 
-    let Some(mut snapshot) = request_snapshot(&ctl_tx, &cancel).await else {
-        return;
-    };
+    let mut snapshot = request_snapshot(&ctl_tx, &cancel)
+        .await
+        .unwrap_or_else(|| StateSnapshot {
+            sensors: Vec::new(),
+            zones: Vec::new(),
+            displays: Vec::new(),
+            pending_reload: None,
+            rollback: None,
+            kvm: None,
+            wear_sampling_status: None,
+        });
     let _ = credentials; // captured in mqtt_transport build; kept here to satisfy the borrow checker
 
     let instance = sanitize_topic_id(&config.publish.instance_id);
@@ -3864,6 +3872,59 @@ mod async_tests {
         if let Some(h) = handle {
             let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
         }
+    }
+
+    #[tokio::test]
+    async fn initial_snapshot_failure_does_not_disable_publisher() {
+        let cfg = Arc::new(enabled_publish_config());
+        let creds = publish_creds_for("tcp://h:1883");
+        let (event_tx, _event_rx_unused) = tokio::sync::broadcast::channel::<DaemonEvent>(2);
+        let (ctl_tx, mut ctl_rx) = mpsc::channel::<ControlMsg>(16);
+        let responder = tokio::spawn(async move {
+            while let Some(msg) = ctl_rx.recv().await {
+                match msg {
+                    ControlMsg::SubscribeEvents(tx) => {
+                        let _ = tx.send(event_tx.subscribe());
+                    }
+                    ControlMsg::Snapshot(_tx) => {
+                        // Drop the reply to model a failed initial snapshot.
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let (transport, transport_ctrl) = FakeTransport::build();
+        let records = transport.records().clone();
+        let records_notify = transport.records_notify().clone();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let deps = StatePublisherDeps {
+            config: cfg,
+            credentials: creds,
+            ctl_tx,
+            cancel: cancel.clone(),
+        };
+        let handle = spawn_with_transport(deps, Box::new(transport)).expect("publisher enabled");
+
+        transport_ctrl
+            .send(FakeCtrl::Connected)
+            .await
+            .expect("fake transport is alive");
+        let published = wait_records_count(
+            &records,
+            &records_notify,
+            Duration::from_secs(2),
+            |records| records.len(),
+        )
+        .await;
+        assert!(
+            published >= 1,
+            "publisher must flush after initial snapshot failure"
+        );
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        responder.abort();
     }
 
     // ── RED: broadcast lag requests a fresh snapshot ───────────

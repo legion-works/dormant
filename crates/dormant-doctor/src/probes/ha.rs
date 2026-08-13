@@ -121,9 +121,9 @@ fn classify_state(name: impl Into<String>, entity: &str, state: SensorState) -> 
             };
             ProbeResult::pass(name, format!("entity '{entity}' reports {state_str}"))
         }
-        SensorState::Unavailable => ProbeResult::skip(
+        SensorState::Unavailable => ProbeResult::fail(
             name,
-            format!("entity '{entity}' reports itself unavailable/unknown"),
+            format!("entity '{entity}' reports unavailable/unknown to HA"),
         ),
     }
 }
@@ -200,17 +200,20 @@ mod tests {
     }
 
     #[test]
-    fn ha_probe_classifies_unavailable_as_skipped_but_present_as_pass() {
+    fn ha_probe_classifies_all_states() {
         let unavailable = classify_state(
             "ha motion",
             "binary_sensor.motion",
             SensorState::Unavailable,
         );
-        assert_eq!(unavailable.status, crate::types::ProbeStatus::Skip);
+        assert_eq!(unavailable.status, crate::types::ProbeStatus::Fail);
         assert!(unavailable.detail.contains("binary_sensor.motion"));
         assert!(unavailable.detail.contains("unavailable"));
 
         let present = classify_state("ha motion", "binary_sensor.motion", SensorState::Present);
         assert_eq!(present.status, crate::types::ProbeStatus::Pass);
+
+        let absent = classify_state("ha motion", "binary_sensor.motion", SensorState::Absent);
+        assert_eq!(absent.status, crate::types::ProbeStatus::Pass);
     }
 }

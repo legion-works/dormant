@@ -1276,10 +1276,20 @@ impl DisplayStateMachine {
     fn reconcile_ownership_gain(&mut self, now: Tick, from: &'static str) -> Vec<Effect> {
         self.owned = true;
 
-        if matches!(self.phase, Phase::Grace { .. })
-            || (self.zone_present != Some(true)
-                && !self.overlays.inhibited
-                && self.overlays.paused.is_none())
+        if let Phase::Grace { until } = self.phase {
+            // The expiry tick may have been consumed while ownership was
+            // absent; preserve the original deadline so reacquisition can
+            // drive the blank ladder without extending Grace.
+            return if self.zone_present == Some(false) {
+                vec![Effect::ScheduleTickAt(until)]
+            } else {
+                vec![]
+            };
+        }
+
+        if self.zone_present != Some(true)
+            && !self.overlays.inhibited
+            && self.overlays.paused.is_none()
         {
             return vec![];
         }
@@ -2810,8 +2820,66 @@ mod tests {
         let effects = sm.step(Input::OwnershipChanged(true), t(20));
 
         assert!(
-            effects.is_empty(),
-            "Grace must not wake on gain, got {effects:?}"
+            !effects.iter().any(|effect| matches!(
+                effect,
+                Effect::IssueWake { .. } | Effect::IssueBlank { .. } | Effect::ShowRender { .. }
+            )),
+            "Grace must not wake or blank on gain, got {effects:?}"
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::ScheduleTickAt(_)))
+        );
+    }
+
+    #[test]
+    fn ownership_gain_after_consumed_grace_tick_rearms_blank() {
+        let mut sm = sm(500);
+        let deadline = get_schedule_tick(&sm.step(Input::ZonePresent(false), t(0)));
+        sm.step(Input::OwnershipChanged(false), t(10));
+
+        let expired_unowned = sm.step(Input::Tick, t(500));
+        assert!(expired_unowned.is_empty());
+        assert_eq!(sm.phase_name(), "grace");
+
+        let rearmed = sm.step(Input::OwnershipChanged(true), t(510));
+        assert_eq!(get_schedule_tick(&rearmed), deadline);
+
+        let effects = sm.step(Input::Tick, t(510));
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::IssueBlank { .. })),
+            "re-armed Grace must enter the blank ladder, got {effects:?}"
+        );
+        assert_eq!(sm.phase_name(), "blanking");
+    }
+
+    #[test]
+    fn ownership_gain_after_presence_returns_does_not_blank() {
+        let mut sm = sm(500);
+        sm.step(Input::ZonePresent(false), t(0));
+        sm.step(Input::OwnershipChanged(false), t(10));
+        sm.step(Input::Tick, t(500));
+        sm.step(Input::ZonePresent(true), t(510));
+
+        let gain = sm.step(Input::OwnershipChanged(true), t(520));
+        assert!(
+            !gain.iter().any(|effect| matches!(
+                effect,
+                Effect::IssueBlank { .. } | Effect::ShowRender { .. }
+            )),
+            "presence must prevent blanking on ownership gain, got {gain:?}"
+        );
+
+        let later = sm.step(Input::Tick, t(600));
+        assert!(
+            !later.iter().any(|effect| matches!(
+                effect,
+                Effect::IssueBlank { .. } | Effect::ShowRender { .. }
+            )),
+            "presence must prevent blanking after ownership gain, got {later:?}"
         );
     }
 
@@ -2839,8 +2907,11 @@ mod tests {
         let effects = sm.step(Input::OwnershipChanged(true), t(30));
 
         assert!(
-            effects.is_empty(),
-            "absent Blanked must not wake on gain, got {effects:?}"
+            !effects.iter().any(|effect| matches!(
+                effect,
+                Effect::IssueWake { .. } | Effect::IssueBlank { .. } | Effect::ShowRender { .. }
+            )),
+            "absent Blanked must not wake or blank on gain, got {effects:?}"
         );
     }
 

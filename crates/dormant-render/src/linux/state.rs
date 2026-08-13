@@ -576,6 +576,24 @@ fn cancel_transition_timer_for(
     }
 }
 
+/// Cancel a per-item load deadline if one is armed.
+fn cancel_item_load_timer_for(
+    session: &mut ScreensaverSession,
+    handle: Option<&calloop::LoopHandle<'static, WaylandState>>,
+) {
+    let token = session.item_load_token.take();
+    if let Some(token) = token
+        && let Some(handle) = handle
+    {
+        handle.remove(token);
+    }
+}
+
+/// Maximum time to wait for mpv to confirm the replacement item. A broken
+/// playlist entry must fall back to black rather than freeze the outgoing
+/// frame indefinitely.
+const ITEM_LOAD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Side-effect flags the wiring applies after [`process_mpv_events`]
 /// returns.  Kept as small data so the helper stays I/O-free and
 /// unit-testable without a `WaylandState` or real `MpvPlayer`.
@@ -666,6 +684,15 @@ pub(super) enum TransitionEvent {
     FrameRendered { ok: bool },
 }
 
+/// Whether an mpv wakeup is still at the pre-`FILE_LOADED` boundary.
+///
+/// mpv may already have advanced its current picture when it reports
+/// `END_FILE`. Rendering that picture before `FILE_LOADED` would expose the
+/// replacement at full opacity before the crossfade has a chance to start.
+fn should_defer_mpv_commit(transition: Option<&TransitionState>) -> bool {
+    transition.is_some_and(|state| state.phase == TransitionPhase::Captured)
+}
+
 /// Crossfade state for one screensaver session.
 ///
 /// Holds the capture buffer (allocated lazily on first `ItemEnded`),
@@ -743,6 +770,9 @@ pub(super) struct ScreensaverSession {
     /// `RegistrationToken` for the calloop deadline timer; removed
     /// when the first frame lands or when the session is torn down.
     pub(super) first_frame_token: Option<calloop::RegistrationToken>,
+    /// Per-item deadline timer. A missing `FILE_LOADED` event must fail back
+    /// to black rather than leave the outgoing frame frozen indefinitely.
+    pub(super) item_load_token: Option<calloop::RegistrationToken>,
     /// Selected transition mode (`Crossfade` or `None`) — copied at
     /// session-build time from `ScreensaverSettings::transition` so
     /// the state machine doesn't have to plumb settings through every
@@ -1387,7 +1417,14 @@ pub(super) trait ViewportStateView {
         black_buffer: &dyn BufferHandle,
     ) {
         self.reset_shift();
-        self.ops().surface_attach(surface, black_buffer, 0, 0);
+        self.attach_and_commit(surface, black_buffer);
+    }
+
+    /// Attach a visible frame and commit it through the Wayland seam. Keeping
+    /// this operation behind the recorder makes the no-commit transition
+    /// boundary testable without constructing a live compositor state.
+    fn attach_and_commit(&self, surface: &dyn SurfaceHandle, buffer: &dyn BufferHandle) {
+        self.ops().surface_attach(surface, buffer, 0, 0);
         self.ops().surface_commit(surface);
     }
 }
@@ -1827,6 +1864,7 @@ impl WaylandState {
             pending_gen: r#gen,
             has_first_frame: false,
             first_frame_token,
+            item_load_token: None,
             // `TransitionMode::None` paths drain mpv events and discard
             // them (see `on_mpv_wakeup`) without ever touching
             // `transition` — the state machine is gated on
@@ -1931,6 +1969,7 @@ impl WaylandState {
     /// `ItemLoaded` in a later one) still drive the lifecycle correctly.
     #[allow(clippy::too_many_lines)] // single-method state machine: drain, render, blend, attach, advance are documented inline below
     fn on_mpv_wakeup(&mut self) {
+        let wayland_ops = self.wayland_ops.clone();
         let mpv_events: Vec<MpvItemEvent> = {
             let Some(session) = self.screensaver_session.as_mut() else {
                 return;
@@ -1994,7 +2033,15 @@ impl WaylandState {
         session.transition = new_transition;
         if cmds.capture_pending {
             capture_front_into_transition(session);
+            cancel_transition_timer_for(session, self.loop_handle.as_ref());
         }
+
+        if should_defer_mpv_commit(session.transition.as_ref()) {
+            let r#gen = session.pending_gen;
+            self.arm_item_load_timer(r#gen);
+            return;
+        }
+        cancel_item_load_timer_for(session, self.loop_handle.as_ref());
 
         // Early-out if we just armed: the timer takes over with the
         // first blended tick.  Don't commit on the arming wakeup.
@@ -2088,14 +2135,20 @@ impl WaylandState {
                 Some(s) => s.wl_surface().clone(),
                 None => return,
             };
-            wl_surface.attach(Some(real_buffer(session.buffers[back_idx].as_ref())), 0, 0);
             wl_surface.damage_buffer(
                 0,
                 0,
                 session.width.cast_signed(),
                 session.height.cast_signed(),
             );
-            wl_surface.commit();
+            let surface_handle = wayland_ops.surface_handle(&wl_surface);
+            wayland_ops.surface_attach(
+                surface_handle.as_ref(),
+                session.buffers[back_idx].as_ref(),
+                0,
+                0,
+            );
+            wayland_ops.surface_commit(surface_handle.as_ref());
             session.buffers_busy[back_idx] = true;
 
             // First-frame success.
@@ -2187,6 +2240,51 @@ impl WaylandState {
         let _ = t_step;
     }
 
+    /// Install a one-shot deadline for mpv's `FILE_LOADED` event.
+    fn arm_item_load_timer(&mut self, r#gen: u64) {
+        if self
+            .screensaver_session
+            .as_ref()
+            .is_some_and(|session| session.item_load_token.is_some())
+        {
+            return;
+        }
+        let Some(handle) = self.loop_handle.clone() else {
+            return;
+        };
+        let timer = Timer::from_duration(ITEM_LOAD_DEADLINE);
+        let inserted =
+            handle.insert_source(timer, move |_deadline, _meta, state: &mut WaylandState| {
+                state.handle_item_load_timeout(r#gen);
+                TimeoutAction::Drop
+            });
+        if let Some(session) = self.screensaver_session.as_mut() {
+            match inserted {
+                Ok(token) => session.item_load_token = Some(token),
+                Err(error) => tracing::error!(
+                    event = "item_load_timer_insert_failed",
+                    display_id = %self.display_id,
+                    r#gen,
+                    error = %error,
+                ),
+            }
+        }
+    }
+
+    /// Fail the screensaver if an ended item never produces `FILE_LOADED`.
+    fn handle_item_load_timeout(&mut self, r#gen: u64) {
+        let timed_out = self.screensaver_session.as_ref().is_some_and(|session| {
+            session.pending_gen == r#gen
+                && session
+                    .transition
+                    .as_ref()
+                    .is_some_and(|transition| transition.phase == TransitionPhase::Captured)
+        });
+        if timed_out {
+            self.fail_screensaver_to_black("next item did not load");
+        }
+    }
+
     /// Per-tick blend progress.  Runs on the calloop thread when the
     /// transition timer fires.  Renders mpv into the back buffer,
     /// advances `t` unconditionally via `tick_step` (this is
@@ -2205,6 +2303,7 @@ impl WaylandState {
     /// completes its fade in the same `frames_for_blend` ticks as
     /// a 60-fps video would.
     fn on_transition_tick(&mut self, r#gen: u64) {
+        let wayland_ops = self.wayland_ops.clone();
         let Some(session) = self.screensaver_session.as_mut() else {
             return;
         };
@@ -2294,14 +2393,20 @@ impl WaylandState {
             Some(s) => s.wl_surface().clone(),
             None => return,
         };
-        wl_surface.attach(Some(real_buffer(session.buffers[back_idx].as_ref())), 0, 0);
         wl_surface.damage_buffer(
             0,
             0,
             session.width.cast_signed(),
             session.height.cast_signed(),
         );
-        wl_surface.commit();
+        let surface_handle = wayland_ops.surface_handle(&wl_surface);
+        wayland_ops.surface_attach(
+            surface_handle.as_ref(),
+            session.buffers[back_idx].as_ref(),
+            0,
+            0,
+        );
+        wayland_ops.surface_commit(surface_handle.as_ref());
         session.buffers_busy[back_idx] = true;
         session.next_render_idx = 1 - back_idx;
 
@@ -2428,6 +2533,9 @@ impl WaylandState {
                 {
                     handle.remove(token);
                 }
+                if let Some(token) = session.item_load_token {
+                    handle.remove(token);
+                }
             }
         }
         // Drop the session — the destructuring here is purely to control
@@ -2447,6 +2555,7 @@ impl WaylandState {
                 pool,
                 buffers,
                 first_frame_token: _,
+                item_load_token: _,
                 pending_reply: _,
                 pending_gen: _,
                 has_first_frame: _,
@@ -3589,6 +3698,51 @@ mod tests {
         assert!(
             log.iter().all(|entry| !entry.contains("-1, -1, -1, -1")),
             "a normal shift tick must never emit the unset tuple: {log:?}"
+        );
+    }
+
+    #[test]
+    fn item_ended_boundary_defers_commit_until_item_loaded_and_fade_ticks() {
+        let fake = FakeShiftView::new(0);
+        let surface = fake.seed_surface();
+        let buffer = fake.seed_buffer();
+        let transition = TransitionState {
+            capture: vec![0; 4],
+            phase: TransitionPhase::Captured,
+            t: 0,
+            t_step: 1,
+            timer_token: None,
+        };
+        assert!(should_defer_mpv_commit(Some(&transition)));
+        if !should_defer_mpv_commit(Some(&transition)) {
+            fake.attach_and_commit(surface.as_ref(), buffer.as_ref());
+        }
+        assert!(
+            fake.take_call_log().is_empty(),
+            "ItemEnded before ItemLoaded must not attach or commit a new frame"
+        );
+
+        let (phase, _, step_cmd) =
+            transition_step(transition.phase, transition.t, TransitionEvent::ItemLoaded);
+        assert_eq!(phase, TransitionPhase::AwaitingFirstFrame);
+        assert_eq!(step_cmd, StepCmd::NoOp);
+        let (phase, _, step_cmd) =
+            transition_step(phase, 0, TransitionEvent::FrameRendered { ok: true });
+        assert_eq!(phase, TransitionPhase::Fading);
+        assert_eq!(step_cmd, StepCmd::ArmTimer);
+        assert!(!should_defer_mpv_commit(Some(&TransitionState {
+            phase,
+            ..transition
+        })));
+        let (_, _, tick_cmd) = tick_step(phase, 0, 1);
+        assert_eq!(tick_cmd, TickCmd::Advance);
+        fake.attach_and_commit(surface.as_ref(), buffer.as_ref());
+        assert_eq!(
+            fake.take_call_log(),
+            vec![
+                "surface_attach(#0, buffer=#1, 0, 0)".to_string(),
+                "surface_commit(#0)".to_string(),
+            ]
         );
     }
 

@@ -19,6 +19,7 @@ use dormant_core::observation::{DaemonObservation, GenerationId, ObservationHub,
 use dormant_core::rules::{ControlMsg, DaemonEvent, RollbackStatus, StateSnapshot};
 use dormant_core::traits::SensorSource;
 use dormant_core::types::{DisplayId, PresenceEvent, SensorId, SensorState, Timestamp};
+use dormant_core::wear::ledger_identity_key;
 use dormantd::app::{
     App, GenerationBarrierGate, ReloadLifecycleCapture, ReloadOutcome, validate_only,
 };
@@ -751,6 +752,10 @@ fn noop_factory() -> std::sync::Arc<dyn NotifySink> {
     std::sync::Arc::new(NoopNotifySink)
 }
 
+fn command_ledger_filename() -> String {
+    format!("wear-{}.json", ledger_identity_key("mon"))
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_apps_keep_wear_paths_and_observations_isolated() {
     let paths_a = TestAppPaths::new();
@@ -769,10 +774,13 @@ async fn concurrent_apps_keep_wear_paths_and_observations_isolated() {
         .expect("write config");
         let wear_dir = paths.state.join("wear");
         for epoch_s in corrupt_epoch..=corrupt_epoch + 10 {
-            fs::create_dir_all(wear_dir.join(format!("wear-mon.json.corrupt.{epoch_s}")))
-                .expect("block corrupt-ledger rename");
+            fs::create_dir_all(
+                wear_dir.join(format!("{}.corrupt.{epoch_s}", command_ledger_filename())),
+            )
+            .expect("block corrupt-ledger rename");
         }
-        fs::write(wear_dir.join("wear-mon.json"), "{ invalid ledger").expect("seed corrupt ledger");
+        fs::write(wear_dir.join(command_ledger_filename()), "{ invalid ledger")
+            .expect("seed corrupt ledger");
     }
 
     let observations_a = ObservationHub::new(16);
@@ -807,8 +815,8 @@ async fn concurrent_apps_keep_wear_paths_and_observations_isolated() {
     let (handle_a, join_a) = started_a.expect("start app A");
     let (handle_b, join_b) = started_b.expect("start app B");
 
-    let expected_a = paths_a.state.join("wear").join("wear-mon.json");
-    let expected_b = paths_b.state.join("wear").join("wear-mon.json");
+    let expected_a = paths_a.state.join("wear").join(command_ledger_filename());
+    let expected_b = paths_b.state.join("wear").join(command_ledger_filename());
     let observed_a = recv_observation(
         &mut rx_a,
         Duration::from_secs(8),
@@ -3517,7 +3525,11 @@ async fn wear_ledger_file_appears_and_seeds() {
     // `tokio::time::interval`'s FIRST tick fires immediately (not after a
     // full period), so the first sample/persist happens right away despite
     // the 5s-floor `sample_interval` validation requires.
-    let wear_file = dir.path().join("state").join("wear").join("wear-mon.json");
+    let wear_file = dir
+        .path()
+        .join("state")
+        .join("wear")
+        .join(command_ledger_filename());
     let ok = wait_for(|| wear_file.exists(), Duration::from_secs(3)).await;
 
     let ledger_check = ok.then(|| {
@@ -3614,7 +3626,11 @@ async fn wear_survives_reload_and_fail_closes_during_swap() {
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 
-    let wear_file = dir.path().join("state").join("wear").join("wear-mon.json");
+    let wear_file = dir
+        .path()
+        .join("state")
+        .join("wear")
+        .join(command_ledger_filename());
     assert!(
         wait_for(|| wear_file.exists(), Duration::from_secs(3)).await,
         "ledger must appear before the reload churn starts"
@@ -3733,7 +3749,11 @@ async fn wear_shutdown_persists_final_ledger() {
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 
-    let wear_file = dir.path().join("state").join("wear").join("wear-mon.json");
+    let wear_file = dir
+        .path()
+        .join("state")
+        .join("wear")
+        .join(command_ledger_filename());
     assert!(
         wait_for(|| wear_file.exists(), Duration::from_secs(3)).await,
         "ledger must appear from the first (immediate) tick's persist"
@@ -3816,7 +3836,11 @@ async fn wear_park_persists_final_ledger() {
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 
-    let wear_file = dir.path().join("state").join("wear").join("wear-mon.json");
+    let wear_file = dir
+        .path()
+        .join("state")
+        .join("wear")
+        .join(command_ledger_filename());
     assert!(
         wait_for(|| wear_file.exists(), Duration::from_secs(3)).await,
         "ledger must appear from the first (immediate) tick's persist"

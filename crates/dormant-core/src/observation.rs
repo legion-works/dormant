@@ -124,6 +124,13 @@ pub enum DaemonObservation {
         /// Error returned while renaming the corrupt ledger.
         rename_error: String,
     },
+    /// A present wear ledger could not be read and must not be overwritten.
+    WearLedgerUnreadable {
+        /// Existing ledger path.
+        path: PathBuf,
+        /// Error returned while reading the ledger.
+        read_error: String,
+    },
     /// Boot fell back from an invalid candidate to a last-known-good configuration.
     BootRollback {
         /// Fingerprint of the failed candidate.

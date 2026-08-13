@@ -491,6 +491,13 @@ impl DisplayController for DdcciController {
                         controller: Self::NAME.to_string(),
                         error: format!("{E_DISPLAY_IO}: failed to set power off: {e}"),
                     })?;
+                // Each VCP transaction is serialized by the shared panel lock;
+                // the lock is not held across this await pair. Another command
+                // may therefore interleave, but any resulting false mismatch
+                // fails toward fallback rather than silently leaving the panel
+                // on. A panel that stops answering after D6_OFF is expected
+                // during sleep, so only a verified still-on value escalates.
+                self.verify_power_off_write(&ident, &lock).await?;
                 Ok(())
             }
             BlankMode::ScreenOffAudioOn => Err(CmdFailure {
@@ -838,6 +845,41 @@ impl DisplayController for DdcciController {
 }
 
 impl DdcciController {
+    /// Verify a `PowerOff` write without treating a panel that stops answering
+    /// during its sleep transition as a failed blank. A successful readback
+    /// that still reports the on value is actionable evidence that the write
+    /// was `ACKed` but not applied, so it must fail and let the executor try the
+    /// next controller.
+    async fn verify_power_off_write(
+        &self,
+        ident: &str,
+        lock: &Arc<PanelLock>,
+    ) -> Result<(), CmdFailure> {
+        match self
+            .ops
+            .get_vcp(ident, VCP_POWER, lock, VcpPriority::Command)
+            .await
+        {
+            Ok(D6_OFF) => Ok(()),
+            Ok(v) => Err(CmdFailure {
+                controller: Self::NAME.to_string(),
+                error: format!(
+                    "{E_DISPLAY_IO}: failed to verify power-off write on {ident}: \
+                     post-write verification mismatch: wrote {D6_OFF}, read back {v}"
+                ),
+            }),
+            Err(e) => {
+                tracing::warn!(
+                    event = "ddcci_power_off_readback_unavailable",
+                    display = %ident,
+                    error = %e,
+                    "D6 power-off readback unavailable after write; accepting sleep transition",
+                );
+                Ok(())
+            }
+        }
+    }
+
     /// Post-write verification for a `BrightnessZero` blank's
     /// `set_vcp(0x10, 0)` write, plus the rollback invariant (Task 6): a
     /// DDC write can silently fail to land (flaky I²C bus, loose cable,
@@ -1865,6 +1907,80 @@ mod tests {
         assert!(
             err.error.contains("not supported"),
             "error should mention D6 not supported: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn blank_power_off_fails_when_readback_stays_on() {
+        let fake = Arc::new(single_display_vcp());
+        fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, Ok(D6_ON));
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::PowerOff,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &PanelLocks::new(),
+        );
+        ctrl.probe().await.unwrap();
+
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, D6_OFF, Ok(()));
+        fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, Ok(D6_ON));
+
+        let err = ctrl.blank(BlankMode::PowerOff).await.unwrap_err();
+        assert!(
+            err.error.contains("post-write verification mismatch"),
+            "power-off must fail when D6 still reports on: {err}"
+        );
+        assert_eq!(ctrl.state.lock().unwrap().last_blank_mode, None);
+    }
+
+    #[tokio::test]
+    async fn blank_power_off_succeeds_when_readback_confirms_off() {
+        let fake = Arc::new(single_display_vcp());
+        fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, Ok(D6_ON));
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::PowerOff,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &PanelLocks::new(),
+        );
+        ctrl.probe().await.unwrap();
+
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, D6_OFF, Ok(()));
+        fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, Ok(D6_OFF));
+
+        ctrl.blank(BlankMode::PowerOff).await.unwrap();
+        assert_eq!(
+            ctrl.state.lock().unwrap().last_blank_mode,
+            Some(BlankMode::PowerOff)
+        );
+    }
+
+    #[tokio::test]
+    async fn blank_power_off_tolerates_readback_transport_error() {
+        let fake = Arc::new(single_display_vcp());
+        fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, Ok(D6_ON));
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::PowerOff,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &PanelLocks::new(),
+        );
+        ctrl.probe().await.unwrap();
+
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, D6_OFF, Ok(()));
+        fake.expect_get(
+            "i2c-dev:56 DEL DELL U2723QE",
+            VCP_POWER,
+            Err("panel stopped responding after power-off".into()),
+        );
+
+        ctrl.blank(BlankMode::PowerOff).await.unwrap();
+        assert_eq!(
+            ctrl.state.lock().unwrap().last_blank_mode,
+            Some(BlankMode::PowerOff)
         );
     }
 

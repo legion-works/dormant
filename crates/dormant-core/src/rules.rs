@@ -1634,7 +1634,7 @@ impl RulesEngine {
                 present: change.present,
                 cause: change.cause.clone(),
             });
-            self.fan_zone_change_to_displays(&change.zone, change.present);
+            self.fan_zone_change_to_displays(&change.zone);
         }
     }
 
@@ -1680,15 +1680,15 @@ impl RulesEngine {
         }
     }
 
-    /// Drive every display machine bound to a rule on this zone through one
-    /// `step(Input::ZonePresent(change.present))`.
+    /// Drive every display machine bound to a rule on this zone through its
+    /// effective presence across all rules sharing the display.
     ///
     /// Paused rules are NOT skipped here — the state machine owns the
     /// pause semantics on its overlays (freeze blank path, leave wake
     /// unaffected, track the zone level so an un-paused machine is never
     /// surprised by a missed edge). `paused_rules` is kept as bookkeeping
     /// for `Resume` routing and snapshot reporting only.
-    fn fan_zone_change_to_displays(&mut self, zone: &ZoneId, present: bool) {
+    fn fan_zone_change_to_displays(&mut self, zone: &ZoneId) {
         // Snapshot the rule ids so the immutable borrow on `self.zone_rules`
         // ends before we step machines mutably.
         let rule_ids: Vec<RuleId> = match self.zone_rules.get(zone) {
@@ -1702,6 +1702,7 @@ impl RulesEngine {
                 None => continue,
             };
             for display_id in displays {
+                let present = self.effective_zone_presence(&display_id);
                 // Issue #125: when presence returns, clear any active
                 // input-wake hold — the room is occupied, so there is
                 // nothing to hold back.
@@ -1717,6 +1718,18 @@ impl RulesEngine {
                 self.step_machine(&display_id, Input::ZonePresent(present), now);
             }
         }
+    }
+
+    /// Reduce every zone driving a display with fail-safe presence semantics.
+    ///
+    /// A display remains awake when any driving zone is occupied or unknown;
+    /// only a display whose every driving zone is known vacant may enter Grace.
+    fn effective_zone_presence(&self, display: &DisplayId) -> bool {
+        self.cfg
+            .rules
+            .iter()
+            .filter(|rule| rule.displays.contains(display))
+            .any(|rule| self.zone_engine.is_present(&rule.zone).unwrap_or(true))
     }
 
     // ── Internal: control messages ─────────────────────────────────────────
@@ -5790,6 +5803,181 @@ fn input_wake_hold_engine(hold: Duration) -> (RulesEngine, DisplayId, Arc<Record
     .expect("engine must be valid");
 
     (engine, display, sink)
+}
+
+#[cfg(test)]
+fn multi_zone_presence_engine() -> (RulesEngine, DisplayId) {
+    use crate::zone::{FusionMode, ZoneMember, ZoneSpec};
+
+    let display = DisplayId("d1".into());
+    let first_zone = ZoneId("z1".into());
+    let second_zone = ZoneId("z2".into());
+    let first_sensor = SensorId("s1".into());
+    let second_sensor = SensorId("s2".into());
+    let sink = Arc::new(RecordingSink::new());
+    let mut executors = HashMap::new();
+    executors.insert(display.clone(), sink as Arc<dyn CommandSink>);
+    let engine = RulesEngine::new(
+        RulesEngineConfig {
+            rules: vec![
+                RuleRuntimeCfg {
+                    rule: RuleId("r1".into()),
+                    zone: first_zone.clone(),
+                    displays: vec![display.clone()],
+                    input_wake_hold: Duration::ZERO,
+                },
+                RuleRuntimeCfg {
+                    rule: RuleId("r2".into()),
+                    zone: second_zone.clone(),
+                    displays: vec![display.clone()],
+                    input_wake_hold: Duration::ZERO,
+                },
+            ],
+            displays: vec![DisplayRuntimeCfg {
+                display: display.clone(),
+                blank_mode: BlankMode::PowerOff,
+                ladder: vec![],
+                timings: DisplayRuntimeCfg::manual_defaults(Duration::ZERO),
+            }],
+            sensors: vec![
+                SensorRuntimeCfg {
+                    sensor: first_sensor.clone(),
+                    kind: SensorKind::Presence,
+                    hold_time: None,
+                    stale_timeout: Duration::from_secs(3600),
+                },
+                SensorRuntimeCfg {
+                    sensor: second_sensor.clone(),
+                    kind: SensorKind::Presence,
+                    hold_time: None,
+                    stale_timeout: Duration::from_secs(3600),
+                },
+            ],
+            doctor_wake_settle: Duration::from_secs(3),
+        },
+        ZoneEngine::new(
+            vec![
+                ZoneSpec {
+                    id: first_zone,
+                    mode: FusionMode::Any,
+                    members: vec![ZoneMember::Sensor(first_sensor)],
+                    weights: HashMap::new(),
+                    unavailable_policy: crate::zone::UnavailablePolicy::Present,
+                },
+                ZoneSpec {
+                    id: second_zone,
+                    mode: FusionMode::Any,
+                    members: vec![ZoneMember::Sensor(second_sensor)],
+                    weights: HashMap::new(),
+                    unavailable_policy: crate::zone::UnavailablePolicy::Present,
+                },
+            ],
+            &[SensorId("s1".into()), SensorId("s2".into())],
+        )
+        .expect("zone engine must be valid"),
+        executors,
+        HashMap::new(),
+        Arc::new(crate::ownership::AlwaysOwned),
+    )
+    .expect("engine must be valid");
+
+    (engine, display)
+}
+
+#[test]
+fn shared_display_stays_active_when_one_zone_vacates() {
+    let (mut engine, display) = multi_zone_presence_engine();
+
+    engine.handle_presence_event(PresenceEvent::new(
+        SensorId("s1".into()),
+        SensorState::Present,
+        Timestamp::now(),
+    ));
+    engine.handle_presence_event(PresenceEvent::new(
+        SensorId("s2".into()),
+        SensorState::Absent,
+        Timestamp::now(),
+    ));
+
+    assert_eq!(
+        engine
+            .machines
+            .get(&display)
+            .expect("display exists")
+            .phase_name(),
+        "active",
+        "an occupied driving zone must prevent a vacancy edge from entering Grace"
+    );
+}
+
+#[test]
+fn shared_display_enters_grace_when_all_zones_vacate() {
+    use crate::state_machine::Phase;
+
+    let (mut engine, display) = multi_zone_presence_engine();
+
+    engine.handle_presence_event(PresenceEvent::new(
+        SensorId("s1".into()),
+        SensorState::Absent,
+        Timestamp::now(),
+    ));
+    engine.handle_presence_event(PresenceEvent::new(
+        SensorId("s2".into()),
+        SensorState::Absent,
+        Timestamp::now(),
+    ));
+
+    assert!(matches!(
+        engine
+            .machines
+            .get(&display)
+            .expect("display exists")
+            .phase(),
+        Phase::Grace { .. }
+    ));
+}
+
+#[test]
+fn shared_display_treats_unknown_zone_as_present() {
+    let (mut engine, display) = multi_zone_presence_engine();
+
+    engine.handle_presence_event(PresenceEvent::new(
+        SensorId("s1".into()),
+        SensorState::Absent,
+        Timestamp::now(),
+    ));
+
+    assert_eq!(
+        engine
+            .machines
+            .get(&display)
+            .expect("display exists")
+            .phase_name(),
+        "active",
+        "an unknown driving zone must resolve to present"
+    );
+}
+
+#[test]
+fn single_rule_display_still_enters_grace_when_its_zone_vacates() {
+    use crate::state_machine::Phase;
+
+    let (mut engine, display, _sink) = input_wake_hold_engine(Duration::ZERO);
+
+    engine.handle_presence_event(PresenceEvent::new(
+        SensorId("s1".into()),
+        SensorState::Absent,
+        Timestamp::now(),
+    ));
+
+    assert!(matches!(
+        engine
+            .machines
+            .get(&display)
+            .expect("display exists")
+            .phase(),
+        Phase::Grace { .. }
+    ));
 }
 
 #[test]

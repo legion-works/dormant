@@ -555,6 +555,14 @@ impl CommandSink for DisplayExecutor {
             if !is_owner_attempt && !controller.is_available().await {
                 continue;
             }
+            if supersede_token.is_cancelled() {
+                // Do not update health on supersede — no real controller
+                // attempt was made here.
+                return Err(CmdFailure {
+                    controller: "superseded".to_string(),
+                    error: format!("{E_WAKE_FAILED}: superseded by blank"),
+                });
+            }
             if controller.wake().await.is_ok() {
                 if supersede_token.is_cancelled() {
                     return Err(CmdFailure {
@@ -738,6 +746,12 @@ impl CommandSink for DisplayExecutor {
             let is_owner_attempt = owner == Some(i);
             if !is_owner_attempt && !controller.is_available().await {
                 continue;
+            }
+            if supersede_token.is_cancelled() {
+                return Err(CmdFailure {
+                    controller: "superseded".to_string(),
+                    error: format!("{E_WAKE_FAILED}: superseded by blank"),
+                });
             }
             if controller.wake().await.is_ok() {
                 if supersede_token.is_cancelled() {
@@ -956,6 +970,8 @@ mod tests {
         blank_delay: Duration,
         /// Same as `blank_delay` but for `wake()`.
         wake_delay: Duration,
+        /// Signals that `reprobe()` has entered the recovery pass.
+        reprobe_entered: Arc<tokio::sync::Notify>,
         /// Scripted [`DisplayController::read_usage_hours`] response — used
         /// by the T5 chain-walk test (test 2).
         usage_hours: Option<u32>,
@@ -1016,6 +1032,10 @@ mod tests {
 
         fn set_wake_delay(&self, d: Duration) {
             self.inner.lock().unwrap().wake_delay = d;
+        }
+
+        fn reprobe_entered(&self) -> Arc<tokio::sync::Notify> {
+            Arc::clone(&self.inner.lock().unwrap().reprobe_entered)
         }
 
         fn set_usage_hours(&self, hours: Option<u32>) {
@@ -1110,8 +1130,14 @@ mod tests {
             // exercise the executor's zero-available heal. With no scripted
             // result the fake keeps its manual `set_available` state, so
             // existing unavailable-chain tests are unaffected.
+            let entered = {
+                let mut g = self.inner.lock().unwrap();
+                g.log.push((self.name.to_string(), "reprobe"));
+                Arc::clone(&g.reprobe_entered)
+            };
+            entered.notify_waiters();
+            tokio::task::yield_now().await;
             let mut g = self.inner.lock().unwrap();
-            g.log.push((self.name.to_string(), "reprobe"));
             match g.probe_result.take() {
                 Some(Ok(())) => {
                     g.available = true;
@@ -2245,6 +2271,50 @@ mod tests {
             None,
             "owner cleared after owner's wake succeeds in reprobe-heal"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wake_reprobe_superseded_before_controller_call_does_not_wake() {
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        a.set_available(false);
+        a.set_probe_result(Ok(()));
+        let retry = RetrySettings {
+            wake_retries: 0,
+            wake_retry_backoff: Duration::from_secs(1),
+        };
+        let (exec, _) = executor_with(vec![a.clone()], retry);
+
+        let reprobe_entered = a.reprobe_entered();
+        let entered = tokio::spawn(async move { reprobe_entered.notified().await });
+        let waking = Arc::clone(&exec);
+        let wake_task = tokio::spawn(async move { waking.wake().await });
+        entered.await.unwrap();
+
+        exec.blank(BlankMode::PowerOff).await.unwrap();
+
+        let err = wake_task.await.unwrap().unwrap_err();
+        assert_eq!(err.controller, "superseded");
+        assert_eq!(a.count_op("wake"), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wake_once_reprobe_superseded_before_controller_call_does_not_wake() {
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        a.set_available(false);
+        a.set_probe_result(Ok(()));
+        let (exec, _) = executor_with(vec![a.clone()], default_retry());
+
+        let reprobe_entered = a.reprobe_entered();
+        let entered = tokio::spawn(async move { reprobe_entered.notified().await });
+        let waking = Arc::clone(&exec);
+        let wake_task = tokio::spawn(async move { waking.wake_once().await });
+        entered.await.unwrap();
+
+        exec.blank(BlankMode::PowerOff).await.unwrap();
+
+        let err = wake_task.await.unwrap().unwrap_err();
+        assert_eq!(err.controller, "superseded");
+        assert_eq!(a.count_op("wake"), 0);
     }
 
     #[tokio::test]

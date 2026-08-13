@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
-use dormant_core::spatial_grid::{LUMA_GRID_COLS, LUMA_GRID_ROWS, LumaGrid};
+use dormant_core::spatial_grid::{
+    LUMA_GRID_COLS, LUMA_GRID_ROWS, LumaGrid, linear_luma as core_linear_luma,
+    srgb_to_linear as core_srgb_to_linear,
+};
 use dormant_core::types::DisplayId;
 use image::ImageReader;
 use thiserror::Error;
@@ -40,19 +43,13 @@ pub struct LumaScanJob {
 /// Convert one normalized sRGB channel to linear light.
 #[must_use]
 pub fn srgb_to_linear(channel: f32) -> f32 {
-    if channel <= 0.04045 {
-        channel / 12.92
-    } else {
-        ((channel + 0.055) / 1.055).powf(2.4)
-    }
+    core_srgb_to_linear(channel)
 }
 
 /// Calculate Rec. 709 luminance after transfer-function conversion.
 #[must_use]
 pub fn linear_luma(rgb: [f32; 3]) -> f32 {
-    0.2126 * srgb_to_linear(rgb[0])
-        + 0.7152 * srgb_to_linear(rgb[1])
-        + 0.0722 * srgb_to_linear(rgb[2])
+    core_linear_luma(rgb)
 }
 
 /// Return the ratified flat linear-light grid for a video wear tag.
@@ -149,11 +146,13 @@ impl LumaCache {
                             as u32;
                         let pixel = rgba.get_pixel(x, y).0;
                         let alpha = f32::from(pixel[3]) / 255.0;
+                        // Composite over black in linear light: convert the
+                        // encoded channels before applying coverage alpha.
                         sum += linear_luma([
-                            f32::from(pixel[0]) / 255.0 * alpha,
-                            f32::from(pixel[1]) / 255.0 * alpha,
-                            f32::from(pixel[2]) / 255.0 * alpha,
-                        ]);
+                            f32::from(pixel[0]) / 255.0,
+                            f32::from(pixel[1]) / 255.0,
+                            f32::from(pixel[2]) / 255.0,
+                        ]) * alpha;
                     }
                 }
                 cells.push(sum / 16.0);
@@ -224,9 +223,23 @@ mod tests {
             grid.cells.len(),
             usize::from(LUMA_GRID_ROWS * LUMA_GRID_COLS)
         );
-        let composited = 128.0 / 255.0 * (128.0 / 255.0);
-        let expected = linear_luma([composited; 3]);
+        // Alpha is coverage over black, applied to the LINEAR luminance —
+        // it is not premultiplied into the encoded channels (issue #283).
+        let alpha = 128.0 / 255.0;
+        let expected = linear_luma([128.0 / 255.0; 3]) * alpha;
         assert!(grid.cells.iter().all(|v| (*v - expected).abs() < 1e-5));
+    }
+
+    #[test]
+    fn scanner_composites_translucent_white_over_black_in_linear_light() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("translucent-white.png");
+        ImageBuffer::from_fn(16, 9, |_, _| Rgba([255_u8, 255, 255, 128]))
+            .save(&path)
+            .unwrap();
+
+        let grid = LumaCache::new().scan_path(&path).unwrap();
+        assert!(grid.cells.iter().all(|value| (*value - 0.5).abs() < 0.005));
     }
     #[test]
     fn scanner_stratified_samples_preserve_black_and_white_halves() {

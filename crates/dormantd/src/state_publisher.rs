@@ -229,9 +229,10 @@ async fn run(deps: StatePublisherDeps, transport_box: Option<Box<dyn PublisherTr
         return;
     };
 
-    let mut snapshot = request_snapshot(&ctl_tx, &cancel)
-        .await
-        .unwrap_or_else(|| StateSnapshot {
+    let mut snapshot = match request_snapshot(&ctl_tx, &cancel).await {
+        SnapshotResult::Ready(snapshot) => snapshot,
+        SnapshotResult::Cancelled => return,
+        SnapshotResult::Unavailable => StateSnapshot {
             sensors: Vec::new(),
             zones: Vec::new(),
             displays: Vec::new(),
@@ -239,7 +240,8 @@ async fn run(deps: StatePublisherDeps, transport_box: Option<Box<dyn PublisherTr
             rollback: None,
             kvm: None,
             wear_sampling_status: None,
-        });
+        },
+    };
     let _ = credentials; // captured in mqtt_transport build; kept here to satisfy the borrow checker
 
     let instance = sanitize_topic_id(&config.publish.instance_id);
@@ -366,7 +368,8 @@ async fn run(deps: StatePublisherDeps, transport_box: Option<Box<dyn PublisherTr
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                     tracing::warn!(event = "publish_events_lagged", skipped);
-                    if let Some(new_snap) = request_snapshot(&ctl_tx, &cancel).await {
+                    if let SnapshotResult::Ready(new_snap) = request_snapshot(&ctl_tx, &cancel).await
+                    {
                         snapshot = new_snap;
                         send_flush(
                             &record_tx,
@@ -405,20 +408,30 @@ async fn finalize_shutdown(
     }
 }
 
-/// Request a [`StateSnapshot`] via `ControlMsg::Snapshot`. Returns
-/// `None` on cancel or engine channel closure.
+enum SnapshotResult {
+    Ready(StateSnapshot),
+    Cancelled,
+    Unavailable,
+}
+
+/// Request a [`StateSnapshot`] via `ControlMsg::Snapshot`, preserving whether
+/// the request was interrupted by generation cancellation or by engine
+/// unavailability.
 async fn request_snapshot(
     ctl_tx: &mpsc::Sender<dormant_core::rules::ControlMsg>,
     cancel: &tokio_util::sync::CancellationToken,
-) -> Option<StateSnapshot> {
+) -> SnapshotResult {
     use dormant_core::rules::ControlMsg;
     let (snap_tx, snap_rx) = tokio::sync::oneshot::channel();
     if ctl_tx.send(ControlMsg::Snapshot(snap_tx)).await.is_err() {
-        return None;
+        return SnapshotResult::Unavailable;
     }
     tokio::select! {
-        () = cancel.cancelled() => None,
-        res = snap_rx => res.ok(),
+        () = cancel.cancelled() => SnapshotResult::Cancelled,
+        res = snap_rx => match res {
+            Ok(snapshot) => SnapshotResult::Ready(snapshot),
+            Err(_) => SnapshotResult::Unavailable,
+        },
     }
 }
 
@@ -480,8 +493,12 @@ async fn flush_full(req: FlushRequest<'_>) {
 
     // 3. Snapshot — fresh if requested (reconnect / HA birth), otherwise
     //    the caller's pre-existing snapshot.
-    if request_fresh_snapshot && let Some(new_snap) = request_snapshot(ctl_tx, cancel).await {
-        *snapshot = new_snap;
+    if request_fresh_snapshot {
+        match request_snapshot(ctl_tx, cancel).await {
+            SnapshotResult::Ready(new_snap) => *snapshot = new_snap,
+            SnapshotResult::Cancelled => return,
+            SnapshotResult::Unavailable => {}
+        }
     }
     let snaps = snapshot_records(cfg, snapshot, instance);
     tracing::debug!(

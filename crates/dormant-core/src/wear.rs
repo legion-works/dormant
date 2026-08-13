@@ -116,12 +116,12 @@ pub struct WearCell {
 
 /// Stable identity for the display a ledger belongs to.
 ///
-/// `key` is the sanitized, filesystem- and config-safe form (see
-/// [`sanitize_identity_key`]) used to key [`WearHandle`] and name ledger
-/// files; `display_name` is the human-readable label shown in UI.
+/// `key` is the collision-resistant, filesystem- and config-safe form used to
+/// key [`WearHandle`] and name ledger files; `display_name` is the
+/// human-readable label shown in UI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WearIdentity {
-    /// Sanitized identity key, stable across restarts for the same panel.
+    /// Collision-resistant identity key, stable across restarts for the same panel.
     pub key: String,
     /// Human-readable display name.
     pub display_name: String,
@@ -658,6 +658,24 @@ pub fn sanitize_identity_key(key: &str) -> String {
     sanitized.chars().take(64).collect()
 }
 
+/// Encode a full panel identity into a filename-safe, injective ledger key.
+///
+/// The legacy [`sanitize_identity_key`] form is lossy: disallowed characters
+/// collapse to `-`, and long identities are truncated. Hex-encoding the UTF-8
+/// bytes preserves every distinction while keeping the result portable across
+/// filesystems.
+#[must_use]
+pub fn ledger_identity_key(identity: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(3 + identity.len() * 2);
+    encoded.push_str("id-");
+    for byte in identity.as_bytes() {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
 #[cfg(test)]
 #[allow(
     clippy::float_cmp,
@@ -949,6 +967,16 @@ mod tests {
         );
         let long = "x".repeat(100);
         assert_eq!(sanitize_identity_key(&long).len(), 64);
+    }
+
+    #[test]
+    fn ledger_identity_key_is_injective_for_sanitization_collisions() {
+        let first = ledger_identity_key("a:b");
+        let second = ledger_identity_key("a/b");
+
+        assert_ne!(first, second);
+        assert!(first.starts_with("id-"));
+        assert!(second.starts_with("id-"));
     }
 
     #[test]

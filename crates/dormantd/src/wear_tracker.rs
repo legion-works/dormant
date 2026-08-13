@@ -50,7 +50,7 @@
 #[cfg(feature = "render")]
 use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -64,7 +64,8 @@ use dormant_core::types::ScreensaverItemReport;
 use dormant_core::types::{DisplayId, StageKind, Tick};
 use dormant_core::wear::{
     PanelType, WEAR_SCHEMA_VERSION, WearAttributionMode, WearHandle, WearIdentity, WearLedger,
-    advisory_active, brightness_norm, hours_since_effective_dwell, sanitize_identity_key,
+    advisory_active, brightness_norm, hours_since_effective_dwell, ledger_identity_key,
+    sanitize_identity_key,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
@@ -349,12 +350,13 @@ fn ensure_ledgers_loaded(
         // chain's own panel-derived identity over the config display name,
         // so a `[displays.*]` rename never orphans an existing ledger.
         // Only controllers with no readback (`command`, `kwin-dpms`,
-        // `ha-passthrough`) fall back to the sanitized config key.
+        // `ha-passthrough`) fall back to the config key as their identity source.
         let identity_source = executors
             .get(display_id)
             .and_then(|sink| sink.panel_identity())
             .unwrap_or_else(|| display_id.0.clone());
-        let key = sanitize_identity_key(&identity_source);
+        let legacy_key = sanitize_identity_key(&identity_source);
+        let key = ledger_identity_key(&identity_source);
         state.storage_key.insert(display_id.clone(), key.clone());
 
         let identity = WearIdentity {
@@ -365,6 +367,7 @@ fn ensure_ledgers_loaded(
         let result = load_or_create_ledger(
             dir,
             &key,
+            &legacy_key,
             identity,
             panel_type,
             cfg.wear.grid_rows,
@@ -426,7 +429,7 @@ fn persist_all_dirty(state: &TrackerState, dir: &Path) {
             .storage_key
             .get(display_id)
             .cloned()
-            .unwrap_or_else(|| sanitize_identity_key(&display_id.0));
+            .unwrap_or_else(|| ledger_identity_key(&display_id.0));
         if let Err(e) = persist_ledger(dir, &key, ledger) {
             tracing::warn!(event = "wear_persist_failed", display = %display_id, error = %e);
         }
@@ -514,7 +517,7 @@ async fn apply_actions(
                     .storage_key
                     .get(&display_id)
                     .cloned()
-                    .unwrap_or_else(|| sanitize_identity_key(&display_id.0));
+                    .unwrap_or_else(|| ledger_identity_key(&display_id.0));
                 if let Err(e) = persist_ledger(dir, &key, ledger) {
                     tracing::warn!(event = "wear_persist_failed", display = %display_id, error = %e);
                 }
@@ -578,7 +581,7 @@ fn sync_handle(state: &TrackerState, handle: &WearHandle) {
             .storage_key
             .get(display_id)
             .cloned()
-            .unwrap_or_else(|| sanitize_identity_key(&display_id.0));
+            .unwrap_or_else(|| ledger_identity_key(&display_id.0));
         guard.insert(key, ledger.clone());
     }
 }
@@ -1400,10 +1403,123 @@ struct LoadResult {
     persist_readonly: bool,
 }
 
+struct LedgerContents {
+    contents: String,
+    persist_readonly: bool,
+}
+
+enum LedgerReadError {
+    Absent,
+    Unreadable {
+        path: PathBuf,
+        error: std::io::Error,
+    },
+}
+
+/// Atomically write bytes to a ledger path using the same unique temporary
+/// file discipline as regular persistence. Legacy adoption uses this to carry
+/// the original JSON bytes forward without reserializing them.
+fn write_atomic_bytes(dir: &Path, key: &str, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let final_path = dir.join(format!("wear-{key}.json"));
+    let tmp_path = dir.join(tmp_filename(key));
+    std::fs::write(&tmp_path, bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o644))?;
+    }
+    std::fs::rename(&tmp_path, &final_path)
+}
+
+fn read_ledger_contents(
+    dir: &Path,
+    key: &str,
+    legacy_key: &str,
+    display_key: &str,
+) -> Result<LedgerContents, LedgerReadError> {
+    let path = dir.join(format!("wear-{key}.json"));
+    let legacy_path = dir.join(format!("wear-{legacy_key}.json"));
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => {
+            if legacy_key != key && legacy_path.exists() {
+                tracing::warn!(
+                    event = "wear_ledger_legacy_ignored",
+                    display = display_key,
+                    canonical_path = %path.display(),
+                    legacy_path = %legacy_path.display(),
+                    "an unmigrated legacy wear ledger was found and ignored"
+                );
+            }
+            Ok(LedgerContents {
+                contents,
+                persist_readonly: false,
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if legacy_key == key {
+                return Err(LedgerReadError::Absent);
+            }
+            match std::fs::read_to_string(&legacy_path) {
+                Ok(contents) => {
+                    let persist_readonly = match write_atomic_bytes(dir, key, contents.as_bytes()) {
+                        Ok(()) => {
+                            let migrated_path = legacy_path.with_extension("json.migrated");
+                            if migrated_path.exists() {
+                                tracing::warn!(
+                                    event = "wear_ledger_migration_failed",
+                                    display = display_key,
+                                    legacy_path = %legacy_path.display(),
+                                    migrated_path = %migrated_path.display(),
+                                    error = "migration backup already exists"
+                                );
+                            } else if let Err(rename_error) =
+                                std::fs::rename(&legacy_path, &migrated_path)
+                            {
+                                tracing::warn!(
+                                    event = "wear_ledger_migration_failed",
+                                    display = display_key,
+                                    legacy_path = %legacy_path.display(),
+                                    migrated_path = %migrated_path.display(),
+                                    error = %rename_error
+                                );
+                            }
+                            false
+                        }
+                        Err(write_error) => {
+                            tracing::warn!(
+                                event = "wear_ledger_migration_failed",
+                                display = display_key,
+                                legacy_path = %legacy_path.display(),
+                                canonical_path = %path.display(),
+                                error = %write_error
+                            );
+                            true
+                        }
+                    };
+                    Ok(LedgerContents {
+                        contents,
+                        persist_readonly,
+                    })
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Err(LedgerReadError::Absent)
+                }
+                Err(error) => Err(LedgerReadError::Unreadable {
+                    path: legacy_path,
+                    error,
+                }),
+            }
+        }
+        Err(error) => Err(LedgerReadError::Unreadable { path, error }),
+    }
+}
+
 /// Load `<dir>/wear-<key>.json`, or create a fresh ledger if absent,
-/// corrupt, or a future schema version. See spec §5.2 / §3.1. Pure math
-/// aside, this is impure (filesystem) — the shell calls it once per display,
-/// the first time that display is observed.
+/// corrupt, or a future schema version. A legacy sanitized-key ledger is
+/// adopted once when the collision-resistant path is absent. See spec §5.2 /
+/// §3.1. Pure math aside, this is impure (filesystem) — the shell calls it
+/// once per display, the first time that display is observed.
 #[allow(
     clippy::too_many_arguments,
     reason = "the load boundary receives the persisted identity, grid shape, and daemon-owned observation sink together"
@@ -1411,6 +1527,7 @@ struct LoadResult {
 fn load_or_create_ledger(
     dir: &Path,
     key: &str,
+    legacy_key: &str,
     identity: WearIdentity,
     panel_type: PanelType,
     rows: u16,
@@ -1418,17 +1535,39 @@ fn load_or_create_ledger(
     now_epoch_s: u64,
     observations: &ObservationHub,
 ) -> LoadResult {
-    let path = dir.join(format!("wear-{key}.json"));
     let display_key = identity.key.clone();
-
-    let Ok(contents) = std::fs::read_to_string(&path) else {
-        // Absent (or otherwise unreadable, e.g. permissions) — brand new.
-        return LoadResult {
-            ledger: WearLedger::new(identity, panel_type, rows, cols, now_epoch_s),
-            needs_seed: true,
-            persist_readonly: false,
-        };
+    let LedgerContents {
+        contents,
+        persist_readonly,
+    } = match read_ledger_contents(dir, key, legacy_key, &display_key) {
+        Ok(contents) => contents,
+        Err(LedgerReadError::Absent) => {
+            return LoadResult {
+                ledger: WearLedger::new(identity, panel_type, rows, cols, now_epoch_s),
+                needs_seed: true,
+                persist_readonly: false,
+            };
+        }
+        Err(LedgerReadError::Unreadable { path, error }) => {
+            tracing::warn!(
+                event = "wear_ledger_unreadable",
+                display = %display_key,
+                path = %path.display(),
+                error = %error
+            );
+            observations.emit(DaemonObservation::WearLedgerUnreadable {
+                path,
+                read_error: error.to_string(),
+            });
+            return LoadResult {
+                ledger: WearLedger::new(identity, panel_type, rows, cols, now_epoch_s),
+                needs_seed: false,
+                persist_readonly: true,
+            };
+        }
     };
+
+    let path = dir.join(format!("wear-{key}.json"));
 
     match serde_json::from_str::<WearLedger>(&contents) {
         Ok(ledger) if ledger.schema_version > WEAR_SCHEMA_VERSION => {
@@ -1472,7 +1611,7 @@ fn load_or_create_ledger(
             LoadResult {
                 ledger,
                 needs_seed: false,
-                persist_readonly: false,
+                persist_readonly,
             }
         }
         Err(_) => {
@@ -1483,7 +1622,7 @@ fn load_or_create_ledger(
                     LoadResult {
                         ledger: WearLedger::new(identity, panel_type, rows, cols, now_epoch_s),
                         needs_seed: false,
-                        persist_readonly: false,
+                        persist_readonly,
                     }
                 }
                 Err(e) => {
@@ -1607,7 +1746,7 @@ mod tests {
     fn fresh_ledger(display: &DisplayId, now: u64) -> WearLedger {
         WearLedger::new(
             WearIdentity {
-                key: sanitize_identity_key(&display.0),
+                key: ledger_identity_key(&display.0),
                 display_name: display.0.clone(),
                 config_display_id: Some(display.0.clone()),
             },
@@ -2235,6 +2374,7 @@ mod tests {
         .expect("write persisted ledger");
         let loaded = load_or_create_ledger(
             dir.path(),
+            "mon",
             "mon",
             identity,
             PanelType::Unknown,
@@ -3058,7 +3198,9 @@ mod tests {
             item_journal: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
-        let expected_file = injected_dir.path().join("wear-mon.json");
+        let expected_file = injected_dir
+            .path()
+            .join(format!("wear-{}.json", ledger_identity_key("mon")));
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while !expected_file.exists() && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -3103,7 +3245,7 @@ mod tests {
             &ObservationHub::new(1),
         );
 
-        let expected_key = sanitize_identity_key(panel_ident);
+        let expected_key = ledger_identity_key(panel_ident);
         assert_eq!(
             state.storage_key.get(&display).cloned(),
             Some(expected_key.clone())
@@ -3160,7 +3302,7 @@ mod tests {
             &ObservationHub::new(1),
         );
 
-        let expected_key = sanitize_identity_key(&display.0);
+        let expected_key = ledger_identity_key(&display.0);
         assert_eq!(
             state.storage_key.get(&display).cloned(),
             Some(expected_key.clone())
@@ -4154,6 +4296,7 @@ mod tests {
         let result = load_or_create_ledger(
             dir.path(),
             "mon",
+            "mon",
             identity,
             PanelType::QdOled,
             9,
@@ -4224,6 +4367,7 @@ mod tests {
         let result = load_or_create_ledger(
             dir.path(),
             "mon",
+            "mon",
             identity,
             PanelType::Unknown,
             9,
@@ -4256,6 +4400,7 @@ mod tests {
         let result = load_or_create_ledger(
             dir.path(),
             "mon",
+            "mon",
             identity,
             PanelType::Unknown,
             9,
@@ -4287,6 +4432,7 @@ mod tests {
         let mut observation_rx = observations.subscribe();
         let result = load_or_create_ledger(
             dir.path(),
+            "mon",
             "mon",
             identity,
             PanelType::Unknown,
@@ -4322,6 +4468,7 @@ mod tests {
 
         let result = load_or_create_ledger(
             dir.path(),
+            "mon",
             "mon",
             identity,
             PanelType::Unknown,
@@ -4378,6 +4525,7 @@ mod tests {
         // `persist_readonly` in production.
         let result = load_or_create_ledger(
             dir.path(),
+            "mon",
             "mon",
             identity,
             PanelType::Unknown,
@@ -4439,6 +4587,7 @@ mod tests {
         // Config now declares QdOled — load must adopt it.
         let result = load_or_create_ledger(
             dir.path(),
+            "mon",
             "mon",
             identity,
             PanelType::QdOled,
@@ -4533,6 +4682,7 @@ mod tests {
         let fresh = load_or_create_ledger(
             dir.path(),
             "mon",
+            "mon",
             identity.clone(),
             PanelType::Unknown,
             9,
@@ -4547,6 +4697,7 @@ mod tests {
         let again = load_or_create_ledger(
             dir.path(),
             "mon",
+            "mon",
             identity,
             PanelType::Unknown,
             9,
@@ -4555,6 +4706,167 @@ mod tests {
             &ObservationHub::new(1),
         );
         assert!(!again.needs_seed);
+    }
+
+    #[tokio::test]
+    async fn unreadable_ledger_is_never_overwritten_by_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wear-mon.json");
+        let original = vec![0xff, 0xfe, 0xfd];
+        std::fs::write(&path, &original).unwrap();
+        let identity = WearIdentity {
+            key: "mon".into(),
+            display_name: "mon".into(),
+            config_display_id: None,
+        };
+
+        let observations = ObservationHub::new(1);
+        let mut observation_rx = observations.subscribe();
+        let result = load_or_create_ledger(
+            dir.path(),
+            "mon",
+            "mon",
+            identity.clone(),
+            PanelType::Unknown,
+            9,
+            16,
+            500,
+            &observations,
+        );
+        let persist_readonly = result.persist_readonly;
+        let needs_seed = result.needs_seed;
+        let display = DisplayId("mon".into());
+        let mut state = TrackerState::default();
+        state.storage_key.insert(display.clone(), "mon".into());
+        if persist_readonly {
+            state.persist_readonly.insert(display.clone());
+        }
+        state.ledgers.insert(display.clone(), result.ledger);
+        let (ctl_tx, mut ctl_rx) = mpsc::channel(1);
+        tokio::spawn(async move { while ctl_rx.recv().await.is_some() {} });
+
+        apply_actions(
+            &mut state,
+            vec![TrackerAction::Persist { display }],
+            &HashMap::new(),
+            &ctl_tx,
+            dir.path(),
+        )
+        .await;
+
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(persist_readonly);
+        assert!(!needs_seed);
+        assert!(matches!(
+            observation_rx.recv().await,
+            Ok(DaemonObservation::WearLedgerUnreadable {
+                path: observed_path,
+                read_error,
+            }) if observed_path == path && !read_error.is_empty()
+        ));
+    }
+
+    #[test]
+    fn colliding_panel_identities_round_trip_to_distinct_ledgers() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_raw = "a:b";
+        let second_raw = "a/b";
+        let first_key = ledger_identity_key(first_raw);
+        let second_key = ledger_identity_key(second_raw);
+        let first_identity = WearIdentity {
+            key: first_key.clone(),
+            display_name: "first".into(),
+            config_display_id: None,
+        };
+        let second_identity = WearIdentity {
+            key: second_key.clone(),
+            display_name: "second".into(),
+            config_display_id: None,
+        };
+        let mut first = WearLedger::new(first_identity.clone(), PanelType::Unknown, 1, 1, 0);
+        first.attribute_uniform(Duration::from_secs(3600), 0.25);
+        let mut second = WearLedger::new(second_identity.clone(), PanelType::Unknown, 1, 1, 0);
+        second.attribute_uniform(Duration::from_secs(7200), 0.75);
+
+        persist_ledger(dir.path(), &first_key, &first).unwrap();
+        persist_ledger(dir.path(), &second_key, &second).unwrap();
+
+        let first_loaded = load_or_create_ledger(
+            dir.path(),
+            &first_key,
+            &sanitize_identity_key(first_raw),
+            first_identity,
+            PanelType::Unknown,
+            1,
+            1,
+            1,
+            &ObservationHub::new(1),
+        );
+        let second_loaded = load_or_create_ledger(
+            dir.path(),
+            &second_key,
+            &sanitize_identity_key(second_raw),
+            second_identity,
+            PanelType::Unknown,
+            1,
+            1,
+            1,
+            &ObservationHub::new(1),
+        );
+
+        assert_ne!(first_key, second_key);
+        assert_eq!(first_loaded.ledger.total_on_hours, first.total_on_hours);
+        assert_eq!(second_loaded.ledger.total_on_hours, second.total_on_hours);
+        assert!(dir.path().join(format!("wear-{first_key}.json")).exists());
+        assert!(dir.path().join(format!("wear-{second_key}.json")).exists());
+    }
+
+    #[test]
+    fn legacy_ledger_is_adopted_and_renamed_without_losing_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw_identity = "a:b";
+        let canonical_key = ledger_identity_key(raw_identity);
+        let legacy_key = sanitize_identity_key(raw_identity);
+        let legacy_identity = WearIdentity {
+            key: legacy_key.clone(),
+            display_name: "mon".into(),
+            config_display_id: None,
+        };
+        let mut legacy = WearLedger::new(legacy_identity, PanelType::Unknown, 1, 1, 0);
+        legacy.attribute_uniform(Duration::from_secs(3600), 0.5);
+        persist_ledger(dir.path(), &legacy_key, &legacy).unwrap();
+        let original = std::fs::read(dir.path().join(format!("wear-{legacy_key}.json"))).unwrap();
+
+        let current_identity = WearIdentity {
+            key: canonical_key.clone(),
+            display_name: "mon".into(),
+            config_display_id: None,
+        };
+        let loaded = load_or_create_ledger(
+            dir.path(),
+            &canonical_key,
+            &legacy_key,
+            current_identity,
+            PanelType::Unknown,
+            1,
+            1,
+            1,
+            &ObservationHub::new(1),
+        );
+
+        assert!(!loaded.needs_seed);
+        assert!(!loaded.persist_readonly);
+        assert_eq!(loaded.ledger.total_on_hours, legacy.total_on_hours);
+        assert_eq!(
+            std::fs::read(dir.path().join(format!("wear-{canonical_key}.json"))).unwrap(),
+            original
+        );
+        assert!(!dir.path().join(format!("wear-{legacy_key}.json")).exists());
+        assert!(
+            dir.path()
+                .join(format!("wear-{legacy_key}.json.migrated"))
+                .exists()
+        );
     }
 
     /// Issue #210 (sweep-2 Task 15): non-screensaver wear attribution must

@@ -55,16 +55,15 @@ fn main() {
         }
     };
 
-    if contents.contains(PLACEHOLDER_MARKER) {
-        panic!(
-            "\n\n\
-             dormant-web: refusing to embed the placeholder SPA into a release build.\n\n\
-             {} is still the checked-in placeholder, so this binary would serve a\n\
-             blank page instead of the dashboard. Build the real bundle first:\n\
-             \n    cd crates/dormant-web/webui && npm ci && npm run build\n\n\
-             Or use the canonical local deploy, which does this for you:\n\
-             \n    bash scripts/deploy-local.sh\n\n",
-            index.display()
-        );
-    }
+    assert!(
+        !contents.contains(PLACEHOLDER_MARKER),
+        "\n\n\
+         dormant-web: refusing to embed the placeholder SPA into a release build.\n\n\
+         {} is still the checked-in placeholder, so this binary would serve a\n\
+         blank page instead of the dashboard. Build the real bundle first:\n\
+         \n    cd crates/dormant-web/webui && npm ci && npm run build\n\n\
+         Or use the canonical local deploy, which does this for you:\n\
+         \n    bash scripts/deploy-local.sh\n\n",
+        index.display()
+    );
 }

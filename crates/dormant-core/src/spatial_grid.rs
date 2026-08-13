@@ -5,6 +5,24 @@ pub const LUMA_GRID_ROWS: u16 = 9;
 /// Number of columns in the fixed luma ordering grid.
 pub const LUMA_GRID_COLS: u16 = 16;
 
+/// Convert one normalized sRGB channel to linear light.
+#[must_use]
+pub fn srgb_to_linear(channel: f32) -> f32 {
+    if channel <= 0.04045 {
+        channel / 12.92
+    } else {
+        ((channel + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// Calculate Rec. 709 luminance after transfer-function conversion.
+#[must_use]
+pub fn linear_luma(rgb: [f32; 3]) -> f32 {
+    0.2126 * srgb_to_linear(rgb[0])
+        + 0.7152 * srgb_to_linear(rgb[1])
+        + 0.0722 * srgb_to_linear(rgb[2])
+}
+
 /// Errors encountered while reducing a raw RGBA frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GridError {
@@ -39,9 +57,8 @@ pub enum GridError {
 
 /// Reduce a packed RGBA8 frame to a 16×9 linear-light luma grid.
 ///
-/// The transfer-function constants and Rec. 709 weights intentionally mirror
-/// `dormant-render::luma`; they should move to a shared pure module if another
-/// consumer needs the same conversion.
+/// The transfer-function constants and Rec. 709 weights are shared with
+/// `dormant-render::luma` through [`linear_luma`].
 ///
 /// # Errors
 ///
@@ -101,20 +118,12 @@ pub fn reduce_rgba8_to_luma_grid(
             let cell = cell_row * usize::from(cols) + cell_col;
             let offset = y * stride + x * 4;
             let alpha = f32::from(rgba[offset + 3]) / 255.0;
-            let red = f32::from(rgba[offset]) / 255.0 * alpha;
-            let green = f32::from(rgba[offset + 1]) / 255.0 * alpha;
-            let blue = f32::from(rgba[offset + 2]) / 255.0 * alpha;
-            let srgb_to_linear = |channel: f32| {
-                if channel <= 0.04045 {
-                    channel / 12.92
-                } else {
-                    ((channel + 0.055) / 1.055).powf(2.4)
-                }
-            };
             sums[cell] += f64::from(
-                0.2126 * srgb_to_linear(red)
-                    + 0.7152 * srgb_to_linear(green)
-                    + 0.0722 * srgb_to_linear(blue),
+                linear_luma([
+                    f32::from(rgba[offset]) / 255.0,
+                    f32::from(rgba[offset + 1]) / 255.0,
+                    f32::from(rgba[offset + 2]) / 255.0,
+                ]) * alpha,
             );
             counts[cell] += 1;
         }
@@ -363,12 +372,12 @@ mod tests {
     }
 
     #[test]
-    fn reduce_rgba8_composites_alpha_over_black_before_transfer() {
+    fn reduce_rgba8_composites_alpha_over_black_in_linear_light() {
         let pixel = [255, 0, 0, 128];
         let rgba = pixel.repeat(16 * 9);
         let grid = reduce_rgba8_to_luma_grid(&rgba, 16, 9, 64, 9, 16).unwrap();
         let alpha = 128.0 / 255.0;
-        let expected = 0.2126 * (alpha + 0.055_f32).powf(2.4) / 1.055_f32.powf(2.4);
+        let expected = 0.2126 * alpha;
         assert!((grid.cells[0] - expected).abs() < 1e-6);
     }
 

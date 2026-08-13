@@ -680,6 +680,29 @@ pub fn validate_with_input_source_readers(
     let sensor_set: HashSet<&str> = cfg.sensors.keys().map(String::as_str).collect();
     let zone_names: HashSet<&str> = cfg.zones.keys().map(String::as_str).collect();
 
+    // A motion pulse must remain believable for its entire hold.  Once the
+    // stale timeout wins, the sweeper marks the sensor unavailable and the
+    // pending absence hold is discarded.
+    for (sensor_id, sensor) in &cfg.sensors {
+        if sensor.kind() != super::schema::SensorKind::Motion {
+            continue;
+        }
+        let Some(hold_time) = sensor.hold_time() else {
+            continue;
+        };
+        let stale_timeout = sensor
+            .stale_timeout()
+            .unwrap_or(cfg.daemon.stale_sensor_timeout);
+        if hold_time > stale_timeout {
+            errors.push(ValidationError {
+                what: crate::error::E_CONFIG_INVALID.into(),
+                detail: format!(
+                    "sensor '{sensor_id}' hold_time {hold_time:?} exceeds effective stale_timeout {stale_timeout:?}; lower hold_time or raise stale_timeout"
+                ),
+            });
+        }
+    }
+
     // ── Zone validation ─────────────────────────────────────────────────
     validate_zones(
         cfg,
@@ -4745,6 +4768,52 @@ stale_timeout = "5m"
         assert_eq!(
             desk.stale_timeout,
             Some(std::time::Duration::from_secs(300))
+        );
+    }
+
+    #[test]
+    fn motion_hold_time_must_not_exceed_effective_stale_timeout() {
+        let errors = validate_str(
+            r#"
+config_version = 1
+
+[sensors.radar]
+type = "usb-ld2410"
+port = "/dev/ttyUSB0"
+kind = "motion"
+hold_time = "6m"
+"#,
+        );
+        assert!(errors.iter().any(|error| {
+            error.detail.contains("hold_time")
+                && error.detail.contains("effective stale_timeout")
+                && error
+                    .detail
+                    .contains("lower hold_time or raise stale_timeout")
+        }));
+    }
+
+    #[test]
+    fn motion_hold_time_at_or_below_stale_timeout_is_valid() {
+        let errors = validate_str(
+            r#"
+config_version = 1
+
+[daemon]
+stale_sensor_timeout = "5m"
+
+[sensors.radar]
+type = "usb-ld2410"
+port = "/dev/ttyUSB0"
+kind = "motion"
+hold_time = "5m"
+"#,
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|error| error.detail.contains("hold_time")),
+            "unexpected hold/stale validation error: {errors:?}"
         );
     }
 

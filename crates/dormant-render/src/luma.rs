@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
-use dormant_core::spatial_grid::{LUMA_GRID_COLS, LUMA_GRID_ROWS, LumaGrid};
+use dormant_core::spatial_grid::{
+    LUMA_GRID_COLS, LUMA_GRID_ROWS, LumaGrid, linear_luma as core_linear_luma,
+    srgb_to_linear as core_srgb_to_linear,
+};
 use dormant_core::types::DisplayId;
 use image::ImageReader;
 use thiserror::Error;
@@ -40,19 +43,13 @@ pub struct LumaScanJob {
 /// Convert one normalized sRGB channel to linear light.
 #[must_use]
 pub fn srgb_to_linear(channel: f32) -> f32 {
-    if channel <= 0.04045 {
-        channel / 12.92
-    } else {
-        ((channel + 0.055) / 1.055).powf(2.4)
-    }
+    core_srgb_to_linear(channel)
 }
 
 /// Calculate Rec. 709 luminance after transfer-function conversion.
 #[must_use]
 pub fn linear_luma(rgb: [f32; 3]) -> f32 {
-    0.2126 * srgb_to_linear(rgb[0])
-        + 0.7152 * srgb_to_linear(rgb[1])
-        + 0.0722 * srgb_to_linear(rgb[2])
+    core_linear_luma(rgb)
 }
 
 /// Return the ratified flat linear-light grid for a video wear tag.

@@ -1044,12 +1044,16 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn panic_wake_result_keeps_display_in_failed_report() {
+    async fn probe_and_wake_all_keeps_panicked_display_in_failed_report() {
         let display = DisplayId("panel".into());
-        let join_error = tokio::spawn(async { panic!("wake exploded") })
-            .await
-            .expect_err("task must panic");
-        let result = panic_wake_result(display.clone(), &join_error);
+        let ctrl = ProbeRequiringController::new();
+        ctrl.panic_on_wake();
+        let exec = executor_with_controller(display.clone(), ctrl);
+
+        let report = probe_and_wake_all(vec![exec], HashMap::new()).await;
+
+        assert_eq!(report.displays.len(), 1);
+        let result = &report.displays[0];
         assert_eq!(result.display, display);
         assert!(!result.ok);
         assert!(result.error.as_deref().unwrap().contains("panicked"));
@@ -1089,6 +1093,7 @@ mod tests {
     #[derive(Default)]
     struct ProbeRequiringInner {
         probed: bool,
+        panic_on_wake: bool,
         wake_results: VecDeque<Result<(), CmdFailure>>,
         probe_calls: usize,
         wake_calls: usize,
@@ -1103,6 +1108,10 @@ mod tests {
 
         fn push_wake_result(&self, r: Result<(), CmdFailure>) {
             self.inner.lock().unwrap().wake_results.push_back(r);
+        }
+
+        fn panic_on_wake(&self) {
+            self.inner.lock().unwrap().panic_on_wake = true;
         }
 
         #[allow(dead_code)]
@@ -1150,6 +1159,9 @@ mod tests {
         async fn wake(&self) -> Result<(), CmdFailure> {
             let mut g = self.inner.lock().unwrap();
             g.wake_calls += 1;
+            if g.panic_on_wake {
+                panic!("scripted wake panic");
+            }
             if !g.probed {
                 return Err(CmdFailure {
                     controller: "probe-requiring".into(),

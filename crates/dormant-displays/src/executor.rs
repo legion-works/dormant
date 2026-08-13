@@ -2297,6 +2297,26 @@ mod tests {
         assert_eq!(a.count_op("wake"), 0);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn wake_once_reprobe_superseded_before_controller_call_does_not_wake() {
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        a.set_available(false);
+        a.set_probe_result(Ok(()));
+        let (exec, _) = executor_with(vec![a.clone()], default_retry());
+
+        let reprobe_entered = a.reprobe_entered();
+        let entered = tokio::spawn(async move { reprobe_entered.notified().await });
+        let waking = Arc::clone(&exec);
+        let wake_task = tokio::spawn(async move { waking.wake_once().await });
+        entered.await.unwrap();
+
+        exec.blank(BlankMode::PowerOff).await.unwrap();
+
+        let err = wake_task.await.unwrap().unwrap_err();
+        assert_eq!(err.controller, "superseded");
+        assert_eq!(a.count_op("wake"), 0);
+    }
+
     #[tokio::test]
     async fn wake_once_reprobe_heal_clears_owner_when_owner_succeeds() {
         // Same scenario through wake_once().

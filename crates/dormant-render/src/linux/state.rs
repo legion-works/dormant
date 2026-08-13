@@ -799,7 +799,7 @@ pub(super) struct WaylandState {
     /// the `wayland_ops` module docs for why a raw `WpViewport` is
     /// never stored here directly.
     pub(super) viewport: Option<Arc<dyn ViewportHandle>>,
-    pub(super) black_buffer: Option<WlBuffer>,
+    black_buffer: Option<BlackBuffer>,
     pub(super) configured_size: (u32, u32),
     pub(super) surface_up: bool,
 
@@ -878,6 +878,22 @@ pub(super) struct WaylandState {
     /// `RecordingWaylandOps` in tests. See `super::wayland_ops` module
     /// docs.
     pub(super) wayland_ops: Arc<dyn WaylandOps>,
+}
+
+/// Opaque black buffer together with the surface size it was allocated for.
+/// Keeping the dimensions beside the proxy makes re-use conditional on the
+/// same invariant the SHM allocator enforces.
+#[derive(Clone)]
+struct BlackBuffer {
+    buffer: WlBuffer,
+    size: (u32, u32),
+}
+
+fn black_buffer_needs_rebuild(
+    buffer_size: Option<(u32, u32)>,
+    configured_size: (u32, u32),
+) -> bool {
+    buffer_size != Some(configured_size)
 }
 
 impl WaylandState {
@@ -1601,7 +1617,10 @@ impl WaylandState {
 
         self.layer_surface = Some(pending.layer_surface);
         self.viewport = viewport;
-        self.black_buffer = Some(buffer);
+        self.black_buffer = Some(BlackBuffer {
+            buffer,
+            size: configured_size,
+        });
         self.configured_size = configured_size;
         self.surface_up = true;
         // U5: black overlay never shifts — no shift timer to arm.
@@ -2332,9 +2351,10 @@ impl WaylandState {
         // unset request apply atomically at the SAME commit
         // regardless of which request was issued first.)
         let dest = self.configured_size;
-        if self.black_buffer.is_none()
+        if black_buffer_needs_rebuild(self.black_buffer.as_ref().map(|buffer| buffer.size), dest)
             && let Some(surface) = self.layer_surface.as_ref()
         {
+            self.black_buffer = None;
             let wl_surface = surface.wl_surface().clone();
             if self.single_pixel_manager.is_some() && self.viewporter.is_some() {
                 let buffer = self
@@ -2350,10 +2370,12 @@ impl WaylandState {
                     );
                     self.viewport = Some(viewport);
                 }
-                self.black_buffer = Some(buffer);
+                self.black_buffer = Some(BlackBuffer { buffer, size: dest });
             } else {
                 match crate::linux::surface::create_shm_black_buffer(dest.0, dest.1, self) {
-                    Ok(buffer) => self.black_buffer = Some(buffer),
+                    Ok(buffer) => {
+                        self.black_buffer = Some(BlackBuffer { buffer, size: dest });
+                    }
                     Err(e) => tracing::error!(
                         event = "screensaver_black_fallback_failed",
                         display_id = %self.display_id,
@@ -2375,7 +2397,7 @@ impl WaylandState {
         if let (Some(surface), Some(black)) = (&self.layer_surface, &self.black_buffer) {
             let wl_surface = surface.wl_surface().clone();
             let surface_handle = self.wayland_ops.surface_handle(&wl_surface);
-            let buffer_handle = wrap_real_buffer(black.clone());
+            let buffer_handle = wrap_real_buffer(black.buffer.clone());
             self.swap_surface_to_black(surface_handle.as_ref(), buffer_handle.as_ref());
         }
     }
@@ -2662,7 +2684,11 @@ impl WaylandState {
                     // method's docs for why moving it is
                     // protocol-safe.)
                     let dest = self.configured_size;
-                    if self.black_buffer.is_none() {
+                    if black_buffer_needs_rebuild(
+                        self.black_buffer.as_ref().map(|buffer| buffer.size),
+                        dest,
+                    ) {
+                        self.black_buffer = None;
                         if self.single_pixel_manager.is_some() && self.viewporter.is_some() {
                             let buffer = self
                                 .single_pixel_manager
@@ -2677,11 +2703,11 @@ impl WaylandState {
                                 );
                                 self.viewport = Some(viewport);
                             }
-                            self.black_buffer = Some(buffer);
+                            self.black_buffer = Some(BlackBuffer { buffer, size: dest });
                         } else if let Ok(buffer) =
                             crate::linux::surface::create_shm_black_buffer(dest.0, dest.1, self)
                         {
-                            self.black_buffer = Some(buffer);
+                            self.black_buffer = Some(BlackBuffer { buffer, size: dest });
                         }
                     }
 
@@ -2693,7 +2719,7 @@ impl WaylandState {
                         // (`out_of_buffer` protocol-error class,
                         // issue #56).
                         let surface_handle = self.wayland_ops.surface_handle(&wl_surface);
-                        let buffer_handle = wrap_real_buffer(black);
+                        let buffer_handle = wrap_real_buffer(black.buffer);
                         self.swap_surface_to_black(surface_handle.as_ref(), buffer_handle.as_ref());
                         tracing::info!(
                             event = "render_black_swap",
@@ -3243,6 +3269,16 @@ mod tests {
         // ShmFallback regardless of shift_px.
         let strategy = super::black_attach_strategy(0, true, false);
         assert_eq!(strategy, super::BlackAttachStrategy::ShmFallback);
+    }
+
+    #[test]
+    fn black_attach_rebuilds_buffer_when_live_configure_changes_size() {
+        assert!(!black_buffer_needs_rebuild(
+            Some((1920, 1080)),
+            (1920, 1080)
+        ));
+        assert!(black_buffer_needs_rebuild(Some((1920, 1080)), (2560, 1440)));
+        assert!(black_buffer_needs_rebuild(None, (2560, 1440)));
     }
 
     // ── surface_match tests (round-3 — M2 stale-event guard) ───────────

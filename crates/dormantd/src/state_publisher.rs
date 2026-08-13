@@ -230,7 +230,7 @@ async fn run(deps: StatePublisherDeps, transport_box: Option<Box<dyn PublisherTr
     };
 
     let mut snapshot = match request_snapshot(&ctl_tx, &cancel).await {
-        SnapshotResult::Ready(snapshot) => snapshot,
+        SnapshotResult::Ready(snapshot) => *snapshot,
         SnapshotResult::Cancelled => return,
         SnapshotResult::Unavailable => StateSnapshot {
             sensors: Vec::new(),
@@ -370,7 +370,7 @@ async fn run(deps: StatePublisherDeps, transport_box: Option<Box<dyn PublisherTr
                     tracing::warn!(event = "publish_events_lagged", skipped);
                     if let SnapshotResult::Ready(new_snap) = request_snapshot(&ctl_tx, &cancel).await
                     {
-                        snapshot = new_snap;
+                        snapshot = *new_snap;
                         send_flush(
                             &record_tx,
                             &cancel,
@@ -409,7 +409,9 @@ async fn finalize_shutdown(
 }
 
 enum SnapshotResult {
-    Ready(StateSnapshot),
+    // Boxed: `StateSnapshot` dwarfs the two unit variants, and the enum is
+    // returned by value on every snapshot request (clippy::large_enum_variant).
+    Ready(Box<StateSnapshot>),
     Cancelled,
     Unavailable,
 }
@@ -429,7 +431,7 @@ async fn request_snapshot(
     tokio::select! {
         () = cancel.cancelled() => SnapshotResult::Cancelled,
         res = snap_rx => match res {
-            Ok(snapshot) => SnapshotResult::Ready(snapshot),
+            Ok(snapshot) => SnapshotResult::Ready(Box::new(snapshot)),
             Err(_) => SnapshotResult::Unavailable,
         },
     }
@@ -495,7 +497,7 @@ async fn flush_full(req: FlushRequest<'_>) {
     //    the caller's pre-existing snapshot.
     if request_fresh_snapshot {
         match request_snapshot(ctl_tx, cancel).await {
-            SnapshotResult::Ready(new_snap) => *snapshot = new_snap,
+            SnapshotResult::Ready(new_snap) => *snapshot = *new_snap,
             SnapshotResult::Cancelled => return,
             SnapshotResult::Unavailable => {}
         }

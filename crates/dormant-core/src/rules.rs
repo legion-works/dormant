@@ -2574,9 +2574,11 @@ impl RulesEngine {
     /// Find the effective `input_wake_hold` for a display.
     ///
     /// Returns `None` if no rule drives this display or if any driving zone
-    /// is currently present.  Returns `Some(hold)` from the first matching
-    /// rule when every driving zone is vacant.
+    /// is currently present.  When every driving zone is vacant, returns the
+    /// shortest matching hold so the display re-evaluates its vacancy state at
+    /// the earliest deadline.
     fn effective_input_wake_hold(&self, display: &DisplayId) -> Option<Duration> {
+        let mut effective: Option<Duration> = None;
         for rule in &self.cfg.rules {
             if rule.displays.contains(display) {
                 let present = self.zone_engine.is_present(&rule.zone).unwrap_or(true); // unknown = present (fail-safe)
@@ -2584,12 +2586,15 @@ impl RulesEngine {
                     // At least one driving zone is present — no hold.
                     return None;
                 }
-                // Zone is known-vacant — use this rule's hold.
-                return Some(rule.input_wake_hold);
+                // The shortest hold bounds how long stale vacancy information
+                // can suppress a re-check when several rules share a display.
+                effective = Some(
+                    effective.map_or(rule.input_wake_hold, |hold| hold.min(rule.input_wake_hold)),
+                );
             }
         }
         // Display is not driven by any rule (e.g. manual-only).
-        None
+        effective
     }
 
     fn compute_sweep_period(&self) -> Duration {
@@ -2688,7 +2693,12 @@ impl RulesEngine {
             machine.set_input_wake_hold_active(false);
         }
         self.feed_ownership(display, now);
-        self.step_machine(display, Input::ZonePresent(false), now);
+        // Presence may have changed while the hold was active without an edge
+        // reaching this engine.  Never re-enter Grace from a display that is
+        // currently driven by an occupied or unknown zone.
+        if self.effective_input_wake_hold(display).is_some() {
+            self.step_machine(display, Input::ZonePresent(false), now);
+        }
     }
 
     // ── Internal: stale sensor sweep ────────────────────────────────────────
@@ -5782,6 +5792,99 @@ fn input_wake_hold_engine(hold: Duration) -> (RulesEngine, DisplayId, Arc<Record
     (engine, display, sink)
 }
 
+#[test]
+fn input_wake_hold_requires_all_driving_zones_vacant() {
+    use crate::zone::{FusionMode, ZoneMember, ZoneSpec};
+
+    let display = DisplayId("d1".into());
+    let first_zone = ZoneId("z1".into());
+    let second_zone = ZoneId("z2".into());
+    let first_sensor = SensorId("s1".into());
+    let second_sensor = SensorId("s2".into());
+    let sink = Arc::new(RecordingSink::new());
+    let mut executors = HashMap::new();
+    executors.insert(display.clone(), sink as Arc<dyn CommandSink>);
+    let cfg = RulesEngineConfig {
+        rules: vec![
+            RuleRuntimeCfg {
+                rule: RuleId("r1".into()),
+                zone: first_zone.clone(),
+                displays: vec![display.clone()],
+                input_wake_hold: Duration::from_secs(120),
+            },
+            RuleRuntimeCfg {
+                rule: RuleId("r2".into()),
+                zone: second_zone.clone(),
+                displays: vec![display.clone()],
+                input_wake_hold: Duration::from_secs(30),
+            },
+        ],
+        displays: vec![DisplayRuntimeCfg {
+            display: display.clone(),
+            blank_mode: BlankMode::PowerOff,
+            ladder: vec![],
+            timings: DisplayRuntimeCfg::manual_defaults(Duration::ZERO),
+        }],
+        sensors: vec![
+            SensorRuntimeCfg {
+                sensor: first_sensor.clone(),
+                kind: SensorKind::Presence,
+                hold_time: None,
+                stale_timeout: Duration::from_secs(3600),
+            },
+            SensorRuntimeCfg {
+                sensor: second_sensor.clone(),
+                kind: SensorKind::Presence,
+                hold_time: None,
+                stale_timeout: Duration::from_secs(3600),
+            },
+        ],
+        doctor_wake_settle: Duration::from_secs(3),
+    };
+    let mut engine = RulesEngine::new(
+        cfg,
+        ZoneEngine::new(
+            vec![
+                ZoneSpec {
+                    id: first_zone.clone(),
+                    mode: FusionMode::Any,
+                    members: vec![ZoneMember::Sensor(first_sensor.clone())],
+                    weights: HashMap::new(),
+                    unavailable_policy: crate::zone::UnavailablePolicy::Present,
+                },
+                ZoneSpec {
+                    id: second_zone.clone(),
+                    mode: FusionMode::Any,
+                    members: vec![ZoneMember::Sensor(second_sensor.clone())],
+                    weights: HashMap::new(),
+                    unavailable_policy: crate::zone::UnavailablePolicy::Present,
+                },
+            ],
+            &[first_sensor.clone(), second_sensor.clone()],
+        )
+        .expect("zone engine must be valid"),
+        executors,
+        HashMap::new(),
+        Arc::new(crate::ownership::AlwaysOwned),
+    )
+    .expect("engine must be valid");
+
+    engine.zone_engine.apply(&PresenceEvent::new(
+        first_sensor,
+        SensorState::Absent,
+        Timestamp::now(),
+    ));
+    assert_eq!(engine.zone_engine.is_present(&first_zone), Some(false));
+    engine.zone_engine.apply(&PresenceEvent::new(
+        second_sensor,
+        SensorState::Present,
+        Timestamp::now(),
+    ));
+    assert_eq!(engine.zone_engine.is_present(&second_zone), Some(true));
+
+    assert_eq!(engine.effective_input_wake_hold(&display), None);
+}
+
 #[cfg(test)]
 /// Drive a display machine through the Happy Path to Blanked:
 /// zone absent → Grace → tick expiry → Blanking → BlankResult(Ok) → Blanked.
@@ -5900,6 +6003,50 @@ async fn vacant_blanked_input_wake_reenters_grace_after_hold() {
         engine.machines.get(&display).unwrap().phase_name(),
         "grace",
         "expired hold must re-enter Grace, never a direct blank"
+    );
+}
+
+/// A zone can become present without the display seeing the edge before the
+/// hold timer fires; expiry must re-check the zones before re-entering Grace.
+#[tokio::test(start_paused = true)]
+async fn presence_at_input_wake_hold_expiry_does_not_reblank() {
+    let (mut engine, display, sink) = input_wake_hold_engine(Duration::from_secs(120));
+
+    drive_to_blanked(&mut engine, &display);
+    engine.handle_control(ControlMsg::InputWake(display.clone()));
+    let wake_gen = engine
+        .machines
+        .get(&display)
+        .map_or(0, DisplayStateMachine::cmd_gen);
+    engine.step_machine(
+        &display,
+        Input::WakeResult {
+            r#gen: wake_gen,
+            result: Ok(()),
+        },
+        Tick::now(),
+    );
+
+    engine.zone_engine.apply(&PresenceEvent::new(
+        SensorId("s1".into()),
+        SensorState::Present,
+        Timestamp::now(),
+    ));
+    let deadline = *engine
+        .input_wake_holds
+        .get(&display)
+        .expect("input-wake hold must be armed");
+    engine.fire_input_wake_hold_expiry(&display, Tick(deadline));
+
+    assert_eq!(
+        engine.machines.get(&display).unwrap().phase_name(),
+        "active"
+    );
+    assert!(
+        !sink
+            .log()
+            .iter()
+            .any(|(_, command)| matches!(command, crate::fakes::SinkCmd::Blank(_)))
     );
 }
 

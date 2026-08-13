@@ -2004,23 +2004,24 @@ impl RulesEngine {
             // Awaiting inside the same loop would force serial execution
             // and let one slow controller (Tizen, HA-passthrough) block
             // every other display under the IPC 2-second budget.
-            let handles: Vec<tokio::task::JoinHandle<(DisplayId, Result<(), CmdFailure>)>> =
+            let handles: Vec<(DisplayId, tokio::task::JoinHandle<Result<(), CmdFailure>>)> =
                 executors
                     .into_iter()
                     .map(|(display_id, sink)| {
-                        tokio::spawn(async move { (display_id, sink.wake_once().await) })
+                        let handle = tokio::spawn(async move { sink.wake_once().await });
+                        (display_id, handle)
                     })
                     .collect();
 
             let mut results: Vec<EmergencyWakeResult> = Vec::with_capacity(handles.len());
-            for handle in handles {
+            for (display_id, handle) in handles {
                 match handle.await {
-                    Ok((display_id, Ok(()))) => results.push(EmergencyWakeResult {
+                    Ok(Ok(())) => results.push(EmergencyWakeResult {
                         display: display_id,
                         ok: true,
                         error: None,
                     }),
-                    Ok((display_id, Err(failure))) => {
+                    Ok(Err(failure)) => {
                         tracing::warn!(
                             event = "emergency_wake_display_failed",
                             display_id = %display_id,
@@ -2035,16 +2036,20 @@ impl RulesEngine {
                         });
                     }
                     Err(join_err) => {
-                        // A spawned per-display task panicked.  Match the
-                        // CLI fallback's tolerance: log + continue, do
-                        // not abort the report.  The row is dropped —
-                        // the report still ships so the operator gets a
-                        // structured view of the survivors.
+                        // A spawned per-display task panicked. Log and
+                        // continue, but keep a failed row so the report
+                        // accounts for every display the daemon attempted.
                         tracing::warn!(
                             event = "emergency_wake_task_panicked",
+                            display_id = %display_id,
                             error = %join_err,
                             "emergency-wake: spawned wake task panicked",
                         );
+                        results.push(EmergencyWakeResult {
+                            display: display_id,
+                            ok: false,
+                            error: Some(format!("spawned wake task panicked: {join_err}")),
+                        });
                     }
                 }
             }
@@ -3297,6 +3302,50 @@ mod tests {
         let sink = Arc::new(crate::fakes::ExerciseSink::new());
         let _ = sink.wake_once().await;
         assert!(matches!(sink.log().last(), Some(SinkCmd::Wake)));
+    }
+
+    #[tokio::test]
+    async fn emergency_wake_keeps_panicked_display_in_failed_report() {
+        struct PanicWakeSink;
+
+        #[async_trait::async_trait]
+        impl CommandSink for PanicWakeSink {
+            async fn blank(&self, _mode: BlankMode) -> Result<(), CmdFailure> {
+                Ok(())
+            }
+
+            async fn wake(&self) -> Result<(), CmdFailure> {
+                panic!("scripted daemon wake panic");
+            }
+
+            async fn wake_once(&self) -> Result<(), CmdFailure> {
+                panic!("scripted daemon wake panic");
+            }
+
+            fn controller_health(&self) -> Vec<ControllerHealth> {
+                vec![]
+            }
+        }
+
+        let display = DisplayId("daemon-panel".into());
+        let sink: Arc<dyn CommandSink> = Arc::new(PanicWakeSink);
+        let mut engine = manual_display_engine(
+            display.clone(),
+            HashMap::from([(display.clone(), sink)]),
+            Arc::new(crate::ownership::AlwaysOwned),
+        );
+        let (reply_tx, reply_rx) = oneshot::channel();
+        engine.handle_control(ControlMsg::EmergencyWake { reply: reply_tx });
+
+        let report = tokio::time::timeout(Duration::from_secs(1), reply_rx)
+            .await
+            .expect("daemon emergency-wake reply arrives")
+            .expect("daemon emergency-wake sender remains live");
+        assert_eq!(report.displays.len(), 1);
+        let result = &report.displays[0];
+        assert_eq!(result.display, display);
+        assert!(!result.ok);
+        assert!(result.error.as_deref().unwrap().contains("panicked"));
     }
 
     #[test]

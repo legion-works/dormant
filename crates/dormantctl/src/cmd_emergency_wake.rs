@@ -1159,9 +1159,7 @@ mod tests {
         async fn wake(&self) -> Result<(), CmdFailure> {
             let mut g = self.inner.lock().unwrap();
             g.wake_calls += 1;
-            if g.panic_on_wake {
-                panic!("scripted wake panic");
-            }
+            assert!(!g.panic_on_wake, "scripted wake panic");
             if !g.probed {
                 return Err(CmdFailure {
                     controller: "probe-requiring".into(),

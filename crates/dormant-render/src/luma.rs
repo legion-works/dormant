@@ -226,8 +226,10 @@ mod tests {
             grid.cells.len(),
             usize::from(LUMA_GRID_ROWS * LUMA_GRID_COLS)
         );
-        let composited = 128.0 / 255.0 * (128.0 / 255.0);
-        let expected = linear_luma([composited; 3]);
+        // Alpha is coverage over black, applied to the LINEAR luminance —
+        // it is not premultiplied into the encoded channels (issue #283).
+        let alpha = 128.0 / 255.0;
+        let expected = linear_luma([128.0 / 255.0; 3]) * alpha;
         assert!(grid.cells.iter().all(|v| (*v - expected).abs() < 1e-5));
     }
 

@@ -126,6 +126,15 @@ impl NotifyState {
             ep.dbus_id = Some(id);
         }
     }
+
+    /// Record the send timestamp for `key` only after the sink accepts the
+    /// notification. A failed sink call must leave the episode eligible for
+    /// an immediate retry.
+    pub fn record_sent(&mut self, key: &EpisodeKey, at: Instant) {
+        if let Some(ep) = self.episodes.get_mut(key) {
+            ep.last_sent = Some(at);
+        }
+    }
 }
 
 // ── Urgency / suppress reason / actions ──────────────────────────────────────
@@ -299,9 +308,6 @@ fn send_with_cooldown(
                 }];
             }
             let replaces = ep.dbus_id;
-            if let Some(entry) = state.episodes.get_mut(&key) {
-                entry.last_sent = Some(now);
-            }
             vec![NotifyAction::Send {
                 key,
                 summary,
@@ -315,7 +321,7 @@ fn send_with_cooldown(
                 key.clone(),
                 Episode {
                     dbus_id: None,
-                    last_sent: Some(now),
+                    last_sent: None,
                     notified: true,
                 },
             );
@@ -682,6 +688,7 @@ async fn perform_actions(
                 Ok(id) => {
                     {
                         let mut st = state.lock().expect("notify state mutex poisoned");
+                        st.record_sent(&key, Instant::now());
                         st.record_dbus_id(&key, id);
                     }
                     tracing::info!(event = "notify_sent", display = %key.display, kind = ?key.kind);
@@ -995,10 +1002,12 @@ mod tests {
     #[test]
     fn wake_at_threshold_notifies_once_then_cooldown() {
         let mut st = NotifyState::default();
+        let sent_at = t0();
         assert!(matches!(
-            decide(&mut st, &wake_retry(3), &cfg(), t0())[..],
+            decide(&mut st, &wake_retry(3), &cfg(), sent_at)[..],
             [NotifyAction::Send { .. }]
         ));
+        st.record_sent(&key_wake("m"), sent_at);
         assert!(
             matches!(
                 decide(
@@ -1341,9 +1350,8 @@ mod tests {
             wait_until(
                 || {
                     let st = state.lock().unwrap();
-                    // The episode was opened by `decide` regardless of the
-                    // sink outcome (coarse assertion, as documented): state
-                    // is not rolled back on a sink failure.
+                    // The episode remains open after a sink failure so a later event can
+                    // retry the notification.
                     st.episodes.contains_key(&key_wake("m"))
                 },
                 Duration::from_secs(2),
@@ -1353,6 +1361,19 @@ mod tests {
         );
         // The failed attempt must not have recorded a notify.
         assert!(sink.notifies.lock().unwrap().is_empty());
+
+        // A failed send must not start the cooldown: the next event is still
+        // emitted even though it arrives inside the configured cooldown.
+        let _ = event_tx.send(wake_retry(4));
+        assert!(
+            wait_until(
+                || !sink.notifies.lock().unwrap().is_empty(),
+                Duration::from_secs(2),
+            )
+            .await,
+            "the event after a failed send must be notified"
+        );
+        assert_eq!(sink.notifies.lock().unwrap().len(), 1);
 
         cancel.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;

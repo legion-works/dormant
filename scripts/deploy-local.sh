@@ -20,6 +20,8 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WEBUI_DIR="$REPO_ROOT/crates/dormant-web/webui"
 INSTALL_DIR="${DORMANT_INSTALL_DIR:-$HOME/.local/bin}"
 SERVICE="app-dormant.service"
+TRAY_SERVICE="dormant-tray.service"
+SKIPPED=""
 
 RESTART=1
 DRY_RUN=0
@@ -56,9 +58,37 @@ cd "$REPO_ROOT"
 cargo build --release -p dormantd --features web-ui,render
 cargo build --release -p dormantctl -p dormant-tray
 
+# Resolve where cargo ACTUALLY wrote the binaries. CARGO_TARGET_DIR (commonly
+# exported so several worktrees share one target dir) redirects the build
+# without changing $REPO_ROOT, so a hardcoded "$REPO_ROOT/target" verifies and
+# installs a STALE binary from an earlier build while the fresh one sits
+# elsewhere.
+#
+# This cost a full debugging session: three rounds of "the fix changes nothing"
+# on real hardware, because every deploy shipped the same stale artifact. It is
+# the defect class this script exists to prevent -- checking something other
+# than the thing being installed.
+TARGET_DIR="$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])' 2>/dev/null)"
+if [ -z "$TARGET_DIR" ]; then
+  TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
+fi
+echo "    target dir: $TARGET_DIR"
+
 echo "==> Verifying the built daemon"
-BIN="$REPO_ROOT/target/release/dormantd"
+BIN="$TARGET_DIR/release/dormantd"
 [ -x "$BIN" ] || { echo "ERROR: $BIN missing" >&2; exit 1; }
+
+# Freshness guard: the binary must be newer than every tracked source file.
+# Catches a stale artifact even if the resolution above is ever wrong again --
+# the failure it backstops is silent, and costs hours to notice.
+STALE_SRC="$(find "$REPO_ROOT/crates" -name '*.rs' -newer "$BIN" -print -quit 2>/dev/null || true)"
+if [ -n "$STALE_SRC" ]; then
+  echo "ERROR: $BIN is older than $STALE_SRC." >&2
+  echo "       The build did not produce this binary -- check CARGO_TARGET_DIR" >&2
+  echo "       (resolved to $TARGET_DIR) against where cargo actually wrote." >&2
+  exit 1
+fi
 
 # Dump once and grep the file. Do NOT pipe `strings` into `grep -q` here:
 # under `set -o pipefail`, grep -q exits on the first match, strings takes
@@ -107,14 +137,31 @@ else
   STOPPED=0
 fi
 
+# The tray holds its own binary open, so cp fails with "Text file busy" while it
+# runs. Stop it the same way -- an unhandled failure here aborts the deploy with
+# the DAEMON ALREADY STOPPED, which is how a routine deploy once left the
+# machine with no running dormantd.
+if [ "$RESTART" -eq 1 ] && systemctl --user is-active --quiet "$TRAY_SERVICE"; then
+  echo "    stopping $TRAY_SERVICE"
+  systemctl --user stop "$TRAY_SERVICE"
+  TRAY_STOPPED=1
+else
+  TRAY_STOPPED=0
+fi
+
 for bin in dormantd dormantctl dormant-tray; do
   if [ -f "$INSTALL_DIR/$bin" ]; then
     cp "$INSTALL_DIR/$bin" "$BACKUP_DIR/$bin"
   fi
-  # "Text file busy" means the binary is still running — the stop above
-  # handles dormantd; a running tray must be closed by hand.
-  cp "$REPO_ROOT/target/release/$bin" "$INSTALL_DIR/$bin"
-  echo "    installed $bin"
+  # A still-running binary yields "Text file busy". Both services are stopped
+  # above; anything else holding one open (a hand-started tray) is reported and
+  # skipped rather than aborting mid-install with the daemon down.
+  if cp "$TARGET_DIR/release/$bin" "$INSTALL_DIR/$bin" 2>/dev/null; then
+    echo "    installed $bin"
+  else
+    echo "    WARN: could not replace $bin (still running?) -- left as-is" >&2
+    SKIPPED="$SKIPPED $bin"
+  fi
 done
 echo "    previous binaries backed up to $BACKUP_DIR"
 
@@ -129,6 +176,15 @@ if [ "$STOPPED" -eq 1 ]; then
     echo "  systemctl --user stop $SERVICE && cp $BACKUP_DIR/dormantd $INSTALL_DIR/dormantd && systemctl --user start $SERVICE" >&2
     exit 1
   fi
+fi
+
+if [ "$TRAY_STOPPED" -eq 1 ]; then
+  echo "    starting $TRAY_SERVICE"
+  systemctl --user start "$TRAY_SERVICE"
+fi
+
+if [ -n "$SKIPPED" ]; then
+  echo "WARN: not replaced:$SKIPPED (still running)" >&2
 fi
 
 echo "==> Done. Roll back with:"

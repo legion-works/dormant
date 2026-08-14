@@ -693,6 +693,30 @@ fn should_defer_mpv_commit(transition: Option<&TransitionState>) -> bool {
     transition.is_some_and(|state| state.phase == TransitionPhase::Captured)
 }
 
+/// Whether a crossfade is in flight, meaning every committed frame must be
+/// blended against the captured old frame before it becomes visible.
+///
+/// mpv advances its own current picture independently of this state machine,
+/// so from `FILE_LOADED` onward the back buffer already holds the replacement
+/// item. Committing it unblended puts the new image on screen at full opacity
+/// — the hard cut the crossfade exists to avoid (issue #274).
+///
+/// The gate is the PHASE, not `t > 0`. Blending is the safe operation at every
+/// point of a live transition: `blend_in_place(capture, buf, 0)` returns the
+/// capture unchanged, so a frame blended at `t == 0` is exactly the old frame
+/// already on screen — invisible, and correct. Gating the capture on `t > 0`
+/// is what let the raw replacement through for one frame at the start of every
+/// fade.
+///
+/// Withholding the commit instead of blending it is NOT an alternative: an
+/// earlier attempt did that and froze the screensaver for 14 hours, because
+/// the render that emits `FrameRendered` never ran, so `AwaitingFirstFrame`
+/// never reached `Fading` and the timer never armed. Render always; blend when
+/// a transition is live; commit unconditionally.
+fn transition_live(transition: Option<&TransitionState>) -> bool {
+    transition.is_some_and(|state| state.phase != TransitionPhase::Idle)
+}
+
 /// Crossfade state for one screensaver session.
 ///
 /// Holds the capture buffer (allocated lazily on first `ItemEnded`),
@@ -2107,11 +2131,14 @@ impl WaylandState {
             }
         }
 
-        // Snapshot  for the visible commit (we never advance
-        // in this path).  The capture is recomputed every tick by
-        // , which does own the t advance.
+        // Snapshot the blend inputs for the visible commit (this path never
+        // advances `t`; the ticker owns that).
+        //
+        // Taken whenever a transition is LIVE, not only when `t > 0` — see
+        // [`transition_live`]. At `t == 0` the blend yields the capture
+        // unchanged, which is the frame already on screen.
         let blend_t = session.transition.as_ref().map_or(0, |tr| tr.t);
-        let capture_clone: Vec<u8> = if blend_t > 0 {
+        let capture_clone: Vec<u8> = if transition_live(session.transition.as_ref()) {
             session
                 .transition
                 .as_ref()
@@ -2126,7 +2153,7 @@ impl WaylandState {
             // SAFETY: back-buffer pointer from mmap + offset; valid
             // for the lifetime of this function.
             let back_slice = unsafe { std::slice::from_raw_parts_mut(ptr, buf_len) };
-            if blend_t > 0 && !capture_clone.is_empty() {
+            if !capture_clone.is_empty() {
                 blend::blend_in_place(&capture_clone, back_slice, blend_t);
             }
 
@@ -2355,8 +2382,13 @@ impl WaylandState {
         // blend at the visible pre-tick value (commits show the
         // progress this tick produced; the post-tick value is the
         // starting point for next time).
+        //
+        // Taken whenever a transition is LIVE, including `t == 0` — see
+        // [`transition_live`]. The first tick of every fade arrives at `t == 0`
+        // with mpv's replacement already in the back buffer; without the
+        // capture it would be committed raw.
         let blend_t = session.transition.as_ref().map_or(0, |tr| tr.t);
-        let capture_clone: Vec<u8> = if blend_t > 0 {
+        let capture_clone: Vec<u8> = if transition_live(session.transition.as_ref()) {
             session
                 .transition
                 .as_ref()
@@ -2384,7 +2416,7 @@ impl WaylandState {
         // offset math; the slice remains valid until the end of this
         // function (the mmap guard is in scope until then).
         let back_slice = unsafe { std::slice::from_raw_parts_mut(back_ptr, buf_len) };
-        if blend_t > 0 && !capture_clone.is_empty() {
+        if !capture_clone.is_empty() {
             blend::blend_in_place(&capture_clone, back_slice, blend_t);
         }
 
@@ -3698,6 +3730,73 @@ mod tests {
         assert!(
             log.iter().all(|entry| !entry.contains("-1, -1, -1, -1")),
             "a normal shift tick must never emit the unset tuple: {log:?}"
+        );
+    }
+
+    /// The residual half of #274: the fade's own first frame.
+    ///
+    /// `should_defer_mpv_commit` closes the `END_FILE`->`FILE_LOADED` window,
+    /// but mpv's replacement is already in the back buffer for the whole of
+    /// `AwaitingFirstFrame` and for the `t == 0` tick that starts the fade.
+    /// Gating the capture on `t > 0` left those frames unblended - a hard cut
+    /// on every transition, observed on hardware as `capture_len=0
+    /// blended=false` at the head of each fade.
+    #[test]
+    fn every_live_transition_phase_takes_a_capture_so_no_frame_commits_raw() {
+        let base = TransitionState {
+            capture: vec![0; 4],
+            phase: TransitionPhase::Idle,
+            t: 0,
+            t_step: 1,
+            timer_token: None,
+        };
+
+        for phase in [
+            TransitionPhase::Captured,
+            TransitionPhase::AwaitingFirstFrame,
+            TransitionPhase::Fading,
+        ] {
+            let probe = TransitionState {
+                capture: base.capture.clone(),
+                phase,
+                t: 0,
+                t_step: base.t_step,
+                timer_token: None,
+            };
+            assert!(
+                transition_live(Some(&probe)),
+                "{phase:?} at t == 0 must still take a capture; without it mpv's \
+                 replacement commits at full opacity"
+            );
+        }
+
+        // Idle is ordinary playback: no transition, nothing to blend against,
+        // and blending there would freeze the visible image.
+        assert!(!transition_live(Some(&base)));
+        assert!(!transition_live(None));
+    }
+
+    /// Why "blend at every live phase" is safe rather than merely convenient.
+    ///
+    /// The fix rests on this identity: a blend at `t == 0` returns the capture
+    /// untouched, so committing it puts the frame that is ALREADY on screen
+    /// back on screen. That is what makes blend-and-commit correct where
+    /// withholding the commit is not - withholding deadlocked the machine for
+    /// 14 hours, because the render is what emits `FrameRendered` and arms the
+    /// timer.
+    #[test]
+    fn blending_at_t_zero_reproduces_the_captured_frame_exactly() {
+        let capture: Vec<u8> = (0u8..64).collect();
+        // The back buffer holds mpv's REPLACEMENT item - a visibly different
+        // image. If the blend leaked any of it, the assert below fails.
+        let mut back: Vec<u8> = (0u8..64).map(|b| 255 - b).collect();
+
+        blend::blend_in_place(&capture, &mut back, 0);
+
+        assert_eq!(
+            back, capture,
+            "t == 0 must yield the captured old frame byte-for-byte; any leak \
+             of the replacement is the #274 hard cut"
         );
     }
 

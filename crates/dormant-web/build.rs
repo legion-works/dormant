@@ -17,7 +17,7 @@
 //! UI three times: a RELEASE build with the placeholder still in place.
 //! Debug builds keep working untouched.
 
-use std::path::Path;
+use std::path::PathBuf;
 
 /// Marker text carried by the checked-in placeholder. Matching on this
 /// rather than a size or hash keeps the check readable and survives
@@ -25,7 +25,15 @@ use std::path::Path;
 const PLACEHOLDER_MARKER: &str = "PLACEHOLDER";
 
 fn main() {
-    let dist = Path::new(env!("CARGO_MANIFEST_DIR")).join("webui/dist");
+    // Read CARGO_MANIFEST_DIR at RUN time, never via `env!`. `env!` bakes in the
+    // path of whichever checkout compiled this build script, and the compiled
+    // script is cached in the target dir -- so with a shared CARGO_TARGET_DIR
+    // across git worktrees, `env!` makes one worktree's build inspect ANOTHER
+    // worktree's `dist/`. That produced a false "placeholder SPA" failure on a
+    // checkout whose bundle was correctly built.
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+        .expect("CARGO_MANIFEST_DIR is always set for a build script");
+    let dist = PathBuf::from(manifest_dir).join("webui/dist");
     let index = dist.join("index.html");
 
     // Rebuild whenever the embedded bundle changes, so a stale success

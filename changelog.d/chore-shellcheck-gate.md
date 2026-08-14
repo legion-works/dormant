@@ -1,5 +1,5 @@
 ---
-kind: added
+kind: improvement
 surfaces: []
 issues: []
 ---

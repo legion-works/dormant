@@ -133,6 +133,32 @@ fi
 echo "    web-ui feature: present"
 echo "    embedded SPA:   real bundle"
 
+# dormantctl gets its own check, because the verification above covers dormantd
+# only -- the script builds and installs three binaries and inspected one.
+#
+# `dormantctl` carries `default = ["render"]`, and a build that loses it still
+# runs, still reports a version, and fails only when it meets a config using a
+# render stage: `E_RENDER_UNAVAILABLE`. That exact failure took down the daemon
+# on this machine once already.
+#
+# Behavioural rather than a symbol grep: validating the config this host will
+# actually run proves the binary handles it. Skipped when no config is present,
+# and it only exercises the render path if the live config uses a render stage --
+# which is the case that matters, since it is the config being deployed for.
+CTL="$(exe_path dormantctl)"
+LIVE_CONFIG="${DORMANT_CONFIG:-$HOME/.config/dormant/config.toml}"
+if [ -f "$LIVE_CONFIG" ]; then
+  if "$CTL" validate --config "$LIVE_CONFIG" >/dev/null 2>&1; then
+    echo "    dormantctl:     validates the live config"
+  else
+    echo "ERROR: the built dormantctl cannot validate $LIVE_CONFIG:" >&2
+    "$CTL" validate --config "$LIVE_CONFIG" 2>&1 | sed 's/^/       /' >&2
+    exit 1
+  fi
+else
+  echo "    dormantctl:     no config at $LIVE_CONFIG, validation skipped"
+fi
+
 if [ "$DRY_RUN" -eq 1 ]; then
   echo "==> --dry-run: built and verified, installing nothing"
   exit 0

@@ -53,42 +53,56 @@ echo "    dist/index.html: $(wc -c < "$WEBUI_DIR/dist/index.html") bytes (real b
 
 echo "==> Building binaries"
 cd "$REPO_ROOT"
+
+# Ask cargo which files it produced instead of reconstructing the path.
+#
+# `--message-format=json` emits a `compiler-artifact` record carrying the
+# absolute `executable` path for every binary built, including when the artifact
+# was already up to date -- so a no-op rebuild still reports. That is
+# authoritative: it settles the target-dir question (CARGO_TARGET_DIR redirects
+# the build without changing $REPO_ROOT, which shipped stale binaries through a
+# whole debugging session) and the staleness question together, with one
+# mechanism and no heuristics.
+build_exes() {
+  cargo build --release --message-format=json "$@" \
+    | python3 -c '
+import json, sys
+for line in sys.stdin:
+    try:
+        m = json.loads(line)
+    except ValueError:
+        continue
+    if m.get("reason") == "compiler-artifact" and m.get("executable"):
+        print(m["executable"])
+'
+}
+
 # dormantd needs its features named explicitly. Folding it into a multi-package
 # build silently drops them, which is its own recurring failure.
-cargo build --release -p dormantd --features web-ui,render
-cargo build --release -p dormantctl -p dormant-tray
+BUILT_EXES="$(build_exes -p dormantd --features web-ui,render)"
+BUILT_EXES="$BUILT_EXES
+$(build_exes -p dormantctl -p dormant-tray)"
 
-# Resolve where cargo ACTUALLY wrote the binaries. CARGO_TARGET_DIR (commonly
-# exported so several worktrees share one target dir) redirects the build
-# without changing $REPO_ROOT, so a hardcoded "$REPO_ROOT/target" verifies and
-# installs a STALE binary from an earlier build while the fresh one sits
-# elsewhere.
-#
-# This cost a full debugging session: three rounds of "the fix changes nothing"
-# on real hardware, because every deploy shipped the same stale artifact. It is
-# the defect class this script exists to prevent -- checking something other
-# than the thing being installed.
-TARGET_DIR="$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
-  | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])' 2>/dev/null)"
-if [ -z "$TARGET_DIR" ]; then
-  TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
-fi
-echo "    target dir: $TARGET_DIR"
+# Look each binary up in what cargo reported, so the file verified below and the
+# file installed later are the same one cargo just wrote.
+exe_path() {
+  printf '%s\n' "$BUILT_EXES" | grep -E "/$1\$" | head -1
+}
+
+for required in dormantd dormantctl dormant-tray; do
+  if [ -z "$(exe_path "$required")" ]; then
+    echo "ERROR: cargo reported no executable for $required." >&2
+    echo "       Built artifacts were:" >&2
+    printf '%s\n' "$BUILT_EXES" | sed 's/^/         /' >&2
+    exit 1
+  fi
+done
+
+echo "    target dir: $(dirname "$(exe_path dormantd)")"
 
 echo "==> Verifying the built daemon"
-BIN="$TARGET_DIR/release/dormantd"
+BIN="$(exe_path dormantd)"
 [ -x "$BIN" ] || { echo "ERROR: $BIN missing" >&2; exit 1; }
-
-# Freshness guard: the binary must be newer than every tracked source file.
-# Catches a stale artifact even if the resolution above is ever wrong again --
-# the failure it backstops is silent, and costs hours to notice.
-STALE_SRC="$(find "$REPO_ROOT/crates" -name '*.rs' -newer "$BIN" -print -quit 2>/dev/null || true)"
-if [ -n "$STALE_SRC" ]; then
-  echo "ERROR: $BIN is older than $STALE_SRC." >&2
-  echo "       The build did not produce this binary -- check CARGO_TARGET_DIR" >&2
-  echo "       (resolved to $TARGET_DIR) against where cargo actually wrote." >&2
-  exit 1
-fi
 
 # Dump once and grep the file. Do NOT pipe `strings` into `grep -q` here:
 # under `set -o pipefail`, grep -q exits on the first match, strings takes
@@ -156,7 +170,7 @@ for bin in dormantd dormantctl dormant-tray; do
   # A still-running binary yields "Text file busy". Both services are stopped
   # above; anything else holding one open (a hand-started tray) is reported and
   # skipped rather than aborting mid-install with the daemon down.
-  if cp "$TARGET_DIR/release/$bin" "$INSTALL_DIR/$bin" 2>/dev/null; then
+  if cp "$(exe_path "$bin")" "$INSTALL_DIR/$bin" 2>/dev/null; then
     echo "    installed $bin"
   else
     echo "    WARN: could not replace $bin (still running?) -- left as-is" >&2

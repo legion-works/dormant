@@ -60,7 +60,18 @@ const GLYPH_PX: u32 = 16;
 const TEMPLATE_PX: u32 = 36;
 
 fn main() {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // Read CARGO_MANIFEST_DIR at RUN time, never via `env!`. `env!` bakes in the
+    // path of whichever checkout compiled this build script, and the compiled
+    // script is cached in the target dir -- so with a shared CARGO_TARGET_DIR
+    // across git worktrees, one worktree's build resolves assets against
+    // ANOTHER worktree's path. When that other checkout is gone the build fails
+    // outright (`read mark.svg at /tmp/.../dormant-tray/../../design/...: No
+    // such file or directory`); when it still exists, it silently reads the
+    // wrong files.
+    let manifest_dir = PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR is always set for a build script"),
+    );
     let repo_root = manifest_dir.join("..").join("..");
 
     let mark_svg = repo_root

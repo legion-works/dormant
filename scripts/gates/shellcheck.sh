@@ -25,10 +25,24 @@ fi
 # NUL-delimited so a path containing whitespace cannot split into two arguments.
 mapfile -t -d '' scripts < <(git ls-files -z '*.sh')
 
+# Exit 2, distinct from shellcheck's own exit 1. A broken check and a clean
+# result must not share an exit code -- otherwise the one byte a caller reads
+# cannot tell "nothing to report" from "this gate no longer works".
 if [ ${#scripts[@]} -eq 0 ]; then
-  printf '%s\n' 'shellcheck: no tracked shell scripts found -- the glob is wrong' >&2
-  exit 1
+  printf '%s\n' 'SCOPE FAILURE: shellcheck found no tracked shell scripts -- the glob is wrong' >&2
+  exit 2
 fi
 
+# Floor set below the current count so ordinary editing does not trip it, but a
+# collapse in what gets scanned surfaces immediately. The denominator is printed
+# on every run, healthy or not: a count nobody sees until the postmortem is a
+# count nobody sees.
+readonly MIN_SCRIPTS=12
 printf 'shellcheck: %d scripts\n' "${#scripts[@]}"
+if [ ${#scripts[@]} -lt "$MIN_SCRIPTS" ]; then
+  printf 'SCOPE FAILURE: only %d scripts scanned, expected at least %d\n' \
+    "${#scripts[@]}" "$MIN_SCRIPTS" >&2
+  exit 2
+fi
+
 shellcheck --severity=warning "${scripts[@]}"

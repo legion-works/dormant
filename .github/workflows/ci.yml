@@ -373,6 +373,8 @@ jobs:
           fetch-depth: 0
       - name: Reject same-SHA reruns
         run: bash scripts/ci/reject_required_rerun.sh
+      - name: Lint shell scripts
+        run: bash scripts/gates/shellcheck.sh
       - name: Check raw test sleep policy
         run: |
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then

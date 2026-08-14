@@ -576,6 +576,24 @@ fn cancel_transition_timer_for(
     }
 }
 
+/// Cancel a per-item load deadline if one is armed.
+fn cancel_item_load_timer_for(
+    session: &mut ScreensaverSession,
+    handle: Option<&calloop::LoopHandle<'static, WaylandState>>,
+) {
+    let token = session.item_load_token.take();
+    if let Some(token) = token
+        && let Some(handle) = handle
+    {
+        handle.remove(token);
+    }
+}
+
+/// Maximum time to wait for mpv to confirm the replacement item. A broken
+/// playlist entry must fall back to black rather than freeze the outgoing
+/// frame indefinitely.
+const ITEM_LOAD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Side-effect flags the wiring applies after [`process_mpv_events`]
 /// returns.  Kept as small data so the helper stays I/O-free and
 /// unit-testable without a `WaylandState` or real `MpvPlayer`.
@@ -666,6 +684,39 @@ pub(super) enum TransitionEvent {
     FrameRendered { ok: bool },
 }
 
+/// Whether an mpv wakeup is still at the pre-`FILE_LOADED` boundary.
+///
+/// mpv may already have advanced its current picture when it reports
+/// `END_FILE`. Rendering that picture before `FILE_LOADED` would expose the
+/// replacement at full opacity before the crossfade has a chance to start.
+fn should_defer_mpv_commit(transition: Option<&TransitionState>) -> bool {
+    transition.is_some_and(|state| state.phase == TransitionPhase::Captured)
+}
+
+/// Whether a crossfade is in flight, meaning every committed frame must be
+/// blended against the captured old frame before it becomes visible.
+///
+/// mpv advances its own current picture independently of this state machine,
+/// so from `FILE_LOADED` onward the back buffer already holds the replacement
+/// item. Committing it unblended puts the new image on screen at full opacity
+/// — the hard cut the crossfade exists to avoid (issue #274).
+///
+/// The gate is the PHASE, not `t > 0`. Blending is the safe operation at every
+/// point of a live transition: `blend_in_place(capture, buf, 0)` returns the
+/// capture unchanged, so a frame blended at `t == 0` is exactly the old frame
+/// already on screen — invisible, and correct. Gating the capture on `t > 0`
+/// is what let the raw replacement through for one frame at the start of every
+/// fade.
+///
+/// Withholding the commit instead of blending it is NOT an alternative: an
+/// earlier attempt did that and froze the screensaver for 14 hours, because
+/// the render that emits `FrameRendered` never ran, so `AwaitingFirstFrame`
+/// never reached `Fading` and the timer never armed. Render always; blend when
+/// a transition is live; commit unconditionally.
+fn transition_live(transition: Option<&TransitionState>) -> bool {
+    transition.is_some_and(|state| state.phase != TransitionPhase::Idle)
+}
+
 /// Crossfade state for one screensaver session.
 ///
 /// Holds the capture buffer (allocated lazily on first `ItemEnded`),
@@ -743,6 +794,9 @@ pub(super) struct ScreensaverSession {
     /// `RegistrationToken` for the calloop deadline timer; removed
     /// when the first frame lands or when the session is torn down.
     pub(super) first_frame_token: Option<calloop::RegistrationToken>,
+    /// Per-item deadline timer. A missing `FILE_LOADED` event must fail back
+    /// to black rather than leave the outgoing frame frozen indefinitely.
+    pub(super) item_load_token: Option<calloop::RegistrationToken>,
     /// Selected transition mode (`Crossfade` or `None`) — copied at
     /// session-build time from `ScreensaverSettings::transition` so
     /// the state machine doesn't have to plumb settings through every
@@ -799,7 +853,7 @@ pub(super) struct WaylandState {
     /// the `wayland_ops` module docs for why a raw `WpViewport` is
     /// never stored here directly.
     pub(super) viewport: Option<Arc<dyn ViewportHandle>>,
-    pub(super) black_buffer: Option<WlBuffer>,
+    black_buffer: Option<BlackBuffer>,
     pub(super) configured_size: (u32, u32),
     pub(super) surface_up: bool,
 
@@ -878,6 +932,22 @@ pub(super) struct WaylandState {
     /// `RecordingWaylandOps` in tests. See `super::wayland_ops` module
     /// docs.
     pub(super) wayland_ops: Arc<dyn WaylandOps>,
+}
+
+/// Opaque black buffer together with the surface size it was allocated for.
+/// Keeping the dimensions beside the proxy makes re-use conditional on the
+/// same invariant the SHM allocator enforces.
+#[derive(Clone)]
+struct BlackBuffer {
+    buffer: WlBuffer,
+    size: (u32, u32),
+}
+
+fn black_buffer_needs_rebuild(
+    buffer_size: Option<(u32, u32)>,
+    configured_size: (u32, u32),
+) -> bool {
+    buffer_size != Some(configured_size)
 }
 
 impl WaylandState {
@@ -1371,7 +1441,14 @@ pub(super) trait ViewportStateView {
         black_buffer: &dyn BufferHandle,
     ) {
         self.reset_shift();
-        self.ops().surface_attach(surface, black_buffer, 0, 0);
+        self.attach_and_commit(surface, black_buffer);
+    }
+
+    /// Attach a visible frame and commit it through the Wayland seam. Keeping
+    /// this operation behind the recorder makes the no-commit transition
+    /// boundary testable without constructing a live compositor state.
+    fn attach_and_commit(&self, surface: &dyn SurfaceHandle, buffer: &dyn BufferHandle) {
+        self.ops().surface_attach(surface, buffer, 0, 0);
         self.ops().surface_commit(surface);
     }
 }
@@ -1601,7 +1678,10 @@ impl WaylandState {
 
         self.layer_surface = Some(pending.layer_surface);
         self.viewport = viewport;
-        self.black_buffer = Some(buffer);
+        self.black_buffer = Some(BlackBuffer {
+            buffer,
+            size: configured_size,
+        });
         self.configured_size = configured_size;
         self.surface_up = true;
         // U5: black overlay never shifts — no shift timer to arm.
@@ -1808,6 +1888,7 @@ impl WaylandState {
             pending_gen: r#gen,
             has_first_frame: false,
             first_frame_token,
+            item_load_token: None,
             // `TransitionMode::None` paths drain mpv events and discard
             // them (see `on_mpv_wakeup`) without ever touching
             // `transition` — the state machine is gated on
@@ -1912,6 +1993,7 @@ impl WaylandState {
     /// `ItemLoaded` in a later one) still drive the lifecycle correctly.
     #[allow(clippy::too_many_lines)] // single-method state machine: drain, render, blend, attach, advance are documented inline below
     fn on_mpv_wakeup(&mut self) {
+        let wayland_ops = self.wayland_ops.clone();
         let mpv_events: Vec<MpvItemEvent> = {
             let Some(session) = self.screensaver_session.as_mut() else {
                 return;
@@ -1975,7 +2057,15 @@ impl WaylandState {
         session.transition = new_transition;
         if cmds.capture_pending {
             capture_front_into_transition(session);
+            cancel_transition_timer_for(session, self.loop_handle.as_ref());
         }
+
+        if should_defer_mpv_commit(session.transition.as_ref()) {
+            let r#gen = session.pending_gen;
+            self.arm_item_load_timer(r#gen);
+            return;
+        }
+        cancel_item_load_timer_for(session, self.loop_handle.as_ref());
 
         // Early-out if we just armed: the timer takes over with the
         // first blended tick.  Don't commit on the arming wakeup.
@@ -2041,11 +2131,14 @@ impl WaylandState {
             }
         }
 
-        // Snapshot  for the visible commit (we never advance
-        // in this path).  The capture is recomputed every tick by
-        // , which does own the t advance.
+        // Snapshot the blend inputs for the visible commit (this path never
+        // advances `t`; the ticker owns that).
+        //
+        // Taken whenever a transition is LIVE, not only when `t > 0` — see
+        // [`transition_live`]. At `t == 0` the blend yields the capture
+        // unchanged, which is the frame already on screen.
         let blend_t = session.transition.as_ref().map_or(0, |tr| tr.t);
-        let capture_clone: Vec<u8> = if blend_t > 0 {
+        let capture_clone: Vec<u8> = if transition_live(session.transition.as_ref()) {
             session
                 .transition
                 .as_ref()
@@ -2060,7 +2153,7 @@ impl WaylandState {
             // SAFETY: back-buffer pointer from mmap + offset; valid
             // for the lifetime of this function.
             let back_slice = unsafe { std::slice::from_raw_parts_mut(ptr, buf_len) };
-            if blend_t > 0 && !capture_clone.is_empty() {
+            if !capture_clone.is_empty() {
                 blend::blend_in_place(&capture_clone, back_slice, blend_t);
             }
 
@@ -2069,14 +2162,20 @@ impl WaylandState {
                 Some(s) => s.wl_surface().clone(),
                 None => return,
             };
-            wl_surface.attach(Some(real_buffer(session.buffers[back_idx].as_ref())), 0, 0);
             wl_surface.damage_buffer(
                 0,
                 0,
                 session.width.cast_signed(),
                 session.height.cast_signed(),
             );
-            wl_surface.commit();
+            let surface_handle = wayland_ops.surface_handle(&wl_surface);
+            wayland_ops.surface_attach(
+                surface_handle.as_ref(),
+                session.buffers[back_idx].as_ref(),
+                0,
+                0,
+            );
+            wayland_ops.surface_commit(surface_handle.as_ref());
             session.buffers_busy[back_idx] = true;
 
             // First-frame success.
@@ -2168,6 +2267,51 @@ impl WaylandState {
         let _ = t_step;
     }
 
+    /// Install a one-shot deadline for mpv's `FILE_LOADED` event.
+    fn arm_item_load_timer(&mut self, r#gen: u64) {
+        if self
+            .screensaver_session
+            .as_ref()
+            .is_some_and(|session| session.item_load_token.is_some())
+        {
+            return;
+        }
+        let Some(handle) = self.loop_handle.clone() else {
+            return;
+        };
+        let timer = Timer::from_duration(ITEM_LOAD_DEADLINE);
+        let inserted =
+            handle.insert_source(timer, move |_deadline, _meta, state: &mut WaylandState| {
+                state.handle_item_load_timeout(r#gen);
+                TimeoutAction::Drop
+            });
+        if let Some(session) = self.screensaver_session.as_mut() {
+            match inserted {
+                Ok(token) => session.item_load_token = Some(token),
+                Err(error) => tracing::error!(
+                    event = "item_load_timer_insert_failed",
+                    display_id = %self.display_id,
+                    r#gen,
+                    error = %error,
+                ),
+            }
+        }
+    }
+
+    /// Fail the screensaver if an ended item never produces `FILE_LOADED`.
+    fn handle_item_load_timeout(&mut self, r#gen: u64) {
+        let timed_out = self.screensaver_session.as_ref().is_some_and(|session| {
+            session.pending_gen == r#gen
+                && session
+                    .transition
+                    .as_ref()
+                    .is_some_and(|transition| transition.phase == TransitionPhase::Captured)
+        });
+        if timed_out {
+            self.fail_screensaver_to_black("next item did not load");
+        }
+    }
+
     /// Per-tick blend progress.  Runs on the calloop thread when the
     /// transition timer fires.  Renders mpv into the back buffer,
     /// advances `t` unconditionally via `tick_step` (this is
@@ -2186,6 +2330,7 @@ impl WaylandState {
     /// completes its fade in the same `frames_for_blend` ticks as
     /// a 60-fps video would.
     fn on_transition_tick(&mut self, r#gen: u64) {
+        let wayland_ops = self.wayland_ops.clone();
         let Some(session) = self.screensaver_session.as_mut() else {
             return;
         };
@@ -2237,8 +2382,13 @@ impl WaylandState {
         // blend at the visible pre-tick value (commits show the
         // progress this tick produced; the post-tick value is the
         // starting point for next time).
+        //
+        // Taken whenever a transition is LIVE, including `t == 0` — see
+        // [`transition_live`]. The first tick of every fade arrives at `t == 0`
+        // with mpv's replacement already in the back buffer; without the
+        // capture it would be committed raw.
         let blend_t = session.transition.as_ref().map_or(0, |tr| tr.t);
-        let capture_clone: Vec<u8> = if blend_t > 0 {
+        let capture_clone: Vec<u8> = if transition_live(session.transition.as_ref()) {
             session
                 .transition
                 .as_ref()
@@ -2266,7 +2416,7 @@ impl WaylandState {
         // offset math; the slice remains valid until the end of this
         // function (the mmap guard is in scope until then).
         let back_slice = unsafe { std::slice::from_raw_parts_mut(back_ptr, buf_len) };
-        if blend_t > 0 && !capture_clone.is_empty() {
+        if !capture_clone.is_empty() {
             blend::blend_in_place(&capture_clone, back_slice, blend_t);
         }
 
@@ -2275,14 +2425,20 @@ impl WaylandState {
             Some(s) => s.wl_surface().clone(),
             None => return,
         };
-        wl_surface.attach(Some(real_buffer(session.buffers[back_idx].as_ref())), 0, 0);
         wl_surface.damage_buffer(
             0,
             0,
             session.width.cast_signed(),
             session.height.cast_signed(),
         );
-        wl_surface.commit();
+        let surface_handle = wayland_ops.surface_handle(&wl_surface);
+        wayland_ops.surface_attach(
+            surface_handle.as_ref(),
+            session.buffers[back_idx].as_ref(),
+            0,
+            0,
+        );
+        wayland_ops.surface_commit(surface_handle.as_ref());
         session.buffers_busy[back_idx] = true;
         session.next_render_idx = 1 - back_idx;
 
@@ -2332,9 +2488,10 @@ impl WaylandState {
         // unset request apply atomically at the SAME commit
         // regardless of which request was issued first.)
         let dest = self.configured_size;
-        if self.black_buffer.is_none()
+        if black_buffer_needs_rebuild(self.black_buffer.as_ref().map(|buffer| buffer.size), dest)
             && let Some(surface) = self.layer_surface.as_ref()
         {
+            self.black_buffer = None;
             let wl_surface = surface.wl_surface().clone();
             if self.single_pixel_manager.is_some() && self.viewporter.is_some() {
                 let buffer = self
@@ -2350,10 +2507,12 @@ impl WaylandState {
                     );
                     self.viewport = Some(viewport);
                 }
-                self.black_buffer = Some(buffer);
+                self.black_buffer = Some(BlackBuffer { buffer, size: dest });
             } else {
                 match crate::linux::surface::create_shm_black_buffer(dest.0, dest.1, self) {
-                    Ok(buffer) => self.black_buffer = Some(buffer),
+                    Ok(buffer) => {
+                        self.black_buffer = Some(BlackBuffer { buffer, size: dest });
+                    }
                     Err(e) => tracing::error!(
                         event = "screensaver_black_fallback_failed",
                         display_id = %self.display_id,
@@ -2375,7 +2534,7 @@ impl WaylandState {
         if let (Some(surface), Some(black)) = (&self.layer_surface, &self.black_buffer) {
             let wl_surface = surface.wl_surface().clone();
             let surface_handle = self.wayland_ops.surface_handle(&wl_surface);
-            let buffer_handle = wrap_real_buffer(black.clone());
+            let buffer_handle = wrap_real_buffer(black.buffer.clone());
             self.swap_surface_to_black(surface_handle.as_ref(), buffer_handle.as_ref());
         }
     }
@@ -2406,6 +2565,9 @@ impl WaylandState {
                 {
                     handle.remove(token);
                 }
+                if let Some(token) = session.item_load_token {
+                    handle.remove(token);
+                }
             }
         }
         // Drop the session — the destructuring here is purely to control
@@ -2425,6 +2587,7 @@ impl WaylandState {
                 pool,
                 buffers,
                 first_frame_token: _,
+                item_load_token: _,
                 pending_reply: _,
                 pending_gen: _,
                 has_first_frame: _,
@@ -2662,7 +2825,11 @@ impl WaylandState {
                     // method's docs for why moving it is
                     // protocol-safe.)
                     let dest = self.configured_size;
-                    if self.black_buffer.is_none() {
+                    if black_buffer_needs_rebuild(
+                        self.black_buffer.as_ref().map(|buffer| buffer.size),
+                        dest,
+                    ) {
+                        self.black_buffer = None;
                         if self.single_pixel_manager.is_some() && self.viewporter.is_some() {
                             let buffer = self
                                 .single_pixel_manager
@@ -2677,11 +2844,11 @@ impl WaylandState {
                                 );
                                 self.viewport = Some(viewport);
                             }
-                            self.black_buffer = Some(buffer);
+                            self.black_buffer = Some(BlackBuffer { buffer, size: dest });
                         } else if let Ok(buffer) =
                             crate::linux::surface::create_shm_black_buffer(dest.0, dest.1, self)
                         {
-                            self.black_buffer = Some(buffer);
+                            self.black_buffer = Some(BlackBuffer { buffer, size: dest });
                         }
                     }
 
@@ -2693,7 +2860,7 @@ impl WaylandState {
                         // (`out_of_buffer` protocol-error class,
                         // issue #56).
                         let surface_handle = self.wayland_ops.surface_handle(&wl_surface);
-                        let buffer_handle = wrap_real_buffer(black);
+                        let buffer_handle = wrap_real_buffer(black.buffer);
                         self.swap_surface_to_black(surface_handle.as_ref(), buffer_handle.as_ref());
                         tracing::info!(
                             event = "render_black_swap",
@@ -3245,6 +3412,16 @@ mod tests {
         assert_eq!(strategy, super::BlackAttachStrategy::ShmFallback);
     }
 
+    #[test]
+    fn black_attach_rebuilds_buffer_when_live_configure_changes_size() {
+        assert!(!black_buffer_needs_rebuild(
+            Some((1920, 1080)),
+            (1920, 1080)
+        ));
+        assert!(black_buffer_needs_rebuild(Some((1920, 1080)), (2560, 1440)));
+        assert!(black_buffer_needs_rebuild(None, (2560, 1440)));
+    }
+
     // ── surface_match tests (round-3 — M2 stale-event guard) ───────────
     //
     // Constructing distinct `ObjectId`s without a real Wayland
@@ -3553,6 +3730,118 @@ mod tests {
         assert!(
             log.iter().all(|entry| !entry.contains("-1, -1, -1, -1")),
             "a normal shift tick must never emit the unset tuple: {log:?}"
+        );
+    }
+
+    /// The residual half of #274: the fade's own first frame.
+    ///
+    /// `should_defer_mpv_commit` closes the `END_FILE`->`FILE_LOADED` window,
+    /// but mpv's replacement is already in the back buffer for the whole of
+    /// `AwaitingFirstFrame` and for the `t == 0` tick that starts the fade.
+    /// Gating the capture on `t > 0` left those frames unblended - a hard cut
+    /// on every transition, observed on hardware as `capture_len=0
+    /// blended=false` at the head of each fade.
+    #[test]
+    fn every_live_transition_phase_takes_a_capture_so_no_frame_commits_raw() {
+        let base = TransitionState {
+            capture: vec![0; 4],
+            phase: TransitionPhase::Idle,
+            t: 0,
+            t_step: 1,
+            timer_token: None,
+        };
+
+        for phase in [
+            TransitionPhase::Captured,
+            TransitionPhase::AwaitingFirstFrame,
+            TransitionPhase::Fading,
+        ] {
+            let probe = TransitionState {
+                capture: base.capture.clone(),
+                phase,
+                t: 0,
+                t_step: base.t_step,
+                timer_token: None,
+            };
+            assert!(
+                transition_live(Some(&probe)),
+                "{phase:?} at t == 0 must still take a capture; without it mpv's \
+                 replacement commits at full opacity"
+            );
+        }
+
+        // Idle is ordinary playback: no transition, nothing to blend against,
+        // and blending there would freeze the visible image.
+        assert!(!transition_live(Some(&base)));
+        assert!(!transition_live(None));
+    }
+
+    /// Why "blend at every live phase" is safe rather than merely convenient.
+    ///
+    /// The fix rests on this identity: a blend at `t == 0` returns the capture
+    /// untouched, so committing it puts the frame that is ALREADY on screen
+    /// back on screen. That is what makes blend-and-commit correct where
+    /// withholding the commit is not - withholding deadlocked the machine for
+    /// 14 hours, because the render is what emits `FrameRendered` and arms the
+    /// timer.
+    #[test]
+    fn blending_at_t_zero_reproduces_the_captured_frame_exactly() {
+        let capture: Vec<u8> = (0u8..64).collect();
+        // The back buffer holds mpv's REPLACEMENT item - a visibly different
+        // image. If the blend leaked any of it, the assert below fails.
+        let mut back: Vec<u8> = (0u8..64).map(|b| 255 - b).collect();
+
+        blend::blend_in_place(&capture, &mut back, 0);
+
+        assert_eq!(
+            back, capture,
+            "t == 0 must yield the captured old frame byte-for-byte; any leak \
+             of the replacement is the #274 hard cut"
+        );
+    }
+
+    #[test]
+    fn item_ended_boundary_defers_commit_until_item_loaded_and_fade_ticks() {
+        let fake = FakeShiftView::new(0);
+        let surface = fake.seed_surface();
+        let buffer = fake.seed_buffer();
+        let transition = TransitionState {
+            capture: vec![0; 4],
+            phase: TransitionPhase::Captured,
+            t: 0,
+            t_step: 1,
+            timer_token: None,
+        };
+        assert!(should_defer_mpv_commit(Some(&transition)));
+        if !should_defer_mpv_commit(Some(&transition)) {
+            fake.attach_and_commit(surface.as_ref(), buffer.as_ref());
+        }
+        assert!(
+            fake.take_call_log().is_empty(),
+            "ItemEnded before ItemLoaded must not attach or commit a new frame"
+        );
+
+        let (phase, _, step_cmd) =
+            transition_step(transition.phase, transition.t, TransitionEvent::ItemLoaded);
+        assert_eq!(phase, TransitionPhase::AwaitingFirstFrame);
+        assert_eq!(step_cmd, StepCmd::NoOp);
+        let (phase, _, step_cmd) =
+            transition_step(phase, 0, TransitionEvent::FrameRendered { ok: true });
+        assert_eq!(phase, TransitionPhase::Fading);
+        assert_eq!(step_cmd, StepCmd::ArmTimer);
+        assert!(!should_defer_mpv_commit(Some(&TransitionState {
+            phase,
+            ..transition
+        })));
+        let (_, _, tick_cmd) = tick_step(phase, 0, 1);
+        assert_eq!(tick_cmd, TickCmd::Advance);
+        fake.attach_and_commit(surface.as_ref(), buffer.as_ref());
+        assert_eq!(
+            fake.take_call_log(),
+            vec![
+                "surface_attach(#0, buffer=#1, 0, 0)".to_string(),
+                "surface_commit(#0)".to_string(),
+            ]
         );
     }
 

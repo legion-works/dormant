@@ -35,6 +35,15 @@ esphome:
   name: ${device_name}
   friendly_name: ${friendly_name}
   min_version: "2025.12.0"
+  # Ask the radar for its stored gate config once the UART is up. Without this
+  # the ld2410 `number:` entities never receive a value -- see the comment above
+  # the `button:` block. The delay puts the read after wifi/API association so a
+  # consumer is connected to observe the result.
+  on_boot:
+    - priority: -100
+      then:
+        - delay: 15s
+        - button.press: radar_query_params
 
 esp32:
   board: esp32-c6-devkitm-1
@@ -174,6 +183,23 @@ sensor:
     still_distance:
       name: "${friendly_name} Still Distance"
       filters: [throttle: 10s]
+
+# The ld2410 `number:` entities below are a VIEW onto the radar module's own
+# NVM, not values ESPHome owns -- nothing here sets them, so they read `unknown`
+# until something asks the module for its stored config. That read is a separate
+# entity, and without this button the gate thresholds never populate: the
+# "adjustable from Home Assistant" claim below is false for all of them.
+# Verified 2026-08-14 on a live device -- every g0-g8 threshold read `unknown`
+# in Home Assistant while the radar was operating on a real calibration curve.
+#
+# The esphome: on_boot press above populates them without a human remembering.
+button:
+  - platform: ld2410
+    query_params:
+      id: radar_query_params
+      name: "${friendly_name} Query Radar Params"
+    restart:
+      name: "${friendly_name} Restart Radar"
 
 # Runtime tuning: detection-bubble shaping + zone cutoff, all adjustable from
 # Home Assistant without reflashing.

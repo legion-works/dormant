@@ -4,6 +4,41 @@ All notable changes to `dormant` are recorded here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims at [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.4] - 2026-08-15
+
+### Changed
+
+- Shell scripts are now linted by shellcheck in pre-commit and CI. Nineteen tracked scripts — every quality gate, the release helpers, and the local deploy script — previously had no automated check of any kind.
+
+### Fixed
+
+- `dormantctl doctor` no longer reports a passing Home Assistant entity when HA says the sensor is unavailable. It now fails that entity with an explicit unavailable/unknown detail so the operator can distinguish a broken sensor from an unreachable probe. ([#276](https://github.com/legion-works/dormant/issues/276))
+- Displays no longer remain awake indefinitely when ownership returns after an unowned Grace expiry; an absent zone resumes the configured blank ladder at its original deadline. ([#281](https://github.com/legion-works/dormant/issues/281))
+- A failed desktop notification no longer suppresses the next alert during the cooldown window. Displays that still cannot wake now produce the follow-up alert immediately after the D-Bus sink recovers. ([#284](https://github.com/legion-works/dormant/issues/284))
+- Home Assistant publishing no longer exits permanently when the daemon cannot answer the startup state snapshot. The publisher continues with an empty snapshot and fills retained state from later events or reconnects. ([#285](https://github.com/legion-works/dormant/issues/285))
+- DDC power-off blanks now verify that the display applied the command instead of reporting success when the panel remains on. ([#286](https://github.com/legion-works/dormant/issues/286))
+- `dormantctl emergency-wake` no longer reports success for only the displays whose wake tasks completed when another task panics, whether it reaches the live daemon or the direct-hardware fallback. The panicked display is now listed as failed with the panic detail. ([#287](https://github.com/legion-works/dormant/issues/287))
+- `dormantctl doctor` no longer reopens USB sensors after a reachable daemon returns `ok` without a report. It now reports the malformed daemon response as failed and preserves the live daemon's ownership of the port. ([#288](https://github.com/legion-works/dormant/issues/288))
+- Motion sensors now reject hold_time values longer than their effective stale_timeout instead of silently dropping the pending absence hold. ([#282](https://github.com/legion-works/dormant/issues/282))
+- Occupied driving zones no longer lose their fail-safe presence state when a shared display's input-wake hold expires. ([#275](https://github.com/legion-works/dormant/issues/275))
+- Displays could blank when one of their occupied rooms reported vacant; they now stay awake while any driving zone is occupied or unknown. ([#296](https://github.com/legion-works/dormant/issues/296))
+- Active wear sampling could misattribute translucent captured pixels because alpha was applied before sRGB linearization. The spatial luma reducer now composites over black in linear light, matching screensaver scans. ([#283](https://github.com/legion-works/dormant/issues/283))
+- `scripts/deploy-local.sh` now installs the exact files cargo reports building, instead of reconstructing their paths. The previous mtime-based freshness check was unsound in both directions and rejected valid builds.
+- `scripts/deploy-local.sh` now installs the binary cargo actually built. With `CARGO_TARGET_DIR` set, it verified and installed a stale artifact from a previous build, so a deploy could silently ship old code. The release-build SPA guard had the same class of bug and read another worktree's bundle.
+- `scripts/deploy-local.sh` verified only the daemon while building and installing three binaries. It now also checks that the built `dormantctl` can validate the config this host runs, catching a build that silently lost the `render` feature.
+- A display blank arriving while wake recovery was re-probing could be undone by a late wake attempt. Recovery now checks for supersession before every re-probe wake, leaving the newer blank in force. ([#280](https://github.com/legion-works/dormant/issues/280))
+- `dormantctl doctor mqtt` no longer reports a healthy sensor when the broker only holds a stale retained value. A retained message is delivered the moment the probe subscribes, so a topic that stopped publishing looked identical to a live one — the probe passed while the daemon marked the same sensor unavailable and the display would not blank. It now reports whether the value was observed live, and names the staleness risk when only a retained one arrives.
+- The ESPHome examples promised the LD2410 gate thresholds were adjustable from Home Assistant, but every one of them read `unknown` — the values live in the radar module and nothing ever asked for them. Tiers 2 and 3 now declare the `query_params` button and press it on boot.
+- The libmpv render tests bounded frame production with real-clock deadlines tight enough to fail on a loaded machine rather than on a regression — one allowed 200ms for mpv to initialise and decode its first frame. All five polling sites now share a single documented hang-detector timeout.
+- Translucent screensaver pixels were assigned the wrong luma because alpha was applied before sRGB linearization. Luma scans now composite over black in linear light. ([#283](https://github.com/legion-works/dormant/issues/283))
+- A corrupt oversized LD2410 frame length could stall parsing and freeze the last presence state indefinitely. The parser now discards impossible lengths and continues to the next valid frame. ([#277](https://github.com/legion-works/dormant/issues/277))
+- The tray's build script resolved its icon assets against a path baked in at compile time, so a build in one git worktree could read another worktree's files — or fail outright once that checkout was gone.
+- The black-overlay fallback now recreates its shared-memory buffer after a live output resize, so it no longer blanks only a stale top-left rectangle. ([#273](https://github.com/legion-works/dormant/issues/273))
+- Screensaver crossfades no longer flash the new image at full opacity before the fade begins. Every frame committed during a transition is now blended against the outgoing image, including the first frame of the fade. ([#274](https://github.com/legion-works/dormant/issues/274))
+- Wear ledger filenames now use collision-resistant full panel identities. Existing wear history stored under the old sanitized filename is adopted automatically on first run and retained as a `.migrated` backup. ([#279](https://github.com/legion-works/dormant/issues/279))
+- An existing wear ledger that cannot be read is now kept read-only instead of being mistaken for a new panel and overwritten with a fresh ledger. ([#278](https://github.com/legion-works/dormant/issues/278))
+- A release build made without first building the web UI produced a daemon that served a blank dashboard instead of the real one. Such a build now fails with the command to fix it, and `scripts/deploy-local.sh` builds and verifies the whole set in one step.
+
 ## [0.12.3] - 2026-08-09
 
 ### Fixed

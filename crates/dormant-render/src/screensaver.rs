@@ -774,6 +774,25 @@ mod tests {
     /// semantics) get the prior effective behaviour — only the
     /// `mpv_player_sets_scale_mode_properties_*` tests below exercise
     /// the scaling properties explicitly.
+    /// Upper bound on how long a test waits for mpv to produce frames.
+    ///
+    /// This is a HANG DETECTOR, not a performance budget, and the distinction
+    /// is the whole point. mpv decodes on its own threads; under `nextest`
+    /// parallelism on a loaded machine those threads can be starved for far
+    /// longer than the decode itself takes. Any bound tight enough to assert
+    /// something about speed is therefore a bound that fails on LOAD rather
+    /// than on regression -- which is exactly what
+    /// `FLAKE-2026-07-18-MPV-FIRSTFRAME` and `FLAKE-2026-07-18-RENDER-FRAMES`
+    /// were. The first gave mpv 200ms total (10 polls x 20ms) to initialise
+    /// and decode its first frame.
+    ///
+    /// Raising the bound costs nothing in the passing case: every loop below
+    /// exits as soon as it has the frames it needs, so this only binds when a
+    /// test is going to fail anyway. It buys the difference between "failed
+    /// because the render path is broken" and "failed because the box was
+    /// busy", which is the only thing the timeout was ever meant to say.
+    const FRAME_PUMP_TIMEOUT: Duration = Duration::from_secs(60);
+
     fn build_test_player() -> Option<(MpvPlayer, PathBuf)> {
         let dir = std::env::temp_dir().join("dormant-render-tests");
         std::fs::create_dir_all(&dir).expect("mkdir temp test dir");
@@ -838,7 +857,7 @@ mod tests {
         let mut hashes: Vec<u64> = Vec::new();
         let mut first_buf: Option<Vec<u8>> = None;
         let start = Instant::now();
-        while rendered < 30 && start.elapsed() < Duration::from_secs(10) {
+        while rendered < 30 && start.elapsed() < FRAME_PUMP_TIMEOUT {
             let mut buf = vec![0xABu8; (320 * 4 * 180) as usize];
             match player.render_frame_into(&mut buf) {
                 Ok(true) => {
@@ -1012,7 +1031,7 @@ mod tests {
             Err(e) => panic!("player init (loadfile error is async): {e}"),
         };
 
-        let deadline = Instant::now() + Duration::from_secs(8);
+        let deadline = Instant::now() + FRAME_PUMP_TIMEOUT;
         let mut saw_no_first_frame = false;
         while Instant::now() < deadline {
             let mut buf = vec![0u8; 64 * 4 * 64];
@@ -1532,7 +1551,8 @@ mod tests {
         // deterministic per (mode, fixture, frame_index); we just need
         // a valid first frame.
         let sample = |player: &mut MpvPlayer| -> Option<Vec<u8>> {
-            for _ in 0..20 {
+            let start = Instant::now();
+            while start.elapsed() < FRAME_PUMP_TIMEOUT {
                 let mut buf = vec![0u8; (320 * 4 * 180) as usize];
                 if let Ok(true) = player.render_frame_into(&mut buf) {
                     return Some(buf);
@@ -1671,7 +1691,8 @@ mod tests {
 
         let mut buf = vec![0u8; 320 * 4 * 180];
         let mut rendered = false;
-        for _ in 0..10 {
+        let start = Instant::now();
+        while start.elapsed() < FRAME_PUMP_TIMEOUT {
             if player.render_frame_into(&mut buf).expect("render") {
                 rendered = true;
                 break;
@@ -1838,7 +1859,7 @@ mod tests {
         let mut first_buf = vec![0xABu8; (320 * 4 * 180) as usize];
         let start = std::time::Instant::now();
         let mut got_first = false;
-        while start.elapsed() < std::time::Duration::from_secs(5) {
+        while start.elapsed() < FRAME_PUMP_TIMEOUT {
             match player.render_frame_into(&mut first_buf) {
                 Ok(true) => {
                     got_first = true;

@@ -16,7 +16,7 @@ use dormant_core::ipc_proto::{
 };
 use dormant_core::observation::ReloadSource;
 use dormant_core::reload::ReloadRequester;
-use dormant_core::rules::{ControlMsg, DaemonEvent, StateSnapshot};
+use dormant_core::rules::{ControlMsg, DaemonEvent};
 use dormant_doctor::DoctorService;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
@@ -28,6 +28,7 @@ use crate::active_sampler::{
     ActiveSamplerHandle, SamplerCommand, SamplerError, SamplingState, SharedSamplerRegistry,
 };
 use crate::direct_switch::{DirectSwitchHandle, SwitchReason, switch_outcome_label};
+use crate::state_publisher::SnapshotResult;
 
 /// Maximum line length for IPC requests/responses (1 MB).
 const MAX_LINE_BYTES: usize = 1_048_576;
@@ -659,7 +660,7 @@ async fn handle_status(
     sampler_registry: &SharedSamplerRegistry,
 ) -> IpcResponse {
     match request_snapshot(ctl_tx).await {
-        Some(mut snap) => {
+        SnapshotResult::Ready(mut snap) => {
             let now = dormant_core::types::Tick::now();
             let handles = sampler_registry.read().map_or_else(
                 |_| Vec::new(),
@@ -680,12 +681,14 @@ async fn handle_status(
                 .collect();
             let (status, statuses) = sampler_status_views(statuses, now);
             snap.wear_sampling_status.clone_from(&status);
-            let mut response = IpcResponse::ok(Some(snap));
+            let mut response = IpcResponse::ok(Some(*snap));
             response.wear_sampling_status = status;
             response.wear_sampling_statuses = Some(statuses);
             response
         }
-        None => IpcResponse::error("engine not available"),
+        SnapshotResult::Cancelled | SnapshotResult::Unavailable => {
+            IpcResponse::error("engine not available")
+        }
     }
 }
 
@@ -737,8 +740,9 @@ async fn handle_blank(
     display: &str,
     mode: BlankRequestMode,
 ) -> IpcResponse {
-    if let Some(err) = validate_display_name(ctl_tx, display).await {
-        return err;
+    match validate_display_name(ctl_tx, display).await {
+        DisplayCheck::Known => {}
+        DisplayCheck::Unknown(error) | DisplayCheck::Unavailable(error) => return error,
     }
     let target = dormant_core::types::DisplayId(display.to_string());
     let msg = match mode {
@@ -753,8 +757,9 @@ async fn handle_blank(
 
 /// Force-wake a display — validates the display name against a snapshot first.
 async fn handle_wake(ctl_tx: &mpsc::Sender<ControlMsg>, display: &str) -> IpcResponse {
-    if let Some(err) = validate_display_name(ctl_tx, display).await {
-        return err;
+    match validate_display_name(ctl_tx, display).await {
+        DisplayCheck::Known => {}
+        DisplayCheck::Unknown(error) | DisplayCheck::Unavailable(error) => return error,
     }
     let msg = ControlMsg::ForceWake(dormant_core::types::DisplayId(display.to_string()));
     if ctl_tx.send(msg).await.is_err() {
@@ -800,8 +805,9 @@ const EXERCISE_IPC_TIMEOUT: Duration = Duration::from_secs(20);
 /// timed out or disconnected); the resume fires from the engine's
 /// internal results channel as soon as the spawned sequence completes.
 async fn handle_exercise(ctl_tx: &mpsc::Sender<ControlMsg>, display: &str) -> IpcResponse {
-    if let Some(err) = validate_display_name(ctl_tx, display).await {
-        return err;
+    match validate_display_name(ctl_tx, display).await {
+        DisplayCheck::Known => {}
+        DisplayCheck::Unknown(error) | DisplayCheck::Unavailable(error) => return error,
     }
 
     let (tx, rx) = oneshot::channel();
@@ -862,16 +868,19 @@ async fn handle_events(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Fetch a snapshot from the engine (bounded).
-async fn request_snapshot(ctl_tx: &mpsc::Sender<ControlMsg>) -> Option<StateSnapshot> {
+/// Fetch a snapshot from the engine with a two-second liveness bound.
+///
+/// Display-specific blank, wake, and exercise requests reject when this bound
+/// expires rather than dispatching an unchecked display identifier.
+async fn request_snapshot(ctl_tx: &mpsc::Sender<ControlMsg>) -> SnapshotResult {
     let (tx, rx) = oneshot::channel();
     if ctl_tx.send(ControlMsg::Snapshot(tx)).await.is_err() {
-        return None;
+        return SnapshotResult::Unavailable;
     }
-    tokio::time::timeout(Duration::from_secs(2), rx)
-        .await
-        .ok()?
-        .ok()
+    match tokio::time::timeout(Duration::from_secs(2), rx).await {
+        Ok(Ok(snapshot)) => SnapshotResult::Ready(Box::new(snapshot)),
+        Ok(Err(_)) | Err(_) => SnapshotResult::Unavailable,
+    }
 }
 
 /// Handle a direct local switch — write the local input code.
@@ -956,19 +965,26 @@ fn switch_outcome_to_response(
     }
 }
 
+/// Outcome of checking a display name against the current engine snapshot.
+enum DisplayCheck {
+    Known,
+    Unknown(IpcResponse),
+    Unavailable(IpcResponse),
+}
+
 /// Validate that a display name exists in the current engine snapshot.
-/// Returns `Some(error_response)` if the display is unknown.
-async fn validate_display_name(
-    ctl_tx: &mpsc::Sender<ControlMsg>,
-    display: &str,
-) -> Option<IpcResponse> {
-    let snap = request_snapshot(ctl_tx).await?;
+async fn validate_display_name(ctl_tx: &mpsc::Sender<ControlMsg>, display: &str) -> DisplayCheck {
+    let SnapshotResult::Ready(snap) = request_snapshot(ctl_tx).await else {
+        return DisplayCheck::Unavailable(IpcResponse::error(format!(
+            "cannot verify display '{display}': engine did not respond"
+        )));
+    };
     let known: std::collections::HashSet<&str> =
         snap.displays.iter().map(|(id, _)| id.as_str()).collect();
     if !known.contains(display) {
-        return Some(IpcResponse::error(format!("unknown display '{display}'")));
+        return DisplayCheck::Unknown(IpcResponse::error(format!("unknown display '{display}'")));
     }
-    None
+    DisplayCheck::Known
 }
 
 /// Read one line from the buffered reader, capping at [`MAX_LINE_BYTES`].
@@ -1618,11 +1634,12 @@ mod tests {
 
     // ── Blank soft/hard routing (issue #124) ─────────────────────────────
     mod blank_routing {
-        use crate::ipc::handle_blank;
-        use dormant_core::ipc_proto::BlankRequestMode;
+        use crate::ipc::{handle_blank, handle_exercise, handle_wake};
+        use dormant_core::ipc_proto::{BlankRequestMode, IpcResponse};
         use dormant_core::rules::{ControlMsg, DisplaySnapshot, StateSnapshot};
         use std::sync::Arc;
         use tokio::sync::mpsc;
+        use tokio::task::JoinHandle;
         use tokio_util::sync::CancellationToken;
 
         /// Spawn a fake engine that responds to `ControlMsg::Snapshot` with a
@@ -1735,6 +1752,63 @@ mod tests {
                 last_msg.lock().unwrap().is_none(),
                 "must not send any control message for an unknown display"
             );
+        }
+
+        async fn assert_missing_snapshot_rejects(
+            mut ctl_rx: mpsc::Receiver<ControlMsg>,
+            handler: JoinHandle<IpcResponse>,
+        ) {
+            let Some(ControlMsg::Snapshot(reply)) = ctl_rx.recv().await else {
+                panic!("handler should request a snapshot");
+            };
+
+            let resp = handler.await.expect("handler task should complete");
+            // Keep the reply sender alive until the handler has timed out.
+            drop(reply);
+            assert!(!resp.ok, "missing snapshot should reject the command");
+            assert!(
+                resp.error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("cannot verify display")),
+                "error should explain that validation did not run, got: {:?}",
+                resp.error
+            );
+            assert!(
+                matches!(
+                    ctl_rx.try_recv(),
+                    Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected)
+                ),
+                "must not send a display command after an unavailable snapshot"
+            );
+        }
+
+        /// A missing snapshot reply must reject blank rather than send an
+        /// unverified display identifier to the engine.
+        #[tokio::test(start_paused = true)]
+        async fn handle_blank_rejects_when_snapshot_does_not_arrive() {
+            let (ctl_tx, ctl_rx) = mpsc::channel(8);
+            let handler = tokio::spawn(async move {
+                handle_blank(&ctl_tx, "missing", BlankRequestMode::Hard).await
+            });
+            assert_missing_snapshot_rejects(ctl_rx, handler).await;
+        }
+
+        /// A missing snapshot reply must reject wake rather than send an
+        /// unverified display identifier to the engine.
+        #[tokio::test(start_paused = true)]
+        async fn handle_wake_rejects_when_snapshot_does_not_arrive() {
+            let (ctl_tx, ctl_rx) = mpsc::channel(8);
+            let handler = tokio::spawn(async move { handle_wake(&ctl_tx, "missing").await });
+            assert_missing_snapshot_rejects(ctl_rx, handler).await;
+        }
+
+        /// A missing snapshot reply must reject exercise rather than send an
+        /// unverified display identifier to the engine.
+        #[tokio::test(start_paused = true)]
+        async fn handle_exercise_rejects_when_snapshot_does_not_arrive() {
+            let (ctl_tx, ctl_rx) = mpsc::channel(8);
+            let handler = tokio::spawn(async move { handle_exercise(&ctl_tx, "missing").await });
+            assert_missing_snapshot_rejects(ctl_rx, handler).await;
         }
     }
 }

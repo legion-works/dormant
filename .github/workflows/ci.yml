@@ -57,7 +57,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev libpipewire-0.3-dev
+      - run: bash scripts/ci/apt_install.sh libudev-dev libwayland-dev libpipewire-0.3-dev
       - run: bash scripts/gates/clippy.sh
 
   test:
@@ -80,7 +80,7 @@ jobs:
       # rust-lld cannot find -ludev/-lmpv). The ~40s apt cost is the reliable
       # price. libblas3/liblapack3 stay explicit: runtime deps of the
       # libmpv/ffmpeg stack the runner image no longer preinstalls.
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev libmpv-dev libpipewire-0.3-dev pkg-config libblas3 liblapack3
+      - run: bash scripts/ci/apt_install.sh libudev-dev libwayland-dev libmpv-dev libpipewire-0.3-dev pkg-config libblas3 liblapack3
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.131
@@ -115,7 +115,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Plain apt-get — see the test job's note on the cache action's two
       # failure modes under runner-image drift.
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev libmpv-dev libpipewire-0.3-dev pkg-config ffmpeg libavcodec-extra libblas3 liblapack3
+      - run: bash scripts/ci/apt_install.sh libudev-dev libwayland-dev libmpv-dev libpipewire-0.3-dev pkg-config ffmpeg libavcodec-extra libblas3 liblapack3
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.131
@@ -185,7 +185,7 @@ jobs:
         run: bash scripts/ci/reject_required_rerun.sh
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev libmpv-dev libpipewire-0.3-dev pkg-config libblas3 liblapack3
+      - run: bash scripts/ci/apt_install.sh libudev-dev libwayland-dev libmpv-dev libpipewire-0.3-dev pkg-config libblas3 liblapack3
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.131
@@ -258,7 +258,7 @@ jobs:
         run: bash scripts/ci/reject_required_rerun.sh
       - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev libpipewire-0.3-dev
+      - run: bash scripts/ci/apt_install.sh libudev-dev libwayland-dev libpipewire-0.3-dev
       - run: bash scripts/gates/msrv.sh
 
   mqtt-integration:
@@ -270,7 +270,7 @@ jobs:
         run: bash scripts/ci/reject_required_rerun.sh
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev libpipewire-0.3-dev mosquitto-clients
+      - run: bash scripts/ci/apt_install.sh libudev-dev libwayland-dev libpipewire-0.3-dev mosquitto-clients
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.131
@@ -304,7 +304,7 @@ jobs:
         run: bash scripts/ci/reject_required_rerun.sh
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev libpipewire-0.3-dev
+      - run: bash scripts/ci/apt_install.sh libudev-dev libwayland-dev libpipewire-0.3-dev
       - run: bash scripts/gates/rustdoc.sh
 
   mdbook:
@@ -431,7 +431,7 @@ jobs:
             python3 scripts/ci/check_changelog_fragment.py --range "$revision_range"
           fi
       - uses: dtolnay/rust-toolchain@stable
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libwayland-dev libpipewire-0.3-dev
+      - run: bash scripts/ci/apt_install.sh libudev-dev libwayland-dev libpipewire-0.3-dev
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.131

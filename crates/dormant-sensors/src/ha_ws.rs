@@ -348,6 +348,17 @@ impl HaProtocol {
             },
             Phase::Subscribed => match msg_type {
                 "event" => self.handle_event(&value),
+                // A revoked token sends auth_invalid mid-session.  Fatal,
+                // same as in AuthSent: otherwise the source believes it is
+                // subscribed while receiving nothing, and fail-safe turns
+                // that silently dead sensor into `unavailable` (present).
+                "auth_invalid" => {
+                    let message = value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown reason");
+                    vec![Action::Fatal(format!("{E_HA_AUTH}: {message}"))]
+                }
                 "result" => {
                     // Check for success/failure.
                     let success = value
@@ -603,6 +614,35 @@ mod tests {
                     "fatal message should contain E_HA_AUTH: {msg}"
                 );
                 assert!(msg.contains("Invalid password"));
+            }
+            other => panic!("expected Fatal, got {other:?}"),
+        }
+    }
+
+    /// A token revoked mid-session sends `auth_invalid` while the protocol is
+    /// already `Subscribed`; treated as non-fatal, the source would believe
+    /// it is subscribed while receiving nothing — and the fail-safe policy
+    /// turns a silently dead sensor into `unavailable` (present), so screens
+    /// never blank.  Fatal forces a reconnect, which fails auth visibly.
+    #[test]
+    fn auth_invalid_after_subscribe_is_fatal() {
+        let mut proto = make_protocol();
+
+        // auth_required
+        let _ = proto.handle_message(r#"{"type":"auth_required"}"#);
+        // auth_ok → subscribed
+        let _ = proto.handle_message(r#"{"type":"auth_ok"}"#);
+
+        // auth_invalid mid-session → Fatal
+        let actions = proto.handle_message(r#"{"type":"auth_invalid","message":"Token revoked"}"#);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            Action::Fatal(msg) => {
+                assert!(
+                    msg.contains(E_HA_AUTH),
+                    "fatal message should contain E_HA_AUTH: {msg}"
+                );
+                assert!(msg.contains("Token revoked"));
             }
             other => panic!("expected Fatal, got {other:?}"),
         }

@@ -716,8 +716,17 @@ fn remove_token_state_tmp(path: &Path) -> Result<(), String> {
 /// file in the same directory + rename) so a crash mid-write never
 /// corrupts an existing good state file. On Unix the file is created
 /// mode `0o600` (owner read/write only) and the directory `0o700`
-/// (owner only) — same boundary as `credentials.toml`. Non-Unix
-/// platforms fall back to a plain write without mode setting.
+/// (owner only) — same boundary as `credentials.toml`.
+///
+/// The mode is set by `OpenOptions` at creation rather than applied
+/// afterwards: a `create` followed by a `set_permissions` leaves the
+/// file briefly readable under a permissive umask, and the token bytes
+/// are already on disk by then.
+///
+/// Not reachable on non-Unix: [`with_token_state_file_lock`] refuses to
+/// run its write closure at all without a supported advisory file lock,
+/// so the `cfg(not(unix))` arm below exists only to keep portability
+/// builds compiling.
 fn write_token_state(path: &Path, map: &HashMap<String, String>) -> Result<(), String> {
     use std::io::Write as _;
 

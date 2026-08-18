@@ -163,9 +163,17 @@ class CheckRunAttemptGuardsTests(unittest.TestCase):
         self.assertEqual(result.stderr, "")
 
     def test_reject_script_rejects_later_attempt(self):
+        # GITHUB_EVENT_PATH is dropped deliberately: the guard reads its
+        # override label from that payload, and this test runs inside the CI job
+        # it is testing. Inheriting the ambient value would aim the guard at the
+        # real pull request, so this case would pass or fail on whether that
+        # pull request happened to carry the label rather than on the guard.
+        environment = os.environ.copy()
+        environment.pop("GITHUB_EVENT_PATH", None)
+        environment["GITHUB_RUN_ATTEMPT"] = "2"
         result = subprocess.run(
             ["bash", str(REJECT_SCRIPT)],
-            env={**os.environ, "GITHUB_RUN_ATTEMPT": "2"},
+            env=environment,
             capture_output=True,
             text=True,
             check=False,

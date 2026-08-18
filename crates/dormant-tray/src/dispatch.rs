@@ -318,6 +318,38 @@ mod tests {
             ),
             DispatchPlan::Ignore
         ));
+
+        // Membership is exact: a case-insensitive or prefix/substring match
+        // must not resurrect a stale target. Display ids are config-defined
+        // identifiers — near-misses name a different display, never the
+        // same one.
+        for near_miss in ["A", "a-gone"] {
+            assert!(
+                matches!(
+                    plan_action(&Action::BlankOne(near_miss.into()), Some(&snapshot), false),
+                    DispatchPlan::Ignore
+                ),
+                "BlankOne({near_miss}) must be ignored"
+            );
+            assert!(
+                matches!(
+                    plan_action(&Action::WakeOne(near_miss.into()), Some(&snapshot), false),
+                    DispatchPlan::Ignore
+                ),
+                "WakeOne({near_miss}) must be ignored"
+            );
+            assert!(
+                matches!(
+                    plan_action(
+                        &Action::SwitchToLocal(near_miss.into()),
+                        Some(&snapshot),
+                        false
+                    ),
+                    DispatchPlan::Ignore
+                ),
+                "SwitchToLocal({near_miss}) must be ignored"
+            );
+        }
     }
 
     /// A targeted action with no snapshot at all is treated like `BlankAll`'s

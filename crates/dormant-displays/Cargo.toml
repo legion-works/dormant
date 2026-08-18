@@ -37,6 +37,9 @@ rcgen = { version = "0.14", features = ["pem", "ring"], optional = true }
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 ddc-hi = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", default-features = false, features = ["fs", "std"] }
+
 # Thin macOS-only FFI surface for `macos_display_catalog` (stable-UUID
 # display resolution via CFUUID + the raw Quartz gamma-table calls).
 # `core-foundation-sys` is the minimal, no-abstraction binding crate — this

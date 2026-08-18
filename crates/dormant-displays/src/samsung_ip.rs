@@ -70,7 +70,11 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+#[cfg(test)]
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use dormant_core::error::E_DISPLAY_IO;
@@ -96,6 +100,50 @@ const TOKEN_REACQUIRED: &str = "samsung_ip_token_reacquired";
 /// Distinct from `TOKEN_REACQUIRED` so a reader can tell the two apart.
 const TOKEN_STATE_LOADED: &str = "samsung_ip_token_state_loaded";
 const TOKEN_STATE_WRITTEN: &str = "samsung_ip_token_state_written";
+
+/// The PID separates writers in separate processes; the counter separates
+/// concurrent writes from the same process.
+static TOKEN_STATE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+type TokenStateHook = Arc<dyn Fn(&Path) + Send + Sync>;
+
+#[cfg(test)]
+static TOKEN_STATE_BEFORE_CACHE_HOOK: StdMutex<Option<TokenStateHook>> = StdMutex::new(None);
+#[cfg(test)]
+static TOKEN_STATE_AFTER_LOAD_HOOK: StdMutex<Option<TokenStateHook>> = StdMutex::new(None);
+#[cfg(test)]
+static TOKEN_STATE_BEFORE_TEMP_CREATE_HOOK: StdMutex<Option<TokenStateHook>> = StdMutex::new(None);
+#[cfg(test)]
+static TOKEN_STATE_AFTER_TEMP_CREATE_HOOK: StdMutex<Option<TokenStateHook>> = StdMutex::new(None);
+#[cfg(test)]
+static TOKEN_STATE_BEFORE_RENAME_HOOK: StdMutex<Option<TokenStateHook>> = StdMutex::new(None);
+#[cfg(test)]
+static TOKEN_STATE_TEST_HOOK_LOCK: StdMutex<()> = StdMutex::new(());
+
+#[cfg(test)]
+type TokenStateWriteFailureHook = Arc<dyn Fn(&Path) -> std::io::Result<()> + Send + Sync>;
+
+#[cfg(test)]
+static TOKEN_STATE_BEFORE_WRITE_FAILURE_HOOK: StdMutex<Option<TokenStateWriteFailureHook>> =
+    StdMutex::new(None);
+
+#[cfg(test)]
+fn run_token_state_hook(hook: &StdMutex<Option<TokenStateHook>>, path: &Path) {
+    let callback = hook.lock().expect("token-state test hook poisoned").clone();
+    if let Some(hook) = callback {
+        hook(path);
+    }
+}
+
+#[cfg(test)]
+fn run_token_state_write_failure_hook(path: &Path) -> std::io::Result<()> {
+    let callback = TOKEN_STATE_BEFORE_WRITE_FAILURE_HOOK
+        .lock()
+        .expect("token-state write-failure hook poisoned")
+        .clone();
+    callback.map_or(Ok(()), |hook| hook(path))
+}
 
 // ── JSON-RPC error codes (string anchors — repo grep rule) ──────────────────────
 
@@ -163,6 +211,8 @@ pub struct RealBacklightTransport {
     /// (no real state file in unit/wiremock tests) and by `for_test_with_state_path`
     /// (which points at a caller-supplied temp path).
     state_path: Option<PathBuf>,
+    #[cfg(test)]
+    skip_state_file_lock: bool,
 }
 
 impl RealBacklightTransport {
@@ -228,6 +278,8 @@ impl RealBacklightTransport {
             token_cache: StdMutex::new(HashMap::new()),
             base_url: None,
             state_path,
+            #[cfg(test)]
+            skip_state_file_lock: false,
         }
     }
 
@@ -253,6 +305,7 @@ impl RealBacklightTransport {
             token_cache: StdMutex::new(HashMap::new()),
             base_url: Some(base_url),
             state_path: None,
+            skip_state_file_lock: false,
         }
     }
 
@@ -278,6 +331,19 @@ impl RealBacklightTransport {
             *transport.token_cache.lock().expect("token cache poisoned") = map;
         }
         transport.state_path = Some(state_path);
+        transport
+    }
+
+    /// Build a state-file transport that bypasses the cross-process lock so
+    /// unit tests can isolate the in-process cache-lock invariant.
+    #[cfg(test)]
+    fn for_test_with_state_path_without_file_lock(
+        base_url: String,
+        timeout: Duration,
+        state_path: PathBuf,
+    ) -> Self {
+        let mut transport = Self::for_test_with_state_path(base_url, timeout, state_path);
+        transport.skip_state_file_lock = true;
         transport
     }
 
@@ -335,19 +401,56 @@ impl RealBacklightTransport {
         Ok(v)
     }
 
+    fn persist_token(&self, host: &str, token: &str) -> Result<(), String> {
+        #[cfg(test)]
+        run_token_state_hook(
+            &TOKEN_STATE_BEFORE_CACHE_HOOK,
+            self.state_path.as_deref().unwrap_or_else(|| Path::new(".")),
+        );
+
+        let mut cache = self.token_cache.lock().expect("token cache poisoned");
+        cache.insert(host.to_string(), token.to_string());
+
+        let result = match self.state_path.as_ref() {
+            Some(path) => self.update_token_state(path, |map| {
+                map.insert(host.to_string(), token.to_string());
+            }),
+            None => Ok(()),
+        };
+        drop(cache);
+        result
+    }
+
+    fn update_token_state(
+        &self,
+        path: &Path,
+        update: impl FnOnce(&mut HashMap<String, String>),
+    ) -> Result<(), String> {
+        #[cfg(not(test))]
+        let _ = self;
+        let write = || update_token_state_unlocked(path, update);
+        #[cfg(test)]
+        if self.skip_state_file_lock {
+            return write();
+        }
+        with_token_state_file_lock(path, write)
+    }
+
     /// Drop the cached token for `host` (called on `-32010`). Also removes
     /// the entry from the on-disk state file so a daemon restart does not
     /// re-load a known-stale token. A failure to update the state file is
     /// logged at WARN but does not propagate — the in-memory invalidation
     /// is what unblocks the next re-acquire.
     fn invalidate_token_inner(&self, host: &str) {
-        if let Ok(mut cache) = self.token_cache.lock() {
+        let mut cache = self.token_cache.lock().ok();
+        if let Some(cache) = cache.as_mut() {
             cache.remove(host);
         }
         if let Some(path) = self.state_path.as_ref() {
-            let mut map = load_token_state(path).unwrap_or_default();
-            if map.remove(host).is_some()
-                && let Err(e) = write_token_state(path, &map)
+            let mut removed = false;
+            if let Err(e) = self.update_token_state(path, |map| {
+                removed = map.remove(host).is_some();
+            }) && removed
             {
                 tracing::warn!(
                     event = TOKEN_STATE_WRITTEN,
@@ -357,6 +460,7 @@ impl RealBacklightTransport {
                 );
             }
         }
+        drop(cache);
     }
 
     /// Drop the cached token for `host` (called on `-32010`).
@@ -396,23 +500,16 @@ impl BacklightTransport for RealBacklightTransport {
             .ok_or_else(|| "token parse failed: missing result.AccessToken".to_string())?
             .to_string();
 
-        {
-            let mut cache = self.token_cache.lock().expect("token cache poisoned");
-            cache.insert(host.to_string(), token.clone());
-        }
         // Persist immediately so a daemon restart reuses this token
         // instead of triggering an on-screen allow prompt.
-        if let Some(path) = self.state_path.as_ref() {
-            let mut map = load_token_state(path).unwrap_or_default();
-            map.insert(host.to_string(), token.clone());
-            if let Err(e) = write_token_state(path, &map) {
-                tracing::warn!(
-                    event = TOKEN_STATE_WRITTEN,
-                    path = %path.display(),
-                    error = %e,
-                    "samsung-ip: failed to persist token to state file",
-                );
-            }
+        if let Err(e) = self.persist_token(host, &token) {
+            let path = self.state_path.as_deref().unwrap_or_else(|| Path::new("."));
+            tracing::warn!(
+                event = TOKEN_STATE_WRITTEN,
+                path = %path.display(),
+                error = %e,
+                "samsung-ip: failed to persist token to state file",
+            );
         }
         Ok(token)
     }
@@ -517,15 +614,57 @@ fn load_token_state(path: &Path) -> Result<HashMap<String, String>, String> {
         .map_err(|e| format!("parse samsung-ip token state '{}': {e}", path.display()))
 }
 
-/// Atomically write the token map to `path`. The write is atomic (temp
-/// file in the same directory + rename) so a crash mid-write never
-/// corrupts an existing good state file. On Unix the file is created
-/// mode `0o600` (owner read/write only) and the directory `0o700`
-/// (owner only) — same boundary as `credentials.toml`. Non-Unix
-/// platforms fall back to a plain write without mode setting.
-fn write_token_state(path: &Path, map: &HashMap<String, String>) -> Result<(), String> {
-    use std::io::Write as _;
+fn update_token_state_unlocked(
+    path: &Path,
+    update: impl FnOnce(&mut HashMap<String, String>),
+) -> Result<(), String> {
+    let mut map = load_token_state(path).unwrap_or_default();
+    #[cfg(test)]
+    run_token_state_hook(&TOKEN_STATE_AFTER_LOAD_HOOK, path);
+    update(&mut map);
+    write_token_state(path, &map)
+}
 
+fn with_token_state_file_lock<T>(
+    path: &Path,
+    write: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    #[cfg(unix)]
+    {
+        use rustix::fs::{FlockOperation, flock};
+        ensure_token_state_parent(path)?;
+        let lock_path = token_state_lock_path(path);
+        let lock_file = {
+            use std::os::unix::fs::OpenOptionsExt as _;
+
+            std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(&lock_path)
+                .map_err(|e| {
+                    format!(
+                        "open samsung-ip token state lock '{}': {e}",
+                        lock_path.display()
+                    )
+                })?
+        };
+        flock(&lock_file, FlockOperation::LockExclusive)
+            .map_err(|e| format!("lock samsung-ip token state '{}': {e}", lock_path.display()))?;
+        write()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, write);
+        // Persisting without an exercised advisory lock would silently revive
+        // the token-loss race; Windows remains disabled until it is tested.
+        Err("samsung-ip token state persistence requires a supported advisory file lock on this platform".to_string())
+    }
+}
+
+fn ensure_token_state_parent(path: &Path) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
             format!(
@@ -542,32 +681,147 @@ fn write_token_state(path: &Path, map: &HashMap<String, String>) -> Result<(), S
             let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
         }
     }
+    Ok(())
+}
+
+fn token_state_lock_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("tokens");
+    path.with_file_name(format!(".{file_name}.lock"))
+}
+
+fn token_state_tmp_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("tokens");
+    let seq = TOKEN_STATE_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    path.with_file_name(format!(".{file_name}.tmp.{}.{seq}", std::process::id()))
+}
+
+fn remove_token_state_tmp(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!(
+            "remove samsung-ip token state tmp '{}': {e}",
+            path.display()
+        )),
+    }
+}
+
+/// Atomically write the token map to `path`. The write is atomic (temp
+/// file in the same directory + rename) so a crash mid-write never
+/// corrupts an existing good state file. On Unix the file is created
+/// mode `0o600` (owner read/write only) and the directory `0o700`
+/// (owner only) — same boundary as `credentials.toml`.
+///
+/// The mode is set by `OpenOptions` at creation rather than applied
+/// afterwards: a `create` followed by a `set_permissions` leaves the
+/// file briefly readable under a permissive umask, and the token bytes
+/// are already on disk by then.
+///
+/// Not reachable on non-Unix: [`with_token_state_file_lock`] refuses to
+/// run its write closure at all without a supported advisory file lock,
+/// so the `cfg(not(unix))` arm below exists only to keep portability
+/// builds compiling.
+fn write_token_state(path: &Path, map: &HashMap<String, String>) -> Result<(), String> {
+    use std::io::Write as _;
+
+    ensure_token_state_parent(path)?;
 
     let raw = serde_json::to_string_pretty(map)
         .map_err(|e| format!("serialize samsung-ip token state: {e}"))?;
 
-    let tmp = path.with_extension("json.tmp");
-    {
-        let mut f = std::fs::File::create(&tmp)
-            .map_err(|e| format!("create samsung-ip token state tmp '{}': {e}", tmp.display()))?;
+    let tmp = token_state_tmp_path(path);
+    #[cfg(test)]
+    run_token_state_hook(&TOKEN_STATE_BEFORE_TEMP_CREATE_HOOK, &tmp);
+    let mut temp_created = false;
+    let write_result = (|| {
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-        }
+        let mut f = {
+            use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)
+                .map_err(|e| {
+                    format!("create samsung-ip token state tmp '{}': {e}", tmp.display())
+                })?;
+            temp_created = true;
+            #[cfg(test)]
+            run_token_state_hook(&TOKEN_STATE_AFTER_TEMP_CREATE_HOOK, &tmp);
+            let mode = f
+                .metadata()
+                .map_err(|e| {
+                    format!(
+                        "inspect samsung-ip token state tmp '{}': {e}",
+                        tmp.display()
+                    )
+                })?
+                .permissions()
+                .mode()
+                & 0o777;
+            if mode != 0o600 {
+                return Err(format!(
+                    "create samsung-ip token state tmp '{}' with mode 0o600: got {mode:o}",
+                    tmp.display()
+                ));
+            }
+            f
+        };
+        #[cfg(not(unix))]
+        let mut f = {
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+                .map_err(|e| {
+                    format!("create samsung-ip token state tmp '{}': {e}", tmp.display())
+                })?;
+            temp_created = true;
+            #[cfg(test)]
+            run_token_state_hook(&TOKEN_STATE_AFTER_TEMP_CREATE_HOOK, &tmp);
+            f
+        };
+        #[cfg(test)]
+        run_token_state_write_failure_hook(&tmp)
+            .map_err(|e| format!("write samsung-ip token state tmp: {e}"))?;
         f.write_all(raw.as_bytes())
             .map_err(|e| format!("write samsung-ip token state tmp: {e}"))?;
         f.sync_all()
             .map_err(|e| format!("fsync samsung-ip token state tmp: {e}"))?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        if !temp_created {
+            return Err(e);
+        }
+        return match remove_token_state_tmp(&tmp) {
+            Ok(()) => Err(e),
+            Err(remove_err) => Err(format!("{e}; {remove_err}")),
+        };
     }
-    std::fs::rename(&tmp, path).map_err(|e| {
-        format!(
-            "rename samsung-ip token state '{}' -> '{}': {e}",
-            tmp.display(),
-            path.display()
-        )
-    })?;
-    Ok(())
+    #[cfg(test)]
+    run_token_state_hook(&TOKEN_STATE_BEFORE_RENAME_HOOK, path);
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let rename_err = format!(
+                "rename samsung-ip token state '{}' -> '{}': {e}",
+                tmp.display(),
+                path.display()
+            );
+            match remove_token_state_tmp(&tmp) {
+                Ok(()) => Err(rename_err),
+                Err(remove_err) => Err(format!("{rename_err}; {remove_err}")),
+            }
+        }
+    }
 }
 
 // ── Fake transport for tests ───────────────────────────────────────────────────
@@ -1046,6 +1300,284 @@ mod tests {
             0o700,
             "parent dir must be 0o700: got {dir_mode:o}"
         );
+    }
+
+    /// The token temp must be owner-only before its first byte is written;
+    /// tightening a wider file afterwards leaves a credential-read window.
+    #[cfg(unix)]
+    #[test]
+    fn token_state_temp_is_mode_0o600_at_creation() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::mpsc;
+
+        let _serial = TOKEN_STATE_TEST_HOOK_LOCK
+            .lock()
+            .expect("token-state test hook lock poisoned");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("samsung-ip-tokens.json");
+        let (mode_tx, mode_rx) = mpsc::channel();
+        *TOKEN_STATE_AFTER_TEMP_CREATE_HOOK
+            .lock()
+            .expect("token-state after-create hook poisoned") = Some(Arc::new(move |tmp| {
+            mode_tx
+                .send(std::fs::metadata(tmp).unwrap().permissions().mode() & 0o777)
+                .unwrap();
+        }));
+
+        write_token_state(&path, &HashMap::new()).unwrap();
+
+        *TOKEN_STATE_AFTER_TEMP_CREATE_HOOK
+            .lock()
+            .expect("token-state after-create hook poisoned") = None;
+        assert_eq!(mode_rx.recv().unwrap(), 0o600);
+    }
+
+    #[test]
+    fn token_state_refuses_preexisting_temp_file() {
+        use std::sync::mpsc;
+
+        let _serial = TOKEN_STATE_TEST_HOOK_LOCK
+            .lock()
+            .expect("token-state test hook lock poisoned");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("samsung-ip-tokens.json");
+        let (tmp_tx, tmp_rx) = mpsc::channel();
+        *TOKEN_STATE_BEFORE_TEMP_CREATE_HOOK
+            .lock()
+            .expect("token-state before-create hook poisoned") = Some(Arc::new(move |tmp| {
+            std::fs::write(tmp, "attacker-owned").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(tmp, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            tmp_tx.send(tmp.to_path_buf()).unwrap();
+        }));
+
+        let result = write_token_state(&path, &HashMap::new());
+
+        *TOKEN_STATE_BEFORE_TEMP_CREATE_HOOK
+            .lock()
+            .expect("token-state before-create hook poisoned") = None;
+        let tmp = tmp_rx.recv().unwrap();
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(tmp).unwrap(), "attacker-owned");
+    }
+
+    #[test]
+    fn token_state_write_failure_removes_temp_file() {
+        let _serial = TOKEN_STATE_TEST_HOOK_LOCK
+            .lock()
+            .expect("token-state test hook lock poisoned");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("samsung-ip-tokens.json");
+        *TOKEN_STATE_BEFORE_WRITE_FAILURE_HOOK
+            .lock()
+            .expect("token-state write-failure hook poisoned") = Some(Arc::new(|_| {
+            Err(std::io::Error::other("forced write failure"))
+        }));
+
+        assert!(write_token_state(&path, &HashMap::new()).is_err());
+
+        *TOKEN_STATE_BEFORE_WRITE_FAILURE_HOOK
+            .lock()
+            .expect("token-state write-failure hook poisoned") = None;
+        let temp_prefix = ".samsung-ip-tokens.json.tmp.";
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(temp_prefix)),
+            "failed token write must not leave a credential-bearing temp file"
+        );
+    }
+
+    #[test]
+    fn token_state_rename_failure_removes_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("samsung-ip-tokens.json");
+        std::fs::create_dir(&path).unwrap();
+
+        assert!(write_token_state(&path, &HashMap::new()).is_err());
+
+        let temp_prefix = ".samsung-ip-tokens.json.tmp.";
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(temp_prefix)),
+            "failed token rename must not leave a credential-bearing temp file"
+        );
+    }
+
+    /// Keeps the cache mutex across the entire state-file update. Releasing it
+    /// before the rename lets two same-process writes preserve only the last
+    /// stale map, even when their temporary paths differ.
+    #[test]
+    fn concurrent_token_updates_keep_both_hosts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::mpsc;
+
+        let _serial = TOKEN_STATE_TEST_HOOK_LOCK
+            .lock()
+            .expect("token-state test hook lock poisoned");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("samsung-ip-tokens.json");
+        let transport = Arc::new(
+            RealBacklightTransport::for_test_with_state_path_without_file_lock(
+                String::new(),
+                Duration::from_secs(1),
+                path.clone(),
+            ),
+        );
+
+        let (second_started_tx, second_started_rx) = mpsc::channel();
+        let (allow_second_tx, allow_second_rx) = mpsc::channel();
+        let allow_second_rx = Arc::new(StdMutex::new(allow_second_rx));
+        let before_cache_calls = Arc::new(AtomicUsize::new(0));
+        let before_cache_path = path.clone();
+        *TOKEN_STATE_BEFORE_CACHE_HOOK
+            .lock()
+            .expect("token-state before-cache hook poisoned") = Some(Arc::new(move |hook_path| {
+            if hook_path != before_cache_path {
+                return;
+            }
+            if before_cache_calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                second_started_tx.send(()).unwrap();
+                allow_second_rx.lock().unwrap().recv().unwrap();
+            }
+        }));
+
+        let (first_loaded_tx, first_loaded_rx) = mpsc::channel();
+        let (second_loaded_tx, second_loaded_rx) = mpsc::channel();
+        let (release_first_tx, release_first_rx) = mpsc::channel();
+        let (release_second_tx, release_second_rx) = mpsc::channel();
+        let release_first_rx = Arc::new(StdMutex::new(release_first_rx));
+        let release_second_rx = Arc::new(StdMutex::new(release_second_rx));
+        let after_load_calls = Arc::new(AtomicUsize::new(0));
+        let after_load_path = path.clone();
+        *TOKEN_STATE_AFTER_LOAD_HOOK
+            .lock()
+            .expect("token-state after-load hook poisoned") = Some(Arc::new(move |hook_path| {
+            if hook_path != after_load_path {
+                return;
+            }
+            match after_load_calls.fetch_add(1, Ordering::SeqCst) {
+                0 => {
+                    first_loaded_tx.send(()).unwrap();
+                    release_first_rx.lock().unwrap().recv().unwrap();
+                }
+                1 => {
+                    second_loaded_tx.send(()).unwrap();
+                    release_second_rx.lock().unwrap().recv().unwrap();
+                }
+                n => panic!("unexpected token-state load hook call {n}"),
+            }
+        }));
+
+        let first = Arc::clone(&transport);
+        let first_writer = std::thread::spawn(move || first.persist_token("192.0.2.11", "token-a"));
+        first_loaded_rx.recv().unwrap();
+
+        let second = Arc::clone(&transport);
+        let second_writer =
+            std::thread::spawn(move || second.persist_token("192.0.2.12", "token-b"));
+        second_started_rx.recv().unwrap();
+        allow_second_tx.send(()).unwrap();
+
+        // The timeout only converts a deadlock into a useful failure: the
+        // channel gates force the order without a scheduling sleep.
+        let second_reached_load_early = second_loaded_rx.recv_timeout(Duration::from_secs(1));
+        release_first_tx.send(()).unwrap();
+        assert!(first_writer.join().unwrap().is_ok());
+
+        if second_reached_load_early.is_err() {
+            second_loaded_rx.recv().unwrap();
+        }
+        release_second_tx.send(()).unwrap();
+        assert!(second_writer.join().unwrap().is_ok());
+
+        *TOKEN_STATE_BEFORE_CACHE_HOOK
+            .lock()
+            .expect("token-state before-cache hook poisoned") = None;
+        *TOKEN_STATE_AFTER_LOAD_HOOK
+            .lock()
+            .expect("token-state after-load hook poisoned") = None;
+
+        assert!(
+            second_reached_load_early.is_err(),
+            "the second writer reached the stale read before the first persisted"
+        );
+        let state = load_token_state(&path).unwrap();
+        assert_eq!(state.get("192.0.2.11"), Some(&"token-a".to_string()));
+        assert_eq!(state.get("192.0.2.12"), Some(&"token-b".to_string()));
+    }
+
+    /// Separate temporary files are required even with serialized state-map
+    /// updates: sharing a temp path makes one writer rename the other's bytes.
+    #[test]
+    fn concurrent_token_state_writes_use_distinct_temp_files() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::mpsc;
+
+        let _serial = TOKEN_STATE_TEST_HOOK_LOCK
+            .lock()
+            .expect("token-state test hook lock poisoned");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("samsung-ip-tokens.json");
+        let (first_ready_tx, first_ready_rx) = mpsc::channel();
+        let (second_ready_tx, second_ready_rx) = mpsc::channel();
+        let (release_first_tx, release_first_rx) = mpsc::channel();
+        let (release_second_tx, release_second_rx) = mpsc::channel();
+        let release_first_rx = Arc::new(StdMutex::new(release_first_rx));
+        let release_second_rx = Arc::new(StdMutex::new(release_second_rx));
+        let before_rename_calls = Arc::new(AtomicUsize::new(0));
+        let before_rename_path = path.clone();
+        *TOKEN_STATE_BEFORE_RENAME_HOOK
+            .lock()
+            .expect("token-state before-rename hook poisoned") = Some(Arc::new(move |hook_path| {
+            if hook_path != before_rename_path {
+                return;
+            }
+            match before_rename_calls.fetch_add(1, Ordering::SeqCst) {
+                0 => {
+                    first_ready_tx.send(()).unwrap();
+                    release_first_rx.lock().unwrap().recv().unwrap();
+                }
+                1 => {
+                    second_ready_tx.send(()).unwrap();
+                    release_second_rx.lock().unwrap().recv().unwrap();
+                }
+                n => panic!("unexpected token-state rename hook call {n}"),
+            }
+        }));
+
+        let first_path = path.clone();
+        let first_writer = std::thread::spawn(move || {
+            let mut state = HashMap::new();
+            state.insert("192.0.2.21".to_string(), "token-a".to_string());
+            write_token_state(&first_path, &state)
+        });
+        first_ready_rx.recv().unwrap();
+
+        let second_path = path.clone();
+        let second_writer = std::thread::spawn(move || {
+            let mut state = HashMap::new();
+            state.insert("192.0.2.22".to_string(), "token-b".to_string());
+            write_token_state(&second_path, &state)
+        });
+        second_ready_rx.recv().unwrap();
+
+        release_first_tx.send(()).unwrap();
+        assert!(first_writer.join().unwrap().is_ok());
+        release_second_tx.send(()).unwrap();
+        assert!(second_writer.join().unwrap().is_ok());
+
+        *TOKEN_STATE_BEFORE_RENAME_HOOK
+            .lock()
+            .expect("token-state before-rename hook poisoned") = None;
     }
 
     /// `load_token_state` returns an empty map for a missing file (the

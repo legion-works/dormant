@@ -98,7 +98,15 @@ jobs:
 
   render:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Highest cap in the matrix: this job installs the largest native surface
+    # (ffmpeg, libmpv, libavcodec-extra), builds dormantd with `--features
+    # render`, then runs nextest over three crates plus doctests. Observed
+    # wall time scales with how much of the dependency graph the cache can
+    # serve: ~5 min warm, ~13 min after an ordinary change, and past 30 min
+    # when a lockfile edit invalidates the tree (2026-08-18, the h2 0.4.16
+    # security bump, which timed out here mid-compile with no JUnit written).
+    # 45 leaves headroom for that cold case without hiding a real hang.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
       - name: Reject same-SHA reruns

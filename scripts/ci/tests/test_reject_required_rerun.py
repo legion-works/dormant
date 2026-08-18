@@ -23,6 +23,12 @@ class RejectRequiredRerunTests(unittest.TestCase):
         path: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         environment = os.environ | {"GITHUB_RUN_ATTEMPT": attempt}
+        # The guard reads its label from GITHUB_EVENT_PATH, and these tests run
+        # inside the very CI job they are testing. Inheriting the ambient value
+        # would point the guard at the real pull request's payload, so a case
+        # meaning "no payload" would silently run against a live one and invert
+        # its own result the moment that pull request carried the label.
+        environment.pop("GITHUB_EVENT_PATH", None)
         with tempfile.TemporaryDirectory() as directory:
             if event is not None:
                 event_path = pathlib.Path(directory) / "event.json"
@@ -74,7 +80,8 @@ class RejectRequiredRerunTests(unittest.TestCase):
             event_path.write_text("{", encoding="utf-8")
             result = subprocess.run(
                 ["/bin/bash", str(RERUN_GUARD)],
-                env=os.environ | {
+                env=os.environ
+                | {
                     "GITHUB_RUN_ATTEMPT": "2",
                     "GITHUB_EVENT_PATH": str(event_path),
                 },

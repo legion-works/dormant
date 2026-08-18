@@ -1193,7 +1193,7 @@ mod tests {
                 (g.hang_on_wake, g.wake_results.pop_front().unwrap_or(Ok(())))
             };
             if hang_on_wake {
-                std::future::pending().await
+                std::future::pending::<()>().await;
             }
             result
         }

@@ -408,7 +408,7 @@ async fn finalize_shutdown(
     }
 }
 
-enum SnapshotResult {
+pub(crate) enum SnapshotResult {
     // Boxed: `StateSnapshot` dwarfs the two unit variants, and the enum is
     // returned by value on every snapshot request (clippy::large_enum_variant).
     Ready(Box<StateSnapshot>),

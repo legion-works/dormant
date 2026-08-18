@@ -67,18 +67,45 @@ pub fn plan_action(
                 })
                 .collect()
         })),
-        Action::BlankOne(display) => DispatchPlan::Ipc(vec![IpcRequest::Blank {
-            display: display.clone(),
-            mode: BlankRequestMode::Hard,
-        }]),
-        Action::WakeOne(display) => DispatchPlan::Ipc(vec![IpcRequest::Wake {
-            display: display.clone(),
-        }]),
-        Action::SwitchToLocal(display) => DispatchPlan::SwitchToLocal(display.clone()),
+        Action::BlankOne(display) => {
+            if display_in_snapshot(display, snapshot) {
+                DispatchPlan::Ipc(vec![IpcRequest::Blank {
+                    display: display.clone(),
+                    mode: BlankRequestMode::Hard,
+                }])
+            } else {
+                DispatchPlan::Ignore
+            }
+        }
+        Action::WakeOne(display) => {
+            if display_in_snapshot(display, snapshot) {
+                DispatchPlan::Ipc(vec![IpcRequest::Wake {
+                    display: display.clone(),
+                }])
+            } else {
+                DispatchPlan::Ignore
+            }
+        }
+        Action::SwitchToLocal(display) => {
+            if display_in_snapshot(display, snapshot) {
+                DispatchPlan::SwitchToLocal(display.clone())
+            } else {
+                DispatchPlan::Ignore
+            }
+        }
         Action::OpenWebUi { port } => DispatchPlan::OpenWeb(*port),
         Action::Quit => DispatchPlan::Quit,
         Action::Separator => DispatchPlan::Ignore,
     }
+}
+
+/// A targeted action must not name a display the daemon no longer reports:
+/// the tray menu can be stale by the time a human clicks it (reload, hotplug,
+/// config change), and a request for a gone display fails against the daemon.
+/// A missing snapshot means there is nothing to validate against, matching
+/// `BlankAll`'s `None`-means-no-displays treatment.
+fn display_in_snapshot(display: &str, snapshot: Option<&StateSnapshot>) -> bool {
+    snapshot.is_some_and(|state| state.displays.iter().any(|(id, _)| id == display))
 }
 
 /// Platform operations needed by [`execute_plan`].
@@ -269,6 +296,82 @@ mod tests {
         );
     }
 
+    /// A targeted action whose display id is no longer in the snapshot must
+    /// not be planned — the tray menu can be stale by the time a human clicks
+    /// it (reload, hotplug, config change).  Issue #319.
+    #[test]
+    fn targeted_action_ignores_display_missing_from_snapshot() {
+        let snapshot = two_display_snapshot();
+        assert!(matches!(
+            plan_action(&Action::BlankOne("gone".into()), Some(&snapshot), false),
+            DispatchPlan::Ignore
+        ));
+        assert!(matches!(
+            plan_action(&Action::WakeOne("gone".into()), Some(&snapshot), false),
+            DispatchPlan::Ignore
+        ));
+        assert!(matches!(
+            plan_action(
+                &Action::SwitchToLocal("gone".into()),
+                Some(&snapshot),
+                false
+            ),
+            DispatchPlan::Ignore
+        ));
+
+        // Membership is exact: a case-insensitive or prefix/substring match
+        // must not resurrect a stale target. Display ids are config-defined
+        // identifiers — near-misses name a different display, never the
+        // same one.
+        for near_miss in ["A", "a-gone"] {
+            assert!(
+                matches!(
+                    plan_action(&Action::BlankOne(near_miss.into()), Some(&snapshot), false),
+                    DispatchPlan::Ignore
+                ),
+                "BlankOne({near_miss}) must be ignored"
+            );
+            assert!(
+                matches!(
+                    plan_action(&Action::WakeOne(near_miss.into()), Some(&snapshot), false),
+                    DispatchPlan::Ignore
+                ),
+                "WakeOne({near_miss}) must be ignored"
+            );
+            assert!(
+                matches!(
+                    plan_action(
+                        &Action::SwitchToLocal(near_miss.into()),
+                        Some(&snapshot),
+                        false
+                    ),
+                    DispatchPlan::Ignore
+                ),
+                "SwitchToLocal({near_miss}) must be ignored"
+            );
+        }
+    }
+
+    /// A targeted action with no snapshot at all is treated like `BlankAll`'s
+    /// `None`-means-no-displays rule: there is nothing to validate against, so
+    /// the plan is ignored rather than firing a request at a possibly-gone
+    /// display.  Issue #319.
+    #[test]
+    fn targeted_action_ignores_absent_snapshot() {
+        assert!(matches!(
+            plan_action(&Action::BlankOne("a".into()), None, false),
+            DispatchPlan::Ignore
+        ));
+        assert!(matches!(
+            plan_action(&Action::WakeOne("a".into()), None, false),
+            DispatchPlan::Ignore
+        ));
+        assert!(matches!(
+            plan_action(&Action::SwitchToLocal("a".into()), None, false),
+            DispatchPlan::Ignore
+        ));
+    }
+
     #[test]
     fn unreachable_suppresses_mutation_but_not_open_or_quit() {
         assert!(matches!(
@@ -355,9 +458,14 @@ mod tests {
 
     #[test]
     fn plan_action_switch_to_local_maps_to_dispatch_plan() {
+        let flag = plan_action(
+            &Action::SwitchToLocal("a".into()),
+            Some(&two_display_snapshot()),
+            false,
+        );
         assert!(matches!(
-            plan_action(&Action::SwitchToLocal("monitor".into()), None, false),
-            DispatchPlan::SwitchToLocal(id) if id == "monitor"
+            flag,
+            DispatchPlan::SwitchToLocal(id) if id == "a"
         ));
     }
 

@@ -28,6 +28,14 @@ const MAX_LINE_BYTES: usize = 1_048_576;
 #[cfg(unix)]
 const EVENTS_READY_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Maximum response wait for ordinary daemon control requests.
+#[cfg(unix)]
+const IPC_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// `Exercise` itself permits the daemon twenty seconds of hardware work.
+#[cfg(unix)]
+const EXERCISE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(25);
+
 /// Connect to the daemon's socket and send one request, returning the
 /// response.
 ///
@@ -39,22 +47,14 @@ const EVENTS_READY_TIMEOUT: Duration = Duration::from_secs(2);
 pub fn send_request(socket_path: &Path, request: &IpcRequest) -> Result<IpcResponse> {
     #[cfg(unix)]
     {
-        use std::io::{BufRead, BufReader, Write};
+        use std::io::Write;
 
         let mut stream = connect(socket_path)?;
         let line = serde_json::to_string(request)?;
         writeln!(stream, "{line}")?;
         stream.flush()?;
 
-        let mut reader = BufReader::new(&stream);
-        let mut response_line = String::new();
-        reader
-            .read_line(&mut response_line)
-            .context("read response from daemon")?;
-
-        let resp: IpcResponse =
-            serde_json::from_str(response_line.trim()).context("parse daemon response")?;
-        Ok(resp)
+        read_response(&stream, request)
     }
     #[cfg(not(unix))]
     {
@@ -108,7 +108,7 @@ pub enum IpcSendOutcome {
 pub fn send_request_typed(socket_path: &Path, request: &IpcRequest) -> IpcSendOutcome {
     #[cfg(unix)]
     {
-        use std::io::{BufRead, BufReader, Write};
+        use std::io::Write;
 
         let mut stream = match connect(socket_path) {
             Ok(s) => s,
@@ -125,18 +125,9 @@ pub fn send_request_typed(socket_path: &Path, request: &IpcRequest) -> IpcSendOu
             );
         }
 
-        let mut reader = BufReader::new(&stream);
-        let mut response_line = String::new();
-        if let Err(e) = reader.read_line(&mut response_line) {
-            return IpcSendOutcome::PostConnectError(
-                anyhow::Error::from(e).context("read response from daemon"),
-            );
-        }
-        match serde_json::from_str::<IpcResponse>(response_line.trim()) {
+        match read_response(&stream, request) {
             Ok(resp) => IpcSendOutcome::Ok(Box::new(resp)),
-            Err(e) => IpcSendOutcome::PostConnectError(
-                anyhow::Error::from(e).context("parse daemon response"),
-            ),
+            Err(error) => IpcSendOutcome::PostConnectError(error),
         }
     }
     #[cfg(not(unix))]
@@ -398,6 +389,73 @@ impl Iterator for EventStream {
 #[cfg(all(unix, test))]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::net::UnixListener;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    fn spawn_nonresponding_server(
+        socket_path: &Path,
+        expected: IpcRequest,
+    ) -> (thread::JoinHandle<()>, mpsc::Sender<()>) {
+        let listener = UnixListener::bind(socket_path).expect("bind fake socket");
+        let (release_tx, release_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept client");
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read request");
+            assert_eq!(
+                serde_json::from_str::<IpcRequest>(line.trim()).expect("parse request"),
+                expected
+            );
+            let _ = release_rx.recv_timeout(Duration::from_secs(11));
+        });
+        (handle, release_tx)
+    }
+
+    #[test]
+    fn send_request_times_out_when_daemon_accepts_but_never_replies() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("dormant.sock");
+        let request = IpcRequest::Status;
+        let (server, release) = spawn_nonresponding_server(&socket, request.clone());
+
+        let error = send_request(&socket, &request).expect_err("stalled daemon must time out");
+
+        drop(release);
+        server.join().expect("fake daemon must finish");
+        assert!(
+            format!("{error:#}").contains("timed out"),
+            "timeout must be explicit: {error:#}"
+        );
+    }
+
+    #[test]
+    fn send_request_typed_reports_post_connect_timeout_when_daemon_stalls() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("dormant.sock");
+        let request = IpcRequest::Doctor;
+        let (server, release) = spawn_nonresponding_server(&socket, request.clone());
+
+        let outcome = send_request_typed(&socket, &request);
+
+        drop(release);
+        server.join().expect("fake daemon must finish");
+        match outcome {
+            IpcSendOutcome::PostConnectError(error) => assert!(
+                format!("{error:#}").contains("timed out"),
+                "timeout must be explicit: {error:#}"
+            ),
+            IpcSendOutcome::ConnectFailed(error) => {
+                panic!("accepted connection must not be classified as connect failure: {error:#}")
+            }
+            IpcSendOutcome::Ok(response) => {
+                panic!("stalled daemon must not return a response: {response:?}")
+            }
+        }
+    }
 
     /// A foreign/unrecognized `"event"` tag must deserialize to
     /// `DaemonEvent::Unknown` instead of erroring the iterator — an older
@@ -494,6 +552,43 @@ pub fn check_response(resp: &IpcResponse) -> Result<()> {
         Ok(())
     } else {
         anyhow::bail!("{}", resp.error.as_deref().unwrap_or("unknown error"))
+    }
+}
+
+#[cfg(unix)]
+fn read_response(stream: &UnixStream, request: &IpcRequest) -> Result<IpcResponse> {
+    use std::io::BufRead;
+
+    let timeout = response_timeout(request);
+    stream
+        .set_read_timeout(Some(timeout))
+        .context("set daemon response timeout")?;
+
+    let mut reader = BufReader::new(stream);
+    let mut response_line = String::new();
+    match reader.read_line(&mut response_line) {
+        Ok(0) => anyhow::bail!("daemon closed connection before sending a response"),
+        Ok(_) => serde_json::from_str(response_line.trim()).context("parse daemon response"),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ) =>
+        {
+            anyhow::bail!(
+                "daemon response timed out after {} seconds",
+                timeout.as_secs()
+            )
+        }
+        Err(error) => Err(error).context("read response from daemon"),
+    }
+}
+
+#[cfg(unix)]
+fn response_timeout(request: &IpcRequest) -> Duration {
+    match request {
+        IpcRequest::Exercise { .. } => EXERCISE_RESPONSE_TIMEOUT,
+        _ => IPC_RESPONSE_TIMEOUT,
     }
 }
 

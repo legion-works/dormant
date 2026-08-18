@@ -1396,52 +1396,37 @@ pub fn snapshot_records(
     }
     let base = sanitize_topic_id(&cfg.publish.base_topic);
     let instance = sanitize_topic_id(instance);
-    // Apply the SAME first-wins collision filter as `discovery_records`
-    // so a sensor/zone/display whose config-order-second sanitized id
-    // also resolves a winner does NOT leak its state/availability
-    // record onto the broker. The contract mandates "publishes ONLY
-    // the first (config-order) — never interleaves two entities on
-    // one topic" — the discovery side already filters via the `seen`
-    // HashSet; the snapshot side MUST do the same.
-    //
-    // The filter is PER-KIND + PER-SANITIZED-ID, not just per
-    // sanitized id, because the first-wins winner is determined by
-    // config order across kinds (sensor first, then zone, then
-    // display). For a sensor "Office Radar" (winner) + zone
-    // "office_radar" (loser), both sanitize to "office_radar" — the
-    // sensor's snapshot is published, the zone's is dropped.
+    // Match discovery's single cross-kind first-wins gate, while keeping
+    // kind-specific winner sets so each snapshot loop knows which entity type
+    // owns its sanitized id.
     let inventory = EntityInventory::from_config(cfg);
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut seen_sensor: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut seen_zone: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut seen_display: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for raw in &inventory.sensors {
+    for &raw in &inventory.sensors {
         let sanitized = sanitize_topic_id(raw);
-        seen_sensor.insert(sanitized);
-    }
-    for raw in &inventory.zones {
-        let sanitized = sanitize_topic_id(raw);
-        if seen_sensor.contains(&sanitized) {
-            // The sanitized id was already claimed by a sensor — the
-            // sensor wins; this zone is a LOSER and its snapshot is
-            // dropped.
-            continue;
+        if seen.insert(sanitized) {
+            seen_sensor.insert(raw.to_owned());
         }
-        seen_zone.insert(sanitized);
     }
-    for raw in &inventory.displays {
+    for &raw in &inventory.zones {
         let sanitized = sanitize_topic_id(raw);
-        if seen_sensor.contains(&sanitized) || seen_zone.contains(&sanitized) {
-            // A sensor or zone already won this sanitized id — the
-            // display is a LOSER.
-            continue;
+        if seen.insert(sanitized) {
+            seen_zone.insert(raw.to_owned());
         }
-        seen_display.insert(sanitized);
+    }
+    for &raw in &inventory.displays {
+        let sanitized = sanitize_topic_id(raw);
+        if seen.insert(sanitized) {
+            seen_display.insert(raw.to_owned());
+        }
     }
     let mut records: Vec<PublishRecord> = Vec::new();
 
     for sensor in &snapshot.sensors {
         let sensor_id = sanitize_topic_id(&sensor.id);
-        if !seen_sensor.contains(&sensor_id) {
+        if !seen_sensor.contains(&sensor.id) {
             continue;
         }
         records.push(state_record(
@@ -1456,7 +1441,7 @@ pub fn snapshot_records(
 
     for zone in &snapshot.zones {
         let zone_id = sanitize_topic_id(&zone.id);
-        if !seen_zone.contains(&zone_id) {
+        if !seen_zone.contains(&zone.id) {
             continue;
         }
         // A zone that has never been resolved (`present = None`)
@@ -1478,7 +1463,7 @@ pub fn snapshot_records(
 
     for (display_id_raw, display) in &snapshot.displays {
         let display_id = sanitize_topic_id(display_id_raw);
-        if !seen_display.contains(&display_id) {
+        if !seen_display.contains(display_id_raw) {
             continue;
         }
         let topic = topic_display_phase(&base, &instance, &display_id);
@@ -2603,6 +2588,76 @@ mod tests {
         assert!(
             payload.get("state_topic").is_some(),
             "winner's payload must carry a state_topic field; got: {payload}"
+        );
+    }
+
+    #[test]
+    fn snapshot_records_deduplicate_sensor_ids_that_sanitize_alike() {
+        let mut cfg = enabled_cfg();
+        cfg.sensors.insert(
+            "desk two".into(),
+            SensorConfig::Mqtt(MqttSensorCfg {
+                broker_url: "tcp://h:1883".into(),
+                topic: "dormant/desk2".into(),
+                field: "/val".into(),
+                payload_on: None,
+                payload_off: None,
+                kind: SensorKind::default(),
+                hold_time: None,
+                stale_timeout: None,
+                availability_topic: None,
+                availability_payload_online: "online".into(),
+                availability_payload_offline: "offline".into(),
+            }),
+        );
+        cfg.sensors.insert(
+            "desk_two".into(),
+            SensorConfig::Mqtt(MqttSensorCfg {
+                broker_url: "tcp://h:1883".into(),
+                topic: "dormant/desk3".into(),
+                field: "/val".into(),
+                payload_on: None,
+                payload_off: None,
+                kind: SensorKind::default(),
+                hold_time: None,
+                stale_timeout: None,
+                availability_topic: None,
+                availability_payload_online: "online".into(),
+                availability_payload_offline: "offline".into(),
+            }),
+        );
+        let snapshot = StateSnapshot {
+            sensors: vec![
+                SensorSnapshot {
+                    id: "desk two".into(),
+                    state: SensorState::Present,
+                    last_seen_secs_ago: 0,
+                    reported: true,
+                },
+                SensorSnapshot {
+                    id: "desk_two".into(),
+                    state: SensorState::Unavailable,
+                    last_seen_secs_ago: 0,
+                    reported: true,
+                },
+            ],
+            zones: Vec::new(),
+            displays: Vec::new(),
+            pending_reload: None,
+            rollback: None,
+            kvm: None,
+            wear_sampling_status: None,
+        };
+
+        let records = snapshot_records(&cfg, &snapshot, "office-pc");
+        let desk_two_records: Vec<&PublishRecord> = records
+            .iter()
+            .filter(|record| record.topic.contains("/sensor/desk_two/"))
+            .collect();
+        assert_eq!(
+            desk_two_records.len(),
+            2,
+            "first-wins: exactly one sensor state and availability pair per sanitized id, got {desk_two_records:?}"
         );
     }
 

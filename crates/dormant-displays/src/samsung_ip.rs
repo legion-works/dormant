@@ -105,41 +105,6 @@ const TOKEN_STATE_WRITTEN: &str = "samsung_ip_token_state_written";
 /// concurrent writes from the same process.
 static TOKEN_STATE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(unix)]
-unsafe extern "C" {
-    fn flock(fd: std::os::raw::c_int, operation: std::os::raw::c_int) -> std::os::raw::c_int;
-}
-
-#[cfg(unix)]
-const LOCK_EXCLUSIVE: std::os::raw::c_int = 2;
-
-#[cfg(windows)]
-#[repr(C)]
-struct WindowsOverlapped {
-    internal: usize,
-    internal_high: usize,
-    offset: u32,
-    offset_high: u32,
-    event: *mut std::ffi::c_void,
-}
-
-#[cfg(windows)]
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    #[link_name = "LockFileEx"]
-    fn lock_file_ex(
-        file: *mut std::ffi::c_void,
-        flags: u32,
-        reserved: u32,
-        bytes_low: u32,
-        bytes_high: u32,
-        overlapped: *mut WindowsOverlapped,
-    ) -> i32;
-}
-
-#[cfg(windows)]
-const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
-
 #[cfg(test)]
 type TokenStateHook = Arc<dyn Fn(&Path) + Send + Sync>;
 
@@ -148,9 +113,20 @@ static TOKEN_STATE_BEFORE_CACHE_HOOK: StdMutex<Option<TokenStateHook>> = StdMute
 #[cfg(test)]
 static TOKEN_STATE_AFTER_LOAD_HOOK: StdMutex<Option<TokenStateHook>> = StdMutex::new(None);
 #[cfg(test)]
+static TOKEN_STATE_BEFORE_TEMP_CREATE_HOOK: StdMutex<Option<TokenStateHook>> = StdMutex::new(None);
+#[cfg(test)]
+static TOKEN_STATE_AFTER_TEMP_CREATE_HOOK: StdMutex<Option<TokenStateHook>> = StdMutex::new(None);
+#[cfg(test)]
 static TOKEN_STATE_BEFORE_RENAME_HOOK: StdMutex<Option<TokenStateHook>> = StdMutex::new(None);
 #[cfg(test)]
 static TOKEN_STATE_TEST_HOOK_LOCK: StdMutex<()> = StdMutex::new(());
+
+#[cfg(test)]
+type TokenStateWriteFailureHook = Arc<dyn Fn(&Path) -> std::io::Result<()> + Send + Sync>;
+
+#[cfg(test)]
+static TOKEN_STATE_BEFORE_WRITE_FAILURE_HOOK: StdMutex<Option<TokenStateWriteFailureHook>> =
+    StdMutex::new(None);
 
 #[cfg(test)]
 fn run_token_state_hook(hook: &StdMutex<Option<TokenStateHook>>, path: &Path) {
@@ -158,6 +134,15 @@ fn run_token_state_hook(hook: &StdMutex<Option<TokenStateHook>>, path: &Path) {
     if let Some(hook) = callback {
         hook(path);
     }
+}
+
+#[cfg(test)]
+fn run_token_state_write_failure_hook(path: &Path) -> std::io::Result<()> {
+    let callback = TOKEN_STATE_BEFORE_WRITE_FAILURE_HOOK
+        .lock()
+        .expect("token-state write-failure hook poisoned")
+        .clone();
+    callback.map_or(Ok(()), |hook| hook(path))
 }
 
 // ── JSON-RPC error codes (string anchors — repo grep rule) ──────────────────────
@@ -646,6 +631,7 @@ fn with_token_state_file_lock<T>(
 ) -> Result<T, String> {
     #[cfg(unix)]
     {
+        use rustix::fs::{FlockOperation, flock};
         ensure_token_state_parent(path)?;
         let lock_path = token_state_lock_path(path);
         let lock_file = {
@@ -665,68 +651,16 @@ fn with_token_state_file_lock<T>(
                     )
                 })?
         };
-        let fd = std::os::unix::io::AsRawFd::as_raw_fd(&lock_file);
-        // SAFETY: `fd` belongs to `lock_file`, which remains open until after
-        // `write` completes and therefore holds the advisory lock throughout.
-        if unsafe { flock(fd, LOCK_EXCLUSIVE) } != 0 {
-            return Err(format!(
-                "lock samsung-ip token state '{}': {}",
-                lock_path.display(),
-                std::io::Error::last_os_error()
-            ));
-        }
+        flock(&lock_file, FlockOperation::LockExclusive)
+            .map_err(|e| format!("lock samsung-ip token state '{}': {e}", lock_path.display()))?;
         write()
     }
-    #[cfg(windows)]
+    #[cfg(not(unix))]
     {
-        use std::os::windows::io::AsRawHandle as _;
-
-        ensure_token_state_parent(path)?;
-        let lock_path = token_state_lock_path(path);
-        let lock_file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|e| {
-                format!(
-                    "open samsung-ip token state lock '{}': {e}",
-                    lock_path.display()
-                )
-            })?;
-        let mut overlapped = WindowsOverlapped {
-            internal: 0,
-            internal_high: 0,
-            offset: 0,
-            offset_high: 0,
-            event: std::ptr::null_mut(),
-        };
-        // SAFETY: `lock_file` remains open and `overlapped` remains live until
-        // after `write` completes, so the whole-file lock spans the update.
-        if unsafe {
-            lock_file_ex(
-                lock_file.as_raw_handle(),
-                LOCKFILE_EXCLUSIVE_LOCK,
-                0,
-                u32::MAX,
-                u32::MAX,
-                &mut overlapped,
-            )
-        } == 0
-        {
-            return Err(format!(
-                "lock samsung-ip token state '{}': {}",
-                lock_path.display(),
-                std::io::Error::last_os_error()
-            ));
-        }
-        write()
-    }
-    #[cfg(all(not(unix), not(windows)))]
-    {
-        let _ = path;
-        write()
+        let _ = (path, write);
+        // Persisting without an exercised advisory lock would silently revive
+        // the token-loss race; Windows remains disabled until it is tested.
+        Err("samsung-ip token state persistence requires a supported advisory file lock on this platform".to_string())
     }
 }
 
@@ -767,6 +701,17 @@ fn token_state_tmp_path(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{file_name}.tmp.{}.{seq}", std::process::id()))
 }
 
+fn remove_token_state_tmp(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!(
+            "remove samsung-ip token state tmp '{}': {e}",
+            path.display()
+        )),
+    }
+}
+
 /// Atomically write the token map to `path`. The write is atomic (temp
 /// file in the same directory + rename) so a crash mid-write never
 /// corrupts an existing good state file. On Unix the file is created
@@ -782,29 +727,92 @@ fn write_token_state(path: &Path, map: &HashMap<String, String>) -> Result<(), S
         .map_err(|e| format!("serialize samsung-ip token state: {e}"))?;
 
     let tmp = token_state_tmp_path(path);
-    {
-        let mut f = std::fs::File::create(&tmp)
-            .map_err(|e| format!("create samsung-ip token state tmp '{}': {e}", tmp.display()))?;
+    #[cfg(test)]
+    run_token_state_hook(&TOKEN_STATE_BEFORE_TEMP_CREATE_HOOK, &tmp);
+    let mut temp_created = false;
+    let write_result = (|| {
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-        }
+        let mut f = {
+            use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)
+                .map_err(|e| {
+                    format!("create samsung-ip token state tmp '{}': {e}", tmp.display())
+                })?;
+            temp_created = true;
+            #[cfg(test)]
+            run_token_state_hook(&TOKEN_STATE_AFTER_TEMP_CREATE_HOOK, &tmp);
+            let mode = f
+                .metadata()
+                .map_err(|e| {
+                    format!(
+                        "inspect samsung-ip token state tmp '{}': {e}",
+                        tmp.display()
+                    )
+                })?
+                .permissions()
+                .mode()
+                & 0o777;
+            if mode != 0o600 {
+                return Err(format!(
+                    "create samsung-ip token state tmp '{}' with mode 0o600: got {mode:o}",
+                    tmp.display()
+                ));
+            }
+            f
+        };
+        #[cfg(not(unix))]
+        let mut f = {
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+                .map_err(|e| {
+                    format!("create samsung-ip token state tmp '{}': {e}", tmp.display())
+                })?;
+            temp_created = true;
+            #[cfg(test)]
+            run_token_state_hook(&TOKEN_STATE_AFTER_TEMP_CREATE_HOOK, &tmp);
+            f
+        };
+        #[cfg(test)]
+        run_token_state_write_failure_hook(&tmp)
+            .map_err(|e| format!("write samsung-ip token state tmp: {e}"))?;
         f.write_all(raw.as_bytes())
             .map_err(|e| format!("write samsung-ip token state tmp: {e}"))?;
         f.sync_all()
             .map_err(|e| format!("fsync samsung-ip token state tmp: {e}"))?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        if !temp_created {
+            return Err(e);
+        }
+        return match remove_token_state_tmp(&tmp) {
+            Ok(()) => Err(e),
+            Err(remove_err) => Err(format!("{e}; {remove_err}")),
+        };
     }
     #[cfg(test)]
     run_token_state_hook(&TOKEN_STATE_BEFORE_RENAME_HOOK, path);
-    std::fs::rename(&tmp, path).map_err(|e| {
-        format!(
-            "rename samsung-ip token state '{}' -> '{}': {e}",
-            tmp.display(),
-            path.display()
-        )
-    })?;
-    Ok(())
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let rename_err = format!(
+                "rename samsung-ip token state '{}' -> '{}': {e}",
+                tmp.display(),
+                path.display()
+            );
+            match remove_token_state_tmp(&tmp) {
+                Ok(()) => Err(rename_err),
+                Err(remove_err) => Err(format!("{rename_err}; {remove_err}")),
+            }
+        }
+    }
 }
 
 // ── Fake transport for tests ───────────────────────────────────────────────────
@@ -1282,6 +1290,116 @@ mod tests {
             dir_mode & 0o777,
             0o700,
             "parent dir must be 0o700: got {dir_mode:o}"
+        );
+    }
+
+    /// The token temp must be owner-only before its first byte is written;
+    /// tightening a wider file afterwards leaves a credential-read window.
+    #[cfg(unix)]
+    #[test]
+    fn token_state_temp_is_mode_0o600_at_creation() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::mpsc;
+
+        let _serial = TOKEN_STATE_TEST_HOOK_LOCK
+            .lock()
+            .expect("token-state test hook lock poisoned");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("samsung-ip-tokens.json");
+        let (mode_tx, mode_rx) = mpsc::channel();
+        *TOKEN_STATE_AFTER_TEMP_CREATE_HOOK
+            .lock()
+            .expect("token-state after-create hook poisoned") = Some(Arc::new(move |tmp| {
+            mode_tx
+                .send(std::fs::metadata(tmp).unwrap().permissions().mode() & 0o777)
+                .unwrap();
+        }));
+
+        write_token_state(&path, &HashMap::new()).unwrap();
+
+        *TOKEN_STATE_AFTER_TEMP_CREATE_HOOK
+            .lock()
+            .expect("token-state after-create hook poisoned") = None;
+        assert_eq!(mode_rx.recv().unwrap(), 0o600);
+    }
+
+    #[test]
+    fn token_state_refuses_preexisting_temp_file() {
+        use std::sync::mpsc;
+
+        let _serial = TOKEN_STATE_TEST_HOOK_LOCK
+            .lock()
+            .expect("token-state test hook lock poisoned");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("samsung-ip-tokens.json");
+        let (tmp_tx, tmp_rx) = mpsc::channel();
+        *TOKEN_STATE_BEFORE_TEMP_CREATE_HOOK
+            .lock()
+            .expect("token-state before-create hook poisoned") = Some(Arc::new(move |tmp| {
+            std::fs::write(tmp, "attacker-owned").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(tmp, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            tmp_tx.send(tmp.to_path_buf()).unwrap();
+        }));
+
+        let result = write_token_state(&path, &HashMap::new());
+
+        *TOKEN_STATE_BEFORE_TEMP_CREATE_HOOK
+            .lock()
+            .expect("token-state before-create hook poisoned") = None;
+        let tmp = tmp_rx.recv().unwrap();
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(tmp).unwrap(), "attacker-owned");
+    }
+
+    #[test]
+    fn token_state_write_failure_removes_temp_file() {
+        let _serial = TOKEN_STATE_TEST_HOOK_LOCK
+            .lock()
+            .expect("token-state test hook lock poisoned");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("samsung-ip-tokens.json");
+        *TOKEN_STATE_BEFORE_WRITE_FAILURE_HOOK
+            .lock()
+            .expect("token-state write-failure hook poisoned") = Some(Arc::new(|_| {
+            Err(std::io::Error::other("forced write failure"))
+        }));
+
+        assert!(write_token_state(&path, &HashMap::new()).is_err());
+
+        *TOKEN_STATE_BEFORE_WRITE_FAILURE_HOOK
+            .lock()
+            .expect("token-state write-failure hook poisoned") = None;
+        let temp_prefix = ".samsung-ip-tokens.json.tmp.";
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(temp_prefix)),
+            "failed token write must not leave a credential-bearing temp file"
+        );
+    }
+
+    #[test]
+    fn token_state_rename_failure_removes_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("samsung-ip-tokens.json");
+        std::fs::create_dir(&path).unwrap();
+
+        assert!(write_token_state(&path, &HashMap::new()).is_err());
+
+        let temp_prefix = ".samsung-ip-tokens.json.tmp.";
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(temp_prefix)),
+            "failed token rename must not leave a credential-bearing temp file"
         );
     }
 

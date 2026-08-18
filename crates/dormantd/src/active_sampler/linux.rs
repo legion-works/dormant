@@ -312,6 +312,16 @@ impl<T: PortalTransport> PortalPipeWireSource<T> {
             }
         }
     }
+
+    async fn capture_after_open(&mut self, mode: StreamMode) -> Result<RawFrame, CaptureError> {
+        match self.capture_one(mode).await {
+            Ok(frame) => Ok(frame),
+            Err(error) => {
+                self.close().await;
+                Err(error)
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -330,7 +340,7 @@ impl<T: PortalTransport> CaptureSource for PortalPipeWireSource<T> {
             self.close().await;
             return Err(error);
         }
-        let frame = self.capture_one(StreamMode::Warm).await?;
+        let frame = self.capture_after_open(StreamMode::Warm).await?;
         tracing::info!(
             event = "wear_sampling_stage",
             display = %self.display,
@@ -355,7 +365,7 @@ impl<T: PortalTransport> CaptureSource for PortalPipeWireSource<T> {
             CONSENT_INTERACTION_TIMEOUT,
         )
         .await?;
-        self.capture_one(StreamMode::Warm).await?;
+        self.capture_after_open(StreamMode::Warm).await?;
         tracing::info!(
             event = "wear_sampling_stage",
             display = %expected.display,
@@ -1784,6 +1794,38 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn active_sampling_protocol_closes_session_when_first_consent_frame_fails() {
+        let transport = FakePortalTransport::grant_with(PortalStartResult::single(
+            73,
+            3072,
+            1728,
+            Some("persistent-output"),
+            "rotated-token",
+            None,
+        ));
+        let mut source = PortalPipeWireSource::from_transport_with_frames(
+            transport.clone(),
+            [Err(CaptureError::Timeout)],
+        );
+
+        let result = source
+            .request_consent(&DisplayExpectation {
+                display: "oled".to_owned(),
+                compositor_output: None,
+            })
+            .await;
+
+        assert_eq!(result, Err(CaptureError::Timeout));
+        assert!(
+            transport
+                .calls()
+                .iter()
+                .any(|call| matches!(call, PortalCall::Close)),
+            "a failed first consent frame must close the portal session"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn active_sampling_protocol_allows_start_response_during_consent_window() {
         let transport = FakePortalTransport::grant_after(
@@ -2050,6 +2092,42 @@ mod tests {
             PortalCall::SelectSources {
                 options: SelectSourcesOptions::for_reattach("saved-token"),
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn active_sampling_protocol_closes_session_when_first_reattach_frame_fails() {
+        let transport = FakePortalTransport::grant_with(PortalStartResult::single(
+            73,
+            3072,
+            1728,
+            Some("persistent-output"),
+            "rotated-token",
+            None,
+        ));
+        let mut source = PortalPipeWireSource::from_transport_with_frames(
+            transport.clone(),
+            [Err(CaptureError::Timeout)],
+        );
+        let ids = vec!["persistent-output".to_owned()];
+        let binding = ConsentBinding {
+            token: "saved-token",
+            sampled_display: "oled",
+            portal_persistent_ids: &ids,
+            granted_width: 3840,
+            granted_height: 2160,
+            stream_position: None,
+        };
+
+        let result = source.connect(&binding).await;
+
+        assert_eq!(result, Err(CaptureError::Timeout));
+        assert!(
+            transport
+                .calls()
+                .iter()
+                .any(|call| matches!(call, PortalCall::Close)),
+            "a failed first reattach frame must close the portal session"
         );
     }
 

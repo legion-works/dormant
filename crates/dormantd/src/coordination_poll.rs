@@ -176,8 +176,11 @@ async fn poll_once(
             .get(&display_id)
             .is_none_or(|last| now.duration_since(*last) >= state_poll_interval);
         let panel_state = if due {
-            last_state_read.insert(display_id.clone(), now);
-            executor.read_state_sampled().await
+            let panel_state = executor.read_state_sampled().await;
+            if panel_state.is_some() {
+                last_state_read.insert(display_id.clone(), now);
+            }
+            panel_state
         } else {
             prior_panel_state
                 .get(&display_id)
@@ -940,6 +943,33 @@ mod tests {
         assert!(record.owned);
         assert!(record.has_successful_input_read);
         assert_eq!(record.consecutive_failures, 0);
+        cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_state_read_retries_on_the_next_poll_tick() {
+        let panel = PanelState {
+            power: Some(PowerState::On),
+            brightness: Some(50),
+        };
+        let sink = Arc::new(ScriptedSink::with_inputs_and_states(
+            [Ok(Some(0x11)), Ok(Some(0x11))],
+            [None, Some(panel.clone())],
+        ));
+        let (_config_tx, _executors_tx, _ctl_rx, state, cancel) = setup(sink.clone());
+        let shared = DisplayId("shared".to_string());
+
+        tick().await;
+        assert_eq!(sink.state_reads(), 1, "first due state read fails");
+        assert_eq!(state.snapshot()[&shared].panel_state, None);
+
+        tick().await;
+        assert_eq!(
+            sink.state_reads(),
+            2,
+            "a failed state read must retry on the next poll tick"
+        );
+        assert_eq!(state.snapshot()[&shared].panel_state, Some(panel));
         cancel.cancel();
     }
 

@@ -5635,12 +5635,14 @@ impl<T: Send + 'static> GenerationRouter<T> {
         let mut state = self.state.lock().await;
         state.target = Some(target.clone());
         while let Some(message) = state.queued.pop_front() {
-            if target.send(message).await.is_err() {
+            if let Err(error) = target.send(message).await {
+                state.queued.push_front(error.0);
+                state.target = None;
                 tracing::error!(
                     event = "generation_route_install_failed",
-                    "new generation closed while queued inputs were being released"
+                    "new generation closed while queued inputs were being released; input retained"
                 );
-                break;
+                return;
             }
         }
         state.paused = false;
@@ -5708,12 +5710,16 @@ impl GenerationRouter<ControlMsg> {
                     .expect("operation registry installed"),
                 generation_id,
             );
-            if target.send(message).await.is_err() {
+            if let Err(error) = target.send(message).await {
+                let message = error.0;
+                state.queued.push_front(message);
+                state.target = None;
                 tracing::error!(
                     event = "generation_route_install_failed",
-                    "new generation closed while queued inputs were being released"
+                    control = ?state.queued.front(),
+                    "new generation closed while queued controls were being released; control retained"
                 );
-                break;
+                return;
             }
         }
         state.paused = false;
@@ -8933,6 +8939,52 @@ mod generation_router_tests {
         cancel.cancel();
         drop(front_tx);
         forwarder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn control_queue_survives_a_failed_generation_install() {
+        let (old_tx, _old_rx) = mpsc::channel(1);
+        let router = GenerationRouter::new_with_generation(
+            old_tx,
+            GenerationId(7),
+            Arc::new(OperationRegistry::default()),
+        );
+        router.pause().await;
+        let cancel = CancellationToken::new();
+        assert!(
+            router
+                .route_control(ControlMsg::ForceWake(DisplayId("first".into())), &cancel)
+                .await
+        );
+        assert!(
+            router
+                .route_control(ControlMsg::ForceWake(DisplayId("second".into())), &cancel)
+                .await
+        );
+
+        let (failed_tx, failed_rx) = mpsc::channel(1);
+        drop(failed_rx);
+        router.install_generation(failed_tx, GenerationId(8)).await;
+
+        let (replacement_tx, mut replacement_rx) = mpsc::channel(2);
+        router
+            .install_generation(replacement_tx, GenerationId(9))
+            .await;
+        let (first, second) = tokio::time::timeout(Duration::from_millis(100), async {
+            let first = replacement_rx
+                .recv()
+                .await
+                .expect("first accepted control remains queued");
+            let second = replacement_rx
+                .recv()
+                .await
+                .expect("second accepted control remains queued");
+            (first, second)
+        })
+        .await
+        .expect("every accepted control is replayed after a replacement generation installs");
+        assert!(matches!(first, ControlMsg::ForceWake(display) if display.0 == "first"));
+        assert!(matches!(second, ControlMsg::ForceWake(display) if display.0 == "second"));
     }
 
     // Issue #209: `route_control` must release the router mutex before

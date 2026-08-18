@@ -28,13 +28,33 @@ const MAX_LINE_BYTES: usize = 1_048_576;
 #[cfg(unix)]
 const EVENTS_READY_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Maximum response wait for ordinary daemon control requests.
+/// Maximum response wait for status and queued control requests.
+///
+/// The daemon bounds a status snapshot at two seconds and acknowledges
+/// pause/resume/blank/wake/reload after queuing work (`dormantd/src/ipc.rs:314-341`,
+/// `865-875`), so ten seconds leaves transport slack without hiding a wedged daemon.
 #[cfg(unix)]
 const IPC_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// `Exercise` itself permits the daemon twenty seconds of hardware work.
+/// `Exercise` permits the daemon twenty seconds of hardware work
+/// (`dormantd/src/ipc.rs:788-820`), plus five seconds for IPC scheduling.
 #[cfg(unix)]
 const EXERCISE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// The daemon gives portal consent five minutes (`dormantd/src/active_sampler.rs:39`);
+/// the extra ten seconds lets it finish and report the terminal flow outcome.
+#[cfg(unix)]
+const CONSENT_INTERACTION_RESPONSE_TIMEOUT: Duration = Duration::from_secs(310);
+
+/// `wear disable-sampling` has a thirty-second CLI wrapper
+/// (`dormantctl/src/cmd_wear.rs:14`); this must outlive that outer contract.
+#[cfg(unix)]
+const WEAR_SAMPLING_DISABLE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(35);
+
+/// No daemon-side bound exists for operator-configured switch hooks; this 120-second
+/// pragmatic ceiling limits a wedged daemon while issue follow-up must add that bound.
+#[cfg(unix)]
+const SWITCH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Connect to the daemon's socket and send one request, returning the
 /// response.
@@ -457,6 +477,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn consent_requests_outlive_the_daemon_consent_window() {
+        let daemon_consent_window = Duration::from_secs(300);
+
+        for request in [
+            IpcRequest::WearSamplingEnable,
+            IpcRequest::WearSamplingEnableFor {
+                display: "oled".to_owned(),
+            },
+        ] {
+            assert!(
+                response_timeout(&request) > daemon_consent_window,
+                "{request:?} must outlive the daemon's consent window"
+            );
+        }
+    }
+
     /// A foreign/unrecognized `"event"` tag must deserialize to
     /// `DaemonEvent::Unknown` instead of erroring the iterator — an older
     /// `dormantctl` talking to a newer daemon must keep streaming past
@@ -587,8 +624,43 @@ fn read_response(stream: &UnixStream, request: &IpcRequest) -> Result<IpcRespons
 #[cfg(unix)]
 fn response_timeout(request: &IpcRequest) -> Duration {
     match request {
+        // Status bounds its snapshot at two seconds; pause/resume/blank/wake/reload
+        // acknowledge queued work; events owns a two-second readiness handshake;
+        // doctor caps its snapshot/probes at two/five seconds; and emergency-wake
+        // caps the daemon fast-path at two (`dormantd/src/ipc.rs:313-341`, `656-786`,
+        // `865-875`; `dormant-doctor/src/service.rs:68-75`; `client.rs:27-29`).
+        IpcRequest::Status
+        | IpcRequest::Pause { .. }
+        | IpcRequest::Resume { .. }
+        | IpcRequest::Blank { .. }
+        | IpcRequest::Wake { .. }
+        | IpcRequest::Events
+        | IpcRequest::Reload
+        | IpcRequest::Doctor
+        | IpcRequest::EmergencyWake => IPC_RESPONSE_TIMEOUT,
+        // The daemon's hardware exercise bound is twenty seconds
+        // (`dormantd/src/ipc.rs:788-820`).
         IpcRequest::Exercise { .. } => EXERCISE_RESPONSE_TIMEOUT,
-        _ => IPC_RESPONSE_TIMEOUT,
+        // No daemon-side bound exists for operator-configured switch hooks; this
+        // pragmatic ceiling is tracked as a follow-up daemon issue.
+        IpcRequest::SwitchToLocal { .. } | IpcRequest::SwitchToPeer { .. } => {
+            SWITCH_RESPONSE_TIMEOUT
+        }
+        // The daemon gives portal consent five minutes
+        // (`dormantd/src/active_sampler.rs:39`).
+        IpcRequest::WearSamplingEnable | IpcRequest::WearSamplingEnableFor { .. } => {
+            CONSENT_INTERACTION_RESPONSE_TIMEOUT
+        }
+        // Status only borrows the sampler registry
+        // (`dormantd/src/ipc.rs:458-472`, `540-568`).
+        IpcRequest::WearSamplingStatus | IpcRequest::WearSamplingStatusFor { .. } => {
+            IPC_RESPONSE_TIMEOUT
+        }
+        // The CLI's outer disable wrapper permits thirty seconds
+        // (`dormantctl/src/cmd_wear.rs:14`, `233-248`).
+        IpcRequest::WearSamplingDisable { .. } | IpcRequest::WearSamplingDisableFor { .. } => {
+            WEAR_SAMPLING_DISABLE_RESPONSE_TIMEOUT
+        }
     }
 }
 

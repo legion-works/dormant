@@ -11,26 +11,25 @@ use dormantctl::client;
 ///
 /// # Errors
 ///
-/// Propagates connection and I/O errors.
+/// Propagates connection, stream I/O, and unexpected stream-end errors.
 pub fn run(socket_path: &Path, json_output: bool) -> Result<()> {
-    let (stream, _shutdown) = client::connect_events(socket_path)?;
+    let (mut stream, _shutdown) = client::connect_events(socket_path)?;
 
-    for event_result in stream {
-        match event_result {
-            Ok(event) => {
+    loop {
+        match stream.next() {
+            Some(Ok(event)) => {
                 if json_output {
                     println!("{}", serde_json::to_string(&event)?);
                 } else {
                     print_event(&event);
                 }
             }
-            Err(e) => {
-                eprintln!("event error: {e}");
+            Some(Err(e)) => {
+                anyhow::bail!("event stream failed: {e:#}");
             }
+            None => anyhow::bail!("event stream ended unexpectedly: daemon closed connection"),
         }
     }
-
-    Ok(())
 }
 
 /// Print a [`DaemonEvent`] as a human-readable line.
@@ -245,6 +244,45 @@ mod tests {
         assert_eq!(
             fmt_event(&event),
             "display desk: wake recovered after 3 attempts"
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod stream_end_tests {
+    use super::*;
+    use dormant_core::ipc_proto::IpcRequest;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::thread;
+
+    #[test]
+    fn watch_errors_when_daemon_closes_the_event_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("dormant.sock");
+        let listener = UnixListener::bind(&socket).expect("bind fake socket");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept client");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone socket"));
+            let mut request = String::new();
+            reader.read_line(&mut request).expect("read request");
+            assert_eq!(
+                serde_json::from_str::<IpcRequest>(request.trim()).expect("parse request"),
+                IpcRequest::Events
+            );
+            let subscribed = serde_json::to_string(&DaemonEvent::Subscribed).expect("serialize");
+            stream
+                .write_all(subscribed.as_bytes())
+                .and_then(|()| stream.write_all(b"\n"))
+                .expect("send subscribed event");
+        });
+
+        let error = run(&socket, false).expect_err("closed event stream must be an error");
+
+        server.join().expect("fake daemon must finish");
+        assert!(
+            format!("{error:#}").contains("event stream ended unexpectedly"),
+            "stream termination must explain the failure: {error:#}"
         );
     }
 }

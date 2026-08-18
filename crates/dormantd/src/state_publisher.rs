@@ -2683,6 +2683,19 @@ mod tests {
             .filter(|r| r.topic.contains("/display_main/") || r.topic.contains("/zone_main/"))
             .count();
         assert_eq!(topic_count, 1, "first-wins across kinds");
+
+        let mut snapshot = snapshot_one_of_each();
+        snapshot.zones.push(ZoneSnapshot {
+            id: "main".into(),
+            present: Some(true),
+        });
+        let records = snapshot_records(&cfg, &snapshot, "office-pc");
+        assert!(
+            !records
+                .iter()
+                .any(|record| record.topic == "dormant/office-pc/display/main/phase"),
+            "the display must not publish state after the earlier zone wins its sanitized id"
+        );
     }
 
     #[test]

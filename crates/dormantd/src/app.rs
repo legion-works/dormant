@@ -8987,6 +8987,48 @@ mod generation_router_tests {
         assert!(matches!(second, ControlMsg::ForceWake(display) if display.0 == "second"));
     }
 
+    #[tokio::test]
+    async fn event_queue_survives_a_failed_generation_install() {
+        let (old_tx, _old_rx) = mpsc::channel(1);
+        let router = GenerationRouter::new(old_tx);
+        router.pause().await;
+        let cancel = CancellationToken::new();
+        let first = PresenceEvent::new(
+            SensorId("first".into()),
+            SensorState::Present,
+            Timestamp::now(),
+        );
+        let second = PresenceEvent::new(
+            SensorId("second".into()),
+            SensorState::Absent,
+            Timestamp::now(),
+        );
+        assert!(router.route(first, &cancel).await);
+        assert!(router.route(second, &cancel).await);
+
+        let (failed_tx, failed_rx) = mpsc::channel(1);
+        drop(failed_rx);
+        router.install(failed_tx).await;
+
+        let (replacement_tx, mut replacement_rx) = mpsc::channel(2);
+        router.install(replacement_tx).await;
+        let (first, second) = tokio::time::timeout(Duration::from_millis(100), async {
+            let first = replacement_rx
+                .recv()
+                .await
+                .expect("first accepted event remains queued");
+            let second = replacement_rx
+                .recv()
+                .await
+                .expect("second accepted event remains queued");
+            (first, second)
+        })
+        .await
+        .expect("every accepted event is replayed after a replacement generation installs");
+        assert_eq!(first.sensor_id.0, "first");
+        assert_eq!(second.sensor_id.0, "second");
+    }
+
     // Issue #209: `route_control` must release the router mutex before
     // `target.send(message).await` so a full target channel cannot block
     // `pause()` (reload quiesce). With a cap-1 channel pre-filled, the

@@ -35,6 +35,11 @@ use dormant_displays::executor::{DisplayExecutor, RetrySettings};
 use dormant_displays::registry;
 use dormant_displays::registry::ControllerBuildContext;
 
+// Direct hardware can legitimately take longer than the IPC fast path while a
+// controller recovers a bus, but five seconds still bounds a wedged I²C call
+// so the final gamma restore and operator report cannot be held forever.
+const DIRECT_HARDWARE_WAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
 // ── CLI surface ────────────────────────────────────────────────────────────────
 
 /// Arguments accepted by `dormantctl emergency-wake`.
@@ -497,14 +502,14 @@ pub(crate) async fn probe_and_wake_all(
     }
 
     let mut results: Vec<EmergencyWakeResult> = Vec::new();
-    for (display_id, handle) in handles {
-        match handle.await {
-            Ok((display_id, Ok(()))) => results.push(EmergencyWakeResult {
+    for (display_id, mut handle) in handles {
+        match tokio::time::timeout(DIRECT_HARDWARE_WAKE_TIMEOUT, &mut handle).await {
+            Ok(Ok((display_id, Ok(())))) => results.push(EmergencyWakeResult {
                 display: display_id,
                 ok: true,
                 error: None,
             }),
-            Ok((display_id, Err(failure))) => {
+            Ok(Ok((display_id, Err(failure)))) => {
                 eprintln!(
                     "warning: direct-hardware wake failed for {display_id}: {}",
                     failure.error
@@ -515,9 +520,22 @@ pub(crate) async fn probe_and_wake_all(
                     error: Some(failure.error),
                 });
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 eprintln!("warning: spawned wake task panicked: {e}");
                 results.push(panic_wake_result(display_id, &e));
+            }
+            Err(_) => {
+                handle.abort();
+                let error = format!(
+                    "direct-hardware wake timed out after {} seconds",
+                    DIRECT_HARDWARE_WAKE_TIMEOUT.as_secs()
+                );
+                eprintln!("warning: direct-hardware wake failed for {display_id}: {error}");
+                results.push(EmergencyWakeResult {
+                    display: display_id,
+                    ok: false,
+                    error: Some(error),
+                });
             }
         }
     }
@@ -1094,6 +1112,7 @@ mod tests {
     struct ProbeRequiringInner {
         probed: bool,
         panic_on_wake: bool,
+        hang_on_wake: bool,
         wake_results: VecDeque<Result<(), CmdFailure>>,
         probe_calls: usize,
         wake_calls: usize,
@@ -1112,6 +1131,10 @@ mod tests {
 
         fn panic_on_wake(&self) {
             self.inner.lock().unwrap().panic_on_wake = true;
+        }
+
+        fn hang_on_wake(&self) {
+            self.inner.lock().unwrap().hang_on_wake = true;
         }
 
         #[allow(dead_code)]
@@ -1157,16 +1180,22 @@ mod tests {
         }
 
         async fn wake(&self) -> Result<(), CmdFailure> {
-            let mut g = self.inner.lock().unwrap();
-            g.wake_calls += 1;
-            assert!(!g.panic_on_wake, "scripted wake panic");
-            if !g.probed {
-                return Err(CmdFailure {
-                    controller: "probe-requiring".into(),
-                    error: format!("{E_DISPLAY_IO}: controller not probed"),
-                });
+            let (hang_on_wake, result) = {
+                let mut g = self.inner.lock().unwrap();
+                g.wake_calls += 1;
+                assert!(!g.panic_on_wake, "scripted wake panic");
+                if !g.probed {
+                    return Err(CmdFailure {
+                        controller: "probe-requiring".into(),
+                        error: format!("{E_DISPLAY_IO}: controller not probed"),
+                    });
+                }
+                (g.hang_on_wake, g.wake_results.pop_front().unwrap_or(Ok(())))
+            };
+            if hang_on_wake {
+                std::future::pending().await
             }
-            g.wake_results.pop_front().unwrap_or(Ok(()))
+            result
         }
 
         async fn read_state(&self) -> Option<PanelState> {
@@ -1331,5 +1360,50 @@ mod tests {
         let report = probe_and_wake_all(Vec::new(), HashMap::new()).await;
         assert!(!report.paused, "fallback path sets paused=false");
         assert!(report.displays.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn probe_and_wake_all_times_out_one_display_and_reports_the_rest() {
+        let wedged_display = DisplayId("wedged".into());
+        let responsive_display = DisplayId("responsive".into());
+        let wedged = ProbeRequiringController::new();
+        wedged.hang_on_wake();
+        let responsive = ProbeRequiringController::new();
+        responsive.push_wake_result(Ok(()));
+
+        let run = tokio::spawn(probe_and_wake_all(
+            vec![
+                executor_with_controller(wedged_display.clone(), wedged),
+                executor_with_controller(responsive_display.clone(), responsive),
+            ],
+            HashMap::new(),
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(6)).await;
+
+        let report = tokio::time::timeout(Duration::from_millis(1), run)
+            .await
+            .expect("a wedged display must not prevent the fallback report")
+            .expect("wake aggregation task must not panic");
+
+        let wedged_row = report
+            .displays
+            .iter()
+            .find(|row| row.display == wedged_display)
+            .expect("wedged display must be reported");
+        assert!(!wedged_row.ok);
+        assert!(
+            wedged_row
+                .error
+                .as_deref()
+                .is_some_and(|detail| detail.contains("timed out")),
+            "wedged display must name the timeout: {wedged_row:?}"
+        );
+        let responsive_row = report
+            .displays
+            .iter()
+            .find(|row| row.display == responsive_display)
+            .expect("responsive display must still be attempted");
+        assert!(responsive_row.ok, "responsive display must still wake");
     }
 }

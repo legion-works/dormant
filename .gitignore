@@ -3,6 +3,12 @@
 
 # Rust (once scaffolded)
 /target/
+
+# The nextest-policy fixture is a real crate that verify_nextest_policy.py
+# builds in place, so running that gate locally leaves a lockfile and a target
+# directory behind. Neither is an input to the check.
+/.github/fixtures/nextest-policy/Cargo.lock
+/.github/fixtures/nextest-policy/target/
 Cargo.lock.orig
 
 # editor / OS noise

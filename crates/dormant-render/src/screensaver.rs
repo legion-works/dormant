@@ -512,6 +512,28 @@ impl MpvPlayer {
         Ok(())
     }
 
+    /// Re-target the software renderer at a new output rectangle — called
+    /// when the compositor resizes a live screensaver surface (issue #316).
+    ///
+    /// The mpv SW render API takes size/format/stride PER
+    /// `mpv_render_context_render` call (see [`Self::render_frame_into`] —
+    /// `MPV_RENDER_PARAM_SW_SIZE` et al. are read on each render), so no
+    /// render-context recreation is needed: only these fields, which the
+    /// next render call reads, are updated.  `stride` is recomputed
+    /// here (bytes-per-row = `width * 4`, XRGB8888) with the same
+    /// overflow discipline as the constructor.
+    pub fn set_output_size(&mut self, width: u32, height: u32) -> Result<(), MpvError> {
+        let width_i = i32::try_from(width).map_err(|e| MpvError::Init(format!("width: {e}")))?;
+        let height_i = i32::try_from(height).map_err(|e| MpvError::Init(format!("height: {e}")))?;
+        let stride = width_i
+            .checked_mul(4)
+            .ok_or_else(|| MpvError::Init("stride overflow".into()))?;
+        self.width = width_i;
+        self.height = height_i;
+        self.stride = stride;
+        Ok(())
+    }
+
     /// Drain mpv's pending events and render the current frame into
     /// `buf`.  Returns `Ok(true)` if a new frame was drawn, `Ok(false)`
     /// if no frame was ready (caller may still want to commit to keep

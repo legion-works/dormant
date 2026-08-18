@@ -950,6 +950,89 @@ fn black_buffer_needs_rebuild(
     buffer_size != Some(configured_size)
 }
 
+/// Screensaver twin of [`black_buffer_needs_rebuild`] (issues #273 / #316):
+/// a live compositor resize changes the size every consumer of the
+/// session's shm pool assumes (mpv's SW render rect, the double-buffer
+/// offsets, the damage rects), so a pool built at a different size must
+/// be rebuilt rather than quietly drawn at the pre-resize dimensions.
+/// `session_dims` is the pool's allocation size (`ScreensaverSession`'s
+/// `width`/`height` — the oversized render dims when pixel-shift is
+/// active), `desired` is `render_dims(new_configured_size)`.
+fn screensaver_buffers_need_rebuild(session_dims: Option<(u32, u32)>, desired: (u32, u32)) -> bool {
+    session_dims != Some(desired)
+}
+
+/// Per-session calloop tokens a live-resize rebuild can touch.  The
+/// sweep table below is the enumerated answer to "what does the rebuild
+/// invalidate" — the deliverable that stops a fourth unswept twin in
+/// the #273 → #316 → item-load chain (each prior fix cleaned up the
+/// size-bound state it was thinking about and left a sibling token
+/// stale).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RebuildTokenKind {
+    /// Crossfade timer inside `TransitionState` — guards the size-bound
+    /// capture buffer / blend geometry the rebuild discards.
+    Transition,
+    /// Per-item `FILE_LOADED` deadline — armed against a `Captured`
+    /// transition phase.  If left stale while `transition` is dropped,
+    /// its one-shot fires into a now-`None` transition (a no-op that
+    /// never clears the token), and `arm_item_load_timer`'s
+    /// `is_some()` early-return then suppresses EVERY future item-load
+    /// deadline: the #274 freeze class (playback silently stops
+    /// advancing, invisible to any non-hardware test).
+    ItemLoad,
+    /// First-frame deadline — protects against a dead player.  A resize
+    /// neither voids nor extends that protection; when the rebuild's own
+    /// render produces the first frame the token is removed explicitly
+    /// (mirroring `on_mpv_wakeup`'s first-frame bookkeeping).
+    ///
+    /// Never constructed by production code: retention needs no call
+    /// site — only the tests pin that the table maps this kind to
+    /// Retain rather than accidentally cancelling it.
+    #[allow(dead_code)]
+    FirstFrame,
+    /// The mpv wakeup pipe's calloop registration — the pipe (read fd,
+    /// write fd, player) survives the rebuild untouched, so the
+    /// registration does too.
+    ///
+    /// Never constructed by production code: see `FirstFrame`.
+    #[allow(dead_code)]
+    Wakeup,
+}
+
+/// Whether a rebuild cancels or deliberately retains a token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RebuildTokenAction {
+    /// Arming context is discarded by the rebuild — cancel before drop.
+    Cancel,
+    /// Arming context survives the rebuild — keep the token armed.
+    Retain,
+}
+
+/// The rebuild token sweep: `Transition` + `ItemLoad` are bound to the
+/// discarded size-dependent transition state; `FirstFrame` + `Wakeup`
+/// guard resources (player liveness, pipe) that survive the rebuild.
+fn rebuild_token_action(kind: RebuildTokenKind) -> RebuildTokenAction {
+    match kind {
+        RebuildTokenKind::Transition | RebuildTokenKind::ItemLoad => RebuildTokenAction::Cancel,
+        RebuildTokenKind::FirstFrame | RebuildTokenKind::Wakeup => RebuildTokenAction::Retain,
+    }
+}
+
+/// Whether the resize rebuild renders the current picture into the new
+/// buffer BEFORE the visible commit (fix-round 2, #316).  Post-first-
+/// frame the player holds a current picture the SW render API draws
+/// unconditionally (`render_frame_into_unconditionally_draws_current_
+/// picture`), and a STATIC item may emit no further mpv wakeup until
+/// the next item duration — committing the freshly allocated (zeroed)
+/// buffer unrendered would strand the resized surface on black, worse
+/// than the wrong-size draw #316 fixes.  Pre-first-frame there is
+/// nothing to draw: the zeroed commit is byte-identical to the install
+/// path, and the retained first-frame deadline still guards that case.
+fn rebuild_commits_rendered_frame(has_first_frame: bool) -> bool {
+    has_first_frame
+}
+
 impl WaylandState {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
@@ -1563,6 +1646,26 @@ impl WaylandState {
             // resize an existing live surface (e.g. output geometry
             // change).  Track the new size and re-aim the viewport.
             self.configured_size = configured_size;
+
+            // #316 (twin of #273): a live resize while the screensaver
+            // is attached must rebuild its shm pool — without this the
+            // session keeps rendering into buffers sized for the
+            // pre-resize surface and the compositor draws the stale
+            // small frame at (0, 0).  The black overlay (#273) gets the
+            // same treatment lazily on its next (re-)show via
+            // `black_buffer_needs_rebuild`; the screensaver has no
+            // re-show trigger, so the pool is rebuilt inline here.
+            let session_dims = self
+                .screensaver_session
+                .as_ref()
+                .map(|session| (session.width, session.height));
+            if session_dims.is_some() {
+                let desired = self.render_dims(configured_size);
+                if screensaver_buffers_need_rebuild(session_dims, desired) {
+                    self.rebuild_screensaver_buffers(configured_size);
+                }
+            }
+
             if let (Some(viewport), true) = (&self.viewport, self.surface_up) {
                 self.wayland_ops.viewport_set_destination(
                     viewport.as_ref(),
@@ -1928,6 +2031,157 @@ impl WaylandState {
             r#gen,
         );
         Ok(())
+    }
+
+    /// Rebuild a live screensaver session's shm pool + double buffers
+    /// after a compositor-initiated resize (#316, the screensaver twin of
+    /// #273).  Mirrors the install path ([`Self::complete_screensaver_show`])
+    /// minus the player/playlist/scaffold construction: re-install the
+    /// shift viewport at the new `configured_size`, allocate a fresh pool
+    /// at `render_dims(configured_size)`, re-target the mpv software
+    /// renderer with the new dims, draw the current picture into the new
+    /// buffer, then attach + commit and swap the rebuilt halves into the
+    /// session.
+    ///
+    /// U5 is preserved: this method runs ONLY while a screensaver
+    /// session is live (the caller gates on
+    /// `self.screensaver_session.is_some()`); the black overlay never
+    /// reaches any shift-viewport install.
+    ///
+    /// Token sweep (see [`rebuild_token_action`], fix-round 2): the
+    /// crossfade timer AND the item-load deadline are cancelled before
+    /// the transition state is dropped — a stale `item_load_token`
+    /// suppresses every future item-load deadline (the #274 freeze
+    /// class).  The first-frame deadline and the mpv wakeup registration
+    /// are deliberately retained: a resize changes neither the "mpv
+    /// produced nothing" risk nor the pipe.
+    ///
+    /// A crossfade cannot survive a resize — the capture buffer and the
+    /// blend geometry are both bound to the old dims — so the transition
+    /// state is dropped wholesale (a deliberate hard cut); the next
+    /// `ItemEnded` starts a fresh cycle with a capture taken at the new
+    /// size.
+    ///
+    /// Any failure degrades to the existing recovery path
+    /// (`fail_screensaver_to_black`) — a resize must never strand the
+    /// display without a drawable surface.
+    fn rebuild_screensaver_buffers(&mut self, configured_size: (u32, u32)) {
+        let Some(wl_surface) = self
+            .layer_surface
+            .as_ref()
+            .map(|surface| surface.wl_surface().clone())
+        else {
+            return;
+        };
+        // Restart the shift walk at the new geometry — same as the install
+        // path ordering (reset, then ensure).  `reset_shift` also unsets
+        // the stale source crop, which would extend past the new,
+        // differently-sized buffers until re-aimed.
+        self.reset_shift();
+        let shift_viewport = self.ensure_shift_viewport(&wl_surface, configured_size);
+        let (width, height) = self.render_dims(configured_size);
+        let Some(stride) = width.checked_mul(4) else {
+            self.fail_screensaver_to_black("resize rebuild: stride overflow");
+            return;
+        };
+        let (pool, [buf0, buf1]) =
+            match create_screensaver_buffers(self.wayland_ops.as_ref(), width, height, stride) {
+                Ok(parts) => parts,
+                Err(e) => {
+                    self.fail_screensaver_to_black(&format!("resize rebuild: RawPool::new: {e}"));
+                    return;
+                }
+            };
+
+        let loop_handle = self.loop_handle.clone();
+        let Some(session) = self.screensaver_session.as_mut() else {
+            // Torn down concurrently (teardown raced this configure) —
+            // the rebuilt pool simply drops here.
+            return;
+        };
+
+        // ── Token sweep (Must 2, fix-round 2 review) ────────────────
+        // Cancel every token whose arming context the rebuild discards.
+        // The Cancel/Retain decision per token lives in the documented
+        // sweep table (`rebuild_token_action`); the Retain arms
+        // (first-frame deadline, pipe wakeup) are left alone on purpose.
+        if rebuild_token_action(RebuildTokenKind::Transition) == RebuildTokenAction::Cancel {
+            cancel_transition_timer_for(session, loop_handle.as_ref());
+        }
+        if rebuild_token_action(RebuildTokenKind::ItemLoad) == RebuildTokenAction::Cancel {
+            cancel_item_load_timer_for(session, loop_handle.as_ref());
+        }
+        session.transition = None;
+
+        if let Err(e) = session.player.set_output_size(width, height) {
+            // The new pool exists but mpv can't bind the new dims —
+            // drop to black via the existing recovery path
+            // (`destroy_screensaver_session` removes every armed timer).
+            self.fail_screensaver_to_black(&format!("resize rebuild: renderer resize: {e}"));
+            return;
+        }
+
+        // ── Render the current picture BEFORE the visible commit ────
+        // (Must 1, fix-round 2 review.)  A static screensaver item can
+        // go its whole display duration without an mpv wakeup that
+        // would draw over a zeroed buffer; `render_frame_into` draws
+        // the current picture unconditionally (same SW-render
+        // behaviour `on_mpv_wakeup` relies on), so the commit below
+        // carries the SAME image at the correct size rather than
+        // black.  Render errors mirror the wakeup path: fatal for the
+        // session, degrade to black.
+        if rebuild_commits_rendered_frame(session.has_first_frame) {
+            let buf_len = (stride as usize) * (height as usize);
+            let render_result: Result<(), String> =
+                real_pool_with_region_mut(pool.as_ref(), 0, buf_len, |back_slice| {
+                    back_slice.fill(0);
+                    session
+                        .player
+                        .render_frame_into(back_slice)
+                        .map(|_| ())
+                        .map_err(|e| format!("{e}"))
+                });
+            if let Err(e) = render_result {
+                self.fail_screensaver_to_black(&format!("resize rebuild: {e}"));
+                return;
+            }
+        }
+
+        // Attach + commit, THEN swap the session halves: the surface
+        // references the OLD buffers until this commit takes effect, so
+        // the old pool must only drop (at the `session.pool` reassignment
+        // below) after the surface has been pointed at the new one.
+        // `wl_buffer.release` remains the compositor's done-signal for
+        // per-buffer reuse bookkeeping (`buffers_busy`); the protocol
+        // itself permits destroying the previous `wl_shm_pool` once
+        // the surface no longer references its buffers.
+        wl_surface.attach(Some(real_buffer(buf0.as_ref())), 0, 0);
+        wl_surface.damage_buffer(0, 0, width.cast_signed(), height.cast_signed());
+        wl_surface.commit();
+
+        session.pool = pool;
+        session.buffers = [buf0, buf1];
+        session.width = width;
+        session.height = height;
+        session.stride = stride;
+        session.next_render_idx = 1;
+        // buf0 was attached above; the compositor hasn't released it yet.
+        session.buffers_busy = [true, false];
+
+        // NOTE: mirror of the install path — only overwrite `self.viewport`
+        // when shift actually built one (see `complete_screensaver_show`).
+        if let Some(vp) = shift_viewport {
+            self.viewport = Some(vp);
+        }
+        self.maybe_arm_shift_timer();
+
+        tracing::info!(
+            event = "render_screensaver_resized",
+            display_id = %self.display_id,
+            output = %self.output_name,
+            width,
+            height,
+        );
     }
 
     /// Configure-timeout equivalent for the screensaver: fires after
@@ -3420,6 +3674,88 @@ mod tests {
         ));
         assert!(black_buffer_needs_rebuild(Some((1920, 1080)), (2560, 1440)));
         assert!(black_buffer_needs_rebuild(None, (2560, 1440)));
+    }
+
+    #[test]
+    fn screensaver_same_size_does_not_rebuild() {
+        assert!(!screensaver_buffers_need_rebuild(
+            Some((1920, 1080)),
+            (1920, 1080)
+        ));
+    }
+
+    #[test]
+    fn screensaver_grow_rebuilds() {
+        assert!(screensaver_buffers_need_rebuild(
+            Some((1920, 1080)),
+            (2560, 1440)
+        ));
+    }
+
+    #[test]
+    fn screensaver_shrink_rebuilds() {
+        assert!(screensaver_buffers_need_rebuild(
+            Some((2560, 1440)),
+            (1920, 1080)
+        ));
+    }
+
+    #[test]
+    fn screensaver_height_only_resize_rebuilds() {
+        // Width identical, height changed — a width-only comparison
+        // misses this class (deletion-only mutation sweeps have).
+        assert!(screensaver_buffers_need_rebuild(
+            Some((1920, 1080)),
+            (1920, 1440)
+        ));
+    }
+
+    #[test]
+    fn screensaver_first_attach_rebuilds() {
+        // No live session dims (None) can never match a real size.
+        assert!(screensaver_buffers_need_rebuild(None, (2560, 1440)));
+    }
+
+    #[test]
+    fn rebuild_token_sweep_cancels_transition_and_item_load() {
+        assert_eq!(
+            rebuild_token_action(RebuildTokenKind::Transition),
+            RebuildTokenAction::Cancel,
+            "transition timer guards the size-bound capture/blend state the rebuild discards"
+        );
+        assert_eq!(
+            rebuild_token_action(RebuildTokenKind::ItemLoad),
+            RebuildTokenAction::Cancel,
+            "a stale item-load token suppresses every future item-load deadline (#274 freeze class)"
+        );
+    }
+
+    #[test]
+    fn rebuild_token_sweep_retains_first_frame_and_wakeup() {
+        assert_eq!(
+            rebuild_token_action(RebuildTokenKind::FirstFrame),
+            RebuildTokenAction::Retain,
+            "a resize neither voids nor extends the dead-player deadline"
+        );
+        assert_eq!(
+            rebuild_token_action(RebuildTokenKind::Wakeup),
+            RebuildTokenAction::Retain,
+            "the mpv wakeup pipe (read fd, player) survives the rebuild untouched"
+        );
+    }
+
+    #[test]
+    fn rebuild_renders_before_commit_once_first_frame_exists() {
+        // Post-first-frame the SW renderer always has a current picture;
+        // a static item may not wake before the next item duration.
+        assert!(rebuild_commits_rendered_frame(true));
+    }
+
+    #[test]
+    fn rebuild_commits_zeroed_buffer_only_pre_first_frame() {
+        // Pre-first-frame there is no picture to draw — the zeroed
+        // commit is install-path behaviour.
+        assert!(!rebuild_commits_rendered_frame(false));
     }
 
     // ── surface_match tests (round-3 — M2 stale-event guard) ───────────

@@ -458,6 +458,28 @@ mod tests {
     }
 
     #[test]
+    fn baked_mark_uses_straight_alpha_channels() {
+        let set = IconSet::load();
+        let (_, pixels) = set.base.first().expect("at least one baked mark size");
+
+        assert!(
+            pixels.chunks_exact(4).any(|pixel| pixel == [0, 0, 0, 0]),
+            "the transparent margin must retain zeroed RGB"
+        );
+        assert!(
+            pixels.chunks_exact(4).any(|pixel| pixel[0] == u8::MAX),
+            "the mark must retain opaque pixels"
+        );
+        assert!(
+            pixels.chunks_exact(4).any(|pixel| {
+                let alpha = pixel[0];
+                alpha > 0 && alpha < u8::MAX && pixel[1..].iter().any(|&channel| channel > alpha)
+            }),
+            "a partially transparent straight-alpha pixel must retain a channel above alpha"
+        );
+    }
+
+    #[test]
     fn failure_badge_writes_red_in_bottom_right_quadrant() {
         // 24×24 fixture with one fully-opaque white pixel per location.
         let size = 24u32;

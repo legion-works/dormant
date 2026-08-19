@@ -36,7 +36,14 @@ fi
 # that cannot finish in the budget.
 readonly update_timeout="${APT_UPDATE_TIMEOUT:-120}"
 readonly install_timeout="${APT_INSTALL_TIMEOUT:-180}"
-readonly attempts="${APT_ATTEMPTS:-3}"
+# Two retries, not three: the install-first pass above is itself an install
+# attempt, so the total is still three. Keeping it at three would ADD a whole
+# install budget to the worst case and push five jobs past their
+# timeout-minutes caps, where GitHub kills the job with no step diagnostic —
+# the opaque failure these bounds exist to prevent. As sized, the worst case is
+# strictly shorter than before install-first existed (render 34min vs 36min,
+# test 25min vs 27min).
+readonly attempts="${APT_ATTEMPTS:-2}"
 
 # GitHub's runners point at a region-local Azure mirror. When that mirror is
 # the thing stalling, retrying against it is just a slower way to fail: on

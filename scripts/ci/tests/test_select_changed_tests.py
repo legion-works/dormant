@@ -474,11 +474,11 @@ rename to crates/example/tests/renamed.rs
                 result = select_changed_tests.run_targets(root, [target], 1)
             self.assertEqual(result, 0)
 
-    def test_run_targets_fails_genuinely_empty_target(self):
-        """A target with zero tests even after --run-ignored all still fails."""
+    def test_run_targets_fails_genuinely_empty_integration_target(self):
+        """An empty INTEGRATION target still fails: it exists only to hold tests."""
         target = select_changed_tests.Target("example", "test", "buggy-filter")
 
-        # Both list calls return empty — the selector is broken.
+        # Both list calls return empty — the selection is wrong for this kind.
         def fake_run(cmd, **kwargs):
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
@@ -487,6 +487,38 @@ rename to crates/example/tests/renamed.rs
             with unittest.mock.patch.object(subprocess, "run", side_effect=fake_run):
                 result = select_changed_tests.run_targets(root, [target], 1)
             self.assertEqual(result, 1)
+
+    def test_run_targets_skips_test_free_bin_target(self):
+        """A bin target with no test code is legitimate, not a selection failure.
+
+        crates/dormant-tray/src/main.rs carries no #[cfg(test)] code, so
+        `-p dormant-tray --bin dormant-tray` lists zero tests. That previously
+        returned 1 and failed changed-test-stress on every dormant-tray change,
+        even with all 120 lib tests passing three stress iterations.
+        """
+        target = select_changed_tests.Target("dormant-tray", "bin", "dormant-tray")
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            with unittest.mock.patch.object(subprocess, "run", side_effect=fake_run):
+                result = select_changed_tests.run_targets(root, [target], 1)
+            self.assertEqual(result, 0)
+
+    def test_run_targets_skips_test_free_lib_target(self):
+        """Same for a lib target — a crate may hold only integration tests."""
+        target = select_changed_tests.Target("example", "lib", "example")
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            with unittest.mock.patch.object(subprocess, "run", side_effect=fake_run):
+                result = select_changed_tests.run_targets(root, [target], 1)
+            self.assertEqual(result, 0)
 
     def test_run_targets_normal_target_unaffected(self):
         """A normal target with runnable tests is not affected by the ignored check."""

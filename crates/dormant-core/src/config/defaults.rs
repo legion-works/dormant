@@ -152,6 +152,12 @@ pub const COORDINATION_REPROBE_MAX_INTERVAL: Duration = Duration::from_secs(120)
 /// Timeout for one shared-display hook action.
 pub const HOOK_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Maximum total time hooks may delay one display-switch operation.  The
+/// 90-second ceiling leaves the IPC client's 120-second response budget room
+/// for the input-source write and daemon scheduling while preventing a hook
+/// sequence from wedging a switch indefinitely.
+pub const HOOK_TOTAL_TIMEOUT: Duration = Duration::from_secs(90);
+
 /// Default timeout for a single pairing-wizard attempt (validated to
 /// `30s..=300s` — see [`mod@super::validate`]).
 pub const PAIR_TIMEOUT: Duration = Duration::from_secs(120);

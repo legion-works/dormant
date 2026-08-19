@@ -16,6 +16,7 @@ use std::time::Duration;
 use crate::types::{BlankMode, SensorId, StageKind};
 use crate::zone::{ZoneEngine, ZoneSpec};
 
+use super::defaults;
 use super::schema::{
     Config, Credentials, DisplayConfig, DisplayScope, HookAction, ValidationError,
 };
@@ -285,6 +286,7 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
     (
         "displays..hooks",
         &[
+            "timeout",
             "before_release",
             "after_release",
             "before_acquire",
@@ -2342,6 +2344,24 @@ fn validate_hooks(
         ("after_acquire", &display.hooks.after_acquire),
         ("on_observed_loss", &display.hooks.on_observed_loss),
     ];
+    if display.hooks.timeout < Duration::from_millis(100) {
+        errors.push(ValidationError {
+            what: crate::error::E_CONFIG_INVALID.into(),
+            detail: format!(
+                "display '{display_id}' hooks.timeout {:?} is below the minimum of 100ms",
+                display.hooks.timeout
+            ),
+        });
+    }
+    if display.hooks.timeout > defaults::HOOK_TOTAL_TIMEOUT {
+        errors.push(ValidationError {
+            what: crate::error::E_CONFIG_INVALID.into(),
+            detail: format!(
+                "display '{display_id}' hooks.timeout exceeds the maximum of {:?}",
+                defaults::HOOK_TOTAL_TIMEOUT
+            ),
+        });
+    }
     for (slot, actions) in slots {
         if display.scope != DisplayScope::Shared && !actions.is_empty() {
             errors.push(ValidationError {
@@ -2350,7 +2370,15 @@ fn validate_hooks(
             });
         }
         for (index, action) in actions.iter().enumerate() {
-            validate_hook_action(display_id, slot, index, action, has_mqtt_broker, errors);
+            validate_hook_action(
+                display_id,
+                slot,
+                index,
+                action,
+                display.hooks.timeout,
+                has_mqtt_broker,
+                errors,
+            );
         }
     }
 }
@@ -2360,6 +2388,7 @@ fn validate_hook_action(
     slot: &str,
     index: usize,
     action: &HookAction,
+    total_timeout: Duration,
     has_mqtt_broker: bool,
     errors: &mut Vec<ValidationError>,
 ) {
@@ -2387,6 +2416,14 @@ fn validate_hook_action(
         errors.push(ValidationError {
             what: crate::error::E_CONFIG_INVALID.into(),
             detail: format!("display '{display_id}' hooks.{slot}[{index}] timeout {:?} is below the minimum of 100ms", action.timeout),
+        });
+    }
+    if action.timeout > total_timeout {
+        errors.push(ValidationError {
+            what: crate::error::E_CONFIG_INVALID.into(),
+            detail: format!(
+                "display '{display_id}' hooks.{slot}[{index}] timeout exceeds hooks.timeout"
+            ),
         });
     }
 }
@@ -2884,6 +2921,45 @@ gracee_period = "60s"
                 .iter()
                 .any(|error| error.what == crate::error::E_CONFIG_INVALID
                     && error.detail.contains("has hooks but is not shared"))
+        );
+    }
+
+    #[test]
+    fn kvm_hook_action_timeout_must_not_exceed_total_hook_timeout() {
+        let errors = validate_str(
+            "config_version = 1\n[displays.main]\ncontrollers = [\"ddcci\"]\nscope = \"shared\"\nshared_input_code = 1\nblank_mode = \"power_off\"\n[displays.main.hooks]\ntimeout = \"1s\"\nbefore_release = [{ command = [\"true\"], timeout = \"2s\" }]\n",
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.what == crate::error::E_CONFIG_INVALID
+                    && error.detail.contains("timeout exceeds hooks.timeout")),
+            "per-action timeout above the total hook timeout must be rejected: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn kvm_hook_total_timeout_is_known_in_strict_mode() {
+        let result = load_str_strict(
+            "config_version = 1\n[displays.main]\ncontrollers = [\"ddcci\"]\nscope = \"shared\"\nshared_input_code = 1\nblank_mode = \"power_off\"\n[displays.main.hooks]\ntimeout = \"1s\"\nbefore_release = []\n",
+        );
+        assert!(
+            result.is_ok(),
+            "hooks.timeout must be accepted by strict unknown-key validation: {result:?}"
+        );
+    }
+
+    #[test]
+    fn kvm_hook_total_timeout_must_not_exceed_client_bound() {
+        let errors = validate_str(
+            "config_version = 1\n[displays.main]\ncontrollers = [\"ddcci\"]\nscope = \"shared\"\nshared_input_code = 1\nblank_mode = \"power_off\"\n[displays.main.hooks]\ntimeout = \"91s\"\nbefore_release = []\n",
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.what == crate::error::E_CONFIG_INVALID
+                    && error.detail.contains("hooks.timeout exceeds the maximum")),
+            "the total hook timeout must preserve the IPC client's ceiling: {errors:?}"
         );
     }
 

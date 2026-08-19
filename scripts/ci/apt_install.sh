@@ -31,6 +31,32 @@ readonly update_timeout=120
 readonly install_timeout=180
 readonly attempts=3
 
+# GitHub's runners point at a region-local Azure mirror. When that mirror is
+# the thing stalling, retrying against it is just a slower way to fail: on
+# 2026-08-19 all three attempts timed out in five jobs across two pull
+# requests, ~6m50s each, entirely inside apt. Falling back to the canonical
+# archive on later attempts routes around a single-mirror outage, which is what
+# the retry comment below already claimed to do and did not.
+readonly fallback_mirror='http://archive.ubuntu.com/ubuntu'
+
+# Both layouts exist across runner images: 24.04 ships deb822, older releases
+# the one-line format. Rewriting whichever is present is enough; a missing file
+# is not an error, it just means that layout is not in use here.
+switch_to_fallback_mirror() {
+  local switched=0 f
+  for f in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do
+    [[ -f $f ]] || continue
+    if sudo sed -i -E "s#https?://[a-z0-9.-]*archive\.ubuntu\.com/ubuntu#${fallback_mirror}#g" "$f" 2>/dev/null; then
+      switched=1
+    fi
+  done
+  if (( switched == 1 )); then
+    printf 'apt_install: switched to %s for the next attempt\n' "$fallback_mirror" >&2
+  else
+    printf '%s\n' 'apt_install: no sources file to rewrite; retrying same mirror' >&2
+  fi
+}
+
 export DEBIAN_FRONTEND=noninteractive
 
 attempt=1
@@ -39,10 +65,16 @@ while (( attempt <= attempts )); do
   # exit status. Reading $? after the `if` block instead yields the status of
   # the `if` statement itself — always 0 — which silently disables the timeout
   # detection below and logs every failure as "exit 0".
-  if timeout "$update_timeout" sudo -E apt-get update \
+  # apt's own stderr is captured rather than inherited: `timeout` kills the
+  # child mid-write, so letting it stream means a stalled attempt often prints
+  # nothing about WHY. Keeping a tail gives the next reader the mirror host and
+  # the failing URL instead of a bare "timed out".
+  err_log="$(mktemp)"
+  if timeout "$update_timeout" sudo -E apt-get update 2>"$err_log" \
     && timeout "$install_timeout" sudo -E apt-get install -y \
-      --no-install-recommends "$@"; then
+      --no-install-recommends "$@" 2>>"$err_log"; then
     printf 'apt_install: installed %d package(s) on attempt %d\n' "$#" "$attempt"
+    rm -f "$err_log"
     exit 0
   else
     status=$?
@@ -57,10 +89,21 @@ while (( attempt <= attempts )); do
     printf 'apt_install: attempt %d/%d failed (exit %d)\n' \
       "$attempt" "$attempts" "$status" >&2
   fi
+  if [[ -s $err_log ]]; then
+    printf '%s\n' 'apt_install: last apt stderr (tail):' >&2
+    tail -n 5 "$err_log" >&2
+  fi
+  rm -f "$err_log"
 
   if (( attempt == attempts )); then
     printf '%s\n' 'apt_install: all attempts exhausted' >&2
     exit 1
+  fi
+
+  # Only after the first failure — attempt 1 should use the runner's own
+  # mirror, which is normally faster than the canonical archive.
+  if (( attempt == 1 )); then
+    switch_to_fallback_mirror
   fi
 
   # Linear backoff. An archive stall is usually brief and often resolves on a

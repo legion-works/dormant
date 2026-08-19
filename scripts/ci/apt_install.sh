@@ -34,16 +34,22 @@ fi
 # every attempt and only the 105 MB download was being cut off. A job whose
 # timeout-minutes cap allows it should raise these rather than retry a download
 # that cannot finish in the budget.
-readonly update_timeout="${APT_UPDATE_TIMEOUT:-120}"
-readonly install_timeout="${APT_INSTALL_TIMEOUT:-180}"
-# Two retries, not three: the install-first pass above is itself an install
-# attempt, so the total is still three. Keeping it at three would ADD a whole
-# install budget to the worst case and push five jobs past their
-# timeout-minutes caps, where GitHub kills the job with no step diagnostic —
-# the opaque failure these bounds exist to prevent. As sized, the worst case is
-# strictly shorter than before install-first existed (render 34min vs 36min,
-# test 25min vs 27min).
-readonly attempts="${APT_ATTEMPTS:-2}"
+readonly update_timeout="${APT_UPDATE_TIMEOUT:-90}"
+readonly install_timeout="${APT_INSTALL_TIMEOUT:-120}"
+# Three retries after the install-first pass, so four independent tries total.
+# Measured 2026-08-19: in one run seven of eight apt jobs succeeded and one
+# failed, and WHICH job fails varies per run (policy on one PR, stress-ubuntu on
+# another, same budgets, same minute, same mirrors). So the failure is
+# per-connection variance, not a dead network or a misconfigured job — when the
+# path is slow no budget rescues it, and when it is healthy 60s suffices.
+#
+# That makes MORE tries strictly better than LONGER ones, which is why the
+# budgets above are deliberately shorter than they were: a fourth attempt buys
+# another independent draw, while a longer single attempt just waits out the
+# same bad connection. Every job still fails inside its timeout-minutes cap,
+# which is the property that keeps a failure legible instead of a GitHub kill
+# with no step diagnostic.
+readonly attempts="${APT_ATTEMPTS:-3}"
 
 # GitHub's runners point at a region-local Azure mirror. When that mirror is
 # the thing stalling, retrying against it is just a slower way to fail: on

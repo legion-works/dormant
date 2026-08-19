@@ -80,7 +80,14 @@ jobs:
       # rust-lld cannot find -ludev/-lmpv). The ~40s apt cost is the reliable
       # price. libblas3/liblapack3 stay explicit: runtime deps of the
       # libmpv/ffmpeg stack the runner image no longer preinstalls.
+      # libmpv-dev pulls the ffmpeg library stack transitively, so this is one
+      # of the three heavy installs in the matrix. See the render job's note:
+      # the wrapper's default 180s install budget assumes a small -dev set, and
+      # a slow-but-working mirror kills a large download mid-fetch instead.
+      # 420s keeps three attempts plus backoff inside this job's 30-minute cap.
       - run: bash scripts/ci/apt_install.sh libudev-dev libwayland-dev libmpv-dev libpipewire-0.3-dev pkg-config libblas3 liblapack3
+        env:
+          APT_INSTALL_TIMEOUT: 420
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.131
@@ -115,7 +122,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Plain apt-get — see the test job's note on the cache action's two
       # failure modes under runner-image drift.
+      # ffmpeg + libavcodec-extra make this the largest install in the matrix
+      # at ~105 MB, which needs roughly 600 kB/s to land inside the wrapper's
+      # default 180s. A slow-but-working mirror misses that and the attempt is
+      # killed mid-download. This job's 45-minute cap has room for a longer
+      # budget; the tighter jobs pull a fraction of the bytes and keep the
+      # default.
       - run: bash scripts/ci/apt_install.sh libudev-dev libwayland-dev libmpv-dev libpipewire-0.3-dev pkg-config ffmpeg libavcodec-extra libblas3 liblapack3
+        env:
+          APT_INSTALL_TIMEOUT: 600
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.131
@@ -185,7 +200,14 @@ jobs:
         run: bash scripts/ci/reject_required_rerun.sh
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # libmpv-dev pulls the ffmpeg library stack transitively, so this is one
+      # of the three heavy installs in the matrix. See the render job's note:
+      # the wrapper's default 180s install budget assumes a small -dev set, and
+      # a slow-but-working mirror kills a large download mid-fetch instead.
+      # 420s keeps three attempts plus backoff inside this job's 30-minute cap.
       - run: bash scripts/ci/apt_install.sh libudev-dev libwayland-dev libmpv-dev libpipewire-0.3-dev pkg-config libblas3 liblapack3
+        env:
+          APT_INSTALL_TIMEOUT: 420
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.131

@@ -1668,8 +1668,11 @@ pub struct DisplayConfig {
 
 /// The KVM hand-off hook slots available on a shared display, plus the
 /// post-hoc observed-loss slot for the losing machine.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HookSlots {
+    /// Maximum total time hooks may consume during one display-switch operation.
+    #[serde(default = "default_hook_total_timeout", with = "humantime_serde")]
+    pub timeout: Duration,
     /// Actions run before releasing a display to another machine.
     #[serde(default)]
     pub before_release: Vec<HookAction>,
@@ -1688,6 +1691,19 @@ pub struct HookSlots {
     /// must never trigger a corrective DDC write or retry.
     #[serde(default)]
     pub on_observed_loss: Vec<HookAction>,
+}
+
+impl Default for HookSlots {
+    fn default() -> Self {
+        Self {
+            timeout: default_hook_total_timeout(),
+            before_release: Vec::new(),
+            after_release: Vec::new(),
+            before_acquire: Vec::new(),
+            after_acquire: Vec::new(),
+            on_observed_loss: Vec::new(),
+        }
+    }
 }
 
 /// Command argv used by a KVM hook.
@@ -1999,6 +2015,9 @@ fn default_cooldown() -> Duration {
 
 fn default_hook_timeout() -> Duration {
     defaults::HOOK_TIMEOUT
+}
+fn default_hook_total_timeout() -> Duration {
+    defaults::HOOK_TOTAL_TIMEOUT
 }
 fn default_pair_timeout() -> Duration {
     defaults::PAIR_TIMEOUT

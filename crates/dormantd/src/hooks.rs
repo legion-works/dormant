@@ -57,7 +57,8 @@
 //! - Entries run in config order within a slot.
 //! - Blocking entries are awaited with their per-entry timeout; non-blocking
 //!   entries are spawned fire-and-forget (their own per-entry timeout is
-//!   enforced inside the spawned task — the spec trap).
+//!   enforced inside the spawned task — the spec trap). Both share the
+//!   display-switch deadline supplied by the direct-switch path.
 //! - A failure logs `hook_failed` and proceeds, UNLESS the entry set
 //!   `abort_on_failure = true` — that aborts the remaining sequence and the
 //!   outcome reports [`HookOutcome::Aborted`] for the claim engine to consume.
@@ -66,7 +67,7 @@
 //!
 //! ## Log anchors (literal, grep-stable)
 //!
-//! `hook_started`, `hook_ok`, `hook_failed`, `hook_timeout`.
+//! `hook_started`, `hook_ok`, `hook_failed`, `hook_timeout`, `hook_slot_timeout`.
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -83,7 +84,7 @@ use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::Mutex as AsyncMutex;
-use tokio::time::{sleep, timeout};
+use tokio::time::{Instant, sleep, timeout};
 use tracing::{debug, info, warn};
 
 // ── Types ──────────────────────────────────────────────────────────────────────
@@ -191,6 +192,8 @@ fn bool_to_digit(b: bool) -> String {
 pub struct HookSlot<'a> {
     pub context: HookContext<'a>,
     pub actions: &'a [HookAction],
+    /// Shared deadline for all hook slots in one display-switch operation.
+    pub deadline: Instant,
 }
 
 /// Sequencing decision for one entry — the pure output of [`decide_slot`].
@@ -215,18 +218,19 @@ pub struct HookDecision {
 /// acquire equivalent).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookOutcome {
-    /// Every blocking entry completed; every non-blocking entry was spawned.
+    /// The slot finished without an aborting failure. Entries after the total
+    /// hook deadline may be counted as failures without being started.
     Completed {
         /// Total entries started (blocking + non-blocking).
         started: usize,
-        /// Entries that returned a failure (failure-on-non-blocking does NOT
-        /// abort and is counted here).
+        /// Entries that returned a failure or were skipped by the total hook
+        /// deadline (failure-on-non-blocking does NOT abort).
         failed: usize,
         /// Entries spawned fire-and-forget.
         spawned: usize,
     },
-    /// An entry with `abort_on_failure = true` failed; the remaining
-    /// entries were skipped.
+    /// An aborting entry failed, including when the total hook deadline made
+    /// that entry impossible to start; remaining entries were skipped.
     Aborted {
         /// Index of the entry whose failure triggered the abort.
         at_index: usize,
@@ -301,14 +305,37 @@ pub async fn run_slot(slot: HookSlot<'_>, runner: Arc<dyn HookRunner>) -> HookOu
     let mut failed = 0usize;
     let mut spawned = 0usize;
 
-    for decision in decisions {
+    for (position, decision) in decisions.iter().enumerate() {
+        if Instant::now() >= slot.deadline {
+            return finish_at_slot_deadline(
+                &decisions[position..],
+                &label,
+                started,
+                failed,
+                spawned,
+            );
+        }
         started += 1;
 
         if decision.blocking {
             // Awaited in-place: the slot observes the outcome and reacts to
             // `abort_on_failure`. No boxing, no spawn.
-            let outcome = run_one(&decision, &env, runner.as_ref()).await;
-            log_outcome(&decision, &label, &outcome);
+            let remaining = slot.deadline.saturating_duration_since(Instant::now());
+            let action_timeout = decision.timeout.min(remaining);
+            let outcome = run_one(decision, &env, runner.as_ref(), action_timeout).await;
+            if outcome
+                .as_ref()
+                .is_err_and(|reason| is_timeout_error(reason) && Instant::now() >= slot.deadline)
+            {
+                return finish_at_slot_deadline(
+                    &decisions[position..],
+                    &label,
+                    started,
+                    failed,
+                    spawned,
+                );
+            }
+            log_outcome(decision, &label, &outcome);
             match outcome {
                 Ok(()) => {}
                 Err(reason) => {
@@ -343,7 +370,10 @@ pub async fn run_slot(slot: HookSlot<'_>, runner: Arc<dyn HookRunner>) -> HookOu
             // progressed past it (spec invariant).
             spawned += 1;
             let action = decision.action.clone();
-            let timeout_ = decision.timeout;
+            let remaining = slot.deadline.saturating_duration_since(Instant::now());
+            let timeout_ = decision.timeout.min(remaining);
+            let deadline_limited = timeout_ < decision.timeout;
+            let deadline = slot.deadline;
             let label_for_task = label.clone();
             let env_for_task = env.clone();
             let index = decision.index;
@@ -352,7 +382,16 @@ pub async fn run_slot(slot: HookSlot<'_>, runner: Arc<dyn HookRunner>) -> HookOu
                 let outcome =
                     dispatch_action(&action, &env_for_task, timeout_, runner_for_task.as_ref())
                         .await;
-                log_spawned_outcome(index, &label_for_task, &action, &outcome);
+                if deadline_limited
+                    && outcome
+                        .as_ref()
+                        .is_err_and(|reason| is_timeout_error(reason))
+                    && Instant::now() >= deadline
+                {
+                    log_slot_timeout(&label_for_task, index, 1);
+                } else {
+                    log_spawned_outcome(index, &label_for_task, &action, &outcome);
+                }
             });
         }
     }
@@ -379,8 +418,43 @@ async fn run_one(
     decision: &HookDecision,
     env: &EnvList,
     runner: &dyn HookRunner,
+    timeout_: Duration,
 ) -> Result<(), String> {
-    dispatch_action(&decision.action, env, decision.timeout, runner).await
+    dispatch_action(&decision.action, env, timeout_, runner).await
+}
+
+fn finish_at_slot_deadline(
+    expired: &[HookDecision],
+    label: &str,
+    started: usize,
+    failed: usize,
+    spawned: usize,
+) -> HookOutcome {
+    let reason = format!("{E_HOOK_TIMEOUT}: total hook timeout elapsed");
+    log_slot_timeout(label, expired[0].index, expired.len());
+
+    let mut failed = failed;
+    for decision in expired {
+        failed += 1;
+        if decision.blocking && decision.abort_on_failure {
+            warn!(
+                event = "hook_slot_timeout_aborted",
+                kind = "hook_aborted",
+                index = decision.index,
+                reason = %reason,
+            );
+            return HookOutcome::Aborted {
+                at_index: decision.index,
+                reason,
+            };
+        }
+    }
+
+    HookOutcome::Completed {
+        started,
+        failed,
+        spawned,
+    }
 }
 
 async fn dispatch_action(
@@ -457,6 +531,16 @@ fn log_spawned_outcome(
             reason = %reason,
         ),
     }
+}
+
+fn log_slot_timeout(label: &str, index: usize, expired_entries: usize) {
+    warn!(
+        event = "hook_slot_timeout",
+        slot = %label,
+        index,
+        expired_entries,
+        "total hook timeout elapsed"
+    );
 }
 
 fn log_decision_outcome(decision: &HookDecision, label: &str, outcome: &Result<(), String>) {
@@ -1376,6 +1460,10 @@ mod tests {
         }
     }
 
+    fn test_deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + Duration::from_secs(60)
+    }
+
     // ── Pure sequencing ─────────────────────────────────────────────────────
 
     #[test]
@@ -1397,10 +1485,12 @@ mod tests {
         let before = HookSlot {
             context: ctx_for(Phase::Before, Direction::Release),
             actions: &actions,
+            deadline: test_deadline(),
         };
         let after = HookSlot {
             context: ctx_for(Phase::After, Direction::Release),
             actions: &actions,
+            deadline: test_deadline(),
         };
         assert!(
             decide_slot(&before).iter().all(|d| d.blocking),
@@ -1431,6 +1521,7 @@ mod tests {
         let slot = HookSlot {
             context: ctx_for(Phase::After, Direction::Release),
             actions: &actions,
+            deadline: test_deadline(),
         };
         let decisions = decide_slot(&slot);
         assert!(!decisions[0].blocking);
@@ -1448,6 +1539,7 @@ mod tests {
         let slot = HookSlot {
             context: ctx_for(Phase::Before, Direction::Release),
             actions: &actions,
+            deadline: test_deadline(),
         };
         let d = &decide_slot(&slot)[0];
         assert_eq!(d.timeout, Duration::from_millis(250));
@@ -1510,6 +1602,7 @@ mod tests {
         let slot = HookSlot {
             context: ctx_for(Phase::Before, Direction::Release),
             actions: &actions,
+            deadline: test_deadline(),
         };
         let outcome = run_slot(slot, Arc::new(runner.clone()) as Arc<dyn HookRunner>).await;
         assert_eq!(
@@ -1554,6 +1647,7 @@ mod tests {
         let slot = HookSlot {
             context: ctx_for(Phase::Before, Direction::Release),
             actions: &actions,
+            deadline: test_deadline(),
         };
         let outcome = run_slot(slot, Arc::new(runner.clone()) as Arc<dyn HookRunner>).await;
         match outcome {
@@ -1588,6 +1682,7 @@ mod tests {
         let slot = HookSlot {
             context: ctx_for(Phase::After, Direction::Acquire),
             actions: &actions,
+            deadline: test_deadline(),
         };
         let outcome = run_slot(slot, Arc::new(runner.clone()) as Arc<dyn HookRunner>).await;
         assert_eq!(
@@ -1625,6 +1720,7 @@ mod tests {
         let slot = HookSlot {
             context: ctx_for(Phase::Before, Direction::Release),
             actions: &actions,
+            deadline: test_deadline(),
         };
         let outcome = run_slot(slot, Arc::new(runner.clone()) as Arc<dyn HookRunner>).await;
         assert_eq!(
@@ -1644,6 +1740,7 @@ mod tests {
         let slot = HookSlot {
             context: ctx_for(Phase::Before, Direction::Release),
             actions: &actions,
+            deadline: test_deadline(),
         };
         let outcome = run_slot(slot, Arc::new(runner.clone()) as Arc<dyn HookRunner>).await;
         assert_eq!(
@@ -1679,6 +1776,7 @@ mod tests {
         let slot = HookSlot {
             context: ctx_for(Phase::Before, Direction::Release),
             actions: &actions,
+            deadline: test_deadline(),
         };
         let outcome = run_slot(slot, Arc::new(runner.clone()) as Arc<dyn HookRunner>).await;
         assert_eq!(
@@ -1717,6 +1815,7 @@ mod tests {
         let slot = HookSlot {
             context: ctx_for(Phase::After, Direction::Release),
             actions: &actions,
+            deadline: test_deadline(),
         };
         // Capture child stdout via a side channel: we wrap the runner in
         // a probe that captures argv0 and runs the real command. The

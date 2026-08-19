@@ -471,8 +471,7 @@ def run_targets(root: pathlib.Path, targets: list[Target], stress_count: int) ->
         if not listed.stdout.strip():
             # The target matched (the selector is not broken), but every test
             # inside is env-gated behind #[ignore].  Confirm by listing with
-            # --run-ignored all; if that returns tests we can skip, otherwise
-            # the target is genuinely empty and the selector is wrong.
+            # --run-ignored all; if that returns tests we can skip.
             ignored_list_cmd = [*list_command, "--run-ignored", "all"]
             ignored_listed = subprocess.run(ignored_list_cmd, cwd=root, text=True, capture_output=True, env=run_env)
             if ignored_listed.returncode == 0 and ignored_listed.stdout.strip():
@@ -481,8 +480,27 @@ def run_targets(root: pathlib.Path, targets: list[Target], stress_count: int) ->
                     file=sys.stderr,
                 )
                 continue
-            print(f"{target.package}/{target.name}: selected target contains zero tests", file=sys.stderr)
-            first_failure = first_failure or 1
+            # Otherwise the target holds no tests at all, and whether that is a
+            # defect depends on the kind. An integration target exists solely to
+            # hold tests, so an empty one means the selection is wrong. A lib or
+            # bin target routinely has none: crates/dormant-tray/src/main.rs has
+            # no #[cfg(test)] code whatsoever, so `-p dormant-tray --bin
+            # dormant-tray` legitimately lists zero tests and previously failed
+            # the whole stress job on every dormant-tray change.
+            #
+            # A broken selector cannot reach this point: the selectors are
+            # `-p <package> --<kind> <name>` built from `cargo metadata`, and
+            # cargo exits 101 for a target it does not know (verified), which the
+            # returncode check above already catches. Reaching here with rc 0
+            # therefore means the target compiled and simply has nothing to run.
+            if target.kind == "test":
+                print(f"{target.package}/{target.name}: selected target contains zero tests", file=sys.stderr)
+                first_failure = first_failure or 1
+                continue
+            print(
+                f"{target.package}/{target.name}: {target.kind} target has no tests; skipping",
+                file=sys.stderr,
+            )
             continue
 
         junit = _manifest_workspace_root(root, target) / "target/nextest/ci/junit.xml"

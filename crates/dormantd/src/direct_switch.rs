@@ -312,6 +312,7 @@ impl DirectSwitchHandle {
         // Suppression guard — cleared explicitly in every code path below,
         // and on Drop as a safety net for unexpected panics.
         let mut guard = SuppressionGuard::set(&self.front_ctl_tx, &display);
+        let hook_deadline = tokio::time::Instant::now() + dc.hooks.timeout;
 
         // Blocking before_acquire — aborts the whole pull on failure.
         let aborted = self
@@ -321,6 +322,7 @@ impl DirectSwitchHandle {
                 Direction::Acquire,
                 Phase::Before,
                 false,
+                hook_deadline,
             )
             .await;
         let cause = reason.as_str();
@@ -352,7 +354,14 @@ impl DirectSwitchHandle {
                 guard.clear();
                 // Fire-and-forget after_acquire (non-blocking by convention).
                 let _ = self
-                    .run_hook(&display, &dc.hooks, Direction::Acquire, Phase::After, false)
+                    .run_hook(
+                        &display,
+                        &dc.hooks,
+                        Direction::Acquire,
+                        Phase::After,
+                        false,
+                        hook_deadline,
+                    )
                     .await;
                 // Record the most recent activity-driven pull time for
                 // cooldown enforcement.
@@ -467,6 +476,7 @@ impl DirectSwitchHandle {
             InputSourceReadback::DifferentFrom(_)
         );
         let cause = reason.as_str();
+        let hook_deadline = tokio::time::Instant::now() + dc.hooks.timeout;
 
         // before_release — aborts the push on failure.
         let aborted = self
@@ -476,6 +486,7 @@ impl DirectSwitchHandle {
                 Direction::Release,
                 Phase::Before,
                 false,
+                hook_deadline,
             )
             .await;
         if let Some(hook_reason) = aborted {
@@ -504,7 +515,14 @@ impl DirectSwitchHandle {
             Ok(()) => {
                 // Fire-and-forget after_release.
                 let _ = self
-                    .run_hook(&display, &dc.hooks, Direction::Release, Phase::After, false)
+                    .run_hook(
+                        &display,
+                        &dc.hooks,
+                        Direction::Release,
+                        Phase::After,
+                        false,
+                        hook_deadline,
+                    )
                     .await;
                 // Emit ownership event for the successful push (panel released to peer).
                 let _ = self.front_ctl_tx.try_send(
@@ -686,6 +704,7 @@ impl DirectSwitchHandle {
         direction: Direction,
         phase: Phase,
         aborted: bool,
+        deadline: tokio::time::Instant,
     ) -> Option<String> {
         let actions = slot_for(hooks, direction, phase);
         if actions.is_empty() {
@@ -702,6 +721,7 @@ impl DirectSwitchHandle {
                 aborted,
             },
             actions,
+            deadline,
         };
         match self.hooks.run_slot(slot).await {
             HookOutcome::Completed { .. } => None,
@@ -718,12 +738,12 @@ impl DirectSwitchHandle {
     pub async fn notify_observed_loss(&self, display: &DisplayId) {
         // Clone the actions Vec outside the watch::Ref borrow so the
         // guard is dropped before the await (watch::Ref is !Send).
-        let actions: Vec<_> = {
+        let (actions, timeout) = {
             let config = self.config.borrow();
             let Some(dc) = config.displays.get(&display.0) else {
                 return;
             };
-            dc.hooks.on_observed_loss.clone()
+            (dc.hooks.on_observed_loss.clone(), dc.hooks.timeout)
         };
         if actions.is_empty() {
             return;
@@ -740,6 +760,7 @@ impl DirectSwitchHandle {
                 aborted: false,
             },
             actions: &actions,
+            deadline: tokio::time::Instant::now() + timeout,
         };
         let _ = self.hooks.run_slot(slot).await;
     }
@@ -751,15 +772,21 @@ impl DirectSwitchHandle {
 #[allow(clippy::too_many_lines)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::future::pending;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use dormant_core::config::schema as cs;
     use dormant_core::config::schema::{
         AudioConfig, DaemonConfig, InputFilterConfig, NotificationsConfig, PublishConfig,
         WatchdogConfig, WearConfig,
     };
+    use dormant_core::error::E_HOOK_TIMEOUT;
     use dormant_core::types::CmdFailure;
-    use tokio::sync::Barrier;
+    use tokio::sync::{Barrier, Notify};
+    use tokio::time::{Instant as TokioInstant, advance};
 
     // ═══════════════════════════════════════════════════════════════════════
     //  Test fakes
@@ -850,6 +877,49 @@ mod tests {
         }
     }
 
+    struct TimeoutHookRunner {
+        calls: AtomicUsize,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    impl TimeoutHookRunner {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                entered: Arc::new(Notify::new()),
+                release: Arc::new(Notify::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::hooks::HookRunner for TimeoutHookRunner {
+        async fn run_command(
+            &self,
+            _env: &crate::hooks::EnvList,
+            _argv: &[String],
+            _timeout: Duration,
+        ) -> crate::hooks::HookIoResult {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.entered.notify_one();
+                self.release.notified().await;
+                Err(format!("{E_HOOK_TIMEOUT}: test hook timed out"))
+            } else {
+                pending().await
+            }
+        }
+
+        async fn publish_mqtt(
+            &self,
+            _topic: &str,
+            _payload: &str,
+            _timeout: Duration,
+        ) -> crate::hooks::HookIoResult {
+            unreachable!("aggregate-bound tests only dispatch command hooks")
+        }
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     //  Test helpers
     // ═══════════════════════════════════════════════════════════════════════
@@ -924,6 +994,16 @@ mod tests {
             timeout: Duration::from_secs(1),
             blocking: Some(true),
             abort_on_failure: true,
+        }
+    }
+
+    fn timeout_before_acquire_action(abort_on_failure: bool) -> cs::HookAction {
+        cs::HookAction {
+            command: Some(vec!["timeout-hook".into()]),
+            mqtt: None,
+            timeout: Duration::from_secs(1),
+            blocking: Some(true),
+            abort_on_failure,
         }
     }
 
@@ -1044,6 +1124,81 @@ mod tests {
             0,
             "write must not be called on hook abort"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pull_proceeds_when_hook_budget_expires_without_abort_flag() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        let runner = Arc::new(TimeoutHookRunner::new());
+        let entered = Arc::clone(&runner.entered);
+        let release = Arc::clone(&runner.release);
+        let hook_engine = Arc::new(HookEngine::with_runner(runner));
+        let mut dc = display_config();
+        dc.hooks.timeout = Duration::from_secs(1);
+        dc.hooks.before_acquire = vec![
+            timeout_before_acquire_action(false),
+            timeout_before_acquire_action(false),
+        ];
+        let (front_ctl_tx, _) = mpsc::channel(8);
+        let handle = build_handle(dc, Arc::clone(&sink), hook_engine, front_ctl_tx);
+
+        let pull =
+            tokio::spawn(async move { handle.pull(display_id(), SwitchReason::Cli, true).await });
+        entered.notified().await;
+        let deadline = TokioInstant::now() + Duration::from_secs(1);
+        advance(Duration::from_secs(1)).await;
+        release.notify_one();
+        tokio::task::yield_now().await;
+
+        assert!(
+            pull.is_finished(),
+            "the switch must finish at the aggregate hook deadline"
+        );
+        assert!(
+            TokioInstant::now() <= deadline,
+            "the hook budget must not exceed its configured deadline"
+        );
+        assert_eq!(pull.await.unwrap(), SwitchOutcome::Switched);
+        assert_eq!(sink.write_calls(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pull_aborts_when_hook_budget_expires_and_a_remaining_hook_is_abortable() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        let runner = Arc::new(TimeoutHookRunner::new());
+        let entered = Arc::clone(&runner.entered);
+        let release = Arc::clone(&runner.release);
+        let hook_engine = Arc::new(HookEngine::with_runner(runner));
+        let mut dc = display_config();
+        dc.hooks.timeout = Duration::from_secs(1);
+        dc.hooks.before_acquire = vec![
+            timeout_before_acquire_action(false),
+            timeout_before_acquire_action(true),
+        ];
+        let (front_ctl_tx, _) = mpsc::channel(8);
+        let handle = build_handle(dc, Arc::clone(&sink), hook_engine, front_ctl_tx);
+
+        let pull =
+            tokio::spawn(async move { handle.pull(display_id(), SwitchReason::Cli, true).await });
+        entered.notified().await;
+        let deadline = TokioInstant::now() + Duration::from_secs(1);
+        advance(Duration::from_secs(1)).await;
+        release.notify_one();
+        tokio::task::yield_now().await;
+
+        assert!(
+            pull.is_finished(),
+            "the switch must finish at the aggregate hook deadline"
+        );
+        assert!(
+            TokioInstant::now() <= deadline,
+            "the hook budget must not exceed its configured deadline"
+        );
+        assert!(matches!(
+            pull.await.unwrap(),
+            SwitchOutcome::HookAborted { .. }
+        ));
+        assert_eq!(sink.write_calls(), 0);
     }
 
     #[tokio::test]

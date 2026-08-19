@@ -280,7 +280,8 @@ impl HotkeyManager {
                 // and we see the latest state exactly once.
                 result = self.refresh_rx.changed() => {
                     if result.is_err() {
-                        return; // sender dropped
+                        self.unregister_current().await;
+                        return;
                     }
                     self.sync_from_state().await;
                 }
@@ -643,6 +644,44 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, RegistrarCall::Register { accel, target } if accel == "Meta+F12" && target == "monitor")),
             "expected Register(Meta+F12, monitor), got: {recorded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_sender_drop_unregisters_active_claim() {
+        let state = Arc::new(tokio::sync::Mutex::new(TrayState::new(
+            "/tmp/dormant.sock".into(),
+        )));
+        {
+            let mut tray = state.lock().await;
+            tray.snapshot = Some(snap_with_kvm(kvm_status("Meta+F12", &["monitor"])));
+            tray.unreachable = false;
+        }
+        let (registrar, registered) = FakeRegistrar::with_notify(false);
+        let calls = Arc::clone(&registrar.calls);
+        let (refresh_tx, refresh_rx) = watch::channel(());
+        let manager = HotkeyManager::new(state, refresh_rx, Some(Box::new(registrar)), None);
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(manager.run(
+            cancel,
+            std::path::PathBuf::from("/tmp/dormant.sock"),
+            Arc::new(NoopCapabilities),
+        ));
+
+        refresh_tx.send_replace(());
+        registered.notified().await;
+        drop(refresh_tx);
+        handle.await.unwrap();
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                RegistrarCall::Register {
+                    accel: "Meta+F12".into(),
+                    target: "monitor".into(),
+                },
+                RegistrarCall::Unregister,
+            ]
         );
     }
 

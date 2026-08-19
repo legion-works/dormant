@@ -16,11 +16,34 @@ const SERVICE: &str = "org.freedesktop.portal.Desktop";
 const PATH: &str = "/org/freedesktop/portal/desktop";
 const INTERFACE: &str = "org.freedesktop.portal.GlobalShortcuts";
 const REQUEST_INTERFACE: &str = "org.freedesktop.portal.Request";
+const SESSION_INTERFACE: &str = "org.freedesktop.portal.Session";
+const SESSION_CLOSE_METHOD: &str = "Close";
 
-pub(super) struct PortalHotkeyRegistrar {
+#[async_trait]
+trait PortalSessionCloser: Send + Sync {
+    async fn close_session(&self, conn: Option<&zbus::Connection>, session: OwnedObjectPath);
+}
+
+pub(super) struct ZbusPortalSessionCloser;
+
+#[async_trait]
+impl PortalSessionCloser for ZbusPortalSessionCloser {
+    async fn close_session(&self, conn: Option<&zbus::Connection>, session: OwnedObjectPath) {
+        let Some(conn) = conn else {
+            return;
+        };
+        let Ok(proxy) = zbus::Proxy::new(conn, SERVICE, &session, SESSION_INTERFACE).await else {
+            return;
+        };
+        let _ = proxy.call::<_, _, ()>(SESSION_CLOSE_METHOD, &()).await;
+    }
+}
+
+pub(super) struct PortalHotkeyRegistrar<C = ZbusPortalSessionCloser> {
     conn: Option<zbus::Connection>,
     session: Option<OwnedObjectPath>,
     signal_task: Option<tokio::task::JoinHandle<()>>,
+    session_closer: C,
 }
 
 impl PortalHotkeyRegistrar {
@@ -29,8 +52,19 @@ impl PortalHotkeyRegistrar {
             conn: None,
             session: None,
             signal_task: None,
+            session_closer: ZbusPortalSessionCloser,
         }
     }
+}
+
+async fn release_session_after_error<C: PortalSessionCloser>(
+    session_closer: &C,
+    conn: Option<&zbus::Connection>,
+    session: OwnedObjectPath,
+    error: HotkeyError,
+) -> Result<(), HotkeyError> {
+    session_closer.close_session(conn, session).await;
+    Err(error)
 }
 
 fn accelerator_string(accelerator: &Accelerator) -> Result<String, HotkeyError> {
@@ -206,7 +240,7 @@ async fn bind_shortcut(
 }
 
 #[async_trait]
-impl HotkeyRegistrar for PortalHotkeyRegistrar {
+impl<C: PortalSessionCloser> HotkeyRegistrar for PortalHotkeyRegistrar<C> {
     async fn register_claim(
         &mut self,
         accelerator: &Accelerator,
@@ -218,7 +252,18 @@ impl HotkeyRegistrar for PortalHotkeyRegistrar {
             .await
             .map_err(|error| HotkeyError::DbusError(format!("session bus: {error}")))?;
         let session = create_session(&conn).await?;
-        bind_shortcut(&conn, &session, accelerator).await?;
+        let session = match bind_shortcut(&conn, &session, accelerator).await {
+            Ok(()) => session,
+            Err(error) => {
+                return release_session_after_error(
+                    &self.session_closer,
+                    Some(&conn),
+                    session,
+                    error,
+                )
+                .await;
+            }
+        };
         let target = target.to_string();
         let listener_conn = conn.clone();
         let listener_session = session.clone();
@@ -239,8 +284,12 @@ impl HotkeyRegistrar for PortalHotkeyRegistrar {
         if let Some(task) = self.signal_task.take() {
             task.abort();
         }
+        if let Some(session) = self.session.take() {
+            self.session_closer
+                .close_session(self.conn.as_ref(), session)
+                .await;
+        }
         self.conn = None;
-        self.session = None;
     }
 }
 
@@ -284,7 +333,36 @@ async fn listen_for_activation(
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        future::pending,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+
     use super::*;
+    use tokio::sync::Notify;
+
+    struct FakeSessionCloser {
+        closed_sessions: Arc<Mutex<Vec<String>>>,
+    }
+
+    struct NotifyOnDrop(Arc<Notify>);
+
+    impl Drop for NotifyOnDrop {
+        fn drop(&mut self) {
+            self.0.notify_one();
+        }
+    }
+
+    #[async_trait]
+    impl PortalSessionCloser for FakeSessionCloser {
+        async fn close_session(&self, _conn: Option<&zbus::Connection>, session: OwnedObjectPath) {
+            self.closed_sessions
+                .lock()
+                .unwrap()
+                .push(session.to_string());
+        }
+    }
 
     #[test]
     fn accelerator_conversion_matches_xdg_wire_format() {
@@ -325,7 +403,90 @@ mod tests {
     }
 
     #[test]
+    fn portal_session_close_targets_xdg_session_interface() {
+        assert_eq!(SERVICE, "org.freedesktop.portal.Desktop");
+        assert_eq!(SESSION_INTERFACE, "org.freedesktop.portal.Session");
+        assert_eq!(SESSION_CLOSE_METHOD, "Close");
+    }
+
+    #[test]
     fn drop_without_registration_does_not_panic() {
         drop(PortalHotkeyRegistrar::new());
+    }
+
+    #[tokio::test]
+    async fn unregister_claim_closes_portal_session() {
+        let closed_sessions = Arc::new(Mutex::new(Vec::new()));
+        let mut registrar = PortalHotkeyRegistrar {
+            conn: None,
+            session: Some(
+                OwnedObjectPath::try_from("/org/freedesktop/portal/desktop/session/1_42/dormant")
+                    .unwrap(),
+            ),
+            signal_task: None,
+            session_closer: FakeSessionCloser {
+                closed_sessions: Arc::clone(&closed_sessions),
+            },
+        };
+
+        registrar.unregister_claim().await;
+
+        assert_eq!(
+            *closed_sessions.lock().unwrap(),
+            vec!["/org/freedesktop/portal/desktop/session/1_42/dormant"]
+        );
+        assert!(registrar.session.is_none());
+    }
+
+    #[tokio::test]
+    async fn unregister_claim_aborts_activation_listener() {
+        let started = Arc::new(Notify::new());
+        let task_dropped = Arc::new(Notify::new());
+        let task_started = Arc::clone(&started);
+        let task_drop_notify = Arc::clone(&task_dropped);
+        let signal_task = tokio::spawn(async move {
+            task_started.notify_one();
+            let _notify_on_drop = NotifyOnDrop(task_drop_notify);
+            pending::<()>().await;
+        });
+        started.notified().await;
+        let mut registrar = PortalHotkeyRegistrar {
+            conn: None,
+            session: None,
+            signal_task: Some(signal_task),
+            session_closer: FakeSessionCloser {
+                closed_sessions: Arc::new(Mutex::new(Vec::new())),
+            },
+        };
+
+        registrar.unregister_claim().await;
+
+        tokio::time::timeout(Duration::from_secs(1), task_dropped.notified())
+            .await
+            .expect("aborting the activation listener must drop its future");
+    }
+
+    #[tokio::test]
+    async fn failed_registration_releases_new_portal_session() {
+        let closed_sessions = Arc::new(Mutex::new(Vec::new()));
+        let closer = FakeSessionCloser {
+            closed_sessions: Arc::clone(&closed_sessions),
+        };
+        let result = release_session_after_error(
+            &closer,
+            None,
+            OwnedObjectPath::try_from("/org/freedesktop/portal/desktop/session/1_42/dormant")
+                .unwrap(),
+            HotkeyError::InvalidAccelerator("Meta+F13".into()),
+        )
+        .await;
+
+        assert_eq!(
+            *closed_sessions.lock().unwrap(),
+            vec!["/org/freedesktop/portal/desktop/session/1_42/dormant"]
+        );
+        assert!(
+            matches!(result, Err(HotkeyError::InvalidAccelerator(value)) if value == "Meta+F13")
+        );
     }
 }

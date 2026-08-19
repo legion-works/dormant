@@ -66,6 +66,24 @@ switch_to_fallback_mirror() {
 
 export DEBIAN_FRONTEND=noninteractive
 
+# GitHub's runner images normally retain package lists from image creation. Use
+# those first so an unrelated repository index cannot block an install that is
+# already resolvable; a stale or incomplete list still falls through to update.
+initial_err_log="$(mktemp)"
+if timeout "$install_timeout" sudo -E apt-get install -y \
+  --no-install-recommends "$@" 2>"$initial_err_log"; then
+  printf 'apt_install: installed %d package(s) from existing package lists; apt-get update skipped\n' "$#"
+  rm -f "$initial_err_log"
+  exit 0
+else
+  initial_status=$?
+fi
+if (( initial_status == 124 )); then
+  printf 'apt_install: initial apt-get install timed out after %ss; refreshing package lists\n' \
+    "$install_timeout" >&2
+fi
+rm -f "$initial_err_log"
+
 attempt=1
 while (( attempt <= attempts )); do
   # `status` is captured in the else branch, where $? is still the condition's
@@ -77,25 +95,29 @@ while (( attempt <= attempts )); do
   # nothing about WHY. Keeping a tail gives the next reader the mirror host and
   # the failing URL instead of a bare "timed out".
   err_log="$(mktemp)"
-  if timeout "$update_timeout" sudo -E apt-get update 2>"$err_log" \
-    && timeout "$install_timeout" sudo -E apt-get install -y \
+  if timeout "$update_timeout" sudo -E apt-get update 2>"$err_log"; then
+    timed_out_phase='install'
+    timed_out_budget="$install_timeout"
+    if timeout "$install_timeout" sudo -E apt-get install -y \
       --no-install-recommends "$@" 2>>"$err_log"; then
-    printf 'apt_install: installed %d package(s) on attempt %d\n' "$#" "$attempt"
-    rm -f "$err_log"
-    exit 0
+      printf 'apt_install: installed %d package(s) on attempt %d\n' "$#" "$attempt"
+      rm -f "$err_log"
+      exit 0
+    else
+      status=$?
+    fi
   else
     status=$?
+    timed_out_phase='update'
+    timed_out_budget="$update_timeout"
   fi
   # `timeout` reports 124 when it kills the child. Distinguishing a stall from
   # a package error matters: a stall is worth retrying against a possibly
   # different mirror, whereas a genuinely missing package will fail the same
   # way three times and the log should say which happened.
   if (( status == 124 )); then
-    # Name the budget in the message. "timed out" alone is what made the
-    # 2026-08-19 failures look like an unreachable mirror rather than a
-    # download that needed more than 180s.
-    printf 'apt_install: attempt %d/%d timed out (update<=%ss install<=%ss)\n' \
-      "$attempt" "$attempts" "$update_timeout" "$install_timeout" >&2
+    printf 'apt_install: attempt %d/%d apt-get %s timed out after %ss\n' \
+      "$attempt" "$attempts" "$timed_out_phase" "$timed_out_budget" >&2
   else
     printf 'apt_install: attempt %d/%d failed (exit %d)\n' \
       "$attempt" "$attempts" "$status" >&2

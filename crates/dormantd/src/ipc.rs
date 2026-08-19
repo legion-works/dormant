@@ -36,6 +36,56 @@ const WEAR_SAMPLING_CONSENT_BUSY: &str = "wear_sampling_consent_busy";
 type SelectedDisplays = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
 type CompositorOutputResolver = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
+struct SocketSetupGuard<'a> {
+    socket_path: &'a Path,
+    armed: bool,
+}
+
+impl<'a> SocketSetupGuard<'a> {
+    fn new(socket_path: &'a Path) -> Self {
+        Self {
+            socket_path,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SocketSetupGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(self.socket_path);
+        }
+    }
+}
+
+fn bind_socket(socket_path: &Path) -> Result<UnixListener> {
+    let old_umask = unsafe { libc::umask(0o077) };
+    let listener = UnixListener::bind(socket_path)
+        .with_context(|| format!("bind Unix socket '{}'", socket_path.display()));
+    unsafe { libc::umask(old_umask) };
+    listener
+}
+
+fn finish_socket_setup(
+    listener: UnixListener,
+    socket_path: &Path,
+    set_permissions: impl FnOnce(&Path, std::fs::Permissions) -> std::io::Result<()>,
+) -> Result<UnixListener> {
+    let mut socket_setup = SocketSetupGuard::new(socket_path);
+    let metadata = std::fs::metadata(socket_path)
+        .with_context(|| format!("stat socket '{}'", socket_path.display()))?;
+    let mut perms = metadata.permissions();
+    perms.set_mode(0o600);
+    set_permissions(socket_path, perms)
+        .with_context(|| format!("set socket permissions '{}'", socket_path.display()))?;
+    socket_setup.disarm();
+    Ok(listener)
+}
+
 #[derive(Clone)]
 struct WearSamplingControls {
     sampler_registry: SharedSamplerRegistry,
@@ -181,18 +231,12 @@ pub fn spawn(
     // sockets and serial ports, not files.  Umask is process-wide, so the
     // narrow window is safe.  The post-bind set_permissions is kept as
     // belt-and-braces.
-    let old_umask = unsafe { libc::umask(0o077) };
-    let listener = UnixListener::bind(socket_path)
-        .with_context(|| format!("bind Unix socket '{}'", socket_path.display()))?;
-    unsafe { libc::umask(old_umask) };
+    let listener = bind_socket(socket_path)?;
 
     // Explicit 0o600 after bind (belt-and-braces — umask already narrowed).
-    let metadata = std::fs::metadata(socket_path)
-        .with_context(|| format!("stat socket '{}'", socket_path.display()))?;
-    let mut perms = metadata.permissions();
-    perms.set_mode(0o600);
-    std::fs::set_permissions(socket_path, perms)
-        .with_context(|| format!("set socket permissions '{}'", socket_path.display()))?;
+    let listener = finish_socket_setup(listener, socket_path, |path, permissions| {
+        std::fs::set_permissions(path, permissions)
+    })?;
 
     tracing::info!(event = "ipc_listening", socket = %socket_path.display());
 
@@ -1548,6 +1592,33 @@ mod tests {
             "plain tempdir should be accepted: {result:?}"
         );
         cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn socket_is_unlinked_when_permission_setup_fails_after_bind() {
+        use std::os::unix::fs::FileTypeExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("dormant.sock");
+        let listener = super::bind_socket(&socket_path).expect("bind Unix socket");
+        let metadata = std::fs::symlink_metadata(&socket_path).expect("stat bound socket");
+        assert!(
+            metadata.file_type().is_socket(),
+            "UnixListener::bind must create the socket before permission setup"
+        );
+
+        let error = super::finish_socket_setup(listener, &socket_path, |_, _| {
+            Err(std::io::Error::other("forced socket permission failure"))
+        })
+        .expect_err("forced permission setup failure should abort IPC startup");
+        assert!(
+            error.to_string().contains("set socket permissions"),
+            "failure must occur during permission setup: {error:#}"
+        );
+        assert!(
+            !socket_path.exists(),
+            "the bound socket must be unlinked when permission setup fails"
+        );
     }
 
     // ── Fix C (#138): exit code stability ─────────────────────────────────

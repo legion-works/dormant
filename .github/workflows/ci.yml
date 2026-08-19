@@ -453,7 +453,16 @@ jobs:
             python3 scripts/ci/check_changelog_fragment.py --range "$revision_range"
           fi
       - uses: dtolnay/rust-toolchain@stable
+      # Tightest cap in the matrix (10 minutes) against the smallest payload:
+      # three small -dev packages. The default budgets are sized for jobs with
+      # ten times the caps and are too generous to fit here, so a total apt
+      # failure would overrun the cap and be killed by GitHub with no step
+      # diagnostic. Sized down instead of raising the cap, which would weaken a
+      # guard on a job that normally finishes in about a minute.
       - run: bash scripts/ci/apt_install.sh libudev-dev libwayland-dev libpipewire-0.3-dev
+        env:
+          APT_UPDATE_TIMEOUT: 60
+          APT_INSTALL_TIMEOUT: 60
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.131

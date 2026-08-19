@@ -121,18 +121,18 @@ fn rasterize_mark(svg_path: &Path, out_dir: &Path) {
 
         resvg::render(&tree, transform, &mut pixmap.as_mut());
 
-        // tiny-skia stores pixels as premultiplied BGRA in native byte
-        // order; ksni::Icon wants ARGB32 in network byte order
-        // (big-endian) and the StatusNotifierItem contract expects
-        // straight (non-premultiplied) alpha.  Unpremultiply, then
-        // swap each 4-byte pixel from `[B,G,R,A]` → `[A,R,G,B]`.
+        // tiny-skia stores premultiplied BGRA.  ksni transports these bytes
+        // directly as StatusNotifierItem ARGB32, while icon.rs composites
+        // variants as straight alpha; preserving premultiplication would
+        // darken the antialiased edge and halo.
         let raw = pixmap.data();
         let mut argb_be = Vec::with_capacity(raw.len());
         for px in raw.chunks_exact(4) {
+            let (r, g, b) = unpremul_to_rgba8(px[2], px[1], px[0], px[3]);
             argb_be.push(px[3]); // A
-            argb_be.push(px[2]); // R
-            argb_be.push(px[1]); // G
-            argb_be.push(px[0]); // B
+            argb_be.push(r); // R
+            argb_be.push(g); // G
+            argb_be.push(b); // B
         }
 
         let out_path = out_dir.join(format!("mark_{size}.bin"));

@@ -87,7 +87,7 @@ jobs:
       # 420s keeps three attempts plus backoff inside this job's 30-minute cap.
       - run: bash scripts/ci/apt_install.sh libudev-dev libwayland-dev libmpv-dev libpipewire-0.3-dev pkg-config libblas3 liblapack3
         env:
-          APT_INSTALL_TIMEOUT: 420
+          APT_INSTALL_TIMEOUT: 300
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.131
@@ -130,7 +130,7 @@ jobs:
       # default.
       - run: bash scripts/ci/apt_install.sh libudev-dev libwayland-dev libmpv-dev libpipewire-0.3-dev pkg-config ffmpeg libavcodec-extra libblas3 liblapack3
         env:
-          APT_INSTALL_TIMEOUT: 600
+          APT_INSTALL_TIMEOUT: 450
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.131
@@ -207,7 +207,7 @@ jobs:
       # 420s keeps three attempts plus backoff inside this job's 30-minute cap.
       - run: bash scripts/ci/apt_install.sh libudev-dev libwayland-dev libmpv-dev libpipewire-0.3-dev pkg-config libblas3 liblapack3
         env:
-          APT_INSTALL_TIMEOUT: 420
+          APT_INSTALL_TIMEOUT: 300
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.131

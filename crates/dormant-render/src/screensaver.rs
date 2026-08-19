@@ -256,7 +256,32 @@ impl MpvPlayer {
         height: u32,
         wakeup_write: std::os::fd::OwnedFd,
     ) -> Result<Self, MpvError> {
-        Self::new_with_catalog(
+        Self::new_with_first_frame_deadline(
+            items,
+            image_duration,
+            audio_enabled,
+            scale_mode,
+            width,
+            height,
+            wakeup_write,
+            FIRST_FRAME_DEADLINE,
+        )
+    }
+
+    /// Build a player with an explicit first-frame deadline.  Production
+    /// callers use [`Self::new`], which supplies [`FIRST_FRAME_DEADLINE`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_first_frame_deadline(
+        items: Vec<PlaylistItem>,
+        image_duration: Duration,
+        audio_enabled: bool,
+        scale_mode: ScaleMode,
+        width: u32,
+        height: u32,
+        wakeup_write: std::os::fd::OwnedFd,
+        first_frame_deadline: Duration,
+    ) -> Result<Self, MpvError> {
+        Self::new_with_catalog_and_first_frame_deadline(
             items,
             image_duration,
             audio_enabled,
@@ -265,6 +290,7 @@ impl MpvPlayer {
             height,
             wakeup_write,
             None,
+            first_frame_deadline,
         )
     }
 
@@ -282,6 +308,32 @@ impl MpvPlayer {
         height: u32,
         wakeup_write: std::os::fd::OwnedFd,
         luma_catalog: Option<LumaCatalog>,
+    ) -> Result<Self, MpvError> {
+        Self::new_with_catalog_and_first_frame_deadline(
+            items,
+            image_duration,
+            audio_enabled,
+            scale_mode,
+            width,
+            height,
+            wakeup_write,
+            luma_catalog,
+            FIRST_FRAME_DEADLINE,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines)]
+    fn new_with_catalog_and_first_frame_deadline(
+        items: Vec<PlaylistItem>,
+        image_duration: Duration,
+        audio_enabled: bool,
+        scale_mode: ScaleMode,
+        width: u32,
+        height: u32,
+        wakeup_write: std::os::fd::OwnedFd,
+        luma_catalog: Option<LumaCatalog>,
+        first_frame_deadline: Duration,
     ) -> Result<Self, MpvError> {
         // ── Scheme allowlist (PRIMARY security control) ───────────
         // Runs BEFORE any mpv interaction so a rejected item never
@@ -451,7 +503,7 @@ impl MpvPlayer {
             width: width_i,
             height: height_i,
             stride,
-            first_frame_deadline: Some(Instant::now() + FIRST_FRAME_DEADLINE),
+            first_frame_deadline: Some(Instant::now() + first_frame_deadline),
             has_first_frame: false,
             items: filtered_items,
             luma_catalog,
@@ -702,7 +754,7 @@ fn resolve_loaded_item(items: &[PlaylistItem], playlist_pos: i64) -> Option<&str
 mod tests {
     use super::*;
     use std::os::fd::FromRawFd;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
 
     #[test]
@@ -815,27 +867,43 @@ mod tests {
     /// busy", which is the only thing the timeout was ever meant to say.
     const FRAME_PUMP_TIMEOUT: Duration = Duration::from_secs(60);
 
-    fn build_test_player() -> Option<(MpvPlayer, PathBuf)> {
-        let dir = std::env::temp_dir().join("dormant-render-tests");
-        std::fs::create_dir_all(&dir).expect("mkdir temp test dir");
-        let video = dir.join("test.mp4");
+    fn build_test_player() -> Option<(MpvPlayer, tempfile::TempDir, PathBuf)> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let video = dir.path().join("test.mp4");
         generate_test_video(&video)?;
-        build_test_player_with_mode(video, ScaleMode::Fit)
+        let player = build_test_player_with_mode(&video, ScaleMode::Fit)?;
+        Some((player, dir, video))
+    }
+
+    #[test]
+    fn build_test_players_use_distinct_video_paths() {
+        let Some((first_player, _first_dir, first_video)) = build_test_player() else {
+            return;
+        };
+        let Some((second_player, _second_dir, second_video)) = build_test_player() else {
+            drop(first_player);
+            return;
+        };
+
+        assert_ne!(
+            first_video, second_video,
+            "parallel nextest processes must not overwrite one another's fixture"
+        );
+
+        drop(first_player);
+        drop(second_player);
     }
 
     /// Build a `MpvPlayer` against an already-generated video path with
     /// an explicit [`ScaleMode`].  Skips on environment capability gaps
     /// (missing codecs/demuxers) — see `build_test_player` for the same
     /// affordance.
-    fn build_test_player_with_mode(
-        video: PathBuf,
-        scale_mode: ScaleMode,
-    ) -> Option<(MpvPlayer, PathBuf)> {
+    fn build_test_player_with_mode(video: &Path, scale_mode: ScaleMode) -> Option<MpvPlayer> {
         let (_read_fd, write_fd) = make_pipe().expect("pipe2");
         // SAFETY: write_fd was just created by pipe2 and is not yet owned
         // by anything else — `OwnedFd` takes exclusive ownership.
         let write_owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(write_fd) };
-        let player = match MpvPlayer::new(
+        let player = match MpvPlayer::new_with_first_frame_deadline(
             vec![PlaylistItem {
                 uri: video.to_string_lossy().into_owned(),
                 image_duration: None,
@@ -847,6 +915,7 @@ mod tests {
             320,
             180,
             write_owned,
+            FRAME_PUMP_TIMEOUT,
         ) {
             Ok(p) => p,
             Err(MpvError::Init(msg)) if msg.contains("loadfile") => {
@@ -858,14 +927,14 @@ mod tests {
             }
             Err(e) => panic!("player init: {e}"),
         };
-        Some((player, video))
+        Some(player)
     }
 
     /// Integration with a real mpv instance + test fixture.  Skips
     /// (does not panic, does not fail) if ffmpeg isn't available.
     #[test]
     fn renders_non_zero_changing_frames() {
-        let Some((mut player, _video)) = build_test_player() else {
+        let Some((mut player, _fixture_dir, _video)) = build_test_player() else {
             eprintln!("ffmpeg unavailable; skipping render test");
             return;
         };
@@ -892,7 +961,7 @@ mod tests {
                     hashes.push(h);
                     rendered += 1;
                 }
-                Ok(false) => {
+                Ok(false) | Err(MpvError::NoFirstFrame) => {
                     std::thread::sleep(Duration::from_millis(16));
                 }
                 Err(e) => panic!("render errored: {e}"),
@@ -937,7 +1006,7 @@ mod tests {
     /// assertion; the readback is best-effort.
     #[test]
     fn sandbox_flags_pinned_after_init() {
-        let Some((player, _video)) = build_test_player() else {
+        let Some((player, _fixture_dir, _video)) = build_test_player() else {
             eprintln!("ffmpeg unavailable; skipping sandbox flag test");
             return;
         };
@@ -1029,7 +1098,7 @@ mod tests {
         let (_read_fd, write_fd) = make_pipe().expect("pipe2");
         let write_owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(write_fd) };
 
-        let mut player = match MpvPlayer::new(
+        let mut player = match MpvPlayer::new_with_first_frame_deadline(
             vec![PlaylistItem {
                 uri: "/nonexistent/path/that/never/exists.mp4".into(),
                 image_duration: None,
@@ -1041,6 +1110,7 @@ mod tests {
             64,
             64,
             write_owned,
+            Duration::from_millis(1),
         ) {
             Ok(p) => p,
             Err(MpvError::Init(msg)) if msg.contains("loadfile") => {
@@ -1246,7 +1316,7 @@ mod tests {
     /// `playlist-count` readback must reflect that.
     #[test]
     fn mpv_player_filters_playlist_to_allowed_items() {
-        let Some((player, _video)) = build_test_player() else {
+        let Some((player, _fixture_dir, _video)) = build_test_player() else {
             eprintln!("ffmpeg unavailable; skipping playlist filter test");
             return;
         };
@@ -1368,7 +1438,7 @@ mod tests {
             eprintln!("ffmpeg unavailable; skipping scale-mode Fit test");
             return;
         }
-        let Some((player, _video)) = build_test_player_with_mode(video, ScaleMode::Fit) else {
+        let Some(player) = build_test_player_with_mode(&video, ScaleMode::Fit) else {
             eprintln!("libmpv cannot load test media; skipping scale-mode Fit test");
             return;
         };
@@ -1403,7 +1473,7 @@ mod tests {
             eprintln!("ffmpeg unavailable; skipping scale-mode Fill test");
             return;
         }
-        let Some((player, _video)) = build_test_player_with_mode(video, ScaleMode::Fill) else {
+        let Some(player) = build_test_player_with_mode(&video, ScaleMode::Fill) else {
             eprintln!("libmpv cannot load test media; skipping scale-mode Fill test");
             return;
         };
@@ -1438,7 +1508,7 @@ mod tests {
             eprintln!("ffmpeg unavailable; skipping scale-mode Stretch test");
             return;
         }
-        let Some((player, _video)) = build_test_player_with_mode(video, ScaleMode::Stretch) else {
+        let Some(player) = build_test_player_with_mode(&video, ScaleMode::Stretch) else {
             eprintln!("libmpv cannot load test media; skipping scale-mode Stretch test");
             return;
         };
@@ -1463,7 +1533,7 @@ mod tests {
             eprintln!("ffmpeg unavailable; skipping scale-mode Center test");
             return;
         }
-        let Some((player, _video)) = build_test_player_with_mode(video, ScaleMode::Center) else {
+        let Some(player) = build_test_player_with_mode(&video, ScaleMode::Center) else {
             eprintln!("libmpv cannot load test media; skipping scale-mode Center test");
             return;
         };
@@ -1534,7 +1604,7 @@ mod tests {
         let build = |mode: ScaleMode| -> Option<MpvPlayer> {
             let (_r, w) = make_pipe().expect("pipe2");
             let write_owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(w) };
-            let player = MpvPlayer::new(
+            let player = MpvPlayer::new_with_first_frame_deadline(
                 vec![PlaylistItem {
                     uri: video.to_string_lossy().into_owned(),
                     image_duration: None,
@@ -1546,6 +1616,7 @@ mod tests {
                 320,
                 180,
                 write_owned,
+                FRAME_PUMP_TIMEOUT,
             );
             match player {
                 Ok(p) => Some(p),
@@ -1576,10 +1647,13 @@ mod tests {
             let start = Instant::now();
             while start.elapsed() < FRAME_PUMP_TIMEOUT {
                 let mut buf = vec![0u8; (320 * 4 * 180) as usize];
-                if let Ok(true) = player.render_frame_into(&mut buf) {
-                    return Some(buf);
+                match player.render_frame_into(&mut buf) {
+                    Ok(true) => return Some(buf),
+                    Ok(false) | Err(MpvError::NoFirstFrame) => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(e) => panic!("render errored: {e}"),
                 }
-                std::thread::sleep(Duration::from_millis(20));
             }
             None
         };
@@ -1706,7 +1780,7 @@ mod tests {
     /// first frame).
     #[test]
     fn mpv_render_context_created_with_advanced_control() {
-        let Some((mut player, _video)) = build_test_player() else {
+        let Some((mut player, _fixture_dir, _video)) = build_test_player() else {
             eprintln!("ffmpeg unavailable; skipping advanced-control test");
             return;
         };
@@ -1715,11 +1789,16 @@ mod tests {
         let mut rendered = false;
         let start = Instant::now();
         while start.elapsed() < FRAME_PUMP_TIMEOUT {
-            if player.render_frame_into(&mut buf).expect("render") {
-                rendered = true;
-                break;
+            match player.render_frame_into(&mut buf) {
+                Ok(true) => {
+                    rendered = true;
+                    break;
+                }
+                Ok(false) | Err(MpvError::NoFirstFrame) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("render errored: {e}"),
             }
-            std::thread::sleep(Duration::from_millis(20));
         }
         assert!(rendered, "render should produce at least one frame");
 
@@ -1863,17 +1942,17 @@ mod tests {
         }
     }
 
-    fn build_test_player_image() -> Option<(MpvPlayer, std::path::PathBuf)> {
-        let dir = std::env::temp_dir().join("dormant-render-tests");
-        std::fs::create_dir_all(&dir).expect("mkdir temp test dir");
-        let image = dir.join("test.jpg");
+    fn build_test_player_image() -> Option<(MpvPlayer, tempfile::TempDir, PathBuf)> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let image = dir.path().join("test.jpg");
         generate_test_image(&image)?;
-        build_test_player_with_mode(image, ScaleMode::Fit)
+        let player = build_test_player_with_mode(&image, ScaleMode::Fit)?;
+        Some((player, dir, image))
     }
 
     #[test]
     fn render_frame_into_unconditionally_draws_current_picture() {
-        let Some((mut player, _image)) = build_test_player_image() else {
+        let Some((mut player, _fixture_dir, _image)) = build_test_player_image() else {
             eprintln!("ffmpeg unavailable; skipping render test");
             return;
         };
@@ -1887,7 +1966,9 @@ mod tests {
                     got_first = true;
                     break;
                 }
-                Ok(false) => std::thread::sleep(std::time::Duration::from_millis(16)),
+                Ok(false) | Err(MpvError::NoFirstFrame) => {
+                    std::thread::sleep(std::time::Duration::from_millis(16));
+                }
                 Err(e) => panic!("render errored: {e}"),
             }
         }

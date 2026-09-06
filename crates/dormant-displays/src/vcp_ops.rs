@@ -731,7 +731,7 @@ fn decode_pnp_manufacturer(high: u8, low: u8) -> Option<String> {
 fn parse_monitor_descriptors(slots: &[u8]) -> (Option<String>, Option<String>) {
     let mut model = None;
     let mut serial = None;
-    for block in slots.chunks_exact(18) {
+    for block in slots.as_chunks::<18>().0 {
         // 0x00 0x00 0x00 = monitor-descriptor signature (per EDID 1.4 §3.10.4).
         if block[0] != 0 || block[1] != 0 || block[2] != 0 {
             continue;

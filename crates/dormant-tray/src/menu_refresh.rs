@@ -63,10 +63,10 @@ mod tests {
     }
 
     impl MenuRefresher for FakeMenuRefresher {
-        async fn refresh_menu(&mut self) -> bool {
+        fn refresh_menu(&mut self) -> impl Future<Output = bool> + Send {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.called.notify_one();
-            self.remains_available
+            std::future::ready(self.remains_available)
         }
     }
 

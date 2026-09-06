@@ -178,7 +178,7 @@ mod tests {
             IconState::Unreachable,
         ] {
             let icon = render_state(state);
-            for pixel in icon.rgba.chunks_exact(4).filter(|p| p[3] != 0) {
+            for pixel in icon.rgba.as_chunks::<4>().0.iter().filter(|p| p[3] != 0) {
                 assert_eq!(&pixel[..3], &[0, 0, 0]);
             }
         }

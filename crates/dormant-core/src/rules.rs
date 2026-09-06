@@ -1505,7 +1505,7 @@ impl RulesEngine {
         cancel: CancellationToken,
     ) {
         // ── Drain pre-run restore effects into live structures. ────────────
-        let drained: Vec<(DisplayId, Vec<Effect>)> = self.pending_restore.drain(..).collect();
+        let drained = std::mem::take(&mut self.pending_restore);
         for (display, effects) in drained {
             for effect in effects {
                 self.process_effect(&display, effect);

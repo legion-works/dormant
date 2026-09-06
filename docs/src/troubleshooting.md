@@ -37,7 +37,8 @@ If sampling is `uniform`, check the sampler status age and journal for capture
 or reattach warnings. Uniform attribution is expected whenever capture is
 unavailable, stale, suspended, denied, timed out, the circuit is open, or the
 monitor binding no longer matches. Re-enable explicitly after granting
-ScreenCast consent; revoke with `dormantctl wear disable-sampling --forget` or
+ScreenCast consent; revoke with `dormantctl wear disable-sampling --display
+<id> --forget` (`--display` is required when more than one display samples) or
 KDE System Settings → Applications → Screen Sharing permissions.
 
 ### Doctor-assisted issue drafting

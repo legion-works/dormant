@@ -362,7 +362,7 @@ mod tests {
     #[test]
     fn reduce_rgba8_averages_linear_luma_not_gamma_channels() {
         let mut rgba = vec![0_u8; 32 * 18 * 4];
-        for channel in rgba.chunks_exact_mut(4) {
+        for channel in rgba.as_chunks_mut::<4>().0 {
             channel[3] = 255;
         }
         rgba[3] = 255;

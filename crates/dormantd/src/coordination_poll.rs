@@ -851,7 +851,13 @@ mod tests {
         assert_eq!(sink.reads(), 48);
         assert_eq!(sink.reprobes(), 6);
         assert_eq!(&failures[..4], &[1, 2, 3, 0]);
-        assert!(failures.chunks_exact(4).all(|chunk| chunk == [1, 2, 3, 0]));
+        assert!(
+            failures
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|chunk| chunk == &[1, 2, 3, 0])
+        );
         cancel.cancel();
     }
 

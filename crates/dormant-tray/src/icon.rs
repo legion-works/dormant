@@ -316,7 +316,7 @@ pub fn draw_failure_badge(pixels: &mut [u8], size: u32) {
     reason = "explicit (a+b)/2 keeps the documented rounding behaviour"
 )]
 pub fn desaturate(pixels: &mut [u8]) {
-    for px in pixels.chunks_exact_mut(4) {
+    for px in pixels.as_chunks_mut::<4>().0 {
         // ARGB BE → bytes [A, R, G, B].
         let r = u16::from(px[1]);
         let g = u16::from(px[2]);
@@ -402,7 +402,7 @@ mod tests {
         let size = 24u32;
         let mut pix = vec![0u8; (size * size * 4) as usize];
         // Seed every pixel to opaque white (A=255, R=255, G=255, B=255).
-        for px in pix.chunks_exact_mut(4) {
+        for px in pix.as_chunks_mut::<4>().0 {
             px.copy_from_slice(&[255, 255, 255, 255]);
         }
         draw_pause_badge(&mut pix, size);
@@ -434,7 +434,7 @@ mod tests {
     fn pause_badge_leaves_top_left_alone() {
         let size = 24u32;
         let mut pix = vec![0u8; (size * size * 4) as usize];
-        for px in pix.chunks_exact_mut(4) {
+        for px in pix.as_chunks_mut::<4>().0 {
             px.copy_from_slice(&[255, 200, 100, 50]); // opaque orange
         }
         draw_pause_badge(&mut pix, size);
@@ -463,15 +463,23 @@ mod tests {
         let (_, pixels) = set.base.first().expect("at least one baked mark size");
 
         assert!(
-            pixels.chunks_exact(4).any(|pixel| pixel == [0, 0, 0, 0]),
+            pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel == &[0, 0, 0, 0]),
             "the transparent margin must retain zeroed RGB"
         );
         assert!(
-            pixels.chunks_exact(4).any(|pixel| pixel[0] == u8::MAX),
+            pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[0] == u8::MAX),
             "the mark must retain opaque pixels"
         );
         assert!(
-            pixels.chunks_exact(4).any(|pixel| {
+            pixels.as_chunks::<4>().0.iter().any(|pixel| {
                 let alpha = pixel[0];
                 alpha > 0 && alpha < u8::MAX && pixel[1..].iter().any(|&channel| channel > alpha)
             }),
@@ -484,7 +492,7 @@ mod tests {
         // 24×24 fixture with one fully-opaque white pixel per location.
         let size = 24u32;
         let mut pix = vec![0u8; (size * size * 4) as usize];
-        for px in pix.chunks_exact_mut(4) {
+        for px in pix.as_chunks_mut::<4>().0 {
             px.copy_from_slice(&[255, 255, 255, 255]);
         }
         draw_failure_badge(&mut pix, size);
@@ -508,7 +516,7 @@ mod tests {
     fn failure_badge_leaves_top_left_alone() {
         let size = 24u32;
         let mut pix = vec![0u8; (size * size * 4) as usize];
-        for px in pix.chunks_exact_mut(4) {
+        for px in pix.as_chunks_mut::<4>().0 {
             px.copy_from_slice(&[255, 200, 100, 50]); // opaque orange
         }
         draw_failure_badge(&mut pix, size);

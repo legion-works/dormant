@@ -1158,7 +1158,7 @@ fn rgba_from_pipewire(
     }
     let mut rgba = Vec::with_capacity(row_bytes.saturating_mul(height));
     for row in input.chunks_exact(stride).take(height) {
-        for pixel in row[..row_bytes].chunks_exact(4) {
+        for pixel in row[..row_bytes].as_chunks::<4>().0 {
             let converted = if format == spa::param::video::VideoFormat::RGBA {
                 [pixel[0], pixel[1], pixel[2], pixel[3]]
             } else if format == spa::param::video::VideoFormat::RGBx {

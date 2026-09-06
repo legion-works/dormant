@@ -4125,11 +4125,7 @@ impl Runner {
     /// has already terminated the prior generation's task. The slot
     /// must be `None` on entry — if it's `Some`, the OLD task would
     /// race the NEW one on `filtered_rx` and `idle_rx`.
-    #[allow(
-        clippy::unused_async,
-        reason = "future-proofs the API; cancel+await may move here later"
-    )]
-    async fn spawn_activity_follow(&mut self) {
+    fn spawn_activity_follow(&mut self) {
         debug_assert!(
             self.activity_follow_slot.is_none(),
             "spawn_activity_follow called before reap_activity_follow — prior generation would race the new one on `filtered_rx`",
@@ -4580,7 +4576,7 @@ impl Runner {
                 // Republish executor/config watches BEFORE activity-follow
                 // or any new edge can write — an edge that fires against a
                 // stale executor writes to the wrong panel.
-                self.spawn_activity_follow().await;
+                self.spawn_activity_follow();
                 self.publish_kvm_status().await;
 
                 // Rollback recovery (rollback-recovery plan, Task 2 §3): a

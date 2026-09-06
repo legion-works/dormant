@@ -127,7 +127,7 @@ fn rasterize_mark(svg_path: &Path, out_dir: &Path) {
         // darken the antialiased edge and halo.
         let raw = pixmap.data();
         let mut argb_be = Vec::with_capacity(raw.len());
-        for px in raw.chunks_exact(4) {
+        for px in raw.as_chunks::<4>().0 {
             let (r, g, b) = unpremul_to_rgba8(px[2], px[1], px[0], px[3]);
             argb_be.push(px[3]); // A
             argb_be.push(r); // R
@@ -156,7 +156,7 @@ fn rasterize_template_mark(svg_path: &Path, out_dir: &Path) {
     resvg::render(&tree, transform, &mut pixmap.as_mut());
 
     let mut rgba = Vec::with_capacity(pixmap.data().len());
-    for pixel in pixmap.data().chunks_exact(4) {
+    for pixel in pixmap.data().as_chunks::<4>().0 {
         rgba.extend_from_slice(&[0, 0, 0, pixel[3]]);
     }
 
@@ -196,7 +196,7 @@ fn rasterize_glyphs(glyphs_dir: &Path, out_dir: &Path) {
         // fixed-point multiply (×256) to round half-up.
         let raw = pixmap.data();
         let mut rgba = Vec::with_capacity(raw.len());
-        for px in raw.chunks_exact(4) {
+        for px in raw.as_chunks::<4>().0 {
             let b = px[0];
             let g = px[1];
             let r = px[2];

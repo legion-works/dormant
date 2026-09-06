@@ -331,8 +331,14 @@ enabled = false
 To cancel a pending flow, close the session, and erase the record, run:
 
 ```bash
-dormantctl wear disable-sampling --forget
+dormantctl wear disable-sampling --display <id> --forget
 ```
+
+`--display` is required whenever more than one display has sampling
+configured; with exactly one it may be omitted. The bare form on a
+multi-display config fails with `multiple displays configured — pass
+--display to pick one` rather than acting on all of them, so a single
+command never closes a session you did not name.
 
 `--forget` is the recovery path for a drifted or stale consent record: it
 deletes the on-disk record so the next `enable-sampling` opens a fresh portal

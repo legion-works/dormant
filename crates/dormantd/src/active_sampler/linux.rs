@@ -427,11 +427,6 @@ impl<T: PortalTransport> CaptureSource for PortalPipeWireSource<T> {
                     .expect("warm worker was initialized")
                     .capture(self.capture_timeout)
                     .await;
-                if result == Err(CaptureError::Timeout)
-                    && let Some(mut worker) = self.warm_worker.take()
-                {
-                    worker.shutdown().await;
-                }
                 result?
             }
         };
@@ -464,27 +459,29 @@ impl<T: PortalTransport> CaptureSource for PortalPipeWireSource<T> {
     }
 
     async fn invalidate_pending_capture(&mut self) {
-        // Drop any retained warm worker so a frame buffered in the cap-1
-        // channel by a cancelled capture cannot be served on the next
-        // attempt as if it were fresh. `Worker::Drop` sends the shutdown
-        // command and reaps the thread; the channel's `Sender` going away
-        // also forces any pending `try_send` from the process callback to
-        // become a no-op.
-        if let Some(mut worker) = self.warm_worker.take() {
-            worker.shutdown().await;
+        // The PipeWire stream owns KWin's buffer pool, so timeout recovery
+        // must cancel its request rather than recreate the connection.
+        if let Some(worker) = self.warm_worker.as_mut() {
+            worker.cancel().await;
         }
     }
 }
 
 #[derive(Debug)]
 enum WarmCommand {
-    Capture,
+    Capture {
+        generation: u64,
+    },
+    Cancel {
+        acknowledged: tokio::sync::oneshot::Sender<()>,
+    },
     Shutdown,
 }
 
 struct WarmWorker {
     commands: pw::channel::Sender<WarmCommand>,
-    frames: tokio::sync::mpsc::Receiver<Result<RawFrame, CaptureError>>,
+    frames: tokio::sync::mpsc::Receiver<(u64, Result<RawFrame, CaptureError>)>,
+    next_generation: u64,
     join: Option<JoinHandle<()>>,
 }
 
@@ -508,7 +505,8 @@ impl WarmWorker {
         init_timeout: Duration,
         display_id: DisplayId,
     ) -> Result<Self, CaptureError> {
-        let (frames_tx, frames) = tokio::sync::mpsc::channel(1);
+        let (frames_tx, frames) =
+            tokio::sync::mpsc::channel::<(u64, Result<RawFrame, CaptureError>)>(1);
         let (initialized_tx, initialized_rx) = std::sync::mpsc::sync_channel(1);
         let join = std::thread::Builder::new()
             .name("dormant-pipewire-warm".to_owned())
@@ -526,6 +524,7 @@ impl WarmWorker {
             Ok(commands) => Ok(Self {
                 commands,
                 frames,
+                next_generation: 0,
                 join: Some(join),
             }),
             Err(error) => {
@@ -544,17 +543,39 @@ impl WarmWorker {
     }
 
     async fn capture(&mut self, timeout: Duration) -> Result<RawFrame, CaptureError> {
-        self.commands.send(WarmCommand::Capture).map_err(|_| {
-            CaptureError::Transport("PipeWire warm worker is unavailable".to_owned())
-        })?;
-        tokio::time::timeout(timeout, self.frames.recv())
-            .await
-            .map_err(|_| CaptureError::Timeout)?
-            .ok_or_else(|| {
-                CaptureError::Transport(
+        self.next_generation = self.next_generation.wrapping_add(1);
+        let generation = self.next_generation;
+        self.commands
+            .send(WarmCommand::Capture { generation })
+            .map_err(|_| {
+                CaptureError::Transport("PipeWire warm worker is unavailable".to_owned())
+            })?;
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let Some((received_generation, result)) =
+                tokio::time::timeout_at(deadline, self.frames.recv())
+                    .await
+                    .map_err(|_| CaptureError::Timeout)?
+            else {
+                return Err(CaptureError::Transport(
                     "PipeWire warm worker ended before delivering a frame".to_owned(),
-                )
-            })?
+                ));
+            };
+            if received_generation == generation {
+                return result;
+            }
+        }
+    }
+
+    async fn cancel(&mut self) {
+        let (acknowledged, ack) = tokio::sync::oneshot::channel();
+        if self
+            .commands
+            .send(WarmCommand::Cancel { acknowledged })
+            .is_ok()
+        {
+            let _ = ack.await;
+        }
     }
 
     async fn shutdown(&mut self) {
@@ -566,8 +587,19 @@ impl WarmWorker {
 
     #[cfg(test)]
     fn spawn_fake(frames: impl IntoIterator<Item = Option<RawFrame>> + Send + 'static) -> Self {
-        let (frames_tx, frames_rx) = tokio::sync::mpsc::channel(1);
+        Self::spawn_fake_observed(frames, None).0
+    }
+
+    #[cfg(test)]
+    fn spawn_fake_observed(
+        frames: impl IntoIterator<Item = Option<RawFrame>> + Send + 'static,
+        stale_frame_on_cancel: Option<RawFrame>,
+    ) -> (Self, FakeWarmWorkerObservations) {
+        let (frames_tx, frames_rx) =
+            tokio::sync::mpsc::channel::<(u64, Result<RawFrame, CaptureError>)>(1);
         let (initialized_tx, initialized_rx) = std::sync::mpsc::sync_channel(1);
+        let observations = FakeWarmWorkerObservations::default();
+        let observations_for_thread = observations.clone();
         let join = std::thread::spawn(move || {
             pw::init();
             let mainloop = pw::main_loop::MainLoopRc::new(None).expect("fake main loop");
@@ -579,23 +611,55 @@ impl WarmWorker {
             ));
             let loop_for_commands = mainloop.clone();
             let scripted_for_commands = scripted.clone();
+            let last_generation = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let last_generation_for_commands = last_generation.clone();
+            let stale_frame_on_cancel =
+                std::rc::Rc::new(std::cell::RefCell::new(stale_frame_on_cancel));
+            let stale_frame_for_commands = stale_frame_on_cancel.clone();
             let _attached = receiver.attach(mainloop.loop_(), move |command| match command {
-                WarmCommand::Capture => {
+                WarmCommand::Capture { generation } => {
+                    observations_for_thread
+                        .captures
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    *last_generation_for_commands.borrow_mut() = Some(generation);
                     if let Some(Some(frame)) = scripted_for_commands.borrow_mut().pop_front() {
-                        let _ = frames_tx.try_send(Ok(frame));
+                        let _ = frames_tx.try_send((generation, Ok(frame)));
                     }
+                }
+                WarmCommand::Cancel { acknowledged } => {
+                    observations_for_thread
+                        .cancels
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if let (Some(generation), Some(frame)) = (
+                        *last_generation_for_commands.borrow(),
+                        stale_frame_for_commands.borrow_mut().take(),
+                    ) {
+                        let _ = frames_tx.try_send((generation, Ok(frame)));
+                    }
+                    let _ = acknowledged.send(());
                 }
                 WarmCommand::Shutdown => loop_for_commands.quit(),
             });
             initialized_tx.send(commands).expect("publish fake sender");
             mainloop.run();
         });
-        Self {
-            commands: initialized_rx.recv().expect("fake worker initialized"),
-            frames: frames_rx,
-            join: Some(join),
-        }
+        (
+            Self {
+                commands: initialized_rx.recv().expect("fake worker initialized"),
+                frames: frames_rx,
+                next_generation: 0,
+                join: Some(join),
+            },
+            observations,
+        )
     }
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct FakeWarmWorkerObservations {
+    captures: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    cancels: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Drop for WarmWorker {
@@ -628,7 +692,8 @@ fn receive_warm_worker_initialization<T>(
 struct WarmFrameState {
     format: spa::param::video::VideoInfoRaw,
     capturing: bool,
-    frames: tokio::sync::mpsc::Sender<Result<RawFrame, CaptureError>>,
+    generation: u64,
+    frames: tokio::sync::mpsc::Sender<(u64, Result<RawFrame, CaptureError>)>,
 }
 
 #[allow(
@@ -638,7 +703,7 @@ struct WarmFrameState {
 fn run_warm_stream(
     fd: OwnedFd,
     node_id: u32,
-    frames: tokio::sync::mpsc::Sender<Result<RawFrame, CaptureError>>,
+    frames: tokio::sync::mpsc::Sender<(u64, Result<RawFrame, CaptureError>)>,
     initialized: &std::sync::mpsc::SyncSender<
         Result<pw::channel::Sender<WarmCommand>, CaptureError>,
     >,
@@ -665,9 +730,10 @@ fn run_warm_stream(
     let state = std::rc::Rc::new(std::cell::RefCell::new(WarmFrameState {
         format: spa::param::video::VideoInfoRaw::default(),
         capturing: false,
+        generation: 0,
         frames,
     }));
-    let frames_for_state = state.borrow().frames.clone();
+    let state_for_state = state.clone();
     let state_for_format = state.clone();
     let state_for_process = state.clone();
     let display_for_state = display_id.clone();
@@ -678,7 +744,10 @@ fn run_warm_stream(
         .state_changed(move |_, (), _, state| {
             log_stream_state(&state, &display_for_state);
             if let Some(error) = stream_state_capture_error(&state) {
-                let _ = frames_for_state.try_send(Err(error));
+                let state = state_for_state.borrow();
+                if state.capturing {
+                    let _ = state.frames.try_send((state.generation, Err(error)));
+                }
             }
         })
         .param_changed(move |stream, (), id, param| {
@@ -710,7 +779,7 @@ fn run_warm_stream(
             let result = capture_buffer(stream, &state.format);
             state.capturing = false;
             let _ = stream_for_process.set_active(false);
-            let _ = state.frames.try_send(result);
+            let _ = state.frames.try_send((state.generation, result));
         })
         .register()
         .map_err(|error| CaptureError::Transport(format!("PipeWire stream listener: {error}")))?;
@@ -733,15 +802,25 @@ fn run_warm_stream(
     let stream_for_commands = stream.clone();
     let state_for_commands = state.clone();
     let _attached = receiver.attach(mainloop.loop_(), move |command| match command {
-        WarmCommand::Capture => {
+        WarmCommand::Capture { generation } => {
             let mut state = state_for_commands.borrow_mut();
             state.capturing = true;
+            state.generation = generation;
             if let Err(error) = stream_for_commands.set_active(true) {
                 state.capturing = false;
-                let _ = state.frames.try_send(Err(CaptureError::Transport(format!(
-                    "activate PipeWire warm stream: {error}"
-                ))));
+                let _ = state.frames.try_send((
+                    generation,
+                    Err(CaptureError::Transport(format!(
+                        "activate PipeWire warm stream: {error}"
+                    ))),
+                ));
             }
+        }
+        WarmCommand::Cancel { acknowledged } => {
+            let mut state = state_for_commands.borrow_mut();
+            state.capturing = false;
+            let _ = stream_for_commands.set_active(false);
+            let _ = acknowledged.send(());
         }
         WarmCommand::Shutdown => {
             let _ = stream_for_commands.set_active(false);
@@ -2527,11 +2606,10 @@ mod tests {
         );
     }
 
-    /// Defect B (warm-worker side): the source's `invalidate_pending_capture`
-    /// must drop the warm worker so a stale frame buffered in the cap-1
-    /// channel cannot be served on the next capture.
+    /// A timeout must reset the worker without tearing down its `PipeWire`
+    /// connection, so the next capture stays on the same buffer pool.
     #[tokio::test]
-    async fn portal_source_invalidate_pending_capture_drops_warm_worker() {
+    async fn portal_source_invalidate_pending_capture_keeps_warm_worker_for_next_capture() {
         let transport = FakePortalTransport::grant_with(PortalStartResult::single(
             73,
             16,
@@ -2541,6 +2619,21 @@ mod tests {
             None,
         ));
         let mut source = PortalPipeWireSource::from_transport(transport);
+        source.stream = Some(ConnectedStream {
+            node_id: 73,
+            restore_token: "rotated-token".to_owned(),
+            persistent_id: None,
+            width: 16,
+            height: 9,
+            position: None,
+            frame_width: 16,
+            frame_height: 9,
+        });
+        source.pipewire_fd = Some(
+            std::fs::File::open("/dev/null")
+                .expect("open test fd")
+                .into(),
+        );
 
         // Inject a fake warm worker. The test module has access to the
         // private field; the public constructor would require a real PipeWire
@@ -2551,15 +2644,90 @@ mod tests {
             height: 1,
             stride: 4,
         };
-        source.warm_worker = Some(WarmWorker::spawn_fake([Some(frame.clone())]));
-        assert!(source.warm_worker.is_some());
+        let (worker, observations) =
+            WarmWorker::spawn_fake_observed([None, Some(frame.clone())], None);
+        source.warm_worker = Some(worker);
+
+        assert_eq!(
+            source.capture_one(StreamMode::Warm).await,
+            Err(CaptureError::Timeout)
+        );
 
         source.invalidate_pending_capture().await;
 
-        assert!(
-            source.warm_worker.is_none(),
-            "invalidate_pending_capture must drop the warm worker"
+        assert_eq!(
+            observations
+                .cancels
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "timeout invalidation must cancel the in-flight capture on the worker loop"
         );
+
+        assert_eq!(
+            source.capture_one(StreamMode::Warm).await,
+            Ok(frame),
+            "the retained worker must serve the next capture"
+        );
+        assert_eq!(
+            observations
+                .captures
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the next capture must use the retained worker instead of spawning a replacement"
+        );
+        source
+            .warm_worker
+            .as_mut()
+            .expect("invalidate_pending_capture must retain the warm worker")
+            .shutdown()
+            .await;
+    }
+
+    /// A frame enqueued after the timeout belongs to the cancelled request,
+    /// not to the capture that follows it.
+    #[tokio::test]
+    async fn warm_worker_discards_frame_from_cancelled_generation() {
+        let stale = RawFrame {
+            rgba: vec![1, 2, 3, 4],
+            width: 1,
+            height: 1,
+            stride: 4,
+        };
+        let fresh = RawFrame {
+            rgba: vec![5, 6, 7, 8],
+            width: 1,
+            height: 1,
+            stride: 4,
+        };
+        let (mut worker, observations) =
+            WarmWorker::spawn_fake_observed([None, Some(fresh.clone())], Some(stale));
+
+        assert_eq!(
+            worker.capture(Duration::from_millis(10)).await,
+            Err(CaptureError::Timeout)
+        );
+        worker.cancel().await;
+
+        assert_eq!(
+            observations
+                .cancels
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "cancel must reset the worker before the next capture"
+        );
+        let next = worker.capture(Duration::from_secs(1)).await;
+        assert!(
+            matches!(next, Ok(ref frame) if *frame == fresh) || next == Err(CaptureError::Timeout),
+            "the next capture must not receive the cancelled request's frame: {next:?}"
+        );
+        assert_eq!(
+            observations
+                .captures
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the worker must accept a fresh capture after cancellation"
+        );
+        worker.shutdown().await;
     }
 
     // ---------------------------------------------------------------------

@@ -243,14 +243,14 @@ async fn poll_once(
             }
             if outcome.entered_contested {
                 tracing::warn!(
-                    event = "ownership_contested",
+                    event = "coord_ownership_contested",
                     display = %display_id,
                     transitions = config.coordination.flap_threshold,
                     window_s = config.coordination.flap_window.as_secs(),
                 );
             }
             if outcome.settled {
-                tracing::info!(event = "ownership_settled", display = %display_id);
+                tracing::info!(event = "coord_ownership_settled", display = %display_id);
             }
             // A potential ownership loss is held pending further confirmations
             // (issue #134). Surfacing the deferred count lets operators see the
@@ -1181,7 +1181,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn emits_ownership_contested_once_for_a_slow_flap() {
+    async fn emits_coord_ownership_contested_once_for_a_slow_flap() {
         let mut inputs = Vec::new();
         for observed in [0x12, 0x11, 0x12, 0x11, 0x12, 0x11, 0x12, 0x11] {
             for _ in 0..3 {
@@ -1192,11 +1192,11 @@ mod tests {
         let mut cfg = config();
         cfg.coordination.poll_interval = Duration::from_secs(2);
         let events = captured_events_with_config(cfg, inputs, 24).await;
-        assert_eq!(count_event(&events, "ownership_contested"), 1);
+        assert_eq!(count_event(&events, "coord_ownership_contested"), 1);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn emits_ownership_settled_after_the_quiet_window() {
+    async fn emits_coord_ownership_settled_after_the_quiet_window() {
         let mut cfg = config();
         cfg.coordination.flap_threshold = 2;
         cfg.coordination.flap_settle = Duration::from_secs(6);
@@ -1214,7 +1214,7 @@ mod tests {
             7,
         )
         .await;
-        assert_eq!(count_event(&events, "ownership_settled"), 1);
+        assert_eq!(count_event(&events, "coord_ownership_settled"), 1);
     }
 
     #[tokio::test(start_paused = true)]

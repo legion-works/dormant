@@ -1,8 +1,8 @@
 //! Daemon-lifetime ownership verdicts for displays shared across instances.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, PoisonError, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::ownership::OwnershipGate;
 use crate::traits::PanelState;
@@ -10,6 +10,42 @@ use crate::types::DisplayId;
 
 /// Interval used to rate-limit logs while shared-display input polling fails.
 pub const COORD_POLL_FAILING_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Per-display transition rate limit for a shared panel's ownership verdict.
+///
+/// The poller supplies this policy together with an explicit clock value so the
+/// coordination cache remains deterministic under tests and paused runtime time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnershipFlapPolicy {
+    /// Maximum committed transitions allowed during [`Self::window`].
+    pub threshold: u32,
+    /// Sliding interval used to count committed ownership transitions.
+    pub window: Duration,
+    /// Quiet interval required before a contested display resumes evaluation.
+    pub settle: Duration,
+}
+
+/// One successful VCP `0x60` read with its configured aliases and sampled
+/// panel state.
+#[derive(Debug, Clone)]
+pub struct InputObservation<'a> {
+    /// Raw input-source code read from the panel.
+    pub observed: u8,
+    /// Configured aliases used to classify [`Self::observed`].
+    pub aliases: &'a InputCodeAliases,
+    /// Panel state sampled alongside the input-source read.
+    pub panel_state: Option<PanelState>,
+}
+
+impl OwnershipFlapPolicy {
+    const fn disabled() -> Self {
+        Self {
+            threshold: u32::MAX,
+            window: Duration::MAX,
+            settle: Duration::MAX,
+        }
+    }
+}
 
 /// Mapping of local and peer input-source codes used to classify a raw VCP 0x60
 /// reading. The local write code can alias a different read-back value (e.g. the
@@ -80,6 +116,10 @@ pub struct InputObservationOutcome {
     /// lets the operator distinguish "poll is healthy" from "the bus is
     /// returning inconsistent values" without parsing the cache.
     pub disagreement_with: Option<u8>,
+    /// `true` only on the transition that entered the contested safety state.
+    pub entered_contested: bool,
+    /// `true` only on the observation that cleared a settled contested state.
+    pub settled: bool,
 }
 
 /// Last known ownership and readback state for one shared display.
@@ -106,6 +146,10 @@ pub struct CoordRecord {
     /// Last successful observation's raw input code; used to detect
     /// disagreements between consecutive successful reads (issue #134).
     pub last_observed_code: Option<u8>,
+    /// Whether transition churn has made this display unsafe to control.
+    pub contested: bool,
+    /// Recent committed ownership transitions, oldest first.
+    pub transition_times: VecDeque<Instant>,
 }
 
 impl CoordRecord {
@@ -119,8 +163,18 @@ impl CoordRecord {
             pending_transition_count: 0,
             pending_transition_code: None,
             last_observed_code: None,
+            contested: false,
+            transition_times: VecDeque::new(),
         }
     }
+}
+
+fn record_success_state(record: &mut CoordRecord, observed: u8, panel_state: Option<PanelState>) {
+    record.has_successful_input_read = true;
+    record.input_code = Some(observed);
+    record.panel_state = panel_state;
+    record.consecutive_failures = 0;
+    record.last_observed_code = Some(observed);
 }
 
 /// Cloneable, daemon-lifetime cache of shared-display ownership verdicts.
@@ -199,11 +253,70 @@ impl CoordinationHandle {
         confirmations: u32,
         panel_state: Option<PanelState>,
     ) -> InputObservationOutcome {
+        self.record_input_observation_at(
+            display,
+            InputObservation {
+                observed,
+                aliases,
+                panel_state,
+            },
+            confirmations,
+            OwnershipFlapPolicy::disabled(),
+            Instant::now(),
+        )
+    }
+
+    /// Record a successful source-input read with an explicit clock and flap
+    /// policy supplied by the poller.
+    ///
+    /// Once the committed transition rate reaches `policy.threshold` inside
+    /// `policy.window`, contested ownership is forced not-owned. This prevents a
+    /// flapping panel from advancing the render ladder while the peer may be
+    /// using it. A verified local write uses [`Self::mark_owned_immediate`] and
+    /// deliberately clears this state because it is first-hand proof.
+    #[must_use]
+    pub fn record_input_observation_at(
+        &self,
+        display: &DisplayId,
+        observation: InputObservation<'_>,
+        confirmations: u32,
+        policy: OwnershipFlapPolicy,
+        now: Instant,
+    ) -> InputObservationOutcome {
         let mut records = self.records.write().unwrap_or_else(PoisonError::into_inner);
         let Some(record) = records.get_mut(display) else {
             return InputObservationOutcome::default();
         };
         let mut outcome = InputObservationOutcome::default();
+        let InputObservation {
+            observed,
+            aliases,
+            panel_state,
+        } = observation;
+
+        if record.contested {
+            // Contested means the panel's reported input is not trustworthy.
+            // Fail closed: retaining owned=true could power off a panel the peer
+            // is actively using.
+            record.owned = false;
+            let settled = record
+                .transition_times
+                .back()
+                .is_none_or(|last| now.saturating_duration_since(*last) >= policy.settle);
+            if settled {
+                record.contested = false;
+                record.transition_times.clear();
+                record.pending_transition_count = 0;
+                record.pending_transition_code = None;
+                outcome.settled = true;
+            }
+
+            record_success_state(record, observed, panel_state);
+            // The clearing observation only proves silence; the next observation
+            // resumes ordinary debounce evaluation from a known not-owned state.
+            return outcome;
+        }
+
         let prior_owned = record.owned;
         let classification = aliases.classify(observed);
         let is_local = matches!(classification, InputSourceObservation::Local);
@@ -268,11 +381,29 @@ impl CoordinationHandle {
             }
         }
 
-        record.has_successful_input_read = true;
-        record.input_code = Some(observed);
-        record.panel_state = panel_state;
-        record.consecutive_failures = 0;
-        record.last_observed_code = Some(observed);
+        if outcome.committed_prior_owned.is_some() {
+            record.transition_times.push_back(now);
+            while record.transition_times.front().is_some_and(|transition| {
+                now.saturating_duration_since(*transition) > policy.window
+            }) {
+                let _ = record.transition_times.pop_front();
+            }
+            let transition_count = u32::try_from(record.transition_times.len()).unwrap_or(u32::MAX);
+            if transition_count >= policy.threshold.max(2) {
+                record.contested = true;
+                record.owned = false;
+                record.pending_transition_count = 0;
+                record.pending_transition_code = None;
+                outcome.entered_contested = true;
+                if !prior_owned {
+                    // A gain that tripped the limiter is net no ownership change:
+                    // the safety verdict remains false, so do not wake the ladder.
+                    outcome.committed_prior_owned = None;
+                }
+            }
+        }
+
+        record_success_state(record, observed, panel_state);
         outcome
     }
 
@@ -312,6 +443,8 @@ impl CoordinationHandle {
         let mut records = self.records.write().unwrap_or_else(PoisonError::into_inner);
         if let Some(record) = records.get_mut(display) {
             record.owned = true;
+            record.contested = false;
+            record.transition_times.clear();
             // Clear any pending transition so the poller's subsequent
             // agreeing reads don't double-fire or register a disagreement.
             record.pending_transition_count = 0;
@@ -397,8 +530,12 @@ impl OwnershipGate for CoordinationGate {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
-    use super::{CoordinationGate, CoordinationHandle, InputCodeAliases, InputSourceObservation};
+    use super::{
+        CoordinationGate, CoordinationHandle, InputCodeAliases, InputObservation,
+        InputObservationOutcome, InputSourceObservation, OwnershipFlapPolicy,
+    };
     use crate::ownership::OwnershipGate;
     use crate::traits::{PanelState, PowerState};
     use crate::types::DisplayId;
@@ -415,6 +552,36 @@ mod tests {
             peer_read: None,
             peer_write: None,
         }
+    }
+
+    fn flap_policy(threshold: u32) -> OwnershipFlapPolicy {
+        OwnershipFlapPolicy {
+            threshold,
+            window: Duration::from_secs(120),
+            settle: Duration::from_secs(60),
+        }
+    }
+
+    fn observe_at(
+        handle: &CoordinationHandle,
+        display: &DisplayId,
+        observed: u8,
+        aliases: &InputCodeAliases,
+        confirmations: u32,
+        policy: OwnershipFlapPolicy,
+        now: Instant,
+    ) -> InputObservationOutcome {
+        handle.record_input_observation_at(
+            display,
+            InputObservation {
+                observed,
+                aliases,
+                panel_state: None,
+            },
+            confirmations,
+            policy,
+            now,
+        )
     }
 
     #[test]
@@ -943,5 +1110,205 @@ mod tests {
             handle.snapshot()[&aoc].owned,
             "display should be owned after mark_owned_immediate"
         );
+    }
+
+    #[test]
+    fn standby_flap_enters_contested_once_and_forces_not_owned() {
+        let handle = CoordinationHandle::new([display("aoc")]);
+        let aoc = display("aoc");
+        let al = aliases(0x0f);
+        let policy = flap_policy(8);
+        let mut now = Instant::now();
+        let mut contested_edges = 0;
+
+        // Each side holds for four 2s polls. Three agreeing observations commit
+        // the ordinary debounce, so this models the 6–10s standby flap rather
+        // than a single corrupted VCP read.
+        for observed in [0x10, 0x0f, 0x10, 0x0f, 0x10, 0x0f, 0x10, 0x0f] {
+            for _ in 0..4 {
+                let outcome = observe_at(&handle, &aoc, observed, &al, 3, policy, now);
+                contested_edges += u32::from(outcome.entered_contested);
+                now += Duration::from_secs(2);
+            }
+        }
+
+        let record = &handle.snapshot()[&aoc];
+        assert!(record.contested);
+        assert!(
+            !record.owned,
+            "a contested panel must be treated as not owned"
+        );
+        assert_eq!(
+            contested_edges, 1,
+            "contested is an edge, not a per-poll event"
+        );
+
+        for _ in 0..4 {
+            let outcome = observe_at(&handle, &aoc, 0x0f, &al, 3, policy, now);
+            assert!(!outcome.entered_contested);
+            assert!(!handle.snapshot()[&aoc].owned);
+            now += Duration::from_secs(2);
+        }
+    }
+
+    #[test]
+    fn contested_hold_forces_not_owned_even_if_seeded_owned() {
+        let handle = CoordinationHandle::new([display("aoc")]);
+        let aoc = display("aoc");
+        let al = aliases(0x0f);
+        let policy = flap_policy(8);
+        let now = Instant::now();
+
+        {
+            let mut records = handle.records.write().unwrap();
+            let record = records.get_mut(&aoc).unwrap();
+            record.owned = true;
+            record.contested = true;
+            record.transition_times.push_back(now);
+        }
+
+        let outcome = observe_at(&handle, &aoc, 0x0f, &al, 3, policy, now);
+
+        assert!(!outcome.settled);
+        assert!(handle.snapshot()[&aoc].contested);
+        assert!(!handle.snapshot()[&aoc].owned);
+    }
+
+    #[test]
+    fn human_kvm_round_trips_do_not_enter_contested() {
+        let handle = CoordinationHandle::new([display("aoc")]);
+        let aoc = display("aoc");
+        let al = aliases(0x0f);
+        let policy = flap_policy(8);
+        let mut now = Instant::now();
+
+        // Three human round-trips spread over five minutes are normal KVM use,
+        // not a repeating standby flap.
+        for _ in 0..3 {
+            let loss = observe_at(&handle, &aoc, 0x10, &al, 1, policy, now);
+            assert_eq!(loss.committed_prior_owned, Some(true));
+            assert!(!loss.entered_contested);
+            now += Duration::from_secs(50);
+
+            let gain = observe_at(&handle, &aoc, 0x0f, &al, 1, policy, now);
+            assert_eq!(gain.committed_prior_owned, Some(false));
+            assert!(!gain.entered_contested);
+            now += Duration::from_secs(50);
+        }
+
+        assert!(!handle.snapshot()[&aoc].contested);
+        assert!(handle.snapshot()[&aoc].owned);
+    }
+
+    #[test]
+    fn contested_clears_after_settle_then_next_observation_can_gain() {
+        let handle = CoordinationHandle::new([display("aoc")]);
+        let aoc = display("aoc");
+        let al = aliases(0x0f);
+        let policy = flap_policy(2);
+        let start = Instant::now();
+
+        let _ = observe_at(&handle, &aoc, 0x10, &al, 1, policy, start);
+        let tripped = observe_at(
+            &handle,
+            &aoc,
+            0x0f,
+            &al,
+            1,
+            policy,
+            start + Duration::from_secs(2),
+        );
+        assert!(tripped.entered_contested);
+        assert!(handle.snapshot()[&aoc].contested);
+
+        let not_yet = observe_at(
+            &handle,
+            &aoc,
+            0x0f,
+            &al,
+            1,
+            policy,
+            start + Duration::from_secs(4),
+        );
+        assert!(
+            !not_yet.settled,
+            "the settle window must not clear immediately"
+        );
+        assert!(handle.snapshot()[&aoc].contested);
+
+        let settled = observe_at(
+            &handle,
+            &aoc,
+            0x0f,
+            &al,
+            1,
+            policy,
+            start + Duration::from_secs(2) + policy.settle,
+        );
+        assert!(settled.settled);
+        assert!(!handle.snapshot()[&aoc].contested);
+        assert!(!handle.snapshot()[&aoc].owned);
+
+        let gain = observe_at(
+            &handle,
+            &aoc,
+            0x0f,
+            &al,
+            1,
+            policy,
+            start + Duration::from_secs(4) + policy.settle,
+        );
+        assert!(!gain.settled, "settled must be emitted once");
+        assert_eq!(gain.committed_prior_owned, Some(false));
+        assert!(handle.snapshot()[&aoc].owned);
+    }
+
+    #[test]
+    fn verified_write_clears_contested_and_transition_history() {
+        let handle = CoordinationHandle::new([display("aoc")]);
+        let aoc = display("aoc");
+        let al = aliases(0x0f);
+        let policy = flap_policy(2);
+        let start = Instant::now();
+
+        let _ = observe_at(&handle, &aoc, 0x10, &al, 1, policy, start);
+        let _ = observe_at(
+            &handle,
+            &aoc,
+            0x0f,
+            &al,
+            1,
+            policy,
+            start + Duration::from_secs(2),
+        );
+        assert!(handle.snapshot()[&aoc].contested);
+
+        handle.mark_owned_immediate(&aoc, 0x0f);
+
+        let record = &handle.snapshot()[&aoc];
+        assert!(!record.contested);
+        assert!(record.transition_times.is_empty());
+        assert!(record.owned);
+    }
+
+    #[test]
+    fn flap_threshold_trips_on_exactly_the_configured_transition() {
+        let handle = CoordinationHandle::new([display("aoc")]);
+        let aoc = display("aoc");
+        let al = aliases(0x0f);
+        let policy = flap_policy(crate::config::defaults::COORDINATION_FLAP_THRESHOLD);
+        let mut now = Instant::now();
+
+        for observed in [0x10, 0x0f, 0x10, 0x0f, 0x10, 0x0f, 0x10] {
+            let outcome = observe_at(&handle, &aoc, observed, &al, 1, policy, now);
+            assert!(!outcome.entered_contested);
+            now += Duration::from_secs(2);
+        }
+        assert!(!handle.snapshot()[&aoc].contested);
+
+        let outcome = observe_at(&handle, &aoc, 0x0f, &al, 1, policy, now);
+        assert!(outcome.entered_contested);
+        assert!(handle.snapshot()[&aoc].contested);
+        assert!(!handle.snapshot()[&aoc].owned);
     }
 }

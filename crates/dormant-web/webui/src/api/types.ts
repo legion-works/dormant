@@ -604,6 +604,9 @@ export interface CoordinationConfig {
   poll_interval?: string;
   state_poll_interval?: string;
   loss_confirmations?: number;
+  flap_threshold?: number;
+  flap_window?: string;
+  flap_settle?: string;
   reprobe_failure_threshold?: number;
   reprobe_interval?: string;
   activity_follow?: boolean;

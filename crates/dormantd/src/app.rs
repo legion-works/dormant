@@ -5488,14 +5488,13 @@ async fn execute_reload_batch(
             Err(detail) => Err(detail),
         };
         runner.ping("after_assemble");
-        runner
-            .reload(
-                assembly,
-                requested_revision,
-                batch.request_ids,
-                batch.sources,
-            )
-            .await
+        Box::pin(runner.reload(
+            assembly,
+            requested_revision,
+            batch.request_ids,
+            batch.sources,
+        ))
+        .await
     };
 
     runner

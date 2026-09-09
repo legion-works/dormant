@@ -1,5 +1,5 @@
 /**
- * Coordination section — the `[coordination]` TOML table, six keys
+ * Coordination section — the `[coordination]` TOML table, eleven keys
  * governing the soft-KVM input-switch protocol between machines.
  *
  * W1-5: 230px label column via cf-field--row.
@@ -43,6 +43,9 @@ const HELP: Record<string, string> = {
   poll_interval: "How often the daemon polls the panel's input code (VCP 0x60). Minimum 1s.",
   state_poll_interval: "How often coordination state is refreshed. Defaults to max(30s, poll_interval) when unset; must be ≥ poll_interval.",
   loss_confirmations: "Number of consecutive poll results that report the peer's code before the daemon concedes ownership. 1–10.",
+  flap_threshold: "Committed ownership transitions allowed within `flap_window` before the panel becomes contested and is forced not-owned. Must be >= 2.",
+  flap_window: "Sliding interval for `flap_threshold`; must be at least `poll_interval`.",
+  flap_settle: "Quiet time without a committed transition before a contested panel resumes normal evaluation; must be at least `poll_interval`.",
   reprobe_failure_threshold: "Number of consecutive failed input reads before on-demand DDC healing. 1–10; defaults to 3.",
   reprobe_interval: "Floor between DDC healing attempts. Failed attempts back off to 60s then 120s; the first successful read resets this floor.",
   activity_follow: "When true, a local keystroke/mouse event pulls the panel to this machine automatically.",
@@ -68,6 +71,12 @@ export default function CoordinationSection({ coordination = {}, store, onDirty,
     ?? coordination.state_poll_interval ?? "";
   const lossConfirmations = (store.getEdit([...root, "loss_confirmations"]) as number | undefined)
     ?? coordination.loss_confirmations ?? 3;
+  const flapThreshold = (store.getEdit([...root, "flap_threshold"]) as number | undefined)
+    ?? coordination.flap_threshold ?? 8;
+  const flapWindow = (store.getEdit([...root, "flap_window"]) as string | undefined)
+    ?? coordination.flap_window ?? "120s";
+  const flapSettle = (store.getEdit([...root, "flap_settle"]) as string | undefined)
+    ?? coordination.flap_settle ?? "60s";
   const reprobeFailureThreshold = (store.getEdit([...root, "reprobe_failure_threshold"]) as number | undefined)
     ?? coordination.reprobe_failure_threshold ?? 3;
   const reprobeInterval = (store.getEdit([...root, "reprobe_interval"]) as string | undefined)
@@ -89,6 +98,8 @@ export default function CoordinationSection({ coordination = {}, store, onDirty,
   const reprobeThresholdError = typeof reprobeFailureThreshold === "number"
     && (reprobeFailureThreshold < 1 || reprobeFailureThreshold > 10)
     ? `must be 1–10, got ${reprobeFailureThreshold}` : undefined;
+  const flapThresholdError = typeof flapThreshold === "number" && flapThreshold < 2
+    ? `must be at least 2, got ${flapThreshold}` : undefined;
 
   function edit(key: string, value: unknown) {
     store.trackEdit([...root, key], value);
@@ -156,6 +167,24 @@ export default function CoordinationSection({ coordination = {}, store, onDirty,
                   value={statePollInterval} locked={false} help={HELP.state_poll_interval}
                   placeholder="max(30s, poll_interval)" error={fieldErrors["coordination.state_poll_interval"]}
                   onEdit={(_, v) => edit("state_poll_interval", v)} />
+              </div>
+              <div className="cf-field cf-field--row" data-field-id="coordination.flap_threshold">
+                <NumberField path={[...root, "flap_threshold"]} label="flap_threshold"
+                  value={flapThreshold} locked={false} help={HELP.flap_threshold}
+                  error={flapThresholdError ?? fieldErrors["coordination.flap_threshold"]} placeholder="8"
+                  onEdit={(_, v) => edit("flap_threshold", v)} />
+              </div>
+              <div className="cf-field cf-field--row" data-field-id="coordination.flap_window">
+                <DurationField path={[...root, "flap_window"]} label="flap_window"
+                  value={flapWindow} locked={false} help={HELP.flap_window} placeholder="120s"
+                  error={fieldErrors["coordination.flap_window"]}
+                  onEdit={(_, v) => edit("flap_window", v)} />
+              </div>
+              <div className="cf-field cf-field--row" data-field-id="coordination.flap_settle">
+                <DurationField path={[...root, "flap_settle"]} label="flap_settle"
+                  value={flapSettle} locked={false} help={HELP.flap_settle} placeholder="60s"
+                  error={fieldErrors["coordination.flap_settle"]}
+                  onEdit={(_, v) => edit("flap_settle", v)} />
               </div>
               <div className="cf-field cf-field--row" data-field-id="coordination.reprobe_failure_threshold">
                 <NumberField path={[...root, "reprobe_failure_threshold"]} label="reprobe_failure_threshold"

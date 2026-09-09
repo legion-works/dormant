@@ -1,5 +1,5 @@
 /**
- * CoordinationSection tests — renders six config fields, live
+ * CoordinationSection tests — renders all config fields, live
  * activation marker, derived latency chip, and client-side validation.
  */
 import { describe, it, expect, afterEach, vi } from "vitest";
@@ -9,11 +9,12 @@ import { createPatchStore } from "../app/config/patch";
 
 afterEach(() => {
   cleanup();
+  localStorage.removeItem("dormant-config-advanced:coordination");
   vi.clearAllMocks();
 });
 
 describe("CoordinationSection", () => {
-  it("renders all six fields with defaults", () => {
+  it("renders all coordination fields with defaults", () => {
     const store = createPatchStore();
 
     render(
@@ -30,8 +31,12 @@ describe("CoordinationSection", () => {
     expect(screen.getByText("activity_follow")).toBeInTheDocument();
     expect(screen.getByText("arm_after")).toBeInTheDocument();
     expect(screen.getByText("cooldown")).toBeInTheDocument();
-    // state_poll_interval is behind Advanced
+    // Advanced coordination fields are hidden by default.
     expect(screen.queryByText("state_poll_interval")).toBeNull();
+    fireEvent.click(screen.getByText("Advanced"));
+    expect(screen.getByText("flap_threshold")).toBeInTheDocument();
+    expect(screen.getByText("flap_window")).toBeInTheDocument();
+    expect(screen.getByText("flap_settle")).toBeInTheDocument();
   });
 
   it("shows ● active when kvm is present", () => {

@@ -133,6 +133,27 @@ pub const COORDINATION_STATE_POLL_INTERVAL: Duration = Duration::from_secs(30);
 /// all) and `<= 10` (a defensive upper bound; production defaults are small).
 pub const COORDINATION_LOSS_CONFIRMATIONS: u32 = 3;
 
+/// Number of committed ownership transitions allowed inside
+/// [`COORDINATION_FLAP_WINDOW`] before the panel becomes contested. A human
+/// working a KVM makes only a few round-trips per minute: four round-trips in
+/// two minutes is eight transitions, the edge of tolerance. A standby flap
+/// makes 12–20 transitions in two minutes and trips this limiter inside the
+/// first 90 seconds. The 23 yields observed over hours during normal afternoon
+/// switching remain below this burst threshold.
+pub const COORDINATION_FLAP_THRESHOLD: u32 = 8;
+
+/// Sliding interval used with [`COORDINATION_FLAP_THRESHOLD`] to detect a
+/// sustained ownership flap. Two minutes tolerates deliberate KVM use while
+/// exposing the 6–10 second standby oscillation before it can churn the render
+/// ladder for hours.
+pub const COORDINATION_FLAP_WINDOW: Duration = Duration::from_secs(120);
+
+/// Quiet time without a committed ownership transition before a contested
+/// panel resumes normal ownership evaluation. The next observation is
+/// intentionally evaluated separately so a stable local panel still observes
+/// the configured debounce after the fault has settled.
+pub const COORDINATION_FLAP_SETTLE: Duration = Duration::from_secs(60);
+
 /// Number of consecutive failed shared-display input reads before the daemon
 /// attempts an on-demand controller re-probe. A sustained transport failure
 /// warrants healing; transient DDC contention does not.

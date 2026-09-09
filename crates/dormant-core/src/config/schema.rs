@@ -189,6 +189,24 @@ pub struct CoordinationConfig {
     #[serde(default = "default_coordination_loss_confirmations")]
     pub loss_confirmations: u32,
 
+    /// Committed ownership transitions allowed within `flap_window` before the
+    /// panel becomes contested and is forced not-owned. Eight transitions allow
+    /// four human KVM round-trips in two minutes, while a 6–10s standby flap
+    /// reaches 12–20 transitions and is contained within the first 90 seconds.
+    /// The 23 yields recorded across an afternoon of normal switching remain
+    /// below this burst limit. Must be `>= 2`.
+    #[serde(default = "default_coordination_flap_threshold")]
+    pub flap_threshold: u32,
+
+    /// Sliding interval for `flap_threshold`; must be at least `poll_interval`.
+    #[serde(default = "default_coordination_flap_window", with = "humantime_serde")]
+    pub flap_window: Duration,
+
+    /// Quiet time without a committed transition before a contested panel
+    /// resumes normal evaluation; must be at least `poll_interval`.
+    #[serde(default = "default_coordination_flap_settle", with = "humantime_serde")]
+    pub flap_settle: Duration,
+
     /// Number of consecutive failed input-source reads before an on-demand
     /// controller re-probe is attempted. This heals stale DDC/CI state after a
     /// display hotplug without re-probing on every transient read failure.
@@ -225,6 +243,9 @@ impl Default for CoordinationConfig {
             poll_interval: defaults::COORDINATION_POLL_INTERVAL,
             state_poll_interval: None,
             loss_confirmations: defaults::COORDINATION_LOSS_CONFIRMATIONS,
+            flap_threshold: defaults::COORDINATION_FLAP_THRESHOLD,
+            flap_window: defaults::COORDINATION_FLAP_WINDOW,
+            flap_settle: defaults::COORDINATION_FLAP_SETTLE,
             reprobe_failure_threshold: defaults::COORDINATION_REPROBE_FAILURE_THRESHOLD,
             reprobe_interval: defaults::COORDINATION_REPROBE_INTERVAL,
             activity_follow: defaults::ACTIVITY_FOLLOW,
@@ -1992,6 +2013,15 @@ fn default_coordination_poll_interval() -> Duration {
 fn default_coordination_loss_confirmations() -> u32 {
     defaults::COORDINATION_LOSS_CONFIRMATIONS
 }
+fn default_coordination_flap_threshold() -> u32 {
+    defaults::COORDINATION_FLAP_THRESHOLD
+}
+fn default_coordination_flap_window() -> Duration {
+    defaults::COORDINATION_FLAP_WINDOW
+}
+fn default_coordination_flap_settle() -> Duration {
+    defaults::COORDINATION_FLAP_SETTLE
+}
 
 fn default_coordination_reprobe_failure_threshold() -> u32 {
     defaults::COORDINATION_REPROBE_FAILURE_THRESHOLD
@@ -3057,6 +3087,9 @@ idle_source = "macos"
         );
         // loss_confirmations default — defends against issue #134 garbled reads.
         assert_eq!(cfg.coordination.loss_confirmations, 3);
+        assert_eq!(cfg.coordination.flap_threshold, 8);
+        assert_eq!(cfg.coordination.flap_window, Duration::from_secs(120));
+        assert_eq!(cfg.coordination.flap_settle, Duration::from_secs(60));
         assert_eq!(cfg.coordination.reprobe_failure_threshold, 3);
         assert_eq!(cfg.coordination.reprobe_interval, Duration::from_secs(30));
         assert_eq!(cfg.coordination.arm_after, Duration::from_secs(7));
@@ -3066,7 +3099,7 @@ idle_source = "macos"
     #[test]
     fn coordination_parses_surviving_fields() {
         let cfg: Config = toml::from_str(
-            "config_version = 1\n[coordination]\npoll_interval = \"3s\"\nstate_poll_interval = \"30s\"\nloss_confirmations = 4\nreprobe_failure_threshold = 5\nreprobe_interval = \"45s\"\nactivity_follow = true\narm_after = \"5s\"\ncooldown = \"10s\"\n",
+            "config_version = 1\n[coordination]\npoll_interval = \"3s\"\nstate_poll_interval = \"30s\"\nloss_confirmations = 4\nflap_threshold = 9\nflap_window = \"3m\"\nflap_settle = \"90s\"\nreprobe_failure_threshold = 5\nreprobe_interval = \"45s\"\nactivity_follow = true\narm_after = \"5s\"\ncooldown = \"10s\"\n",
         )
         .unwrap();
 
@@ -3077,10 +3110,17 @@ idle_source = "macos"
             Some(Duration::from_secs(30))
         );
         assert_eq!(cfg.coordination.loss_confirmations, 4);
+        assert_eq!(cfg.coordination.flap_threshold, 9);
+        assert_eq!(cfg.coordination.flap_window, Duration::from_secs(180));
+        assert_eq!(cfg.coordination.flap_settle, Duration::from_secs(90));
         assert_eq!(cfg.coordination.reprobe_failure_threshold, 5);
         assert_eq!(cfg.coordination.reprobe_interval, Duration::from_secs(45));
         assert_eq!(cfg.coordination.arm_after, Duration::from_secs(5));
         assert_eq!(cfg.coordination.cooldown, Duration::from_secs(10));
+
+        let serialized = toml::to_string(&cfg).unwrap();
+        let round_tripped: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(round_tripped.coordination, cfg.coordination);
     }
 
     #[test]

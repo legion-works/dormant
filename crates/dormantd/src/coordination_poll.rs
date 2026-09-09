@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use dormant_core::config::{Config, DisplayScope, defaults};
 use dormant_core::coordination::{
-    COORD_POLL_FAILING_LOG_INTERVAL, CoordinationHandle, InputCodeAliases, InputSourceObservation,
+    COORD_POLL_FAILING_LOG_INTERVAL, CoordinationHandle, InputCodeAliases, InputObservation,
+    InputSourceObservation, OwnershipFlapPolicy,
 };
 use dormant_core::rules::{ControlMsg, DaemonEvent};
 use dormant_core::traits::CommandSink;
@@ -202,12 +203,20 @@ async fn poll_once(
             }
 
             let before = deps.state.snapshot();
-            let outcome = deps.state.record_input_observation(
+            let outcome = deps.state.record_input_observation_at(
                 &display_id,
-                observed,
-                &aliases,
+                InputObservation {
+                    observed,
+                    aliases: &aliases,
+                    panel_state,
+                },
                 config.coordination.loss_confirmations,
-                panel_state,
+                OwnershipFlapPolicy {
+                    threshold: config.coordination.flap_threshold,
+                    window: config.coordination.flap_window,
+                    settle: config.coordination.flap_settle,
+                },
+                now.into_std(),
             );
             let previous = before.get(&display_id);
             if previous.is_some_and(|record| {
@@ -231,6 +240,17 @@ async fn poll_once(
                     previous_code,
                     observed,
                 );
+            }
+            if outcome.entered_contested {
+                tracing::warn!(
+                    event = "ownership_contested",
+                    display = %display_id,
+                    transitions = config.coordination.flap_threshold,
+                    window_s = config.coordination.flap_window.as_secs(),
+                );
+            }
+            if outcome.settled {
+                tracing::info!(event = "ownership_settled", display = %display_id);
             }
             // A potential ownership loss is held pending further confirmations
             // (issue #134). Surfacing the deferred count lets operators see the
@@ -1025,7 +1045,7 @@ mod tests {
         let display = DisplayId("shared".to_string());
         let executors = HashMap::from([(display.clone(), sink as Arc<dyn CommandSink>)]);
         let (executors_tx, executors_rx) = watch::channel(Arc::new(executors));
-        let (ctl_tx, _ctl_rx) = mpsc::channel(8);
+        let (ctl_tx, _ctl_rx) = mpsc::channel(64);
         let deps = CoordinationPollDeps {
             config_rx,
             ctl_tx,
@@ -1062,11 +1082,12 @@ mod tests {
         let sink = Arc::new(ScriptedSink::with_inputs(inputs));
         let events = capture.0.clone();
         let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(capture));
+        let poll_interval = cfg.coordination.poll_interval;
         let (config_tx, config_rx) = watch::channel(Arc::new(cfg));
         let display = DisplayId("shared".to_string());
         let executors = HashMap::from([(display.clone(), sink as Arc<dyn CommandSink>)]);
         let (executors_tx, executors_rx) = watch::channel(Arc::new(executors));
-        let (ctl_tx, _ctl_rx) = mpsc::channel(8);
+        let (ctl_tx, _ctl_rx) = mpsc::channel(64);
         let deps = CoordinationPollDeps {
             config_rx,
             ctl_tx,
@@ -1079,7 +1100,7 @@ mod tests {
         let mut last_state_read = HashMap::new();
         let mut reprobe_state = HashMap::new();
         for _ in 0..ticks {
-            tokio::time::advance(Duration::from_secs(6)).await;
+            tokio::time::advance(poll_interval).await;
             poll_once(
                 &deps,
                 &mut last_failing_log,
@@ -1157,6 +1178,43 @@ mod tests {
             .await
             .contains(&"coord_ownership_loss_deferred".to_string())
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn emits_ownership_contested_once_for_a_slow_flap() {
+        let mut inputs = Vec::new();
+        for observed in [0x12, 0x11, 0x12, 0x11, 0x12, 0x11, 0x12, 0x11] {
+            for _ in 0..3 {
+                inputs.push(Ok(Some(observed)));
+            }
+        }
+
+        let mut cfg = config();
+        cfg.coordination.poll_interval = Duration::from_secs(2);
+        let events = captured_events_with_config(cfg, inputs, 24).await;
+        assert_eq!(count_event(&events, "ownership_contested"), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn emits_ownership_settled_after_the_quiet_window() {
+        let mut cfg = config();
+        cfg.coordination.flap_threshold = 2;
+        cfg.coordination.flap_settle = Duration::from_secs(6);
+        let events = captured_events_with_config(
+            cfg,
+            [
+                Ok(Some(0x12)),
+                Ok(Some(0x12)),
+                Ok(Some(0x12)),
+                Ok(Some(0x11)),
+                Ok(Some(0x11)),
+                Ok(Some(0x11)),
+                Ok(Some(0x11)),
+            ],
+            7,
+        )
+        .await;
+        assert_eq!(count_event(&events, "ownership_settled"), 1);
     }
 
     #[tokio::test(start_paused = true)]

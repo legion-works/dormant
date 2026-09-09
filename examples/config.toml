@@ -74,10 +74,15 @@ config_version = 1
 # There is no `enabled` key — there is no mDNS discovery, instance pairing,
 # or claim protocol to enable. Switching is a direct local DDC write.
 # See docs/src/multi-machine.md.
-# [coordination]
+[coordination]
 # poll_interval = "2s"            # shared-display ownership poll cadence (>= 1s)
 # state_poll_interval = "30s"     # panel-state refresh cadence (unset → max(30s, poll_interval); when set, >= poll_interval)
 # loss_confirmations = 3          # consecutive "not mine" VCP 0x60 reads before ownership flips true→false (1..=10)
+# The limiter defaults are active below so copied examples retain the safe
+# contested-panel behavior even when the other coordination defaults are implicit.
+flap_threshold = 8   # committed ownership transitions allowed in flap_window before forced not-owned (>= 2)
+flap_window = "120s" # sliding transition-count window (>= poll_interval)
+flap_settle = "60s"  # quiet time before a contested panel resumes evaluation (>= poll_interval)
 # activity_follow = false         # when true, a local activity edge pulls a shared display to this machine
 # arm_after = "7s"                # grace window after a local arm before the pull commits
 # cooldown = "3s"                 # minimum interval between successive activity-driven pulls

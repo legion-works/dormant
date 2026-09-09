@@ -87,6 +87,9 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "poll_interval",
             "state_poll_interval",
             "loss_confirmations",
+            "flap_threshold",
+            "flap_window",
+            "flap_settle",
             "reprobe_failure_threshold",
             "reprobe_interval",
             "activity_follow",
@@ -1045,6 +1048,33 @@ fn validate_coordination(cfg: &Config, errors: &mut Vec<ValidationError>) {
         });
     }
     validate_loss_confirmations(&cfg.coordination, errors);
+    if cfg.coordination.flap_window < cfg.coordination.poll_interval {
+        errors.push(ValidationError {
+            what: crate::error::E_CONFIG_INVALID.into(),
+            detail: format!(
+                "coordination flap_window {:?} must be >= poll_interval {:?}",
+                cfg.coordination.flap_window, cfg.coordination.poll_interval
+            ),
+        });
+    }
+    if cfg.coordination.flap_threshold < 2 {
+        errors.push(ValidationError {
+            what: crate::error::E_CONFIG_INVALID.into(),
+            detail: format!(
+                "coordination flap_threshold {} must be >= 2",
+                cfg.coordination.flap_threshold
+            ),
+        });
+    }
+    if cfg.coordination.flap_settle < cfg.coordination.poll_interval {
+        errors.push(ValidationError {
+            what: crate::error::E_CONFIG_INVALID.into(),
+            detail: format!(
+                "coordination flap_settle {:?} must be >= poll_interval {:?}",
+                cfg.coordination.flap_settle, cfg.coordination.poll_interval
+            ),
+        });
+    }
     if !(1..=10).contains(&cfg.coordination.reprobe_failure_threshold) {
         errors.push(ValidationError {
             what: crate::error::E_CONFIG_INVALID.into(),
@@ -3237,7 +3267,7 @@ gracee_period = "60s"
 
     #[test]
     fn kvm_known_keys_accept_every_new_config_key() {
-        let config = "config_version = 1\n[keymap]\nclaim_hotkey = \"Meta+F12\"\n[input_filter]\nignore_devices = [\"*jiggler*\"]\n[coordination]\npoll_interval = \"2s\"\nactivity_follow = false\narm_after = \"7s\"\ncooldown = \"3s\"\n[displays.main]\ncontrollers = [\"ddcci\"]\nscope = \"shared\"\nshared_input_code = 1\nblank_mode = \"power_off\"\n[displays.main.hooks]\nbefore_release = [{ command = [\"true\"], timeout = \"100ms\", blocking = true, abort_on_failure = false }]\nafter_release = [{ mqtt = { topic = \"x\", payload = \"y\" } }]\nbefore_acquire = []\nafter_acquire = []\n";
+        let config = "config_version = 1\n[keymap]\nclaim_hotkey = \"Meta+F12\"\n[input_filter]\nignore_devices = [\"*jiggler*\"]\n[coordination]\npoll_interval = \"2s\"\nflap_threshold = 8\nflap_window = \"2m\"\nflap_settle = \"1m\"\nactivity_follow = false\narm_after = \"7s\"\ncooldown = \"3s\"\n[displays.main]\ncontrollers = [\"ddcci\"]\nscope = \"shared\"\nshared_input_code = 1\nblank_mode = \"power_off\"\n[displays.main.hooks]\nbefore_release = [{ command = [\"true\"], timeout = \"100ms\", blocking = true, abort_on_failure = false }]\nafter_release = [{ mqtt = { topic = \"x\", payload = \"y\" } }]\nbefore_acquire = []\nafter_acquire = []\n";
         let value: toml::Value = toml::from_str(config).unwrap();
         assert!(collect_unknown_keys(&value).is_empty());
     }
@@ -8045,6 +8075,33 @@ availability_payload_offline = "down"
                 "loss_confirmations={value} must be accepted, got {errors:?}"
             );
         }
+    }
+
+    #[test]
+    fn coordination_flap_settings_enforce_bounds() {
+        for (key, value, expected) in [
+            ("flap_window", "\"999ms\"", "flap_window"),
+            ("flap_settle", "\"999ms\"", "flap_settle"),
+            ("flap_threshold", "1", "flap_threshold"),
+        ] {
+            let errors = validate_str(&format!(
+                "config_version = 1\n[coordination]\n{key} = {value}\n"
+            ));
+            assert!(
+                errors.iter().any(|error| {
+                    error.what == crate::error::E_CONFIG_INVALID && error.detail.contains(expected)
+                }),
+                "{key}={value} must be rejected with E_CONFIG_INVALID, got {errors:?}"
+            );
+        }
+
+        let errors = validate_str(
+            "config_version = 1\n[coordination]\npoll_interval = \"2s\"\nflap_window = \"2s\"\nflap_settle = \"2s\"\nflap_threshold = 2\n",
+        );
+        assert!(
+            !errors.iter().any(|error| error.detail.contains("flap_")),
+            "boundary flap settings must be accepted, got {errors:?}"
+        );
     }
 
     #[test]

@@ -21,7 +21,10 @@ use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
 
 use crate::linux::state::WaylandState;
-use crate::linux::wayland_ops::ViewportHandle;
+use crate::linux::wayland_ops::{
+    RetainedShmPool, ViewportHandle, WaylandOps, create_shm_buffer, real_buffer,
+    real_pool_with_region_mut,
+};
 
 /// Opaque black in `u32` ARGB host order, matching
 /// `WpSinglePixelBufferManagerV1::create_u32_rgba_buffer`.
@@ -41,6 +44,7 @@ pub(super) const LAYER_NAMESPACE: &str = "dormant";
 /// "the 4th byte is ignored"; the same byte stream is correct opaque
 /// content either way.  The black shm fallback uses the same format
 /// for symmetry — opaque content, no alpha channel to manage.
+#[cfg(test)]
 pub(super) const SHM_PIXEL_FORMAT: wayland_client::protocol::wl_shm::Format =
     wayland_client::protocol::wl_shm::Format::Xrgb8888;
 
@@ -122,35 +126,24 @@ pub(super) fn attach_single_pixel_black(
 pub(super) fn create_shm_black_buffer(
     width: u32,
     height: u32,
-    state: &WaylandState,
+    ops: &dyn WaylandOps,
+    retained_pool: &mut Option<RetainedShmPool>,
 ) -> Result<WlBuffer, String> {
     let stride = width.cast_signed() * 4;
-    let byte_len =
-        (usize::try_from(stride).map_err(|e| format!("stride cast: {e}"))?) * (height as usize);
-    let mut pool = smithay_client_toolkit::shm::raw::RawPool::new(byte_len, &state.shm_state)
-        .map_err(|e| format!("RawPool::new: {e}"))?;
-    {
-        let mmap = pool.mmap();
-        let pixel = OPAQUE_BLACK_U32.to_ne_bytes();
-        for row in 0..height as usize {
-            let row_start = row * (width as usize) * 4;
-            for col in 0..(width as usize) {
-                let offset = row_start + col * 4;
-                mmap[offset..offset + 4].copy_from_slice(&pixel);
-            }
+    let (pool, buffer) = create_shm_buffer(ops, retained_pool, width, height)
+        .map_err(|e| format!("shm buffer: {e}"))?;
+    let byte_len = usize::try_from(stride)
+        .map_err(|e| format!("stride cast: {e}"))?
+        .checked_mul(height as usize)
+        .ok_or_else(|| "shm buffer byte length overflowed usize".to_string())?;
+    let pixel = OPAQUE_BLACK_U32.to_ne_bytes();
+    #[allow(clippy::chunks_exact_to_as_chunks)]
+    real_pool_with_region_mut(pool.as_ref(), 0, byte_len, |mmap| {
+        for chunk in mmap.chunks_exact_mut(4) {
+            chunk.copy_from_slice(&pixel);
         }
-    }
-    let qh = state.queue_handle.clone();
-    let buffer = pool.create_buffer(
-        0,
-        width.cast_signed(),
-        height.cast_signed(),
-        stride,
-        SHM_PIXEL_FORMAT,
-        (),
-        &qh,
-    );
-    Ok(buffer)
+    });
+    Ok(real_buffer(buffer.as_ref()).clone())
 }
 
 #[cfg(test)]

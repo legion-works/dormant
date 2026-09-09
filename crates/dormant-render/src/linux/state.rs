@@ -51,8 +51,9 @@ use super::blend::{self, T_MAX};
 #[cfg(test)]
 use super::wayland_ops::RecordingWaylandOps;
 use super::wayland_ops::{
-    BufferHandle, PoolHandle, ScreensaverPool, SurfaceHandle, ViewportHandle, WaylandOps,
-    create_screensaver_buffers, real_buffer, real_pool_with_region_mut, wrap_real_buffer,
+    BufferHandle, PoolHandle, RetainedShmPool, ScreensaverPool, SurfaceHandle, ViewportHandle,
+    WaylandOps, create_screensaver_buffers, real_buffer, real_pool_with_region_mut,
+    wrap_real_buffer,
 };
 use crate::command::RenderCommand;
 use crate::latch::FirstInputLatch;
@@ -852,6 +853,8 @@ pub(super) struct WaylandState {
     /// never stored here directly.
     pub(super) viewport: Option<Arc<dyn ViewportHandle>>,
     black_buffer: Option<BlackBuffer>,
+    /// Retains the fallback overlay's backing pool across surface teardown.
+    pub(super) black_pool: Option<RetainedShmPool>,
     pub(super) configured_size: (u32, u32),
     pub(super) surface_up: bool,
 
@@ -1076,6 +1079,7 @@ impl WaylandState {
             layer_surface: None,
             viewport: None,
             black_buffer: None,
+            black_pool: None,
             configured_size: (0, 0),
             surface_up: false,
             pending_show: None,
@@ -1755,7 +1759,8 @@ impl WaylandState {
                 match crate::linux::surface::create_shm_black_buffer(
                     configured_size.0,
                     configured_size.1,
-                    self,
+                    self.wayland_ops.as_ref(),
+                    &mut self.black_pool,
                 ) {
                     Ok(b) => {
                         wl_surface.attach(Some(&b), 0, 0);
@@ -2775,7 +2780,12 @@ impl WaylandState {
                 }
                 self.black_buffer = Some(BlackBuffer { buffer, size: dest });
             } else {
-                match crate::linux::surface::create_shm_black_buffer(dest.0, dest.1, self) {
+                match crate::linux::surface::create_shm_black_buffer(
+                    dest.0,
+                    dest.1,
+                    self.wayland_ops.as_ref(),
+                    &mut self.black_pool,
+                ) {
                     Ok(buffer) => {
                         self.black_buffer = Some(BlackBuffer { buffer, size: dest });
                     }
@@ -3108,9 +3118,12 @@ impl WaylandState {
                                 self.viewport = Some(viewport);
                             }
                             self.black_buffer = Some(BlackBuffer { buffer, size: dest });
-                        } else if let Ok(buffer) =
-                            crate::linux::surface::create_shm_black_buffer(dest.0, dest.1, self)
-                        {
+                        } else if let Ok(buffer) = crate::linux::surface::create_shm_black_buffer(
+                            dest.0,
+                            dest.1,
+                            self.wayland_ops.as_ref(),
+                            &mut self.black_pool,
+                        ) {
                             self.black_buffer = Some(BlackBuffer { buffer, size: dest });
                         }
                     }

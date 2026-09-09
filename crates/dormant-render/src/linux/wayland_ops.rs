@@ -338,7 +338,8 @@ pub(super) fn real_buffer(handle: &dyn BufferHandle) -> &WlBuffer {
 /// it through [`WaylandOps::surface_attach`] like any other buffer.
 /// Real-only — the sole callers (`state.rs`'s `fail_screensaver_to_black`
 /// and the black content-swap branch of `handle_show`) only ever run
-/// in production.
+/// in production. The shm fallback now allocates through the same
+/// [`WaylandOps`] seam as the screensaver path.
 pub(super) fn wrap_real_buffer(buffer: WlBuffer) -> Arc<dyn BufferHandle> {
     Arc::new(RealBufferHandle(buffer))
 }
@@ -763,11 +764,61 @@ impl WaylandOps for RecordingWaylandOps {
 /// The screensaver's allocated pool handle plus its two buffer
 /// handles (`buf0` at offset 0, `buf1` at offset `stride * height`).
 pub(super) type ScreensaverBuffers = (Arc<dyn PoolHandle>, [Arc<dyn BufferHandle>; 2]);
+type ShmBuffer = (Arc<dyn PoolHandle>, Arc<dyn BufferHandle>);
 
-/// A display-lifetime pool retained across screensaver sessions.
-pub(super) struct ScreensaverPool {
+/// A display-lifetime pool retained across surface sessions.
+pub(super) struct RetainedShmPool {
     pool: Arc<dyn PoolHandle>,
     byte_len: usize,
+}
+
+/// Screensaver-specific name retained for the session state field and docs.
+pub(super) type ScreensaverPool = RetainedShmPool;
+
+fn ensure_retained_pool(
+    ops: &dyn WaylandOps,
+    retained_pool: &mut Option<RetainedShmPool>,
+    byte_len: usize,
+) -> Result<Arc<dyn PoolHandle>, CreatePoolError> {
+    match retained_pool.as_ref() {
+        Some(retained) if retained.byte_len >= byte_len => Ok(retained.pool.clone()),
+        _ => {
+            let pool = ops.create_shm_pool(byte_len)?;
+            *retained_pool = Some(RetainedShmPool {
+                pool: pool.clone(),
+                byte_len,
+            });
+            Ok(pool)
+        }
+    }
+}
+
+/// Allocate one XRGB shm buffer from a display-retained, grow-only pool.
+pub(super) fn create_shm_buffer(
+    ops: &dyn WaylandOps,
+    retained_pool: &mut Option<RetainedShmPool>,
+    width: u32,
+    height: u32,
+) -> Result<ShmBuffer, CreatePoolError> {
+    let stride = width.checked_mul(4).ok_or_else(|| {
+        CreatePoolError::Create(io::Error::other("shm buffer stride overflowed u32"))
+    })?;
+    let byte_len = usize::try_from(stride)
+        .ok()
+        .and_then(|stride| stride.checked_mul(height as usize))
+        .ok_or_else(|| {
+            CreatePoolError::Create(io::Error::other("shm buffer byte length overflowed usize"))
+        })?;
+    let pool = ensure_retained_pool(ops, retained_pool, byte_len)?;
+    let buffer = ops.pool_create_buffer(
+        pool.as_ref(),
+        0,
+        width.cast_signed(),
+        height.cast_signed(),
+        stride.cast_signed(),
+        wl_shm::Format::Xrgb8888,
+    );
+    Ok((pool, buffer))
 }
 
 pub(super) fn create_screensaver_buffers(
@@ -785,17 +836,7 @@ pub(super) fn create_screensaver_buffers(
     })?;
     let pool_byte_len =
         usize::try_from(pool_byte_len_bytes).expect("pool byte length must fit in usize");
-    let pool = match retained_pool.as_ref() {
-        Some(retained) if retained.byte_len >= pool_byte_len => retained.pool.clone(),
-        _ => {
-            let pool = ops.create_shm_pool(pool_byte_len)?;
-            *retained_pool = Some(ScreensaverPool {
-                pool: pool.clone(),
-                byte_len: pool_byte_len,
-            });
-            pool
-        }
-    };
+    let pool = ensure_retained_pool(ops, retained_pool, pool_byte_len)?;
     let fmt = wl_shm::Format::Xrgb8888;
     let w = width.cast_signed();
     let h = height.cast_signed();
@@ -981,6 +1022,40 @@ mod tests {
             2,
             "the smaller third show must reuse the larger retained pool"
         );
+    }
+
+    #[test]
+    fn overlay_show_teardown_show_reuses_one_pool() {
+        let ops = RecordingWaylandOps::new();
+        let mut retained_pool = None;
+        for (width, height) in [(640, 480), (640, 480), (640, 480)] {
+            let (_pool, buffer) = create_shm_buffer(&ops, &mut retained_pool, width, height)
+                .expect("overlay buffer must allocate");
+            drop(buffer);
+        }
+        let pool_creates = ops
+            .take_call_log()
+            .iter()
+            .filter(|call| call.starts_with("create_shm_pool("))
+            .count();
+        assert_eq!(pool_creates, 1, "overlay shows retain one display pool");
+    }
+
+    #[test]
+    fn overlay_pool_grows_for_larger_show_and_does_not_shrink() {
+        let ops = RecordingWaylandOps::new();
+        let mut retained_pool = None;
+        for (width, height) in [(640, 480), (800, 600), (640, 480)] {
+            let (_pool, buffer) = create_shm_buffer(&ops, &mut retained_pool, width, height)
+                .expect("overlay buffer must allocate");
+            drop(buffer);
+        }
+        let pool_creates = ops
+            .take_call_log()
+            .iter()
+            .filter(|call| call.starts_with("create_shm_pool("))
+            .count();
+        assert_eq!(pool_creates, 2, "overlay pool grows but does not shrink");
     }
 
     #[test]

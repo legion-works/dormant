@@ -241,6 +241,15 @@ async fn poll_once(
                     observed,
                 );
             }
+            if let Some(previous_code) = outcome.contested_readback_changed {
+                tracing::debug!(
+                    event = "coord_contested_readback_changed",
+                    display = %display_id,
+                    previous_code,
+                    observed,
+                    "input-source readback changed during contested hold",
+                );
+            }
             if outcome.entered_contested {
                 tracing::warn!(
                     event = "coord_ownership_contested",

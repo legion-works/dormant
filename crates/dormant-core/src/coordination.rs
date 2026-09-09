@@ -116,6 +116,8 @@ pub struct InputObservationOutcome {
     /// lets the operator distinguish "poll is healthy" from "the bus is
     /// returning inconsistent values" without parsing the cache.
     pub disagreement_with: Option<u8>,
+    /// Previous raw code when the readback changed during a contested hold; `None` otherwise.
+    pub contested_readback_changed: Option<u8>,
     /// `true` only on the transition that entered the contested safety state.
     pub entered_contested: bool,
     /// `true` only on the observation that cleared a settled contested state.
@@ -188,6 +190,7 @@ fn record_contested_observation(
     now: Instant,
 ) -> InputObservationOutcome {
     record.owned = false;
+    let previous_code = record.last_observed_code;
     if record.last_observed_code != Some(observed) {
         record.last_raw_change = Some(now);
     }
@@ -195,6 +198,9 @@ fn record_contested_observation(
         .last_raw_change
         .is_none_or(|last| now.saturating_duration_since(last) >= policy.settle);
     let mut outcome = InputObservationOutcome::default();
+    if previous_code != Some(observed) {
+        outcome.contested_readback_changed = previous_code;
+    }
     if settled {
         record.contested = false;
         record.transition_times.clear();
@@ -1332,6 +1338,61 @@ mod tests {
             spurious + policy.settle,
         );
         assert!(settled.settled);
+    }
+
+    #[test]
+    fn contested_readback_change_reports_previous_code_once() {
+        let handle = CoordinationHandle::new([display("aoc")]);
+        let aoc = display("aoc");
+        let al = aliases(0x0f);
+        let policy = flap_policy(8);
+        let start = Instant::now();
+
+        for (offset, observed) in [0x10, 0x0f, 0x10, 0x0f, 0x10, 0x0f, 0x10, 0x0f]
+            .into_iter()
+            .enumerate()
+        {
+            let _ = observe_at(
+                &handle,
+                &aoc,
+                observed,
+                &al,
+                1,
+                policy,
+                start + Duration::from_secs(offset as u64),
+            );
+        }
+
+        let same = observe_at(
+            &handle,
+            &aoc,
+            0x0f,
+            &al,
+            1,
+            policy,
+            start + Duration::from_secs(8),
+        );
+        assert_eq!(same.contested_readback_changed, None);
+        let changed = observe_at(
+            &handle,
+            &aoc,
+            0x10,
+            &al,
+            1,
+            policy,
+            start + Duration::from_secs(9),
+        );
+        assert_eq!(changed.contested_readback_changed, Some(0x0f));
+        let repeated = observe_at(
+            &handle,
+            &aoc,
+            0x10,
+            &al,
+            1,
+            policy,
+            start + Duration::from_secs(10),
+        );
+        assert_eq!(repeated.contested_readback_changed, None);
     }
 
     #[test]

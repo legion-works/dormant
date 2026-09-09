@@ -148,6 +148,8 @@ pub struct CoordRecord {
     pub last_observed_code: Option<u8>,
     /// Whether transition churn has made this display unsafe to control.
     pub contested: bool,
+    /// Last raw input-code change observed while contested.
+    pub last_raw_change: Option<Instant>,
     /// Recent committed ownership transitions, oldest first.
     pub transition_times: VecDeque<Instant>,
 }
@@ -164,6 +166,7 @@ impl CoordRecord {
             pending_transition_code: None,
             last_observed_code: None,
             contested: false,
+            last_raw_change: None,
             transition_times: VecDeque::new(),
         }
     }
@@ -175,6 +178,33 @@ fn record_success_state(record: &mut CoordRecord, observed: u8, panel_state: Opt
     record.panel_state = panel_state;
     record.consecutive_failures = 0;
     record.last_observed_code = Some(observed);
+}
+
+fn record_contested_observation(
+    record: &mut CoordRecord,
+    observed: u8,
+    panel_state: Option<PanelState>,
+    policy: OwnershipFlapPolicy,
+    now: Instant,
+) -> InputObservationOutcome {
+    record.owned = false;
+    if record.last_observed_code != Some(observed) {
+        record.last_raw_change = Some(now);
+    }
+    let settled = record
+        .last_raw_change
+        .is_none_or(|last| now.saturating_duration_since(last) >= policy.settle);
+    let mut outcome = InputObservationOutcome::default();
+    if settled {
+        record.contested = false;
+        record.transition_times.clear();
+        record.last_raw_change = None;
+        record.pending_transition_count = 0;
+        record.pending_transition_code = None;
+        outcome.settled = true;
+    }
+    record_success_state(record, observed, panel_state);
+    outcome
 }
 
 /// Cloneable, daemon-lifetime cache of shared-display ownership verdicts.
@@ -298,23 +328,9 @@ impl CoordinationHandle {
             // Contested means the panel's reported input is not trustworthy.
             // Fail closed: retaining owned=true could power off a panel the peer
             // is actively using.
-            record.owned = false;
-            let settled = record
-                .transition_times
-                .back()
-                .is_none_or(|last| now.saturating_duration_since(*last) >= policy.settle);
-            if settled {
-                record.contested = false;
-                record.transition_times.clear();
-                record.pending_transition_count = 0;
-                record.pending_transition_code = None;
-                outcome.settled = true;
-            }
-
-            record_success_state(record, observed, panel_state);
             // The clearing observation only proves silence; the next observation
             // resumes ordinary debounce evaluation from a known not-owned state.
-            return outcome;
+            return record_contested_observation(record, observed, panel_state, policy, now);
         }
 
         let prior_owned = record.owned;
@@ -392,6 +408,7 @@ impl CoordinationHandle {
             if transition_count >= policy.threshold.max(2) {
                 record.contested = true;
                 record.owned = false;
+                record.last_raw_change = Some(now);
                 record.pending_transition_count = 0;
                 record.pending_transition_code = None;
                 outcome.entered_contested = true;
@@ -445,6 +462,7 @@ impl CoordinationHandle {
             record.owned = true;
             record.contested = false;
             record.transition_times.clear();
+            record.last_raw_change = None;
             // Clear any pending transition so the poller's subsequent
             // agreeing reads don't double-fire or register a disagreement.
             record.pending_transition_count = 0;
@@ -1172,6 +1190,148 @@ mod tests {
         assert!(!outcome.settled);
         assert!(handle.snapshot()[&aoc].contested);
         assert!(!handle.snapshot()[&aoc].owned);
+    }
+
+    #[test]
+    fn contested_flap_continues_without_settling() {
+        let handle = CoordinationHandle::new([display("aoc")]);
+        let aoc = display("aoc");
+        let al = aliases(0x0f);
+        let policy = flap_policy(8);
+        let start = Instant::now();
+
+        for (offset, observed) in [0x10, 0x0f, 0x10, 0x0f, 0x10, 0x0f, 0x10, 0x0f]
+            .into_iter()
+            .enumerate()
+        {
+            let outcome = observe_at(
+                &handle,
+                &aoc,
+                observed,
+                &al,
+                1,
+                policy,
+                start + Duration::from_secs(offset as u64),
+            );
+            assert!(!outcome.settled);
+        }
+        assert!(handle.snapshot()[&aoc].contested);
+
+        for offset in 8..=8 + policy.settle.as_secs() * 3 {
+            let observed = if offset % 2 == 0 { 0x10 } else { 0x0f };
+            let outcome = observe_at(
+                &handle,
+                &aoc,
+                observed,
+                &al,
+                1,
+                policy,
+                start + Duration::from_secs(offset),
+            );
+            assert!(!outcome.settled, "contested flap settled at {offset}s");
+            assert!(handle.snapshot()[&aoc].contested);
+        }
+    }
+
+    #[test]
+    fn contested_settles_after_last_raw_change() {
+        let handle = CoordinationHandle::new([display("aoc")]);
+        let aoc = display("aoc");
+        let al = aliases(0x0f);
+        let policy = flap_policy(8);
+        let start = Instant::now();
+
+        for (offset, observed) in [0x10, 0x0f, 0x10, 0x0f, 0x10, 0x0f, 0x10, 0x0f]
+            .into_iter()
+            .enumerate()
+        {
+            let _ = observe_at(
+                &handle,
+                &aoc,
+                observed,
+                &al,
+                1,
+                policy,
+                start + Duration::from_secs(offset as u64),
+            );
+        }
+        let entry = start + Duration::from_secs(7);
+        let last_change = entry + Duration::from_secs(30);
+        let _ = observe_at(&handle, &aoc, 0x10, &al, 1, policy, last_change);
+
+        let before_settle = observe_at(
+            &handle,
+            &aoc,
+            0x10,
+            &al,
+            1,
+            policy,
+            (last_change + policy.settle)
+                .checked_sub(Duration::from_secs(1))
+                .unwrap(),
+        );
+        assert!(!before_settle.settled);
+        let settled = observe_at(
+            &handle,
+            &aoc,
+            0x10,
+            &al,
+            1,
+            policy,
+            last_change + policy.settle,
+        );
+        assert!(settled.settled);
+    }
+
+    #[test]
+    fn contested_single_spurious_read_resets_settle_clock() {
+        let handle = CoordinationHandle::new([display("aoc")]);
+        let aoc = display("aoc");
+        let al = aliases(0x0f);
+        let policy = flap_policy(8);
+        let start = Instant::now();
+
+        for (offset, observed) in [0x10, 0x0f, 0x10, 0x0f, 0x10, 0x0f, 0x10, 0x0f]
+            .into_iter()
+            .enumerate()
+        {
+            let _ = observe_at(
+                &handle,
+                &aoc,
+                observed,
+                &al,
+                1,
+                policy,
+                start + Duration::from_secs(offset as u64),
+            );
+        }
+        let entry = start + Duration::from_secs(7);
+        let spurious = (entry + policy.settle)
+            .checked_sub(Duration::from_secs(5))
+            .unwrap();
+        let _ = observe_at(&handle, &aoc, 0x10, &al, 1, policy, spurious);
+        let not_yet = observe_at(
+            &handle,
+            &aoc,
+            0x10,
+            &al,
+            1,
+            policy,
+            (spurious + policy.settle)
+                .checked_sub(Duration::from_secs(1))
+                .unwrap(),
+        );
+        assert!(!not_yet.settled);
+        let settled = observe_at(
+            &handle,
+            &aoc,
+            0x10,
+            &al,
+            1,
+            policy,
+            spurious + policy.settle,
+        );
+        assert!(settled.settled);
     }
 
     #[test]

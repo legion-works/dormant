@@ -155,8 +155,8 @@ Consecutive-read debounce cannot reject an input-source flap that holds each
 side longer than its confirmation window. The daemon therefore tracks committed
 ownership transitions in `flap_window` (default `120s`). At
 `flap_threshold = 8`, it marks the display **contested** and forces the local
-verdict to not-owned until `flap_settle = 60s` passes without another committed
-transition. Eight transitions tolerate four human KVM round-trips in two
+ verdict to not-owned until `flap_settle = 60s` passes with no change in the
+ panel's reported input. Eight transitions tolerate four human KVM round-trips in two
 minutes; a 6–10 second standby flap produces 12–20 and is contained in the
 first 90 seconds. The 23 yields observed over an afternoon of ordinary KVM use
 are spread across hours and do not trip the burst threshold.
@@ -371,7 +371,7 @@ any key within it) has no effect without a shared display.
 | `loss_confirmations` | integer | `3` | Consecutive agreeing VCP `0x60` readings required before the cached ownership verdict flips — symmetric for gain and loss. Defends against garbled reads from concurrent cross-machine DDC traffic (issue #134). Validated `1..=10`. A verified local pull marks ownership immediately (the machine has first-hand proof), so `loss_confirmations` only governs the poll-observed transitions. |
 | `flap_threshold` | integer | `8` | Committed transitions permitted within `flap_window` before ownership is contested; minimum `2`. Eight permits four normal KVM round-trips in two minutes but catches the 12–20 transitions from a 6–10s standby flap. |
 | `flap_window` | duration | `"120s"` | Sliding transition-count interval; must be `>= poll_interval`. |
-| `flap_settle` | duration | `"60s"` | Quiet interval before a contested display resumes normal evaluation; must be `>= poll_interval`. Contested forces not-owned so this machine cannot power off a panel the peer may be using. |
+| `flap_settle` | duration | `"60s"` | Quiet time — no change in the panel's reported input — before a contested display resumes normal evaluation; must be `>= poll_interval`. Contested forces not-owned so this machine cannot power off a panel the peer may be using. |
 | `activity_follow` | boolean | `false` | When `true`, a genuine local activity edge (keyboard, mouse, tablet) pulls a shared display to this machine after `arm_after` idle. |
 | `arm_after` | duration | `"7s"` | Grace window after receiving a local arm before the pull commits (only meaningful when `activity_follow = true`). |
 | `cooldown` | duration | `"3s"` | Minimum interval between successive activity-driven pulls. Hotkeys, CLI, tray, and web bypass this — an explicit operator action is never swallowed. |

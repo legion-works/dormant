@@ -202,8 +202,8 @@ pub struct CoordinationConfig {
     #[serde(default = "default_coordination_flap_window", with = "humantime_serde")]
     pub flap_window: Duration,
 
-    /// Quiet time without a committed transition before a contested panel
-    /// resumes normal evaluation; must be at least `poll_interval`.
+    /// Quiet time — no change in the panel's reported input — before a
+    /// contested panel resumes evaluation; must be at least `poll_interval`.
     #[serde(default = "default_coordination_flap_settle", with = "humantime_serde")]
     pub flap_settle: Duration,
 

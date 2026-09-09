@@ -1152,6 +1152,29 @@ mod tests {
     }
 
     #[test]
+    fn contested_hold_forces_not_owned_even_if_seeded_owned() {
+        let handle = CoordinationHandle::new([display("aoc")]);
+        let aoc = display("aoc");
+        let al = aliases(0x0f);
+        let policy = flap_policy(8);
+        let now = Instant::now();
+
+        {
+            let mut records = handle.records.write().unwrap();
+            let record = records.get_mut(&aoc).unwrap();
+            record.owned = true;
+            record.contested = true;
+            record.transition_times.push_back(now);
+        }
+
+        let outcome = observe_at(&handle, &aoc, 0x0f, &al, 3, policy, now);
+
+        assert!(!outcome.settled);
+        assert!(handle.snapshot()[&aoc].contested);
+        assert!(!handle.snapshot()[&aoc].owned);
+    }
+
+    #[test]
     fn human_kvm_round_trips_do_not_enter_contested() {
         let handle = CoordinationHandle::new([display("aoc")]);
         let aoc = display("aoc");

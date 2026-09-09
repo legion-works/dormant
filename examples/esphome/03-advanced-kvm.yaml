@@ -125,7 +125,17 @@ output:
     id: usb_press_pin
     pin: GPIO3
 
+# The LD2410C's onboard BLE radio ships enabled and advertises as
+# HLK-LD2410_<mac>. Nothing here reads it (presence flows over UART), but
+# Home Assistant's ld2410_ble integration auto-discovers and connects to it,
+# recording motion straight off the chip with no consumer. Default it off;
+# the state persists in the module's NVM. Re-enable only for the vendor's
+# phone app.
 switch:
+  - platform: ld2410
+    bluetooth:
+      name: "${friendly_name} Radar Bluetooth"
+      restore_mode: RESTORE_DEFAULT_OFF
   - platform: output
     id: usb_press_raw
     output: usb_press_pin

@@ -42,6 +42,8 @@ Ready-to-flash ESPHome configs for the MQTT topology live in [`examples/esphome/
 
 Both are **fail-safe symmetric**: broker loss (MQTT, via the retained LWT) and USB unplug both mark the sensor `unavailable`, which the default zone policy treats as *present* — dormant never blanks a room it can't see, whichever transport drops.
 
+> **The LD2410C has its own Bluetooth radio, and it ships on.** The module advertises as `HLK-LD2410_<mac>` independently of the ESP board, and Home Assistant's `ld2410_ble` integration auto-discovers it and connects — recording motion straight off the chip with nothing consuming it (35k recorder rows a week on one desk). Every example tier exposes the `ld2410` `bluetooth` switch with `restore_mode: RESTORE_DEFAULT_OFF`; if a config predates it, add the switch and turn it off once — the state persists in the module's NVM across power loss. Re-enable only for the vendor's HLKRadarTool phone app, and turn it back off afterwards.
+
 > **2D zones need different silicon.** The LD2410C reports one target along a single axis (distance), so it does 1D near/far zones only. True X/Y polygon zones (as on the Everything Presence Pro) need a multi-target radar like the LD2450, which wires to the same ESP32 identically — swap the module, keep the board and config shape.
 
 ### LD2410C tuning and hardware quirks

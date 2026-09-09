@@ -764,8 +764,15 @@ impl WaylandOps for RecordingWaylandOps {
 /// handles (`buf0` at offset 0, `buf1` at offset `stride * height`).
 pub(super) type ScreensaverBuffers = (Arc<dyn PoolHandle>, [Arc<dyn BufferHandle>; 2]);
 
+/// A display-lifetime pool retained across screensaver sessions.
+pub(super) struct ScreensaverPool {
+    pool: Arc<dyn PoolHandle>,
+    byte_len: usize,
+}
+
 pub(super) fn create_screensaver_buffers(
     ops: &dyn WaylandOps,
+    retained_pool: &mut Option<ScreensaverPool>,
     width: u32,
     height: u32,
     stride: u32,
@@ -778,7 +785,17 @@ pub(super) fn create_screensaver_buffers(
     })?;
     let pool_byte_len =
         usize::try_from(pool_byte_len_bytes).expect("pool byte length must fit in usize");
-    let pool = ops.create_shm_pool(pool_byte_len)?;
+    let pool = match retained_pool.as_ref() {
+        Some(retained) if retained.byte_len >= pool_byte_len => retained.pool.clone(),
+        _ => {
+            let pool = ops.create_shm_pool(pool_byte_len)?;
+            *retained_pool = Some(ScreensaverPool {
+                pool: pool.clone(),
+                byte_len: pool_byte_len,
+            });
+            pool
+        }
+    };
     let fmt = wl_shm::Format::Xrgb8888;
     let w = width.cast_signed();
     let h = height.cast_signed();
@@ -837,9 +854,11 @@ mod tests {
         // `create_buffer` call sites, not just the `create_dual_buffers_core`
         // closure's arithmetic (PR #57's ad-hoc seam).
         let ops = RecordingWaylandOps::new();
+        let mut retained_pool = None;
         let (width, height, stride) = (640u32, 480u32, 2560u32);
-        let (_pool, _buffers) = create_screensaver_buffers(&ops, width, height, stride)
-            .expect("pool creation must succeed");
+        let (_pool, _buffers) =
+            create_screensaver_buffers(&ops, &mut retained_pool, width, height, stride)
+                .expect("pool creation must succeed");
         let expected_pool_len = 2u64 * u64::from(stride) * u64::from(height);
         let expected_buf1_offset = u64::from(stride) * u64::from(height);
         let log = ops.take_call_log();
@@ -874,8 +893,9 @@ mod tests {
         // checked op this function performs (the `i32::try_from` on
         // the offset, later in the function, is never reached).
         let ops = RecordingWaylandOps::new();
+        let mut retained_pool = None;
         let (width, height, stride) = (640u32, u32::MAX, u32::MAX);
-        let result = create_screensaver_buffers(&ops, width, height, stride);
+        let result = create_screensaver_buffers(&ops, &mut retained_pool, width, height, stride);
         assert!(
             matches!(result, Err(CreatePoolError::Create(_))),
             "expected Err(CreatePoolError::Create(_)) for an overflowing pool size, got {result:?}"
@@ -883,6 +903,83 @@ mod tests {
         assert!(
             ops.take_call_log().is_empty(),
             "must fail before issuing any WaylandOps call"
+        );
+    }
+
+    #[test]
+    fn screensaver_show_teardown_show_reuses_one_pool() {
+        let ops = RecordingWaylandOps::new();
+        let mut retained_pool = None;
+        let (width, height, stride) = (640u32, 480u32, 2560u32);
+
+        for _ in 0..3 {
+            let (_pool, buffers) =
+                create_screensaver_buffers(&ops, &mut retained_pool, width, height, stride)
+                    .expect("screensaver buffers must allocate");
+            drop(buffers);
+        }
+
+        let log = ops.take_call_log();
+        let pool_creates = log
+            .iter()
+            .filter(|call| call.starts_with("create_shm_pool("))
+            .count();
+        assert_eq!(
+            pool_creates, 1,
+            "one display keeps one pool across sessions"
+        );
+    }
+
+    #[test]
+    fn screensaver_recreated_buffers_use_the_retained_pool() {
+        let ops = RecordingWaylandOps::new();
+        let mut retained_pool = None;
+        let (width, height, stride) = (640u32, 480u32, 2560u32);
+
+        for _ in 0..3 {
+            let (_pool, buffers) =
+                create_screensaver_buffers(&ops, &mut retained_pool, width, height, stride)
+                    .expect("screensaver buffers must allocate");
+            drop(buffers);
+        }
+
+        let log = ops.take_call_log();
+        let buffer_creates: Vec<_> = log
+            .iter()
+            .filter(|call| call.starts_with("create_buffer("))
+            .collect();
+        assert_eq!(
+            buffer_creates.len(),
+            6,
+            "each show still creates two buffers"
+        );
+        assert!(
+            buffer_creates.iter().all(|call| call.contains("pool=#0")),
+            "every session buffer must come from the retained pool"
+        );
+    }
+
+    #[test]
+    fn screensaver_pool_grows_for_larger_show_and_does_not_shrink() {
+        let ops = RecordingWaylandOps::new();
+        let mut retained_pool = None;
+        let smaller = (640u32, 480u32, 2560u32);
+        let larger = (800u32, 600u32, 3200u32);
+
+        for (width, height, stride) in [smaller, larger, smaller] {
+            let (_pool, buffers) =
+                create_screensaver_buffers(&ops, &mut retained_pool, width, height, stride)
+                    .expect("screensaver buffers must allocate");
+            drop(buffers);
+        }
+
+        let log = ops.take_call_log();
+        assert_eq!(
+            log.iter()
+                .filter(|call| call.starts_with("create_shm_pool("))
+                .count(),
+            2,
+            "the smaller third show must reuse the larger retained pool"
         );
     }
 

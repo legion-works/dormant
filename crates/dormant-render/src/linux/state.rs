@@ -51,7 +51,7 @@ use super::blend::{self, T_MAX};
 #[cfg(test)]
 use super::wayland_ops::RecordingWaylandOps;
 use super::wayland_ops::{
-    BufferHandle, PoolHandle, SurfaceHandle, ViewportHandle, WaylandOps,
+    BufferHandle, PoolHandle, ScreensaverPool, SurfaceHandle, ViewportHandle, WaylandOps,
     create_screensaver_buffers, real_buffer, real_pool_with_region_mut, wrap_real_buffer,
 };
 use crate::command::RenderCommand;
@@ -744,7 +744,7 @@ pub(super) struct TransitionState {
 }
 
 /// Active screensaver overlay — owned by the wayland thread, drives a
-/// [`MpvPlayer`] into a double-buffered shm pool and registers the mpv
+/// [`MpvPlayer`] into double-buffered `wl_buffer`s and registers the mpv
 /// wakeup pipe read end as a calloop source.  The `wl_buffer`s live in
 /// the SAME `RawPool` at offsets 0 and `stride * height` so the
 /// compositor never reads the buffer mpv is currently writing.
@@ -754,10 +754,8 @@ pub(super) struct TransitionState {
 /// written buffer to the surface and flip the index.
 pub(super) struct ScreensaverSession {
     pub(super) player: MpvPlayer,
-    /// Opaque handle to the owned pool covering both buffers
-    /// (`2 * stride * height` bytes) — real (production) or recorder
-    /// (tests), created via [`create_screensaver_buffers`]. Real mmap
-    /// access for per-frame writes goes through
+    /// Clone of the display-retained pool covering both buffers
+    /// (`2 * stride * height` bytes). Real mmap access for per-frame writes goes through
     /// [`real_pool_with_region_mut`]; never downcast directly.
     pub(super) pool: Arc<dyn PoolHandle>,
     /// `buffers[0]` lives at offset 0, `buffers[1]` at offset
@@ -878,10 +876,14 @@ pub(super) struct WaylandState {
 
     // ── Screensaver session (RenderScreensaver stage) ─────────────────────
     /// Active screensaver overlay — `Some` while a screensaver surface is
-    /// live.  Owns the [`MpvPlayer`], the double-buffered shm pool, and
+    /// live. Owns the [`MpvPlayer`] and double-buffered `wl_buffer`s, and
     /// (via the `screensaver_wakeup_token` below) the calloop registration
     /// of the mpv wakeup pipe read end.
     pub(super) screensaver_session: Option<ScreensaverSession>,
+
+    /// Retains the backing `wl_shm_pool` after teardown because `KWin` defers
+    /// releasing dead-client pool pages while an output is DPMS-off.
+    pub(super) screensaver_pool: Option<ScreensaverPool>,
 
     /// calloop `RegistrationToken` for the mpv wakeup pipe read end —
     /// used to unregister the Generic source when the screensaver
@@ -1081,6 +1083,7 @@ impl WaylandState {
             queue_handle,
             loop_should_exit,
             screensaver_session: None,
+            screensaver_pool: None,
             screensaver_wakeup_token: None,
             loop_handle: None,
             shift_settings: ShiftSettings::default(),
@@ -1911,13 +1914,17 @@ impl WaylandState {
         // both `create_buffer` calls via `self.wayland_ops`, so
         // reverting either the arithmetic or the call sites fails
         // that recorder test, not just an arithmetic-only unit test.
-        let (pool, [buf0, buf1]) =
-            create_screensaver_buffers(self.wayland_ops.as_ref(), width, height, stride).map_err(
-                |e| {
-                    // player drops (closes write fd).
-                    cmd_failure("screensaver", &format!("RawPool::new: {e}"))
-                },
-            )?;
+        let (pool, [buf0, buf1]) = create_screensaver_buffers(
+            self.wayland_ops.as_ref(),
+            &mut self.screensaver_pool,
+            width,
+            height,
+            stride,
+        )
+        .map_err(|e| {
+            // player drops (closes write fd).
+            cmd_failure("screensaver", &format!("RawPool::new: {e}"))
+        })?;
 
         // Attach the first back buffer (all zeros — opaque black under
         // XRGB8888) and commit.  mpv's first wakeup will follow shortly
@@ -2037,8 +2044,8 @@ impl WaylandState {
     /// after a compositor-initiated resize (#316, the screensaver twin of
     /// #273).  Mirrors the install path ([`Self::complete_screensaver_show`])
     /// minus the player/playlist/scaffold construction: re-install the
-    /// shift viewport at the new `configured_size`, allocate a fresh pool
-    /// at `render_dims(configured_size)`, re-target the mpv software
+    /// shift viewport at the new `configured_size`, create fresh buffers
+    /// from a retained pool sized for `render_dims(configured_size)`, re-target the mpv software
     /// renderer with the new dims, draw the current picture into the new
     /// buffer, then attach + commit and swap the rebuilt halves into the
     /// session.
@@ -2084,14 +2091,19 @@ impl WaylandState {
             self.fail_screensaver_to_black("resize rebuild: stride overflow");
             return;
         };
-        let (pool, [buf0, buf1]) =
-            match create_screensaver_buffers(self.wayland_ops.as_ref(), width, height, stride) {
-                Ok(parts) => parts,
-                Err(e) => {
-                    self.fail_screensaver_to_black(&format!("resize rebuild: RawPool::new: {e}"));
-                    return;
-                }
-            };
+        let (pool, [buf0, buf1]) = match create_screensaver_buffers(
+            self.wayland_ops.as_ref(),
+            &mut self.screensaver_pool,
+            width,
+            height,
+            stride,
+        ) {
+            Ok(parts) => parts,
+            Err(e) => {
+                self.fail_screensaver_to_black(&format!("resize rebuild: RawPool::new: {e}"));
+                return;
+            }
+        };
 
         let loop_handle = self.loop_handle.clone();
         let Some(session) = self.screensaver_session.as_mut() else {
@@ -2149,8 +2161,8 @@ impl WaylandState {
 
         // Attach + commit, THEN swap the session halves: the surface
         // references the OLD buffers until this commit takes effect, so
-        // the old pool must only drop (at the `session.pool` reassignment
-        // below) after the surface has been pointed at the new one.
+        // the old session pool reference must only drop at the
+        // `session.pool` reassignment below, after the surface points at the new buffers.
         // `wl_buffer.release` remains the compositor's done-signal for
         // per-buffer reuse bookkeeping (`buffers_busy`); the protocol
         // itself permits destroying the previous `wl_shm_pool` once
@@ -2798,7 +2810,7 @@ impl WaylandState {
     /// transition timer), drops the session — `MpvPlayer`'s `Drop`
     /// unregisters the mpv callback, frees the render context, drops
     /// the mpv handle, and closes the write fd; the session drops
-    /// the read fd, the `RawPool`, and the two `WlBuffer`s.  No manual
+    /// the read fd and two `WlBuffer`s, while the display retains its pool. No manual
     /// `player.destroy()` call needed.
     fn destroy_screensaver_session(&mut self) {
         // Remove ALL calloop sources FIRST so no further callbacks fire
@@ -2825,7 +2837,7 @@ impl WaylandState {
             }
         }
         // Drop the session — the destructuring here is purely to control
-        // drop order (player first, then read fd, then pool).  The
+        // drop order (player first, then read fd, then its pool clone). The
         // player's `Drop` runs the mpv teardown.
         if let Some(session) = self.screensaver_session.take() {
             let clear_report =
@@ -2864,13 +2876,10 @@ impl WaylandState {
             {
                 drop(read_fd);
             }
-            // pool + buffers drop here (opaque `Arc<dyn PoolHandle>` /
-            // `[Arc<dyn BufferHandle>; 2]` — test-seam #55, Task 2); in
-            // production these are the sole references, so dropping
-            // them drops the wrapped `RawPool`, whose own `Drop`
-            // destroys the `wl_shm_pool` and in turn releases the
-            // `WlBuffer`s.  The transition field's capture Vec drops
-            // here too (~21 MiB at
+            // The session's pool clone and buffers drop here (opaque
+            // `Arc<dyn PoolHandle>` / `[Arc<dyn BufferHandle>; 2]`). The
+            // display-lifetime cache retains the pool; only the buffers are
+            // destroyed between sessions. The transition capture Vec drops here too (~21 MiB at
             // 4K); Rust's struct field drop order runs it before pool
             // because we declared `transition` AFTER `pool` in the
             // struct.  Doesn't actually matter for correctness — both
@@ -2930,7 +2939,7 @@ impl WaylandState {
     /// pending show with a soft error — the daemon may legitimately
     /// teardown before configure arrives.
     pub(super) fn destroy_surface(&mut self) {
-        // Destroy any active screensaver session first — frees mpv + shm.
+        // Destroy any active screensaver session first — frees mpv and buffers.
         // If we destroy the surface without this, the player keeps running
         // and the wakeup pipe keeps firing on a dead surface.
         self.destroy_screensaver_session();

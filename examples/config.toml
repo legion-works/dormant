@@ -80,7 +80,7 @@ config_version = 1
 # loss_confirmations = 3          # consecutive "not mine" VCP 0x60 reads before ownership flips true→false (1..=10)
 # The limiter defaults are active below so copied examples retain the safe
 # contested-panel behavior even when the other coordination defaults are implicit.
-flap_threshold = 8   # committed ownership transitions allowed in flap_window before forced not-owned (>= 2)
+flap_threshold = 5   # committed ownership transitions allowed in flap_window before forced not-owned (>= 2)
 flap_window = "120s" # sliding transition-count window (>= poll_interval)
 flap_settle = "60s"  # quiet time — no change in the panel's reported input — before a contested panel resumes evaluation (>= poll_interval)
 # activity_follow = false         # when true, a local activity edge pulls a shared display to this machine

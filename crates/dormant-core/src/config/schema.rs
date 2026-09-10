@@ -190,11 +190,10 @@ pub struct CoordinationConfig {
     pub loss_confirmations: u32,
 
     /// Committed ownership transitions allowed within `flap_window` before the
-    /// panel becomes contested and is forced not-owned. Eight transitions allow
-    /// four human KVM round-trips in two minutes, while a 6–10s standby flap
-    /// reaches 12–20 transitions and is contained within the first 90 seconds.
-    /// The 23 yields recorded across an afternoon of normal switching remain
-    /// below this burst limit. Must be `>= 2`.
+    /// panel becomes contested and is forced not-owned. Five transitions allow
+    /// three human KVM round-trips over five minutes to stay below the limit in
+    /// any two-minute window, while live standby readback data reaches six
+    /// committed transitions per two-minute window. Must be `>= 2`.
     #[serde(default = "default_coordination_flap_threshold")]
     pub flap_threshold: u32,
 
@@ -3087,7 +3086,7 @@ idle_source = "macos"
         );
         // loss_confirmations default — defends against issue #134 garbled reads.
         assert_eq!(cfg.coordination.loss_confirmations, 3);
-        assert_eq!(cfg.coordination.flap_threshold, 8);
+        assert_eq!(cfg.coordination.flap_threshold, 5);
         assert_eq!(cfg.coordination.flap_window, Duration::from_secs(120));
         assert_eq!(cfg.coordination.flap_settle, Duration::from_secs(60));
         assert_eq!(cfg.coordination.reprobe_failure_threshold, 3);

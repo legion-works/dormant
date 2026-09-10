@@ -1520,14 +1520,20 @@ mod tests {
         let policy = flap_policy(crate::config::defaults::COORDINATION_FLAP_THRESHOLD);
         let mut now = Instant::now();
 
-        for observed in [0x10, 0x0f, 0x10, 0x0f, 0x10, 0x0f, 0x10] {
+        for transition in 0..policy.threshold - 1 {
+            let observed = if transition % 2 == 0 { 0x10 } else { 0x0f };
             let outcome = observe_at(&handle, &aoc, observed, &al, 1, policy, now);
             assert!(!outcome.entered_contested);
             now += Duration::from_secs(2);
         }
         assert!(!handle.snapshot()[&aoc].contested);
 
-        let outcome = observe_at(&handle, &aoc, 0x0f, &al, 1, policy, now);
+        let observed = if (policy.threshold - 1).is_multiple_of(2) {
+            0x10
+        } else {
+            0x0f
+        };
+        let outcome = observe_at(&handle, &aoc, observed, &al, 1, policy, now);
         assert!(outcome.entered_contested);
         assert!(handle.snapshot()[&aoc].contested);
         assert!(!handle.snapshot()[&aoc].owned);

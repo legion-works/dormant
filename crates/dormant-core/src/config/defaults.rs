@@ -135,12 +135,11 @@ pub const COORDINATION_LOSS_CONFIRMATIONS: u32 = 3;
 
 /// Number of committed ownership transitions allowed inside
 /// [`COORDINATION_FLAP_WINDOW`] before the panel becomes contested. A human
-/// working a KVM makes only a few round-trips per minute: four round-trips in
-/// two minutes is eight transitions, the edge of tolerance. A standby flap
-/// makes 12–20 transitions in two minutes and trips this limiter inside the
-/// first 90 seconds. The 23 yields observed over hours during normal afternoon
-/// switching remain below this burst threshold.
-pub const COORDINATION_FLAP_THRESHOLD: u32 = 8;
+/// working a KVM makes only a few round-trips per minute: three round-trips in
+/// five minutes stay below five transitions in any two-minute window. Live
+/// standby readback data reaches six committed transitions per two-minute
+/// window, so this limiter contains the burst without changing the floor.
+pub const COORDINATION_FLAP_THRESHOLD: u32 = 5;
 
 /// Sliding interval used with [`COORDINATION_FLAP_THRESHOLD`] to detect a
 /// sustained ownership flap. Two minutes tolerates deliberate KVM use while

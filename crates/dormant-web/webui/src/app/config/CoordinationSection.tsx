@@ -72,7 +72,7 @@ export default function CoordinationSection({ coordination = {}, store, onDirty,
   const lossConfirmations = (store.getEdit([...root, "loss_confirmations"]) as number | undefined)
     ?? coordination.loss_confirmations ?? 3;
   const flapThreshold = (store.getEdit([...root, "flap_threshold"]) as number | undefined)
-    ?? coordination.flap_threshold ?? 8;
+    ?? coordination.flap_threshold ?? 5;
   const flapWindow = (store.getEdit([...root, "flap_window"]) as string | undefined)
     ?? coordination.flap_window ?? "120s";
   const flapSettle = (store.getEdit([...root, "flap_settle"]) as string | undefined)
@@ -171,7 +171,7 @@ export default function CoordinationSection({ coordination = {}, store, onDirty,
               <div className="cf-field cf-field--row" data-field-id="coordination.flap_threshold">
                 <NumberField path={[...root, "flap_threshold"]} label="flap_threshold"
                   value={flapThreshold} locked={false} help={HELP.flap_threshold}
-                  error={flapThresholdError ?? fieldErrors["coordination.flap_threshold"]} placeholder="8"
+                  error={flapThresholdError ?? fieldErrors["coordination.flap_threshold"]} placeholder="5"
                   onEdit={(_, v) => edit("flap_threshold", v)} />
               </div>
               <div className="cf-field cf-field--row" data-field-id="coordination.flap_window">

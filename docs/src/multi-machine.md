@@ -154,12 +154,12 @@ Ownership **gain** and **loss** are debounced differently depending on the path:
 Consecutive-read debounce cannot reject an input-source flap that holds each
 side longer than its confirmation window. The daemon therefore tracks committed
 ownership transitions in `flap_window` (default `120s`). At
-`flap_threshold = 8`, it marks the display **contested** and forces the local
+`flap_threshold = 5`, it marks the display **contested** and forces the local
  verdict to not-owned until `flap_settle = 60s` passes with no change in the
- panel's reported input. Eight transitions tolerate four human KVM round-trips in two
-minutes; a 6–10 second standby flap produces 12–20 and is contained in the
-first 90 seconds. The 23 yields observed over an afternoon of ordinary KVM use
-are spread across hours and do not trip the burst threshold.
+panel's reported input. Five transitions keep three human KVM round-trips over
+five minutes below the limit in any two-minute window; live standby readback
+data reaches six committed transitions per two-minute window and is contained
+by the lower threshold.
 
 Contested never freezes an owned verdict. If the peer has the panel, retaining
 owned could let this daemon advance to a DDC power-off stage on the peer's
@@ -369,7 +369,7 @@ any key within it) has no effect without a shared display.
 | `poll_interval` | duration | `"2s"` | Shared-display ownership poll cadence (VCP `0x60`); minimum `"1s"`. |
 | `state_poll_interval` | duration | unset | Panel-state (brightness/power) refresh cadence for `DisplaySnapshot` cosmetics. When unset, defaults to `max(30s, poll_interval)`; when set, must be `>= poll_interval`. Ownership still polls at `poll_interval`; only panel state refreshes here, to cut per-transaction i2c traffic. |
 | `loss_confirmations` | integer | `3` | Consecutive agreeing VCP `0x60` readings required before the cached ownership verdict flips — symmetric for gain and loss. Defends against garbled reads from concurrent cross-machine DDC traffic (issue #134). Validated `1..=10`. A verified local pull marks ownership immediately (the machine has first-hand proof), so `loss_confirmations` only governs the poll-observed transitions. |
-| `flap_threshold` | integer | `8` | Committed transitions permitted within `flap_window` before ownership is contested; minimum `2`. Eight permits four normal KVM round-trips in two minutes but catches the 12–20 transitions from a 6–10s standby flap. |
+| `flap_threshold` | integer | `5` | Committed transitions permitted within `flap_window` before ownership is contested; minimum `2`. Five keeps three human KVM round-trips over five minutes below the limit in any two-minute window while containing live standby readback bursts reaching six committed transitions per window. |
 | `flap_window` | duration | `"120s"` | Sliding transition-count interval; must be `>= poll_interval`. |
 | `flap_settle` | duration | `"60s"` | Quiet time — no change in the panel's reported input — before a contested display resumes normal evaluation; must be `>= poll_interval`. Contested forces not-owned so this machine cannot power off a panel the peer may be using. |
 | `activity_follow` | boolean | `false` | When `true`, a genuine local activity edge (keyboard, mouse, tablet) pulls a shared display to this machine after `arm_after` idle. |

@@ -272,4 +272,4 @@ For the USB-serial topology, thresholds are set via the module's own serial prot
 | `"presence"` | Binary: occupied or vacant. Stable. |
 | `"motion"` | Transient: triggers on motion, clears after hold time. Good for hallways and pass-through areas. |
 
-Motion sensors use the `hold_time` to bridge gaps between motion pulses. A 5-minute hold keeps the zone occupied for 5 minutes after the last trigger — enough to prevent the TV from blanking while you are still on the couch but not moving.
+Motion sensors use the `hold_time` to bridge gaps between motion pulses. A 5-minute hold keeps the zone occupied for 5 minutes after the last trigger — enough to prevent the TV from blanking while you are still on the couch but not moving. Presence sensors with a `hold_time` get the same off-debounce; this is the recommended setting for radar modules whose still-target detection drops out for seconds at a time, including the LD2410C.

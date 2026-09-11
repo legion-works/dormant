@@ -990,8 +990,8 @@ pub struct SensorRuntimeCfg {
     pub sensor: SensorId,
     /// How this sensor's events are interpreted.
     pub kind: SensorKind,
-    /// Motion-sensor hold-time override (`Some(h)` → stretch pulses by `h`;
-    /// `None` → no hold; ignored unless `kind == Motion`).
+    /// Per-sensor hold-time override (`Some(h)` defers an `Absent` event until
+    /// the hold expires; `None` passes events through immediately).
     pub hold_time: Option<Duration>,
     /// After this much wall-clock silence without an event, the sensor is
     /// marked `Unavailable` by the sweeper.
@@ -1332,11 +1332,11 @@ impl RulesEngine {
                 .push(rule.rule.clone());
         }
 
-        // Per-sensor hold state — only populated when the sensor is Motion
-        // with a hold_time override.  All other sensors pass through.
+        // Per-sensor hold state — populated whenever a hold_time override is
+        // configured. All other sensors pass through.
         let mut holds: HashMap<SensorId, HoldState> = HashMap::new();
         for scfg in &cfg.sensors {
-            if scfg.kind == SensorKind::Motion && scfg.hold_time.is_some() {
+            if scfg.hold_time.is_some() {
                 holds.insert(scfg.sensor.clone(), HoldState::default());
             }
         }
@@ -1598,8 +1598,7 @@ impl RulesEngine {
             self.availability_online.remove(&ev.sensor_id);
         }
 
-        // Hold-filter: swallow / arm / pass through based on the sensor's
-        // kind and hold_time.
+        // Hold-filter: swallow / arm / pass through based on hold_time.
         let effective = self.apply_hold_filter(ev);
 
         let Some(effective) = effective else {
@@ -1638,8 +1637,8 @@ impl RulesEngine {
         }
     }
 
-    /// Apply motion-sensor hold-time semantics.  Returns `None` if the event
-    /// was swallowed by an armed hold.
+    /// Apply hold-time semantics. Returns `None` if the event was swallowed
+    /// by an armed hold.
     fn apply_hold_filter(&mut self, ev: PresenceEvent) -> Option<PresenceEvent> {
         // Pass-through if this sensor has no hold state configured.
         if !self.holds.contains_key(&ev.sensor_id) {
@@ -4489,6 +4488,124 @@ mod tests {
             Arc::new(crate::ownership::AlwaysOwned),
         )
         .expect("single hold-sensor engine config is valid")
+    }
+
+    fn presence_hold_engine(
+        id: &str,
+        hold: Duration,
+    ) -> (RulesEngine, ZoneId, broadcast::Receiver<DaemonEvent>) {
+        use crate::zone::{FusionMode, ZoneMember, ZoneSpec};
+
+        let sensor = SensorId(id.into());
+        let zone = ZoneId("desk".into());
+        let mut engine = RulesEngine::new(
+            RulesEngineConfig {
+                rules: vec![],
+                displays: vec![],
+                sensors: vec![SensorRuntimeCfg {
+                    sensor: sensor.clone(),
+                    kind: SensorKind::Presence,
+                    hold_time: Some(hold),
+                    stale_timeout: Duration::from_secs(3600),
+                }],
+                doctor_wake_settle: Duration::from_secs(3),
+            },
+            ZoneEngine::new(
+                vec![ZoneSpec {
+                    id: zone.clone(),
+                    mode: FusionMode::Any,
+                    members: vec![ZoneMember::Sensor(sensor)],
+                    weights: HashMap::new(),
+                    unavailable_policy: crate::zone::UnavailablePolicy::Present,
+                }],
+                &[SensorId(id.into())],
+            )
+            .expect("single-sensor zone engine is valid"),
+            HashMap::new(),
+            HashMap::new(),
+            Arc::new(crate::ownership::AlwaysOwned),
+        )
+        .expect("presence hold engine config is valid");
+        let (sub_tx, mut sub_rx) = oneshot::channel();
+        engine.handle_control(ControlMsg::SubscribeEvents(sub_tx));
+        let events = sub_rx.try_recv().expect("subscription reply sent inline");
+        (engine, zone, events)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn presence_sensor_with_hold_time_defers_absent() {
+        let hold = Duration::from_secs(30);
+        let (mut engine, zone, mut events) = presence_hold_engine("desk", hold);
+        let sensor = SensorId("desk".into());
+
+        engine.handle_presence_event(PresenceEvent::new(
+            sensor.clone(),
+            SensorState::Present,
+            Timestamp::now(),
+        ));
+        while events.try_recv().is_ok() {}
+
+        engine.handle_presence_event(PresenceEvent::new(
+            sensor,
+            SensorState::Absent,
+            Timestamp::now(),
+        ));
+        assert!(engine.zone_engine.is_present(&zone).unwrap_or(false));
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(event, DaemonEvent::ZoneChanged { present: false, .. }),
+                "an off inside the hold must not clear the zone"
+            );
+        }
+
+        tokio::time::advance(hold + Duration::from_secs(1)).await;
+        engine.fire_due_timers(Tick::now());
+
+        assert!(!engine.zone_engine.is_present(&zone).unwrap_or(true));
+        assert!(
+            std::iter::from_fn(|| events.try_recv().ok())
+                .any(|event| matches!(event, DaemonEvent::ZoneChanged { present: false, .. })),
+            "hold expiry must emit the deferred zone-clear event"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn presence_sensor_hold_rearms_on_present() {
+        let hold = Duration::from_secs(30);
+        let (mut engine, zone, mut events) = presence_hold_engine("desk", hold);
+        let sensor = SensorId("desk".into());
+
+        engine.handle_presence_event(PresenceEvent::new(
+            sensor.clone(),
+            SensorState::Present,
+            Timestamp::now(),
+        ));
+        while events.try_recv().is_ok() {}
+        engine.handle_presence_event(PresenceEvent::new(
+            sensor.clone(),
+            SensorState::Absent,
+            Timestamp::now(),
+        ));
+
+        tokio::time::advance(Duration::from_secs(15)).await;
+        engine.handle_presence_event(PresenceEvent::new(
+            sensor.clone(),
+            SensorState::Present,
+            Timestamp::now(),
+        ));
+        assert!(
+            engine.holds[&sensor].pending_absent.is_none(),
+            "a new Present must discard the deferred Absent"
+        );
+
+        tokio::time::advance(Duration::from_secs(16)).await;
+        engine.fire_due_timers(Tick::now());
+
+        assert!(engine.zone_engine.is_present(&zone).unwrap_or(false));
+        assert!(
+            engine.holds[&sensor].pending_absent.is_none(),
+            "the original deadline must not retain a deferred Absent"
+        );
     }
 
     /// T3 review S1: no test in the original diff configured a `hold_time`

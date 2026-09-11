@@ -41,7 +41,7 @@ const SENSOR_SCALAR_KEYS: string[] = [
 /** Per-field help and placeholder — accurate to the real config semantics. */
 const HELP: Record<string, string> = {
   kind: "presence = continuous occupancy; motion = pulse, stretched by hold_time.",
-  hold_time: "How long a motion pulse is treated as present.",
+  hold_time: "How long the sensor stays present after its last on; an off inside the window is deferred.",
   stale_timeout: "A sensor silent this long becomes unavailable.",
   availability_topic: "Optional LWT/availability topic override — defaults to <topic>/availability if unset.",
   availability_payload_online: "Payload marking the sensor online. Informational only — no event is emitted.",

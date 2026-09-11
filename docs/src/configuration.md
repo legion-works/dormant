@@ -40,7 +40,7 @@ Common fields on all sensor types:
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `kind` | string | `"presence"` | Sensor semantics: `"presence"` (binary occupied/vacant) or `"motion"` (transient event) |
-| `hold_time` | duration | none | Per-sensor override: how long occupancy persists after the last trigger |
+| `hold_time` | duration | none | Per-sensor override: how long occupancy persists after the sensor's last `on` — an `off` inside the window is deferred to its end, and dropped if another `on` arrives first. Applies to both sensor kinds. |
 | `stale_timeout` | duration | none | Per-sensor override: how long before no data means unavailable |
 
 ### `type = "mqtt"`

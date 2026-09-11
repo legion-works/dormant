@@ -1192,7 +1192,7 @@ pub struct MqttSensorCfg {
     #[serde(default)]
     pub kind: SensorKind,
 
-    /// Per-sensor hold-time override.
+    /// Per-sensor hold-time override; defers an off event until the hold expires.
     #[serde(default, with = "humantime_serde::option")]
     pub hold_time: Option<Duration>,
 
@@ -1215,7 +1215,7 @@ pub struct HaSensorCfg {
     #[serde(default)]
     pub kind: SensorKind,
 
-    /// Per-sensor hold-time override.
+    /// Per-sensor hold-time override; defers an off event until the hold expires.
     #[serde(default, with = "humantime_serde::option")]
     pub hold_time: Option<Duration>,
 
@@ -1239,7 +1239,7 @@ pub struct UsbLd2410Cfg {
     #[serde(default)]
     pub kind: SensorKind,
 
-    /// Per-sensor hold-time override.
+    /// Per-sensor hold-time override; defers an off event until the hold expires.
     #[serde(default, with = "humantime_serde::option")]
     pub hold_time: Option<Duration>,
 

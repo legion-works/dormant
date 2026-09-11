@@ -685,13 +685,10 @@ pub fn validate_with_input_source_readers(
     let sensor_set: HashSet<&str> = cfg.sensors.keys().map(String::as_str).collect();
     let zone_names: HashSet<&str> = cfg.zones.keys().map(String::as_str).collect();
 
-    // A motion pulse must remain believable for its entire hold.  Once the
-    // stale timeout wins, the sweeper marks the sensor unavailable and the
-    // pending absence hold is discarded.
+    // A held presence state must remain believable for its entire hold. Once
+    // the stale timeout wins, the sweeper marks the sensor unavailable and
+    // the pending absence hold is discarded.
     for (sensor_id, sensor) in &cfg.sensors {
-        if sensor.kind() != super::schema::SensorKind::Motion {
-            continue;
-        }
         let Some(hold_time) = sensor.hold_time() else {
             continue;
         };
@@ -4878,7 +4875,7 @@ stale_timeout = "5m"
     }
 
     #[test]
-    fn motion_hold_time_must_not_exceed_effective_stale_timeout() {
+    fn hold_time_must_not_exceed_effective_stale_timeout() {
         let errors = validate_str(
             r#"
 config_version = 1
@@ -4900,7 +4897,7 @@ hold_time = "6m"
     }
 
     #[test]
-    fn motion_hold_time_at_or_below_stale_timeout_is_valid() {
+    fn hold_time_at_or_below_stale_timeout_is_valid() {
         let errors = validate_str(
             r#"
 config_version = 1

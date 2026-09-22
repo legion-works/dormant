@@ -131,9 +131,10 @@ stale_sensor_timeout = "5m"
 log_level = "info"
 socket_path = "/run/user/1000/dormant.sock"
 
-# idle_source: "auto" (default) | "wayland" | "dbus" | "macos"
-# "macos" selects the CoreGraphics idle-time source (macOS builds only —
-# see the macos_idle_* keys below, which tune that source's noise handling).
+# idle_source: "auto" (default) | "wayland" | "dbus" | "macos" | "windows"
+# "macos" selects the CoreGraphics idle-time source (macOS builds only);
+# "windows" selects the GetLastInputInfo idle-time source (Windows builds only).
+# Both share the macos_idle_* keys below, which tune the idle guard's noise handling.
 # idle_source = "auto"
 #
 # macos_idle_frozen_polls = 3    # consecutive identical-looking polls before a reading is

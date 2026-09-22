@@ -19,7 +19,7 @@ Required. Must be `1`. This gates backward compatibility — bump when making br
 | `log_level` | string | `"info"` | Tracing log level: `"trace"`, `"debug"`, `"info"`, `"warn"`, `"error"` |
 | `socket_path` | path | auto | Unix-domain socket for `dormantctl` IPC (defaults to XDG_RUNTIME_DIR) |
 | `idle_time_unit` | string | `"auto"` | How to interpret screensaver idle values: `"auto"`, `"ms"`, `"s"`. KDE returns ms despite the spec saying seconds — auto detects the unit at runtime |
-| `idle_source` | string | `"auto"` | User-activity source: `"auto"`, `"wayland"`, `"dbus"`, or `"macos"` (CoreGraphics idle time, macOS builds only) |
+| `idle_source` | string | `"auto"` | User-activity source: `"auto"`, `"wayland"`, `"dbus"`, `"macos"` (CoreGraphics idle time, macOS builds only), or `"windows"` (GetLastInputInfo idle time, Windows builds only) |
 | `macos_idle_frozen_polls` | integer | `3` | macOS only: consecutive identical-looking idle-clock polls before a reading is treated as frozen (defensive against a stuck clock) |
 | `macos_idle_sanity_cap` | duration | `"24h"` | macOS only: idle readings above this are treated as bogus, not real idle time (must be `> 0`) |
 | `macos_idle_startup_grace` | duration | `"15s"` | macOS only: idle readings are untrusted for this long after daemon startup (must be `> 0`) |

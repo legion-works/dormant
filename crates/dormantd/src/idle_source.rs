@@ -907,10 +907,12 @@ pub(crate) fn create_filtered_source(
 /// macOS source's [`crate::macos_idle::MacosIdleGuard`]; it's plain data on
 /// every platform (not `cfg`-gated) so callers don't need their own `cfg` to
 /// build one, even though it's only consulted when `effective` resolves to
-/// `Macos` on an actual macOS build.
+/// `Macos` on an actual macOS build. The Windows source reuses the same
+/// guard (and therefore the same knobs) — see `crate::windows_idle`.
 ///
 /// Returns `None` when there are no rules.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn create_source(
     mode: dormant_core::config::IdleSource,
     rules: Vec<ActivityRule>,
@@ -968,12 +970,19 @@ pub fn create_source(
             tracing::info!(event = "idle_source_selected", source = "macos");
             dormant_core::config::IdleSource::Macos
         }
-        // Windows (or any other non-Linux, non-macOS target): keep the
+        // Auto selects Windows ON WINDOWS ONLY — the Linux/macOS Auto arms
+        // above stay byte-identical, and this arm never fires there.
+        #[cfg(target_os = "windows")]
+        dormant_core::config::IdleSource::Auto => {
+            tracing::info!(event = "idle_source_selected", source = "windows");
+            dormant_core::config::IdleSource::Windows
+        }
+        // Any other non-Linux, non-macOS, non-Windows target: keep the
         // existing unsupported/fail-toward-inactive behavior — fall back to
         // the DBus source, whose non-Linux stub (`dbus_run` below) never
         // publishes anything, so rules simply stay at their inactive
         // default rather than wedging displays awake.
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
         dormant_core::config::IdleSource::Auto => {
             tracing::info!(event = "idle_source_selected", source = "dbus");
             dormant_core::config::IdleSource::Dbus
@@ -998,6 +1007,24 @@ pub fn create_source(
             tracing::warn!(
                 event = "macos_idle_unsupported",
                 "macos idle source requested but this platform is not macOS; \
+                 treating user as inactive via dbus fallback",
+            );
+            dormant_core::config::IdleSource::Dbus
+        }
+        // Explicitly configured on Windows: use the real GetLastInputInfo
+        // source.
+        #[cfg(target_os = "windows")]
+        dormant_core::config::IdleSource::Windows => {
+            tracing::info!(event = "idle_source_selected", source = "windows");
+            dormant_core::config::IdleSource::Windows
+        }
+        // Explicitly configured on a foreign (non-Windows) target: same
+        // warn-and-fall-back-to-DBus contract as the `Macos` arm above.
+        #[cfg(not(target_os = "windows"))]
+        dormant_core::config::IdleSource::Windows => {
+            tracing::warn!(
+                event = "windows_idle_unsupported",
+                "windows idle source requested but this platform is not Windows; \
                  treating user as inactive via dbus fallback",
             );
             dormant_core::config::IdleSource::Dbus
@@ -1036,8 +1063,17 @@ pub fn create_source(
         dormant_core::config::IdleSource::Macos => Some(Box::new(
             crate::macos_idle::MacosIdleSource::new(rules, poll_interval, macos_guard_cfg, idle_tx),
         )),
-        // Auto/Macos resolved to one of the above on this platform, or
-        // Macos degraded to Dbus above — unreachable in practice.
+        #[cfg(target_os = "windows")]
+        dormant_core::config::IdleSource::Windows => {
+            Some(Box::new(crate::windows_idle::WindowsIdleSource::new(
+                rules,
+                poll_interval,
+                macos_guard_cfg,
+                idle_tx,
+            )))
+        }
+        // Auto/Macos/Windows resolved to one of the above on this platform,
+        // or Macos/Windows degraded to Dbus above — unreachable in practice.
         _ => None,
     }
 }
@@ -1287,6 +1323,53 @@ mod tests {
     #[test]
     #[cfg(not(target_os = "macos"))]
     fn create_source_auto_on_foreign_target_never_selects_macos() {
+        let rules = vec![ActivityRule {
+            rule: RuleId("r".into()),
+            idle_threshold: Duration::from_secs(120),
+        }];
+        let result = create_source(
+            dormant_core::config::IdleSource::Auto,
+            rules,
+            Duration::from_secs(5),
+            IdleTimeUnit::Auto,
+            crate::macos_idle::MacosIdleGuardConfig::default(),
+            None,
+        );
+        assert!(result.is_some());
+    }
+
+    // ── Windows selection tests ──────────────────────────────────────────────
+
+    /// Explicitly-configured `idle_source = "windows"` on a foreign
+    /// (non-Windows) target must not silently no-op or fail to start — it
+    /// degrades to `DBus` the same way `Macos` does on non-macOS (see
+    /// `create_source`'s `windows_idle_unsupported` arm). Linux-runnable; the
+    /// Windows-target counterpart (selects the real `WindowsIdleSource`) is
+    /// exercised on the Windows CI lane.
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn create_source_windows_explicit_on_foreign_target_falls_back_to_dbus() {
+        let rules = vec![ActivityRule {
+            rule: RuleId("r".into()),
+            idle_threshold: Duration::from_secs(120),
+        }];
+        let result = create_source(
+            dormant_core::config::IdleSource::Windows,
+            rules,
+            Duration::from_secs(5),
+            IdleTimeUnit::Auto,
+            crate::macos_idle::MacosIdleGuardConfig::default(),
+            None,
+        );
+        // Falls back to DBus rather than returning None or panicking.
+        assert!(result.is_some());
+    }
+
+    /// `Auto` on a foreign target must never resolve to `Windows` — it stays
+    /// on the existing Linux Wayland→DBus (or non-Linux `DBus`) path.
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn create_source_auto_on_foreign_target_never_selects_windows() {
         let rules = vec![ActivityRule {
             rule: RuleId("r".into()),
             idle_threshold: Duration::from_secs(120),

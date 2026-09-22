@@ -16,3 +16,4 @@ pub mod mqtt;
 pub mod samsung;
 pub mod usb;
 pub mod wear_sampling;
+pub mod windows_idle;

@@ -27,6 +27,14 @@ tokio-serial = { workspace = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation-sys = "0.8.7"
 
+[target.'cfg(windows)'.dependencies]
+# `GetLastInputInfo`/`GetTickCount` for the windows-idle doctor probe. Pinned
+# to 0.61.2 — already in the lock via `dormantd`, so this adds no duplicate.
+windows-sys = { version = "0.61.2", features = [
+  "Win32_System_SystemInformation",
+  "Win32_UI_Input_KeyboardAndMouse",
+] }
+
 [dev-dependencies]
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "time", "macros", "rt"] }

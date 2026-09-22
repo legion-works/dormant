@@ -418,11 +418,12 @@ pub enum IdleTimeUnit {
 /// Which idle source the activity inhibitor should use.
 ///
 /// * `Auto` (default) — on macOS, always use the `CoreGraphics` idle-time
-///   source; on Linux, prefer Wayland's `ext_idle_notifier_v1` when
+///   source; on Windows, always use the `GetLastInputInfo` idle-time source;
+///   on Linux, prefer Wayland's `ext_idle_notifier_v1` when
 ///   `WAYLAND_DISPLAY` is set and the compositor advertises the protocol,
-///   falling back to `DBus` `GetSessionIdleTime` otherwise; elsewhere
-///   (Windows), `DBus` (whose non-Linux implementation is an inert stub —
-///   see `dormantd::idle_source`'s `dbus_run`).
+///   falling back to `DBus` `GetSessionIdleTime` otherwise; on any other
+///   target, `DBus` (whose non-Linux implementation is an inert stub — see
+///   `dormantd::idle_source`'s `dbus_run`).
 /// * `Wayland` — force the Wayland idle notifier; the daemon will error at
 ///   startup if the compositor does not expose the protocol.
 /// * `Dbus` — always use the `DBus` screensaver poll.
@@ -435,6 +436,11 @@ pub enum IdleTimeUnit {
 ///   treats `wayland` requested on non-Linux: warn once
 ///   (`macos_idle_unsupported`) and fail toward inactive by falling back to
 ///   `DBus`, rather than refusing to start.
+/// * `Windows` — use the Windows `GetLastInputInfo` idle-time source. Same
+///   additive/foreign-target contract as `Macos`: selecting `windows` on a
+///   non-Windows build warns once (`windows_idle_unsupported`) and falls back
+///   to `DBus`. The `daemon.macos_idle_*` guard tunables also govern this
+///   source (the guard is shared; only the key prefix is historical).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IdleSource {
@@ -448,6 +454,8 @@ pub enum IdleSource {
     Dbus,
     /// Force the macOS `CoreGraphics` idle-time source.
     Macos,
+    /// Force the Windows `GetLastInputInfo` idle-time source.
+    Windows,
 }
 
 // ── WearConfig ──────────────────────────────────────────────────────────────────

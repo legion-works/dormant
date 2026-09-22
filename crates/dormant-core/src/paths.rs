@@ -539,7 +539,28 @@ mod tests {
 
     #[test]
     fn wear_state_dir_is_wear_subdir() {
-        assert!(wear_state_dir().ends_with("dormant/wear"));
+        // `ends_with("dormant/wear")` encoded the Linux layout, where
+        // `state_dir()` is `$XDG_STATE_HOME/dormant`. Windows derives
+        // `%LOCALAPPDATA%\dormant\state`, so the last two components are
+        // `state` and `wear` and the old assertion failed there for the wrong
+        // reason. Assert the invariant the test is named for instead.
+        let state = state_dir();
+        let wear = wear_state_dir();
+        assert!(
+            wear.starts_with(&state),
+            "wear dir {wear:?} must live under the state dir {state:?}"
+        );
+        assert_eq!(
+            wear.file_name().and_then(std::ffi::OsStr::to_str),
+            Some("wear"),
+            "wear dir must be the `wear` subdirectory"
+        );
+        assert!(
+            state
+                .components()
+                .any(|c| c.as_os_str() == std::ffi::OsStr::new("dormant")),
+            "state dir {state:?} must be dormant-scoped"
+        );
     }
 
     // ── Task 5: macOS path routing ──────────────────────────────────────────

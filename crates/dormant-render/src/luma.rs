@@ -198,6 +198,7 @@ mod tests {
     use dormant_core::spatial_grid::{LUMA_GRID_COLS, LUMA_GRID_ROWS};
     use image::{ImageBuffer, Rgba};
     use std::fs;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     #[test]
@@ -290,8 +291,22 @@ mod tests {
         ImageBuffer::from_pixel(16, 9, Rgba([240_u8, 240, 240, 255]))
             .save(&path)
             .unwrap();
+
+        // Stamp the mtime forward explicitly instead of assuming the second
+        // write lands in a later clock tick. Windows file times advance on the
+        // ~15.6 ms system tick, so two writes this close share one mtime and
+        // the precondition below fails through no fault of the cache. Linux
+        // nanosecond timestamps hide that, which is why this only surfaced
+        // once the Windows leg ran each test in its own (faster) process.
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(before + Duration::from_secs(2))
+            .unwrap();
+
         let after = fs::metadata(&path).unwrap().modified().unwrap();
-        assert_ne!(before, after);
+        assert_ne!(before, after, "precondition: the mtime must have moved");
         let second = cache.scan_path(&path).unwrap();
         assert_ne!(first, second);
     }

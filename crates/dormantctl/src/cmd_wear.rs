@@ -449,28 +449,66 @@ mod tests {
     // state. The end-to-end story — that `run_enable` actually queries
     // `Status` before sending `WearSamplingEnable` and then prints the
     // matching hint — needs a fake daemon on a real socket.
+    //
+    // Unix-only: the fake daemon binds a `std::os::unix::net::UnixListener`,
+    // the transport the IPC client speaks. Gated as a unit so the whole
+    // wire-integration section compiles only where that transport exists.
+    #[cfg(unix)]
+    mod wire {
+        use super::*;
 
-    use std::collections::BTreeMap;
-    use std::io::{BufRead, Write};
-    use std::os::unix::net::UnixListener;
-    use std::path::Path;
-    use std::sync::{Arc, Mutex};
+        use std::collections::BTreeMap;
+        use std::io::{BufRead, Write};
+        use std::os::unix::net::UnixListener;
+        use std::path::Path;
+        use std::sync::{Arc, Mutex};
 
-    use dormant_core::ipc_proto::{IpcRequest, IpcResponse, WearSamplingStatusMapEntry};
-    use dormant_core::wear::WearSamplingStatus as Lifecycle;
+        use dormant_core::ipc_proto::{IpcRequest, IpcResponse, WearSamplingStatusMapEntry};
+        use dormant_core::wear::WearSamplingStatus as Lifecycle;
 
-    /// Two-shot scripted fake daemon: serves two replies in order, capturing
-    /// the wire request that preceded each.
-    fn spawn_two_reply_daemon(
-        socket_path: &Path,
-        replies: Vec<dormant_core::ipc_proto::IpcResponse>,
-    ) -> (Arc<Mutex<Vec<IpcRequest>>>, std::thread::JoinHandle<()>) {
-        let _ = std::fs::remove_file(socket_path);
-        let listener = UnixListener::bind(socket_path).expect("bind fake socket");
-        let captured: Arc<Mutex<Vec<IpcRequest>>> = Arc::new(Mutex::new(Vec::new()));
-        let captured_clone = Arc::clone(&captured);
-        let handle = std::thread::spawn(move || {
-            for reply in replies {
+        /// Two-shot scripted fake daemon: serves two replies in order, capturing
+        /// the wire request that preceded each.
+        fn spawn_two_reply_daemon(
+            socket_path: &Path,
+            replies: Vec<dormant_core::ipc_proto::IpcResponse>,
+        ) -> (Arc<Mutex<Vec<IpcRequest>>>, std::thread::JoinHandle<()>) {
+            let _ = std::fs::remove_file(socket_path);
+            let listener = UnixListener::bind(socket_path).expect("bind fake socket");
+            let captured: Arc<Mutex<Vec<IpcRequest>>> = Arc::new(Mutex::new(Vec::new()));
+            let captured_clone = Arc::clone(&captured);
+            let handle = std::thread::spawn(move || {
+                for reply in replies {
+                    let (stream, _) = listener.accept().expect("accept");
+                    let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                    let mut buf = String::new();
+                    reader.read_line(&mut buf).expect("read request line");
+                    let req: IpcRequest = serde_json::from_str(buf.trim()).expect("parse request");
+                    captured_clone.lock().unwrap().push(req);
+                    let line = serde_json::to_string(&reply).expect("serialize reply");
+                    let mut stream = stream;
+                    stream
+                        .write_all(line.as_bytes())
+                        .and_then(|()| stream.write_all(b"\n"))
+                        .expect("write reply");
+                }
+            });
+            (captured, handle)
+        }
+
+        /// One-shot scripted fake daemon: serves one reply then drops the
+        /// listener. Used by error-path tests where the CLI must not send a
+        /// second request — letting `spawn_two_reply_daemon` accept a
+        /// phantom second reply hangs the daemon thread until the test
+        /// times out.
+        fn spawn_one_reply_daemon(
+            socket_path: &Path,
+            reply: dormant_core::ipc_proto::IpcResponse,
+        ) -> (Arc<Mutex<Vec<IpcRequest>>>, std::thread::JoinHandle<()>) {
+            let _ = std::fs::remove_file(socket_path);
+            let listener = UnixListener::bind(socket_path).expect("bind fake socket");
+            let captured: Arc<Mutex<Vec<IpcRequest>>> = Arc::new(Mutex::new(Vec::new()));
+            let captured_clone = Arc::clone(&captured);
+            let handle = std::thread::spawn(move || {
                 let (stream, _) = listener.accept().expect("accept");
                 let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
                 let mut buf = String::new();
@@ -483,498 +521,476 @@ mod tests {
                     .write_all(line.as_bytes())
                     .and_then(|()| stream.write_all(b"\n"))
                     .expect("write reply");
+            });
+            (captured, handle)
+        }
+
+        /// Build a Status reply carrying a per-display status map (the cycle-A
+        /// daemon shape). One entry per display id; `state` defaults to
+        /// `NeedsConsent` so the `consent_hint` stays the dialog one (issue #189).
+        fn status_reply_with_map(entries: &[(&str, WearSamplingState)]) -> IpcResponse {
+            let mut reply = IpcResponse::ok(None);
+            let mut map: BTreeMap<String, WearSamplingStatusMapEntry> = BTreeMap::new();
+            let mut singular: Option<Lifecycle> = None;
+            for (id, state) in entries {
+                map.insert(
+                    (*id).to_owned(),
+                    WearSamplingStatusMapEntry {
+                        state: *state,
+                        uniform_reason: None,
+                        compositor_output: None,
+                        source_gate: None,
+                    },
+                );
+                // Mirror the daemon's singular-field behavior: populated only
+                // when exactly one display is selected.
+                if entries.len() == 1 {
+                    singular = Some(Lifecycle {
+                        state: *state,
+                        last_capture_age_s: None,
+                        uniform_reason: None,
+                        bound_display: Some((*id).to_owned()),
+                        compositor_output: None,
+                        granted_at_epoch_s: None,
+                        source_gate: None,
+                    });
+                }
             }
-        });
-        (captured, handle)
-    }
+            reply.wear_sampling_statuses = Some(map);
+            reply.wear_sampling_status = singular;
+            reply
+        }
 
-    /// One-shot scripted fake daemon: serves one reply then drops the
-    /// listener. Used by error-path tests where the CLI must not send a
-    /// second request — letting `spawn_two_reply_daemon` accept a
-    /// phantom second reply hangs the daemon thread until the test
-    /// times out.
-    fn spawn_one_reply_daemon(
-        socket_path: &Path,
-        reply: dormant_core::ipc_proto::IpcResponse,
-    ) -> (Arc<Mutex<Vec<IpcRequest>>>, std::thread::JoinHandle<()>) {
-        let _ = std::fs::remove_file(socket_path);
-        let listener = UnixListener::bind(socket_path).expect("bind fake socket");
-        let captured: Arc<Mutex<Vec<IpcRequest>>> = Arc::new(Mutex::new(Vec::new()));
-        let captured_clone = Arc::clone(&captured);
-        let handle = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().expect("accept");
-            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
-            let mut buf = String::new();
-            reader.read_line(&mut buf).expect("read request line");
-            let req: IpcRequest = serde_json::from_str(buf.trim()).expect("parse request");
-            captured_clone.lock().unwrap().push(req);
-            let line = serde_json::to_string(&reply).expect("serialize reply");
-            let mut stream = stream;
-            stream
-                .write_all(line.as_bytes())
-                .and_then(|()| stream.write_all(b"\n"))
-                .expect("write reply");
-        });
-        (captured, handle)
-    }
+        /// `run_enable` MUST query `Status` first so it can pick the right hint,
+        /// then send `WearSamplingEnable` — and when the daemon already reports
+        /// `Streaming`, the dialog hint MUST NOT be printed (issue #189).
+        #[test]
+        fn run_enable_sends_status_first_then_enable_and_skips_dialog_hint_when_streaming() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket = dir.path().join("dormant.sock");
+            let status_reply = status_reply_with_map(&[("desk", WearSamplingState::Streaming)]);
+            let enable_reply = IpcResponse::wear_sampling(WearSamplingStatus::Granted);
+            let (captured, daemon) =
+                spawn_two_reply_daemon(&socket, vec![status_reply, enable_reply]);
 
-    /// Build a Status reply carrying a per-display status map (the cycle-A
-    /// daemon shape). One entry per display id; `state` defaults to
-    /// `NeedsConsent` so the `consent_hint` stays the dialog one (issue #189).
-    fn status_reply_with_map(entries: &[(&str, WearSamplingState)]) -> IpcResponse {
-        let mut reply = IpcResponse::ok(None);
-        let mut map: BTreeMap<String, WearSamplingStatusMapEntry> = BTreeMap::new();
-        let mut singular: Option<Lifecycle> = None;
-        for (id, state) in entries {
+            run_enable(&socket, None).expect("run_enable");
+
+            daemon.join().expect("fake daemon thread");
+
+            let requests = captured.lock().unwrap().clone();
+            assert_eq!(
+                requests.len(),
+                2,
+                "expected Status then Enable, got {requests:?}"
+            );
+            assert!(
+                matches!(requests[0], IpcRequest::Status),
+                "first request must be Status (to pick the hint), got {:?}",
+                requests[0]
+            );
+            assert!(
+                matches!(requests[1], IpcRequest::WearSamplingEnable),
+                "single-display omission must preserve the legacy unit variant, got {:?}",
+                requests[1]
+            );
+        }
+
+        /// Legacy daemons that omit `wear_sampling_status` (and the
+        /// `wear_sampling_statuses` map) MUST still get the dialog hint (we
+        /// cannot tell that reattach is silent, so we assume the worst case
+        /// and warn the operator).
+        #[test]
+        fn run_enable_prints_dialog_hint_when_status_omits_wear_sampling_status() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket = dir.path().join("dormant.sock");
+            let status_reply = IpcResponse::ok(None);
+            let enable_reply = IpcResponse::wear_sampling(WearSamplingStatus::Granted);
+            let (captured, daemon) =
+                spawn_two_reply_daemon(&socket, vec![status_reply, enable_reply]);
+
+            run_enable(&socket, None).expect("run_enable");
+
+            daemon.join().expect("fake daemon thread");
+            let requests = captured.lock().unwrap().clone();
+            assert_eq!(requests.len(), 2);
+            assert!(matches!(requests[0], IpcRequest::Status));
+            // Legacy daemons: no `wear_sampling_statuses` map ⇒ sole = 0 ⇒
+            // the unit variant is the only safe choice.
+            assert!(matches!(requests[1], IpcRequest::WearSamplingEnable));
+        }
+
+        // ── #185 Task 24b — per-display CLI forwarding ───────────────────────
+        //
+        // Cycle A added the daemon-side registry. Cycle B wires the CLI: when
+        // the daemon has multiple selected displays, omitting `--display` is an
+        // error (the operator must pick one). With exactly one selected,
+        // omission still sends the legacy unit variant so the existing single-
+        // display ergonomics survive.
+
+        /// When the daemon reports multiple selected displays, `run_enable`
+        /// WITHOUT `--display` MUST return an error and MUST NOT send any
+        /// per-display variant (no wire traffic beyond the Status query).
+        #[test]
+        fn run_enable_without_display_errors_under_multi_selection() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket = dir.path().join("dormant.sock");
+            let status_reply = status_reply_with_map(&[
+                ("desk", WearSamplingState::NeedsConsent),
+                ("tv", WearSamplingState::NeedsConsent),
+            ]);
+            // One-shot daemon: Status only. The CLI must not request any
+            // Enable variant on the error path, so spawning a second reply
+            // would deadlock the daemon thread (and the test) waiting on it.
+            let (captured, daemon) = spawn_one_reply_daemon(&socket, status_reply);
+
+            let result = run_enable(&socket, None);
+            let err = format!(
+                "{}",
+                result.expect_err("must error on multi-selection without --display")
+            );
+            assert!(
+                err.contains("--display"),
+                "error must point the operator at --display, got: {err}"
+            );
+            // Only one request reached the wire: the Status probe. The CLI
+            // refused before sending an Enable.
+            daemon.join().expect("fake daemon thread");
+            let requests = captured.lock().unwrap().clone();
+            assert_eq!(
+                requests,
+                vec![IpcRequest::Status],
+                "multi-selection without --display must NOT send any Enable variant, got {requests:?}"
+            );
+        }
+
+        /// When the daemon reports multiple selected displays, `run_enable`
+        /// WITH `--display <id>` MUST send `WearSamplingEnableFor { display }`.
+        #[test]
+        fn run_enable_with_display_sends_for_variant_under_multi_selection() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket = dir.path().join("dormant.sock");
+            let status_reply = status_reply_with_map(&[
+                ("desk", WearSamplingState::NeedsConsent),
+                ("tv", WearSamplingState::NeedsConsent),
+            ]);
+            let enable_reply = IpcResponse::wear_sampling(WearSamplingStatus::Granted);
+            let (captured, daemon) =
+                spawn_two_reply_daemon(&socket, vec![status_reply, enable_reply]);
+
+            run_enable(&socket, Some("tv")).expect("run_enable");
+
+            daemon.join().expect("fake daemon thread");
+            let requests = captured.lock().unwrap().clone();
+            assert_eq!(requests.len(), 2);
+            assert!(matches!(requests[0], IpcRequest::Status));
+            assert!(
+                matches!(
+                    &requests[1],
+                    IpcRequest::WearSamplingEnableFor { display } if display == "tv"
+                ),
+                "multi-selection with --display tv must send WearSamplingEnableFor {{ display: \"tv\" }}, got {:?}",
+                requests[1]
+            );
+        }
+
+        /// With exactly one selected display, omitting `--display` MUST send
+        /// the legacy unit variant `WearSamplingEnable` (issue #185 backward
+        /// compatibility, preserves existing single-display operator scripts).
+        #[test]
+        fn run_enable_omission_under_solo_selection_sends_unit_variant() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket = dir.path().join("dormant.sock");
+            let status_reply = status_reply_with_map(&[("desk", WearSamplingState::NeedsConsent)]);
+            let enable_reply = IpcResponse::wear_sampling(WearSamplingStatus::Granted);
+            let (captured, daemon) =
+                spawn_two_reply_daemon(&socket, vec![status_reply, enable_reply]);
+
+            run_enable(&socket, None).expect("run_enable");
+
+            daemon.join().expect("fake daemon thread");
+            let requests = captured.lock().unwrap().clone();
+            assert_eq!(requests.len(), 2);
+            assert!(matches!(requests[0], IpcRequest::Status));
+            assert!(
+                matches!(requests[1], IpcRequest::WearSamplingEnable),
+                "solo-selection omission must preserve the legacy unit variant, got {:?}",
+                requests[1]
+            );
+        }
+
+        /// With exactly one selected display, passing `--display <id>` matching
+        /// the sole id MUST send `WearSamplingEnableFor { display }` (the
+        /// explicit selector still routes through the new variant).
+        #[test]
+        fn run_enable_with_display_matches_sole_sends_for_variant() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket = dir.path().join("dormant.sock");
+            let status_reply = status_reply_with_map(&[("desk", WearSamplingState::NeedsConsent)]);
+            let enable_reply = IpcResponse::wear_sampling(WearSamplingStatus::Granted);
+            let (captured, daemon) =
+                spawn_two_reply_daemon(&socket, vec![status_reply, enable_reply]);
+
+            run_enable(&socket, Some("desk")).expect("run_enable");
+
+            daemon.join().expect("fake daemon thread");
+            let requests = captured.lock().unwrap().clone();
+            assert_eq!(requests.len(), 2);
+            assert!(
+                matches!(
+                    &requests[1],
+                    IpcRequest::WearSamplingEnableFor { display } if display == "desk"
+                ),
+                "explicit --display must send WearSamplingEnableFor {{ display }}, got {:?}",
+                requests[1]
+            );
+        }
+
+        /// With multiple selected displays, passing `--display <unknown>` MUST
+        /// error (no wire traffic beyond the Status probe).
+        #[test]
+        fn run_enable_with_unknown_display_errors_under_multi_selection() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket = dir.path().join("dormant.sock");
+            let status_reply = status_reply_with_map(&[
+                ("desk", WearSamplingState::NeedsConsent),
+                ("tv", WearSamplingState::NeedsConsent),
+            ]);
+            let (captured, daemon) = spawn_one_reply_daemon(&socket, status_reply);
+
+            let result = run_enable(&socket, Some("unknown"));
+            let err = format!("{}", result.expect_err("unknown --display must error"));
+            assert!(
+                err.contains("not a selected"),
+                "error must name the unknown display, got: {err}"
+            );
+            daemon.join().expect("fake daemon thread");
+            let requests = captured.lock().unwrap().clone();
+            assert_eq!(
+                requests,
+                vec![IpcRequest::Status],
+                "unknown --display must NOT send any Enable variant, got {requests:?}"
+            );
+        }
+
+        /// `run_disable` mirrors `run_enable`: required `--display` under
+        /// multi-selection, omission OK under solo selection (legacy unit
+        /// variant).
+        #[test]
+        fn run_disable_without_display_errors_under_multi_selection() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket = dir.path().join("dormant.sock");
+            let status_reply = status_reply_with_map(&[
+                ("desk", WearSamplingState::NeedsConsent),
+                ("tv", WearSamplingState::NeedsConsent),
+            ]);
+            let (captured, daemon) = spawn_one_reply_daemon(&socket, status_reply);
+
+            let result = run_disable(&socket, false, None);
+            let err = format!(
+                "{}",
+                result.expect_err("disable without --display must error under multi-selection")
+            );
+            assert!(err.contains("--display"), "got: {err}");
+            daemon.join().expect("fake daemon thread");
+            let requests = captured.lock().unwrap().clone();
+            assert_eq!(
+                requests,
+                vec![IpcRequest::Status],
+                "disable multi-selection without --display must NOT send any Disable variant, got {requests:?}"
+            );
+        }
+
+        #[test]
+        fn run_disable_with_display_sends_for_variant_under_multi_selection() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket = dir.path().join("dormant.sock");
+            let status_reply = status_reply_with_map(&[
+                ("desk", WearSamplingState::NeedsConsent),
+                ("tv", WearSamplingState::NeedsConsent),
+            ]);
+            let disable_reply = IpcResponse::wear_sampling(WearSamplingStatus::Granted);
+            let (captured, daemon) =
+                spawn_two_reply_daemon(&socket, vec![status_reply, disable_reply]);
+
+            run_disable(&socket, true, Some("desk")).expect("disable");
+
+            daemon.join().expect("fake daemon thread");
+            let requests = captured.lock().unwrap().clone();
+            assert_eq!(requests.len(), 2);
+            assert!(
+                matches!(
+                    &requests[1],
+                    IpcRequest::WearSamplingDisableFor { display, forget } if display == "desk" && *forget
+                ),
+                "explicit --display must send WearSamplingDisableFor with forget=true, got {:?}",
+                requests[1]
+            );
+        }
+
+        /// Solo-selection disable: omitting `--display` MUST preserve the
+        /// legacy unit `WearSamplingDisable { forget }` wire tag.
+        #[test]
+        fn run_disable_omission_under_solo_selection_sends_unit_variant() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket = dir.path().join("dormant.sock");
+            let status_reply = status_reply_with_map(&[("desk", WearSamplingState::NeedsConsent)]);
+            let disable_reply = IpcResponse::wear_sampling(WearSamplingStatus::Granted);
+            let (captured, daemon) =
+                spawn_two_reply_daemon(&socket, vec![status_reply, disable_reply]);
+
+            run_disable(&socket, false, None).expect("disable");
+
+            daemon.join().expect("fake daemon thread");
+            let requests = captured.lock().unwrap().clone();
+            assert_eq!(requests.len(), 2);
+            assert!(
+                matches!(
+                    requests[1],
+                    IpcRequest::WearSamplingDisable { forget: false }
+                ),
+                "solo-selection omission must preserve the legacy unit variant, got {:?}",
+                requests[1]
+            );
+        }
+
+        // ── source_gate surfaces in the per-display status hint ────────────────
+        //
+        // The enable/disable flows look up the per-display status map before
+        // sending their request. The lookup MUST surface the redacted
+        // source-gate for the SELECTED display only — not for any other
+        // configured display. The hint is captured by routing through
+        // `classify_sampling` directly: the printed line in production is
+        // `source: <gate>` when the selected entry carries a gate, and
+        // nothing otherwise. The test pins both branches.
+        #[test]
+        fn source_gate_in_status_hint() {
+            // Multi-display map: the monitor is mismatched, the TV is
+            // matched. The test passes a third display id (unknown) to prove
+            // the gate is resolved by looking up the SELECTED id, not by
+            // enumerating the map.
+            let mut map: BTreeMap<String, WearSamplingStatusMapEntry> = BTreeMap::new();
             map.insert(
-                (*id).to_owned(),
+                "tv".to_owned(),
                 WearSamplingStatusMapEntry {
-                    state: *state,
+                    state: WearSamplingState::Streaming,
+                    uniform_reason: None,
+                    compositor_output: None,
+                    source_gate: Some("matched".to_owned()),
+                },
+            );
+            map.insert(
+                "monitor".to_owned(),
+                WearSamplingStatusMapEntry {
+                    state: WearSamplingState::Streaming,
+                    uniform_reason: None,
+                    compositor_output: None,
+                    source_gate: Some("mismatched".to_owned()),
+                },
+            );
+
+            // Selecting the monitor surfaces monitor's gate, NOT tv's.
+            let gate_monitor = classify_sampling(&map, Some("monitor"))
+                .expect("monitor is a selected display")
+                .source_gate;
+            assert_eq!(
+                gate_monitor.as_deref(),
+                Some("mismatched"),
+                "selected display's gate must be the monitor's, not the TV's"
+            );
+            // Belt-and-braces: the TV's matched gate must NOT be reachable
+            // through the monitor selection. (The redacted form never carries
+            // a per-display map; this confirms the test's invariant by
+            // showing the lookup is keyed on the chosen display.)
+            assert_ne!(
+                gate_monitor.as_deref(),
+                Some("matched"),
+                "monitor selection must not surface the TV's gate"
+            );
+
+            // Selecting the TV surfaces the TV's gate, NOT the monitor's.
+            let gate_tv = classify_sampling(&map, Some("tv"))
+                .expect("tv is a selected display")
+                .source_gate;
+            assert_eq!(gate_tv.as_deref(), Some("matched"));
+            assert_ne!(gate_tv.as_deref(), Some("mismatched"));
+
+            // Solo selection (omitted --display with one entry) surfaces
+            // that entry's gate and never falls back to an absent display.
+            let mut solo = BTreeMap::new();
+            solo.insert(
+                "monitor".to_owned(),
+                WearSamplingStatusMapEntry {
+                    state: WearSamplingState::NeedsConsent,
+                    uniform_reason: None,
+                    compositor_output: None,
+                    source_gate: Some("unknown".to_owned()),
+                },
+            );
+            let gate_solo = classify_sampling(&solo, None)
+                .expect("sole selection is valid")
+                .source_gate;
+            assert_eq!(gate_solo.as_deref(), Some("unknown"));
+
+            // A display with no gate configuration (render-only monitor)
+            // returns `None` for the gate — the hint is suppressed, never
+            // invented. Pinned so a future "fall back to 'unknown'" patch is
+            // caught: the source-gate string is a wire-bound contract, not
+            // a derived default.
+            let mut no_gate = BTreeMap::new();
+            no_gate.insert(
+                "monitor".to_owned(),
+                WearSamplingStatusMapEntry {
+                    state: WearSamplingState::NeedsConsent,
                     uniform_reason: None,
                     compositor_output: None,
                     source_gate: None,
                 },
             );
-            // Mirror the daemon's singular-field behavior: populated only
-            // when exactly one display is selected.
-            if entries.len() == 1 {
-                singular = Some(Lifecycle {
-                    state: *state,
-                    last_capture_age_s: None,
+            let gate_absent = classify_sampling(&no_gate, Some("monitor"))
+                .expect("monitor is a selected display")
+                .source_gate;
+            assert!(
+                gate_absent.is_none(),
+                "absent gate configuration must surface as None, not a synthesized string"
+            );
+
+            // The wire-bound hint line is the literal `source: <gate>` form.
+            // Drive run_enable end-to-end to make sure the new 3-tuple return
+            // shape from classify_sampling is consumed without error in the
+            // enable path, and the wire tag is the per-display variant.
+            // The contract-pinned assertions on `classify_sampling` above
+            // prove the SELECTED display's gate is the one that surfaces;
+            // `run_enable` wires that to the `source: <gate>` stdout line in
+            // production.
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket = dir.path().join("dormant.sock");
+            let mut wire_map: BTreeMap<String, WearSamplingStatusMapEntry> = BTreeMap::new();
+            wire_map.insert(
+                "tv".to_owned(),
+                WearSamplingStatusMapEntry {
+                    state: WearSamplingState::NeedsConsent,
                     uniform_reason: None,
-                    bound_display: Some((*id).to_owned()),
                     compositor_output: None,
-                    granted_at_epoch_s: None,
-                    source_gate: None,
-                });
-            }
+                    source_gate: Some("matched".to_owned()),
+                },
+            );
+            wire_map.insert(
+                "monitor".to_owned(),
+                WearSamplingStatusMapEntry {
+                    state: WearSamplingState::NeedsConsent,
+                    uniform_reason: None,
+                    compositor_output: None,
+                    source_gate: Some("mismatched".to_owned()),
+                },
+            );
+            let mut status_reply = IpcResponse::ok(None);
+            status_reply.wear_sampling_statuses = Some(wire_map);
+            let enable_reply = IpcResponse::wear_sampling(WearSamplingStatus::Granted);
+            let (_captured, daemon) =
+                spawn_two_reply_daemon(&socket, vec![status_reply, enable_reply]);
+
+            run_enable(&socket, Some("monitor")).expect("run_enable with --display monitor");
+            daemon.join().expect("fake daemon thread");
         }
-        reply.wear_sampling_statuses = Some(map);
-        reply.wear_sampling_status = singular;
-        reply
-    }
-
-    /// `run_enable` MUST query `Status` first so it can pick the right hint,
-    /// then send `WearSamplingEnable` — and when the daemon already reports
-    /// `Streaming`, the dialog hint MUST NOT be printed (issue #189).
-    #[test]
-    fn run_enable_sends_status_first_then_enable_and_skips_dialog_hint_when_streaming() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let socket = dir.path().join("dormant.sock");
-        let status_reply = status_reply_with_map(&[("desk", WearSamplingState::Streaming)]);
-        let enable_reply = IpcResponse::wear_sampling(WearSamplingStatus::Granted);
-        let (captured, daemon) = spawn_two_reply_daemon(&socket, vec![status_reply, enable_reply]);
-
-        run_enable(&socket, None).expect("run_enable");
-
-        daemon.join().expect("fake daemon thread");
-
-        let requests = captured.lock().unwrap().clone();
-        assert_eq!(
-            requests.len(),
-            2,
-            "expected Status then Enable, got {requests:?}"
-        );
-        assert!(
-            matches!(requests[0], IpcRequest::Status),
-            "first request must be Status (to pick the hint), got {:?}",
-            requests[0]
-        );
-        assert!(
-            matches!(requests[1], IpcRequest::WearSamplingEnable),
-            "single-display omission must preserve the legacy unit variant, got {:?}",
-            requests[1]
-        );
-    }
-
-    /// Legacy daemons that omit `wear_sampling_status` (and the
-    /// `wear_sampling_statuses` map) MUST still get the dialog hint (we
-    /// cannot tell that reattach is silent, so we assume the worst case
-    /// and warn the operator).
-    #[test]
-    fn run_enable_prints_dialog_hint_when_status_omits_wear_sampling_status() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let socket = dir.path().join("dormant.sock");
-        let status_reply = IpcResponse::ok(None);
-        let enable_reply = IpcResponse::wear_sampling(WearSamplingStatus::Granted);
-        let (captured, daemon) = spawn_two_reply_daemon(&socket, vec![status_reply, enable_reply]);
-
-        run_enable(&socket, None).expect("run_enable");
-
-        daemon.join().expect("fake daemon thread");
-        let requests = captured.lock().unwrap().clone();
-        assert_eq!(requests.len(), 2);
-        assert!(matches!(requests[0], IpcRequest::Status));
-        // Legacy daemons: no `wear_sampling_statuses` map ⇒ sole = 0 ⇒
-        // the unit variant is the only safe choice.
-        assert!(matches!(requests[1], IpcRequest::WearSamplingEnable));
-    }
-
-    // ── #185 Task 24b — per-display CLI forwarding ───────────────────────
-    //
-    // Cycle A added the daemon-side registry. Cycle B wires the CLI: when
-    // the daemon has multiple selected displays, omitting `--display` is an
-    // error (the operator must pick one). With exactly one selected,
-    // omission still sends the legacy unit variant so the existing single-
-    // display ergonomics survive.
-
-    /// When the daemon reports multiple selected displays, `run_enable`
-    /// WITHOUT `--display` MUST return an error and MUST NOT send any
-    /// per-display variant (no wire traffic beyond the Status query).
-    #[test]
-    fn run_enable_without_display_errors_under_multi_selection() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let socket = dir.path().join("dormant.sock");
-        let status_reply = status_reply_with_map(&[
-            ("desk", WearSamplingState::NeedsConsent),
-            ("tv", WearSamplingState::NeedsConsent),
-        ]);
-        // One-shot daemon: Status only. The CLI must not request any
-        // Enable variant on the error path, so spawning a second reply
-        // would deadlock the daemon thread (and the test) waiting on it.
-        let (captured, daemon) = spawn_one_reply_daemon(&socket, status_reply);
-
-        let result = run_enable(&socket, None);
-        let err = format!(
-            "{}",
-            result.expect_err("must error on multi-selection without --display")
-        );
-        assert!(
-            err.contains("--display"),
-            "error must point the operator at --display, got: {err}"
-        );
-        // Only one request reached the wire: the Status probe. The CLI
-        // refused before sending an Enable.
-        daemon.join().expect("fake daemon thread");
-        let requests = captured.lock().unwrap().clone();
-        assert_eq!(
-            requests,
-            vec![IpcRequest::Status],
-            "multi-selection without --display must NOT send any Enable variant, got {requests:?}"
-        );
-    }
-
-    /// When the daemon reports multiple selected displays, `run_enable`
-    /// WITH `--display <id>` MUST send `WearSamplingEnableFor { display }`.
-    #[test]
-    fn run_enable_with_display_sends_for_variant_under_multi_selection() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let socket = dir.path().join("dormant.sock");
-        let status_reply = status_reply_with_map(&[
-            ("desk", WearSamplingState::NeedsConsent),
-            ("tv", WearSamplingState::NeedsConsent),
-        ]);
-        let enable_reply = IpcResponse::wear_sampling(WearSamplingStatus::Granted);
-        let (captured, daemon) = spawn_two_reply_daemon(&socket, vec![status_reply, enable_reply]);
-
-        run_enable(&socket, Some("tv")).expect("run_enable");
-
-        daemon.join().expect("fake daemon thread");
-        let requests = captured.lock().unwrap().clone();
-        assert_eq!(requests.len(), 2);
-        assert!(matches!(requests[0], IpcRequest::Status));
-        assert!(
-            matches!(
-                &requests[1],
-                IpcRequest::WearSamplingEnableFor { display } if display == "tv"
-            ),
-            "multi-selection with --display tv must send WearSamplingEnableFor {{ display: \"tv\" }}, got {:?}",
-            requests[1]
-        );
-    }
-
-    /// With exactly one selected display, omitting `--display` MUST send
-    /// the legacy unit variant `WearSamplingEnable` (issue #185 backward
-    /// compatibility, preserves existing single-display operator scripts).
-    #[test]
-    fn run_enable_omission_under_solo_selection_sends_unit_variant() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let socket = dir.path().join("dormant.sock");
-        let status_reply = status_reply_with_map(&[("desk", WearSamplingState::NeedsConsent)]);
-        let enable_reply = IpcResponse::wear_sampling(WearSamplingStatus::Granted);
-        let (captured, daemon) = spawn_two_reply_daemon(&socket, vec![status_reply, enable_reply]);
-
-        run_enable(&socket, None).expect("run_enable");
-
-        daemon.join().expect("fake daemon thread");
-        let requests = captured.lock().unwrap().clone();
-        assert_eq!(requests.len(), 2);
-        assert!(matches!(requests[0], IpcRequest::Status));
-        assert!(
-            matches!(requests[1], IpcRequest::WearSamplingEnable),
-            "solo-selection omission must preserve the legacy unit variant, got {:?}",
-            requests[1]
-        );
-    }
-
-    /// With exactly one selected display, passing `--display <id>` matching
-    /// the sole id MUST send `WearSamplingEnableFor { display }` (the
-    /// explicit selector still routes through the new variant).
-    #[test]
-    fn run_enable_with_display_matches_sole_sends_for_variant() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let socket = dir.path().join("dormant.sock");
-        let status_reply = status_reply_with_map(&[("desk", WearSamplingState::NeedsConsent)]);
-        let enable_reply = IpcResponse::wear_sampling(WearSamplingStatus::Granted);
-        let (captured, daemon) = spawn_two_reply_daemon(&socket, vec![status_reply, enable_reply]);
-
-        run_enable(&socket, Some("desk")).expect("run_enable");
-
-        daemon.join().expect("fake daemon thread");
-        let requests = captured.lock().unwrap().clone();
-        assert_eq!(requests.len(), 2);
-        assert!(
-            matches!(
-                &requests[1],
-                IpcRequest::WearSamplingEnableFor { display } if display == "desk"
-            ),
-            "explicit --display must send WearSamplingEnableFor {{ display }}, got {:?}",
-            requests[1]
-        );
-    }
-
-    /// With multiple selected displays, passing `--display <unknown>` MUST
-    /// error (no wire traffic beyond the Status probe).
-    #[test]
-    fn run_enable_with_unknown_display_errors_under_multi_selection() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let socket = dir.path().join("dormant.sock");
-        let status_reply = status_reply_with_map(&[
-            ("desk", WearSamplingState::NeedsConsent),
-            ("tv", WearSamplingState::NeedsConsent),
-        ]);
-        let (captured, daemon) = spawn_one_reply_daemon(&socket, status_reply);
-
-        let result = run_enable(&socket, Some("unknown"));
-        let err = format!("{}", result.expect_err("unknown --display must error"));
-        assert!(
-            err.contains("not a selected"),
-            "error must name the unknown display, got: {err}"
-        );
-        daemon.join().expect("fake daemon thread");
-        let requests = captured.lock().unwrap().clone();
-        assert_eq!(
-            requests,
-            vec![IpcRequest::Status],
-            "unknown --display must NOT send any Enable variant, got {requests:?}"
-        );
-    }
-
-    /// `run_disable` mirrors `run_enable`: required `--display` under
-    /// multi-selection, omission OK under solo selection (legacy unit
-    /// variant).
-    #[test]
-    fn run_disable_without_display_errors_under_multi_selection() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let socket = dir.path().join("dormant.sock");
-        let status_reply = status_reply_with_map(&[
-            ("desk", WearSamplingState::NeedsConsent),
-            ("tv", WearSamplingState::NeedsConsent),
-        ]);
-        let (captured, daemon) = spawn_one_reply_daemon(&socket, status_reply);
-
-        let result = run_disable(&socket, false, None);
-        let err = format!(
-            "{}",
-            result.expect_err("disable without --display must error under multi-selection")
-        );
-        assert!(err.contains("--display"), "got: {err}");
-        daemon.join().expect("fake daemon thread");
-        let requests = captured.lock().unwrap().clone();
-        assert_eq!(
-            requests,
-            vec![IpcRequest::Status],
-            "disable multi-selection without --display must NOT send any Disable variant, got {requests:?}"
-        );
-    }
-
-    #[test]
-    fn run_disable_with_display_sends_for_variant_under_multi_selection() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let socket = dir.path().join("dormant.sock");
-        let status_reply = status_reply_with_map(&[
-            ("desk", WearSamplingState::NeedsConsent),
-            ("tv", WearSamplingState::NeedsConsent),
-        ]);
-        let disable_reply = IpcResponse::wear_sampling(WearSamplingStatus::Granted);
-        let (captured, daemon) = spawn_two_reply_daemon(&socket, vec![status_reply, disable_reply]);
-
-        run_disable(&socket, true, Some("desk")).expect("disable");
-
-        daemon.join().expect("fake daemon thread");
-        let requests = captured.lock().unwrap().clone();
-        assert_eq!(requests.len(), 2);
-        assert!(
-            matches!(
-                &requests[1],
-                IpcRequest::WearSamplingDisableFor { display, forget } if display == "desk" && *forget
-            ),
-            "explicit --display must send WearSamplingDisableFor with forget=true, got {:?}",
-            requests[1]
-        );
-    }
-
-    /// Solo-selection disable: omitting `--display` MUST preserve the
-    /// legacy unit `WearSamplingDisable { forget }` wire tag.
-    #[test]
-    fn run_disable_omission_under_solo_selection_sends_unit_variant() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let socket = dir.path().join("dormant.sock");
-        let status_reply = status_reply_with_map(&[("desk", WearSamplingState::NeedsConsent)]);
-        let disable_reply = IpcResponse::wear_sampling(WearSamplingStatus::Granted);
-        let (captured, daemon) = spawn_two_reply_daemon(&socket, vec![status_reply, disable_reply]);
-
-        run_disable(&socket, false, None).expect("disable");
-
-        daemon.join().expect("fake daemon thread");
-        let requests = captured.lock().unwrap().clone();
-        assert_eq!(requests.len(), 2);
-        assert!(
-            matches!(
-                requests[1],
-                IpcRequest::WearSamplingDisable { forget: false }
-            ),
-            "solo-selection omission must preserve the legacy unit variant, got {:?}",
-            requests[1]
-        );
-    }
-
-    // ── source_gate surfaces in the per-display status hint ────────────────
-    //
-    // The enable/disable flows look up the per-display status map before
-    // sending their request. The lookup MUST surface the redacted
-    // source-gate for the SELECTED display only — not for any other
-    // configured display. The hint is captured by routing through
-    // `classify_sampling` directly: the printed line in production is
-    // `source: <gate>` when the selected entry carries a gate, and
-    // nothing otherwise. The test pins both branches.
-    #[test]
-    fn source_gate_in_status_hint() {
-        // Multi-display map: the monitor is mismatched, the TV is
-        // matched. The test passes a third display id (unknown) to prove
-        // the gate is resolved by looking up the SELECTED id, not by
-        // enumerating the map.
-        let mut map: BTreeMap<String, WearSamplingStatusMapEntry> = BTreeMap::new();
-        map.insert(
-            "tv".to_owned(),
-            WearSamplingStatusMapEntry {
-                state: WearSamplingState::Streaming,
-                uniform_reason: None,
-                compositor_output: None,
-                source_gate: Some("matched".to_owned()),
-            },
-        );
-        map.insert(
-            "monitor".to_owned(),
-            WearSamplingStatusMapEntry {
-                state: WearSamplingState::Streaming,
-                uniform_reason: None,
-                compositor_output: None,
-                source_gate: Some("mismatched".to_owned()),
-            },
-        );
-
-        // Selecting the monitor surfaces monitor's gate, NOT tv's.
-        let gate_monitor = classify_sampling(&map, Some("monitor"))
-            .expect("monitor is a selected display")
-            .source_gate;
-        assert_eq!(
-            gate_monitor.as_deref(),
-            Some("mismatched"),
-            "selected display's gate must be the monitor's, not the TV's"
-        );
-        // Belt-and-braces: the TV's matched gate must NOT be reachable
-        // through the monitor selection. (The redacted form never carries
-        // a per-display map; this confirms the test's invariant by
-        // showing the lookup is keyed on the chosen display.)
-        assert_ne!(
-            gate_monitor.as_deref(),
-            Some("matched"),
-            "monitor selection must not surface the TV's gate"
-        );
-
-        // Selecting the TV surfaces the TV's gate, NOT the monitor's.
-        let gate_tv = classify_sampling(&map, Some("tv"))
-            .expect("tv is a selected display")
-            .source_gate;
-        assert_eq!(gate_tv.as_deref(), Some("matched"));
-        assert_ne!(gate_tv.as_deref(), Some("mismatched"));
-
-        // Solo selection (omitted --display with one entry) surfaces
-        // that entry's gate and never falls back to an absent display.
-        let mut solo = BTreeMap::new();
-        solo.insert(
-            "monitor".to_owned(),
-            WearSamplingStatusMapEntry {
-                state: WearSamplingState::NeedsConsent,
-                uniform_reason: None,
-                compositor_output: None,
-                source_gate: Some("unknown".to_owned()),
-            },
-        );
-        let gate_solo = classify_sampling(&solo, None)
-            .expect("sole selection is valid")
-            .source_gate;
-        assert_eq!(gate_solo.as_deref(), Some("unknown"));
-
-        // A display with no gate configuration (render-only monitor)
-        // returns `None` for the gate — the hint is suppressed, never
-        // invented. Pinned so a future "fall back to 'unknown'" patch is
-        // caught: the source-gate string is a wire-bound contract, not
-        // a derived default.
-        let mut no_gate = BTreeMap::new();
-        no_gate.insert(
-            "monitor".to_owned(),
-            WearSamplingStatusMapEntry {
-                state: WearSamplingState::NeedsConsent,
-                uniform_reason: None,
-                compositor_output: None,
-                source_gate: None,
-            },
-        );
-        let gate_absent = classify_sampling(&no_gate, Some("monitor"))
-            .expect("monitor is a selected display")
-            .source_gate;
-        assert!(
-            gate_absent.is_none(),
-            "absent gate configuration must surface as None, not a synthesized string"
-        );
-
-        // The wire-bound hint line is the literal `source: <gate>` form.
-        // Drive run_enable end-to-end to make sure the new 3-tuple return
-        // shape from classify_sampling is consumed without error in the
-        // enable path, and the wire tag is the per-display variant.
-        // The contract-pinned assertions on `classify_sampling` above
-        // prove the SELECTED display's gate is the one that surfaces;
-        // `run_enable` wires that to the `source: <gate>` stdout line in
-        // production.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let socket = dir.path().join("dormant.sock");
-        let mut wire_map: BTreeMap<String, WearSamplingStatusMapEntry> = BTreeMap::new();
-        wire_map.insert(
-            "tv".to_owned(),
-            WearSamplingStatusMapEntry {
-                state: WearSamplingState::NeedsConsent,
-                uniform_reason: None,
-                compositor_output: None,
-                source_gate: Some("matched".to_owned()),
-            },
-        );
-        wire_map.insert(
-            "monitor".to_owned(),
-            WearSamplingStatusMapEntry {
-                state: WearSamplingState::NeedsConsent,
-                uniform_reason: None,
-                compositor_output: None,
-                source_gate: Some("mismatched".to_owned()),
-            },
-        );
-        let mut status_reply = IpcResponse::ok(None);
-        status_reply.wear_sampling_statuses = Some(wire_map);
-        let enable_reply = IpcResponse::wear_sampling(WearSamplingStatus::Granted);
-        let (_captured, daemon) = spawn_two_reply_daemon(&socket, vec![status_reply, enable_reply]);
-
-        run_enable(&socket, Some("monitor")).expect("run_enable with --display monitor");
-        daemon.join().expect("fake daemon thread");
     }
 }

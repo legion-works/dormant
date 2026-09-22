@@ -220,10 +220,12 @@ fn remove_agent(dest: &Path) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn install_writes_both_embedded_plists_to_named_paths_mode_0644() {
         let tmp = tempfile::tempdir().expect("tempdir");

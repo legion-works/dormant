@@ -986,14 +986,22 @@ mod tests {
             "both media files found via canonicalized root"
         );
         for item in &playlist {
+            // `starts_with('/')` and `contains("/./")` encoded POSIX path
+            // syntax; a canonicalized Windows path is `C:\...` or `\\?\C:\...`
+            // and separates with a backslash. Ask the path type instead.
+            let path = std::path::Path::new(&item.uri);
             assert!(
-                item.uri.starts_with('/'),
+                path.is_absolute(),
                 "canonicalized path must be absolute: {}",
                 item.uri
             );
             // The redundant dot must be absent (canonicalize stripped it).
+            // This deliberately inspects the RAW string rather than
+            // `Path::components()`, which normalizes `.` away and would make
+            // the assertion unfalsifiable. Split on both separators so the
+            // check is platform-independent without being POSIX-only.
             assert!(
-                !item.uri.contains("/./"),
+                !item.uri.split(['/', '\\']).any(|segment| segment == "."),
                 "canonicalize must strip redundant '.' from path: {}",
                 item.uri
             );

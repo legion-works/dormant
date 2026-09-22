@@ -171,7 +171,12 @@ jobs:
       # enabled automatically via dev-dependencies.
       - run: cargo build --workspace --features web-ui
       - run: cargo test --workspace --features web-ui
-      - run: cargo clippy --workspace --all-targets --features web-ui -- -D warnings -W clippy::pedantic
+      # Through the shared gate script, not a raw `cargo clippy`: the lint
+      # contract (-D warnings, pedantic, --all-targets) lives in exactly one
+      # place, and scripts/ci/check_gate_parity.py enforces that.
+      - run: bash scripts/gates/clippy.sh
+        env:
+          DORMANT_GATE_FEATURES: --features web-ui
 
   macos-test:
     runs-on: macos-14

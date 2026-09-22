@@ -2242,6 +2242,11 @@ mod tests {
 
     /// A successful `acquire_token` MUST persist the token to the state
     /// file so it survives the next daemon restart.
+    ///
+    /// Unix-only: `with_token_state_file_lock` refuses to run its write
+    /// closure without a supported advisory file lock, so persistence is
+    /// deliberately disabled on Windows and there is no behaviour to assert.
+    #[cfg(unix)]
     #[tokio::test]
     async fn real_transport_persists_acquired_token_to_state_file() {
         use wiremock::matchers::{body_partial_json, method, path};
@@ -2285,6 +2290,11 @@ mod tests {
     /// A `-32010` unauthorized response invalidates BOTH the in-memory
     /// cache and the persisted entry — the next `acquire_token` calls
     /// `createAccessToken` and overwrites the persisted entry.
+    ///
+    /// Unix-only for the same reason as
+    /// `real_transport_persists_acquired_token_to_state_file`: the persisted
+    /// half of the invariant does not exist on Windows.
+    #[cfg(unix)]
     #[tokio::test]
     async fn real_transport_unauthorized_invalidates_persisted_token() {
         use wiremock::matchers::{body_partial_json, method, path};

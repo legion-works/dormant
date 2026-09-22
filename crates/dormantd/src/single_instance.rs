@@ -151,6 +151,7 @@ fn acquire_impl(lock_path: &Path) -> anyhow::Result<SingleInstanceLock> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::*;
 
     #[test]

@@ -4859,6 +4859,7 @@ async fn absent_mqtt_hazard_warns_at_startup_and_not_on_rejected_reload() {
 // suite keeps growing. A new HEAVY (multi-second real sleep) test in half
 // (2) should be weighed against that shrinking margin before it lands.
 
+#[cfg(unix)]
 use dormantd::sd_notify::SdNotify;
 
 /// `install_capture_subscriber`'s buffer is process-global and, once
@@ -4896,6 +4897,7 @@ fn capture_count_lock() -> &'static Mutex<()> {
 }
 
 /// [`one_display_config`] plus a `[watchdog]` section.
+#[cfg(unix)]
 fn watchdog_config(marker: &Path, stability_window: &str, lkg_enabled: bool) -> String {
     format!(
         "{}\n[watchdog]\nlkg_enabled = {lkg_enabled}\nstability_window = \"{stability_window}\"\n",
@@ -4906,6 +4908,11 @@ fn watchdog_config(marker: &Path, stability_window: &str, lkg_enabled: bool) -> 
 /// Bind a fresh `UnixDatagram` "systemd" listener at a tempdir path and
 /// build an `SdNotify` targeting it (the `from_socket_for_test` seam,
 /// R2-M8/T4 fix).
+// Unix-only scaffolding: binds a `UnixDatagram` and builds an `SdNotify`
+// targeting it. The four tests below that assert LKG/sidecar writes are
+// portable logic that only needs this unix setup — gated for now, listed as
+// lost Windows coverage.
+#[cfg(unix)]
 fn fake_systemd_socket(dir: &Path) -> (std::os::unix::net::UnixDatagram, SdNotify) {
     let path = dir.join("notify.sock");
     let listener = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
@@ -4914,6 +4921,7 @@ fn fake_systemd_socket(dir: &Path) -> (std::os::unix::net::UnixDatagram, SdNotif
     (listener, sd)
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn watchdog_healthy_run_writes_lkg_and_sidecar() {
     let dir = TempDir::new().unwrap();
@@ -4966,6 +4974,7 @@ async fn watchdog_healthy_run_writes_lkg_and_sidecar() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn watchdog_lkg_disabled_writes_nothing() {
     let dir = TempDir::new().unwrap();
@@ -5004,6 +5013,7 @@ async fn watchdog_lkg_disabled_writes_nothing() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(
     clippy::await_holding_lock,
@@ -5494,12 +5504,13 @@ async fn watchdog_ping_before_rebuild_old_on_spawn_generation_failure() {
 /// must fire BEFORE `assemble_loaded` is called), then releases and
 /// asserts `after_assemble` fires once the probe unblocks and assembly
 /// completes.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(
     clippy::await_holding_lock,
     reason = "capture_count_lock() serializes every reload-driving test in this binary against \
-              this exact-count reader (see the lock's doc comment) and is always released \
-              promptly at test end"
+                  this exact-count reader (see the lock's doc comment) and is always released \
+                  promptly at test end"
 )]
 async fn watchdog_ping_brackets_reload_assembly_boundary() {
     let _guard = capture_count_lock()

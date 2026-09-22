@@ -359,7 +359,7 @@ impl ActiveSamplerHandle {
             .map_err(|_| SamplerError::CommandChannelClosed)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn test_handle() -> (Self, mpsc::Receiver<SamplerCommand>) {
         let (handle, command_rx, _status_tx) = Self::new(SamplerStatus {
             state: SamplingState::NeedsConsent,

@@ -688,7 +688,10 @@ fn vcp_display_info_from_ddc_info(info: &ddc_hi::DisplayInfo) -> VcpDisplayInfo 
 /// on Windows.
 #[cfg(any(
     target_os = "macos",
-    all(test, any(target_os = "linux", target_os = "macos"))
+    all(
+        test,
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    )
 ))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EdidIdentity {
@@ -715,7 +718,10 @@ struct EdidIdentity {
 /// which [`VcpDisplayInfo::claim_identity`] collapses to `None` (honest).
 #[cfg(any(
     target_os = "macos",
-    all(test, any(target_os = "linux", target_os = "macos"))
+    all(
+        test,
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    )
 ))]
 fn parse_edid_identity(edid: &[u8]) -> Option<EdidIdentity> {
     // The base block is 128 bytes; the four 18-byte descriptor slots live at
@@ -737,7 +743,10 @@ fn parse_edid_identity(edid: &[u8]) -> Option<EdidIdentity> {
 /// "unused" and is skipped rather than fabricated into a partial id.
 #[cfg(any(
     target_os = "macos",
-    all(test, any(target_os = "linux", target_os = "macos"))
+    all(
+        test,
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    )
 ))]
 fn decode_pnp_manufacturer(high: u8, low: u8) -> Option<String> {
     let id = u16::from_be_bytes([high, low]);
@@ -763,7 +772,10 @@ fn decode_pnp_manufacturer(high: u8, low: u8) -> Option<String> {
 /// so never matched any descriptor.
 #[cfg(any(
     target_os = "macos",
-    all(test, any(target_os = "linux", target_os = "macos"))
+    all(
+        test,
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    )
 ))]
 fn parse_monitor_descriptors(slots: &[u8]) -> (Option<String>, Option<String>) {
     let mut model = None;
@@ -788,7 +800,10 @@ fn parse_monitor_descriptors(slots: &[u8]) -> (Option<String>, Option<String>) {
 /// `None`.
 #[cfg(any(
     target_os = "macos",
-    all(test, any(target_os = "linux", target_os = "macos"))
+    all(
+        test,
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    )
 ))]
 fn descriptor_string(data: &[u8]) -> Option<String> {
     let end = data

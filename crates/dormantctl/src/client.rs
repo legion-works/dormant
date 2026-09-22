@@ -1,31 +1,33 @@
-//! Unix socket client for communicating with `dormantd`.
+//! IPC client for communicating with `dormantd`.
 //!
-//! Connects to the daemon's Unix domain socket, sends a single JSON
-//! [`IpcRequest`], and reads the response (or event stream).
-//!
-//! On non-Unix platforms all functions return a clear error — IPC is
-//! Unix-only in this release (Windows native support is M3).
+//! Connects to the daemon's transport — a Unix domain socket on Unix, a
+//! Windows named pipe on Windows — sends a single JSON [`IpcRequest`], and
+//! reads the response (or event stream).
 
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
-#[cfg(unix)]
 use anyhow::Context;
 use anyhow::Result;
 use dormant_core::ipc_proto::{IpcRequest, IpcResponse};
 use dormant_core::rules::DaemonEvent;
-#[cfg(unix)]
 use std::io::BufReader;
-#[cfg(unix)]
 use std::time::Duration;
 
-/// Maximum line length for IPC frames (1 MB).  Must match the server's limit.
+/// The client's connection handle: a Unix-domain socket on Unix, a named-pipe
+/// handle (a [`std::fs::File`]) on Windows.  Both implement `Read + Write`, so
+/// the request/response plumbing is transport-agnostic; only [`connect`] and
+/// the read-timeout helper differ per platform.
 #[cfg(unix)]
+type Transport = UnixStream;
+#[cfg(windows)]
+type Transport = std::fs::File;
+
+/// Maximum line length for IPC frames (1 MB).  Must match the server's limit.
 const MAX_LINE_BYTES: usize = 1_048_576;
 
 /// Maximum wait for the daemon's per-connection event-stream readiness frame.
-#[cfg(unix)]
 const EVENTS_READY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Maximum response wait for status and queued control requests.
@@ -33,57 +35,40 @@ const EVENTS_READY_TIMEOUT: Duration = Duration::from_secs(2);
 /// The daemon bounds a status snapshot at two seconds and acknowledges
 /// pause/resume/blank/wake/reload after queuing work (`dormantd/src/ipc.rs:314-341`,
 /// `865-875`), so ten seconds leaves transport slack without hiding a wedged daemon.
-#[cfg(unix)]
 const IPC_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// `Exercise` permits the daemon twenty seconds of hardware work
 /// (`dormantd/src/ipc.rs:788-820`), plus five seconds for IPC scheduling.
-#[cfg(unix)]
 const EXERCISE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// The daemon gives portal consent five minutes (`dormantd/src/active_sampler.rs:39`);
 /// the extra ten seconds lets it finish and report the terminal flow outcome.
-#[cfg(unix)]
 const CONSENT_INTERACTION_RESPONSE_TIMEOUT: Duration = Duration::from_secs(310);
 
 /// `wear disable-sampling` has a thirty-second CLI wrapper
 /// (`dormantctl/src/cmd_wear.rs:14`); this must outlive that outer contract.
-#[cfg(unix)]
 const WEAR_SAMPLING_DISABLE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(35);
 
 /// No daemon-side bound exists for operator-configured switch hooks; this 120-second
 /// pragmatic ceiling limits a wedged daemon while issue follow-up must add that bound.
-#[cfg(unix)]
 const SWITCH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Connect to the daemon's socket and send one request, returning the
+/// Connect to the daemon's transport and send one request, returning the
 /// response.
 ///
 /// # Errors
 ///
 /// - Connection refused / file not found → friendly error with exit-code hint.
 /// - I/O or JSON errors.
-/// - On non-Unix platforms, always returns an error.
 pub fn send_request(socket_path: &Path, request: &IpcRequest) -> Result<IpcResponse> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
+    use std::io::Write;
 
-        let mut stream = connect(socket_path)?;
-        let line = serde_json::to_string(request)?;
-        writeln!(stream, "{line}")?;
-        stream.flush()?;
+    let mut stream = connect(socket_path)?;
+    let line = serde_json::to_string(request)?;
+    writeln!(stream, "{line}")?;
+    stream.flush()?;
 
-        read_response(&stream, request)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (socket_path, request);
-        anyhow::bail!(
-            "{}: IPC is only supported on Unix platforms in this release",
-            dormant_core::error::E_IPC
-        );
-    }
+    read_response(&stream, request)
 }
 
 /// The outcome of a typed IPC round-trip — distinguishes a connect-time
@@ -103,9 +88,9 @@ pub enum IpcSendOutcome {
     /// run in.
     ConnectFailed(anyhow::Error),
     /// The connect succeeded but the round-trip did not (write failed,
-    /// read EOF, malformed JSON, non-Unix platform). The daemon is
-    /// reachable; its state is authoritative. Do NOT fall back to
-    /// offline — respect the daemon's reachability.
+    /// read EOF, malformed JSON). The daemon is reachable; its state is
+    /// authoritative. Do NOT fall back to offline — respect the daemon's
+    /// reachability.
     PostConnectError(anyhow::Error),
     /// The round-trip succeeded; the daemon's response is the third
     /// variant's payload. Boxed to keep the enum small (`IpcResponse`
@@ -126,37 +111,26 @@ pub enum IpcSendOutcome {
 /// the `expect` is a belt-and-braces guard, not a normal failure mode.
 #[must_use = "the typed outcome must be inspected; an Ok variant means a successful round-trip, a PostConnectError must be surfaced to the operator, only ConnectFailed is safe to fall back from"]
 pub fn send_request_typed(socket_path: &Path, request: &IpcRequest) -> IpcSendOutcome {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
+    use std::io::Write;
 
-        let mut stream = match connect(socket_path) {
-            Ok(s) => s,
-            Err(e) => return IpcSendOutcome::ConnectFailed(e),
-        };
-        if let Err(e) = (|| -> std::io::Result<()> {
-            let line = serde_json::to_string(request).expect("IpcRequest is always serializable");
-            writeln!(stream, "{line}")?;
-            stream.flush()?;
-            Ok(())
-        })() {
-            return IpcSendOutcome::PostConnectError(
-                anyhow::Error::from(e).context("write doctor request to daemon"),
-            );
-        }
-
-        match read_response(&stream, request) {
-            Ok(resp) => IpcSendOutcome::Ok(Box::new(resp)),
-            Err(error) => IpcSendOutcome::PostConnectError(error),
-        }
+    let mut stream = match connect(socket_path) {
+        Ok(s) => s,
+        Err(e) => return IpcSendOutcome::ConnectFailed(e),
+    };
+    if let Err(e) = (|| -> std::io::Result<()> {
+        let line = serde_json::to_string(request).expect("IpcRequest is always serializable");
+        writeln!(stream, "{line}")?;
+        stream.flush()?;
+        Ok(())
+    })() {
+        return IpcSendOutcome::PostConnectError(
+            anyhow::Error::from(e).context("write doctor request to daemon"),
+        );
     }
-    #[cfg(not(unix))]
-    {
-        let _ = (socket_path, request);
-        IpcSendOutcome::PostConnectError(anyhow::anyhow!(
-            "{}: IPC is only supported on Unix platforms in this release",
-            dormant_core::error::E_IPC
-        ))
+
+    match read_response(&stream, request) {
+        Ok(resp) => IpcSendOutcome::Ok(Box::new(resp)),
+        Err(error) => IpcSendOutcome::PostConnectError(error),
     }
 }
 
@@ -165,19 +139,19 @@ pub fn send_request_typed(socket_path: &Path, request: &IpcRequest) -> IpcSendOu
 /// handle.
 ///
 /// The returned [`EventShutdown`] holds a clone of the underlying
-/// Unix-stream FD.  Callers that want to abort the blocking read on the
+/// transport handle.  Callers that want to abort the blocking read on the
 /// stream (for early exit on cancellation or error) should invoke
-/// [`EventShutdown::shutdown`] — that fires the FD's `shutdown(Both)`,
-/// which makes the in-flight `read_line` return EOF/Err so the iterator
-/// ends and the pump thread exits.  Without this, a blocking read on
-/// a socket whose remote end has already closed (or whose caller has
-/// stopped iterating) leaks the pump thread.
+/// [`EventShutdown::shutdown`] — on Unix that fires the FD's
+/// `shutdown(Both)`, on Windows it cancels the pending pipe read — which
+/// makes the in-flight `read_line` return EOF/Err so the iterator ends and
+/// the pump thread exits.  Without this, a blocking read on a socket whose
+/// remote end has already closed (or whose caller has stopped iterating)
+/// leaks the pump thread.
 ///
 /// # Errors
 ///
 /// - Connection refused / file not found → friendly error.
 /// - I/O or JSON errors on the initial response.
-/// - On non-Unix platforms, always returns an error.
 pub fn connect_events(socket_path: &Path) -> Result<(EventStream, EventShutdown)> {
     #[cfg(unix)]
     {
@@ -238,11 +212,51 @@ pub fn connect_events(socket_path: &Path) -> Result<(EventStream, EventShutdown)
             },
         ))
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::io::Write;
+
+        let mut stream = connect(socket_path)?;
+        // Keep a clone of the pipe handle so `EventShutdown` can cancel the
+        // pump thread's parked read — see the doc above.
+        let shutdown_handle = stream
+            .try_clone()
+            .context("clone event-stream pipe handle")?;
+        let request = IpcRequest::Events;
+        let line = serde_json::to_string(&request)?;
+        writeln!(stream, "{line}")?;
+        stream.flush()?;
+
+        // Read the readiness frame under `EVENTS_READY_TIMEOUT`.  A timeout
+        // here mirrors the Unix `poll` timeout: proceed with no pending event
+        // rather than failing the connection.
+        let pending = match read_line_with_timeout(&stream, EVENTS_READY_TIMEOUT) {
+            Ok(None) => None,
+            Ok(Some(readiness_line)) => serde_json::from_str(readiness_line.trim())
+                .map(|event| match event {
+                    DaemonEvent::Subscribed => None,
+                    event => Some(event),
+                })
+                .context("parse event stream readiness")?,
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => None,
+            Err(error) => return Err(error).context("read event stream readiness"),
+        };
+
+        Ok((
+            EventStream {
+                reader: BufReader::new(stream),
+                pending,
+            },
+            EventShutdown {
+                stream: shutdown_handle,
+            },
+        ))
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = socket_path;
         anyhow::bail!(
-            "{}: IPC is only supported on Unix platforms in this release",
+            "{}: IPC is only supported on Unix and Windows platforms in this release",
             dormant_core::error::E_IPC
         );
     }
@@ -292,14 +306,52 @@ impl EventShutdown {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub struct EventShutdown {
+    /// Clone of the event-stream's named-pipe handle.  Held open so
+    /// [`EventShutdown::shutdown`] can cancel the pump thread's pending read
+    /// on the shared pipe object.
+    stream: Transport,
+}
+
+#[cfg(windows)]
+impl EventShutdown {
+    /// Cancel the pump thread's pending read on the named pipe.
+    ///
+    /// Windows has no `shutdown(2)` for a pipe handle; the equivalent is
+    /// `CancelIoEx`, which cancels outstanding I/O on the file object from any
+    /// thread.  The clone held here shares the pipe object with the reader, so
+    /// cancelling through it unblocks the parked `read_line`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the OS error when `CancelIoEx` fails.  Callers treat the result
+    /// as best-effort — the goal is to unblock the read, not a clean close.
+    pub fn shutdown(&self) -> std::io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::IO::CancelIoEx;
+
+        let handle = self.stream.as_raw_handle();
+        // SAFETY: `handle` is a valid open pipe handle owned by `self.stream`
+        // for the duration of the call; a null OVERLAPPED cancels all pending
+        // I/O on the file object.
+        let cancelled = unsafe { CancelIoEx(handle, std::ptr::null()) };
+        if cancelled == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 pub struct EventShutdown {
     _marker: std::marker::PhantomData<()>,
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 impl EventShutdown {
-    /// No-op on non-Unix — IPC is not supported there.
+    /// No-op on unsupported platforms — IPC is not available there.
     ///
     /// # Errors
     ///
@@ -313,30 +365,30 @@ impl EventShutdown {
 /// An iterator over [`DaemonEvent`] JSON lines from the event stream.
 ///
 /// Generic over the reader so tests can drive the parsing/line-length logic
-/// against an in-memory buffer instead of a real `UnixStream`; production
-/// code always uses the default `R = UnixStream` (via [`EventStream::from_reader`]
+/// against an in-memory buffer instead of a real transport; production
+/// code always uses the default `R = Transport` (via [`EventStream::from_reader`]
 /// / [`connect_events`]).
-#[cfg(unix)]
-pub struct EventStream<R = UnixStream> {
+#[cfg(any(unix, windows))]
+pub struct EventStream<R = Transport> {
     reader: BufReader<R>,
     pending: Option<DaemonEvent>,
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub struct EventStream {
     _marker: std::marker::PhantomData<()>,
 }
 
-#[cfg(unix)]
-impl EventStream<UnixStream> {
-    /// Build an `EventStream` from a pre-connected `BufReader<UnixStream>`.
+#[cfg(any(unix, windows))]
+impl EventStream<Transport> {
+    /// Build an `EventStream` from a pre-connected `BufReader<Transport>`.
     ///
     /// The caller is responsible for writing the `Events` request line
     /// to `reader.get_ref()` before constructing the stream — this
     /// constructor is primarily for tests that drive the iterator
     /// against a `UnixStream::pair()` or similar.
     #[must_use]
-    pub fn from_reader(reader: BufReader<UnixStream>) -> Self {
+    pub fn from_reader(reader: BufReader<Transport>) -> Self {
         Self {
             reader,
             pending: None,
@@ -357,7 +409,7 @@ impl<R: std::io::Read> EventStream<R> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl<R: std::io::Read> Iterator for EventStream<R> {
     type Item = Result<DaemonEvent>;
 
@@ -401,7 +453,7 @@ impl<R: std::io::Read> Iterator for EventStream<R> {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 impl Iterator for EventStream {
     type Item = Result<DaemonEvent>;
 
@@ -583,6 +635,138 @@ mod tests {
     }
 }
 
+#[cfg(all(windows, test))]
+mod windows_tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// Unique pipe name per test so parallel runs cannot collide.
+    fn unique_pipe_name(tag: &str) -> String {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        format!(
+            r"\\.\pipe\dormant-client-test-{tag}-{}-{n}",
+            std::process::id()
+        )
+    }
+
+    fn ok_response() -> IpcResponse {
+        IpcResponse {
+            ok: true,
+            error: None,
+            snapshot: None,
+            doctor_report: None,
+            emergency_report: None,
+            exercise_report: None,
+            wear_sampling: None,
+            wear_sampling_status: None,
+            wear_sampling_statuses: None,
+            switch_outcome: None,
+        }
+    }
+
+    /// Round-trip over a real Windows named pipe: the client opens the pipe,
+    /// sends a request, and reads the response the server writes back.
+    // `#[tokio::test]`, not `#[test]`: `ServerOptions::create` registers the
+    // pipe handle with the Tokio reactor, so it panics with "there is no
+    // reactor running" outside a runtime context.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn windows_named_pipe_round_trip() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::windows::named_pipe::ServerOptions;
+
+        let pipe_name = unique_pipe_name("round-trip");
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe_name)
+            .expect("create first pipe instance");
+
+        let server_task = tokio::spawn(async move {
+            server.connect().await.expect("client connects to the pipe");
+            let mut reader = BufReader::new(server);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read request");
+            let response = serde_json::to_string(&ok_response()).unwrap();
+            reader
+                .get_mut()
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .expect("write response");
+        });
+
+        let path = PathBuf::from(&pipe_name);
+        let request = IpcRequest::Status;
+        let response = tokio::task::spawn_blocking(move || send_request(&path, &request))
+            .await
+            .expect("client task joins")
+            .expect("round-trip succeeds");
+
+        assert!(response.ok, "server response must round-trip");
+        server_task.await.expect("server task completes");
+    }
+
+    /// A server that accepts but never answers must make the client return the
+    /// timeout error within the expected window.  The client runs on a std
+    /// thread and the test waits on a channel with a hard bound, so a broken
+    /// timeout fails the test instead of parking the suite.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn windows_send_request_times_out_when_daemon_never_replies() {
+        use tokio::net::windows::named_pipe::ServerOptions;
+
+        let pipe_name = unique_pipe_name("timeout");
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe_name)
+            .expect("create first pipe instance");
+
+        let server_task = tokio::spawn(async move {
+            server.connect().await.expect("client connects to the pipe");
+            // Hold the connection open and never answer.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        let path = PathBuf::from(&pipe_name);
+        let request = IpcRequest::Status;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(send_request(&path, &request));
+        });
+
+        let start = Instant::now();
+        let result = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("client must return within 30s");
+        let elapsed = start.elapsed();
+
+        server_task.abort();
+        let error = result.expect_err("a stalled daemon must time out");
+        assert!(
+            format!("{error:#}").contains("timed out"),
+            "timeout must be explicit: {error:#}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "timeout must fire within the bound, took {elapsed:?}"
+        );
+    }
+
+    /// A missing pipe must produce the same "is the daemon running?" hint the
+    /// Unix `ENOENT` path produces.
+    #[test]
+    fn windows_missing_pipe_reports_daemon_not_running() {
+        let pipe_name = unique_pipe_name("missing");
+        let path = PathBuf::from(&pipe_name);
+        let error = send_request(&path, &IpcRequest::Status)
+            .expect_err("a missing pipe must fail to connect");
+        assert!(
+            format!("{error:#}").contains("daemon not running"),
+            "missing pipe must produce the friendly hint: {error:#}"
+        );
+    }
+}
+
 /// Check an [`IpcResponse`] for success, printing "ok" or returning an error.
 ///
 /// # Errors
@@ -626,7 +810,71 @@ fn read_response(stream: &UnixStream, request: &IpcRequest) -> Result<IpcRespons
     }
 }
 
-#[cfg(unix)]
+/// Read one newline-terminated line from a Windows named-pipe handle with a
+/// deadline.
+///
+/// `std::fs::File` has no `set_read_timeout`, and a Windows named pipe has no
+/// synchronous read-timeout primitive, so the blocking `read_line` runs on a
+/// dedicated thread and the caller waits on a channel with `recv_timeout`.
+///
+/// Cost: if the daemon never answers, the reader thread stays parked in
+/// `read_line` until the process exits.  `dormantctl` is a short-lived CLI, so
+/// that is acceptable; the long-lived tray uses the event stream, not this
+/// path.
+///
+/// Returns `Ok(None)` on EOF, `Ok(Some(line))` on a line, and an
+/// [`std::io::ErrorKind::TimedOut`] error when the deadline elapses — the same
+/// shape the Unix `set_read_timeout` path produces.
+#[cfg(windows)]
+fn read_line_with_timeout(
+    stream: &Transport,
+    timeout: Duration,
+) -> std::io::Result<Option<String>> {
+    use std::io::BufRead;
+
+    let mut reader = stream.try_clone()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let result = BufReader::new(&mut reader).read_line(&mut line);
+        let _ = tx.send((result, line));
+    });
+
+    match rx.recv_timeout(timeout) {
+        Ok((Ok(0), _)) => Ok(None),
+        Ok((Ok(_), line)) => Ok(Some(line)),
+        Ok((Err(error), _)) => Err(error),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "daemon response timed out",
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(std::io::Error::other(
+            "daemon reader thread exited unexpectedly",
+        )),
+    }
+}
+
+/// Read the daemon's response over a Windows named pipe.
+///
+/// Mirrors the Unix `set_read_timeout` path: EOF, a parse error, and a
+/// deadline expiry produce the same messages.
+#[cfg(windows)]
+fn read_response(stream: &Transport, request: &IpcRequest) -> Result<IpcResponse> {
+    let timeout = response_timeout(request);
+
+    match read_line_with_timeout(stream, timeout) {
+        Ok(None) => anyhow::bail!("daemon closed connection before sending a response"),
+        Ok(Some(response_line)) => {
+            serde_json::from_str(response_line.trim()).context("parse daemon response")
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => anyhow::bail!(
+            "daemon response timed out after {} seconds",
+            timeout.as_secs()
+        ),
+        Err(error) => Err(error).context("read response from daemon"),
+    }
+}
+
 fn response_timeout(request: &IpcRequest) -> Duration {
     match request {
         // Status bounds its snapshot at two seconds; pause/resume/blank/wake/reload
@@ -671,7 +919,7 @@ fn response_timeout(request: &IpcRequest) -> Duration {
 
 /// Connect to the daemon's Unix socket.
 #[cfg(unix)]
-fn connect(socket_path: &Path) -> Result<UnixStream> {
+fn connect(socket_path: &Path) -> Result<Transport> {
     UnixStream::connect(socket_path).with_context(|| {
         format!(
             "daemon not running at '{}'?\n\
@@ -679,4 +927,44 @@ fn connect(socket_path: &Path) -> Result<UnixStream> {
             socket_path.display(),
         )
     })
+}
+
+/// Connect to the daemon's named pipe.
+///
+/// Opening a pipe can fail with `ERROR_PIPE_BUSY` (231) when every instance is
+/// momentarily taken; the daemon creates the next instance immediately after
+/// accepting, so a short bounded retry rides that out.  A missing pipe
+/// (`ERROR_FILE_NOT_FOUND`) produces the same "is the daemon running?" hint the
+/// Unix `ENOENT` path produces.
+#[cfg(windows)]
+fn connect(socket_path: &Path) -> Result<Transport> {
+    use std::fs::OpenOptions;
+
+    /// `CreateFile` on a pipe whose instances are all busy.
+    const ERROR_PIPE_BUSY: i32 = 231;
+    /// Bounded retry budget: five attempts, 50 ms apart (~250 ms total).  The
+    /// daemon creates the next instance immediately after accepting, so a
+    /// longer wait would only delay a genuine "daemon not running" report.
+    const PIPE_BUSY_RETRIES: u32 = 5;
+    const PIPE_BUSY_BACKOFF: Duration = Duration::from_millis(50);
+
+    let mut attempt = 0;
+    loop {
+        match OpenOptions::new().read(true).write(true).open(socket_path) {
+            Ok(file) => return Ok(file),
+            Err(error)
+                if error.raw_os_error() == Some(ERROR_PIPE_BUSY) && attempt < PIPE_BUSY_RETRIES =>
+            {
+                attempt += 1;
+                std::thread::sleep(PIPE_BUSY_BACKOFF);
+            }
+            Err(error) => {
+                return Err(anyhow::Error::new(error).context(format!(
+                    "daemon not running at '{}'?\n\
+                     Start dormantd first, or check the socket path with --socket",
+                    socket_path.display(),
+                )));
+            }
+        }
+    }
 }

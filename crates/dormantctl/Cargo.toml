@@ -35,6 +35,15 @@ futures-util = "0.3"
 default = ["render"]
 render = ["dormant-core/render"]
 
+[target.'cfg(windows)'.dependencies]
+# `CancelIoEx` cancels the event-stream reader's pending pipe read from another
+# thread — the Windows analogue of `UnixStream::shutdown`. Pinned to 0.61.2,
+# already in the lock (tokio, mio, …) so this adds no duplicate build.
+windows-sys = { version = "0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_System_IO",
+] }
+
 [package.metadata.dist]
 dist = true
 

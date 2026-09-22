@@ -242,7 +242,29 @@ Windows does not use XDG layout:
 `%PROGRAMDATA%` — first existing file wins. There is no `chmod 600` step: the
 credentials-permission check is a Unix mode check and does not apply.
 
-### Running it
+### Setup script
+
+`scripts\windows-setup.ps1` does the build, install, config bootstrap, and a
+smoke test in one pass. It is the fastest way to a working install and the
+easiest way to report a problem, since it prints a pass/fail summary:
+
+```powershell
+git clone git@github.com:legion-works/dormant.git
+cd dormant
+.\scripts\windows-setup.ps1
+```
+
+It never overwrites an existing config, and `-SkipBuild` re-tests an existing
+install without recompiling. The blank/wake step is consent-gated and arms an
+independent wake process first, so a display cannot be left dark even if the
+script is interrupted. Add `-RegisterLogonTask` to have the daemon start at
+logon.
+
+Prerequisites are Rust (https://rustup.rs) and the Visual Studio Build Tools
+"Desktop development with C++" workload for the MSVC linker; the script checks
+for both and tells you what is missing.
+
+### Running it manually
 
 There is no installer and no service unit yet. Run the daemon from a terminal:
 

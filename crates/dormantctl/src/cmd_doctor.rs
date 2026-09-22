@@ -136,6 +136,9 @@ pub enum DoctorSubcommand {
     /// Probe active macOS power assertions preventing display sleep.
     /// `Fail` when a dormant-owned assertion is still active. macOS only.
     MacosPower,
+    /// Probe the Windows idle clock (two bounded raw readings, `Fail` when
+    /// they are identical). Windows only.
+    WindowsIdle,
     /// Probe Samsung Tizen displays (reachability, power state, token).
     Samsung,
     /// Probe the evdev input-filter backend — confirms `/dev/input/event*`
@@ -260,6 +263,7 @@ async fn run_async(args: &DoctorArgs) -> Result<DoctorOutcome> {
         Some(DoctorSubcommand::MacosDisplaySleep) => run_macos_display_sleep().await,
         Some(DoctorSubcommand::MacosDisplayCatalog) => run_macos_display_catalog().await,
         Some(DoctorSubcommand::MacosPower) => run_macos_power().await,
+        Some(DoctorSubcommand::WindowsIdle) => run_windows_idle().await,
         Some(DoctorSubcommand::Samsung) => {
             let (cfg, creds, note) = load_config_and_creds(args)?;
             if let Some(n) = &note {
@@ -674,6 +678,28 @@ async fn run_macos_idle() -> Result<DoctorOutcome> {
     #[cfg(not(target_os = "macos"))]
     {
         Ok(DoctorOutcome::NotSupported("macos-idle".into()))
+    }
+}
+
+/// `doctor windows-idle` — two bounded raw readings of the idle clock.
+///
+/// `async` only actually awaits anything on Windows (`#[cfg(not(target_os =
+/// "windows"))]`'s body is a bare `Ok(..)`) — the `unused_async` lint fires
+/// on every non-Windows build, so it is suppressed there specifically rather
+/// than dropping `async` (which would require a matching, more invasive
+/// signature change at the `Some(DoctorSubcommand::WindowsIdle) => ...await`
+/// call site above, needed on Windows).
+#[cfg_attr(not(target_os = "windows"), allow(clippy::unused_async))]
+async fn run_windows_idle() -> Result<DoctorOutcome> {
+    #[cfg(target_os = "windows")]
+    {
+        let results = vec![dormant_doctor::probe_windows_idle().await];
+        print_table(&results);
+        Ok(outcome(&results))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(DoctorOutcome::NotSupported("windows-idle".into()))
     }
 }
 
@@ -1299,6 +1325,28 @@ mod tests {
         assert!(
             matches!(power, DoctorSubcommand::MacosPower),
             "expected MacosPower, got {power:?}"
+        );
+    }
+
+    /// The Windows read-only doctor arm must parse as its own subcommand
+    /// variant under the exact kebab-case name `windows-idle` — on every
+    /// platform (parsing is unconditional; only the handler behind the
+    /// variant is Windows-gated, mirroring the macOS arms above).
+    #[test]
+    fn doctor_parses_windows_idle_arm() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Wrapper {
+            #[command(subcommand)]
+            sub: DoctorSubcommand,
+        }
+
+        let idle = Wrapper::try_parse_from(["dormantctl", "windows-idle"])
+            .expect("windows-idle should parse")
+            .sub;
+        assert!(
+            matches!(idle, DoctorSubcommand::WindowsIdle),
+            "expected WindowsIdle, got {idle:?}"
         );
     }
 

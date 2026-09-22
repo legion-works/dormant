@@ -233,7 +233,7 @@ mod ffi {
         // Safety: `info` is a valid, correctly-sized `LASTINPUTINFO` with
         // `cbSize` set as the API requires; `GetLastInputInfo` only writes
         // into it and returns a `BOOL`.
-        let ok = unsafe { GetLastInputInfo(&mut info) };
+        let ok = unsafe { GetLastInputInfo(&raw mut info) };
         if ok == 0 {
             return Err(WindowsIdleReadError(
                 "GetLastInputInfo returned failure".into(),

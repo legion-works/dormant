@@ -40,6 +40,8 @@ pub use probes::macos_power_off::probe_macos_power_off_hazard;
 pub use probes::mqtt::probe_mqtt_all;
 pub use probes::samsung::probe_samsung;
 pub use probes::usb::probe_usb;
+#[cfg(target_os = "windows")]
+pub use probes::windows_idle::probe_windows_idle;
 
 use dormant_core::config::Config;
 use dormant_core::config::schema::Credentials;
@@ -211,6 +213,18 @@ pub async fn probe_all_offline(cfg: &Config, creds: &Credentials) -> Vec<ProbeRe
             probes::macos_power_off::probe_macos_power_off_hazard(cfg)
                 .into_iter()
                 .map(|r| r.with_category("platform")),
+        );
+    }
+
+    // Windows-only read-only platform probe — always run on a Windows host
+    // (not gated by any per-display/per-sensor config): idle-clock health.
+    // Read-only; never blanks or wakes a display.
+    #[cfg(target_os = "windows")]
+    {
+        results.push(
+            probes::windows_idle::probe_windows_idle()
+                .await
+                .with_category("platform"),
         );
     }
 

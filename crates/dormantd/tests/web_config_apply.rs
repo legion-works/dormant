@@ -1,9 +1,11 @@
 #![cfg(unix)]
-//! Unix-only: these drive the daemon end to end, and `dormantd::ipc` — the
-//! IPC server the daemon exposes and these tests talk to — is `#[cfg(unix)]`
-//! (`dormantd/src/lib.rs:27`). There is no Windows transport yet, so the
-//! daemon cannot be exercised there. The Windows named-pipe transport
-//! un-gates this file; see issue #265.
+//! Unix-only: the fixtures drive the daemon's `command` display controller
+//! with POSIX shell text — `printf X >> 'file'`, `test -e`, `true`/`false` —
+//! and observe behaviour by counting marker bytes those commands append.
+//! `cmd /C` has no equivalent spelling, so the suite needs a platform-aware
+//! fixture helper before it can run on Windows. Tracked in the Windows
+//! support issue (#265); the IPC transport that previously blocked it is
+//! done (#371, #373).
 //!
 //! Integration tests for the config-apply full loop: web UI → daemon reload
 //! → filesystem artifacts.

@@ -170,10 +170,28 @@ jobs:
       # for x86_64-pc-windows-gnu); the remaining features are test-only seams
       # enabled automatically via dev-dependencies.
       - run: cargo build --workspace --features web-ui
-      # --no-fail-fast: cargo stops at the first failing test BINARY, so a
-      # workspace with unix assumptions in several crates surfaces one crate
-      # per CI round. Report them all in one run instead.
-      - run: cargo test --workspace --features web-ui --no-fail-fast
+      # nextest, not `cargo test`, for the same reason the Linux `test` job
+      # uses it: nextest runs each test in its OWN PROCESS, while `cargo test`
+      # runs them as threads sharing one. Tests that capture `tracing` output
+      # through a thread-local subscriber are order- and thread-sensitive under
+      # the shared-process model, and this repo has hit that before
+      # (active_sampler's capture_tracing tests flaked on Windows under
+      # `cargo test` while passing on the nextest-backed Linux gate). Process
+      # isolation removes the class rather than retrying past it.
+      #
+      # The `ci` profile also carries fail-fast = false, so the original reason
+      # for --no-fail-fast still holds: report every failing crate in one run
+      # instead of one crate per CI round.
+      #
+      # Through the shared gate script with a feature override, the same shape
+      # the clippy step uses: the test contract (workspace scope, `ci` profile,
+      # doctest pass) stays in one place and only the feature set varies.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.131
+      - run: bash scripts/gates/rust-tests.sh
+        env:
+          DORMANT_GATE_FEATURES: --features web-ui
       # Through the shared gate script, not a raw `cargo clippy`: the lint
       # contract (-D warnings, pedantic, --all-targets) lives in exactly one
       # place, and scripts/ci/check_gate_parity.py enforces that.

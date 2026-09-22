@@ -255,11 +255,69 @@ mod tests {
     use super::*;
     use dormant_core::error::E_DISPLAY_IO;
 
+    /// Shell fixtures, written in the syntax of the shell the controller
+    /// actually uses: `sh -c` on Unix, `cmd /C` on Windows.
+    ///
+    /// Each helper produces the SAME observable behaviour on both platforms,
+    /// so the assertions never relax to a common denominator — only the
+    /// spelling differs.
+    ///
+    /// Windows fixtures deliberately contain no `"` characters. Rust escapes
+    /// arguments by argv rules even when the program is `cmd`, so an embedded
+    /// quote arrives as `\"`, which `cmd` does not understand. Quote-free
+    /// strings are safe: with `/C`, `cmd` strips the leading and trailing
+    /// quote it was given and runs the remainder verbatim.
+    mod shell {
+        /// Succeed with no output.
+        pub fn ok() -> String {
+            if cfg!(windows) {
+                "exit 0".into()
+            } else {
+                "true".into()
+            }
+        }
+
+        /// Write `msg` to stderr, then exit with `code`.
+        pub fn stderr_then_exit(msg: &str, code: i32) -> String {
+            if cfg!(windows) {
+                format!("echo {msg} 1>&2 & exit {code}")
+            } else {
+                format!("echo {msg} >&2; exit {code}")
+            }
+        }
+
+        /// A command that keeps running for at least `secs` seconds, so a
+        /// controller timeout shorter than that is guaranteed to fire.
+        ///
+        /// Not a raw sleep — this builds a command STRING for the child
+        /// process; no test thread blocks here.
+        ///
+        /// `ping -n` rather than `timeout /t` on Windows: the controller gives
+        /// the child a null stdin, and `timeout` refuses to run when input is
+        /// redirected.
+        pub fn long_running(secs: u32) -> String {
+            if cfg!(windows) {
+                format!("ping -n {} 127.0.0.1 >nul", secs + 1)
+            } else {
+                format!("sleep {secs}")
+            }
+        }
+
+        /// Write `first` then `second` to stderr, then exit with `code`.
+        pub fn stderr_pair_then_exit(first: &str, second: &str, code: i32) -> String {
+            if cfg!(windows) {
+                format!("echo {first} 1>&2 & echo {second} 1>&2 & exit {code}")
+            } else {
+                format!("printf '{first}' >&2; printf '{second}' >&2; exit {code}")
+            }
+        }
+    }
+
     #[tokio::test]
     async fn exit0_ok() {
         let c = CommandController::new(
-            "true".into(),
-            "true".into(),
+            shell::ok(),
+            shell::ok(),
             vec![BlankMode::PowerOff],
             Duration::from_secs(5),
         );
@@ -270,8 +328,8 @@ mod tests {
     #[tokio::test]
     async fn exit1_err_with_code_and_stderr() {
         let c = CommandController::new(
-            "echo boom >&2; exit 7".into(),
-            "true".into(),
+            shell::stderr_then_exit("boom", 7),
+            shell::ok(),
             vec![BlankMode::PowerOff],
             Duration::from_secs(5),
         );
@@ -297,8 +355,8 @@ mod tests {
     #[tokio::test]
     async fn sleep_past_timeout_errs() {
         let c = CommandController::new(
-            "sleep 5".into(),
-            "true".into(),
+            shell::long_running(5),
+            shell::ok(),
             vec![BlankMode::PowerOff],
             Duration::from_millis(200),
         );
@@ -310,8 +368,8 @@ mod tests {
     #[tokio::test]
     async fn mode_not_declared_rejected() {
         let c = CommandController::new(
-            "true".into(),
-            "true".into(),
+            shell::ok(),
+            shell::ok(),
             vec![BlankMode::ScreenOffAudioOn],
             Duration::from_secs(5),
         );
@@ -327,8 +385,8 @@ mod tests {
         let prefix = "x".repeat(500);
         let suffix = "END_OF_FAILURE";
         let c = CommandController::new(
-            format!("printf '{prefix}' >&2; printf '{suffix}' >&2; exit 1"),
-            "true".into(),
+            shell::stderr_pair_then_exit(&prefix, suffix, 1),
+            shell::ok(),
             vec![BlankMode::PowerOff],
             Duration::from_secs(5),
         );
@@ -354,6 +412,14 @@ mod tests {
     /// timeout for an otherwise-successful command. With the concurrent drain
     /// in place the command completes normally; this is an outer-timeout I/O
     /// contract (the 3s bound is a ceiling, not a timing-window assertion).
+    // Unix-only fixture: needs a shell that can emit >200 KiB to stderr in one
+    // expression. `sh` has `yes X | head -c`; `cmd` has no compact equivalent,
+    // and the `for /L`/`type` workarounds either need a quoted path (which
+    // Rust's argv escaping mangles for `cmd`) or produce a non-deterministic
+    // size that cannot anchor the tail-cap assertion. The DRAIN BEHAVIOUR
+    // under test is portable and matters more on Windows, where pipe buffers
+    // are smaller — tracked as follow-up, not settled as Unix-only.
+    #[cfg(unix)]
     #[tokio::test]
     async fn stderr_flood_exit0_is_ok() {
         let c = CommandController::new(
@@ -371,6 +437,14 @@ mod tests {
 
     /// Must 1 — non-zero exit after a stderr flood must still surface the
     /// diagnostic that mattered (a marker printed AFTER the flood).
+    // Unix-only fixture: needs a shell that can emit >200 KiB to stderr in one
+    // expression. `sh` has `yes X | head -c`; `cmd` has no compact equivalent,
+    // and the `for /L`/`type` workarounds either need a quoted path (which
+    // Rust's argv escaping mangles for `cmd`) or produce a non-deterministic
+    // size that cannot anchor the tail-cap assertion. The DRAIN BEHAVIOUR
+    // under test is portable and matters more on Windows, where pipe buffers
+    // are smaller — tracked as follow-up, not settled as Unix-only.
+    #[cfg(unix)]
     #[tokio::test]
     async fn stderr_flood_nonzero_keeps_tail() {
         let c = CommandController::new(

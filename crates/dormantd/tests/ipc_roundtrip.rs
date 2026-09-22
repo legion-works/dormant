@@ -2,6 +2,10 @@
 //! socket with a fake control loop, then connect as a client and verify
 //! request/response round-trips.
 
+// The whole file drives the unix-socket IPC server (`dormantd::ipc` is
+// `#[cfg(unix)]`), so it is unix-only by nature.
+#![cfg(unix)]
+
 use std::collections::{BTreeMap, HashMap};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;

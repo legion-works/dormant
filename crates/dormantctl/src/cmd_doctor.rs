@@ -1067,6 +1067,8 @@ mod tests {
         );
     }
 
+    // Unix-only: asserts unix permission-mode handling.
+    #[cfg(unix)]
     #[test]
     fn load_credentials_resilient_perms_error() {
         let path = make_temp_path("perms");
@@ -1631,6 +1633,7 @@ mod tests {
     ///
     /// Returns `(captured, stop_tx, join)`. Send `stop_tx` to ask the
     /// daemon to exit, then `join` to confirm clean shutdown.
+    #[cfg(unix)]
     fn spawn_one_shot_doctor_daemon(
         socket_path: &Path,
         response: dormant_core::ipc_proto::IpcResponse,
@@ -1707,6 +1710,7 @@ mod tests {
     /// Build a `DoctorReport` containing a Skip check for the configured
     /// USB port (mirrors the live `DoctorService` output: owned sensors
     /// are reported from the snapshot, never re-probed).
+    #[cfg(unix)]
     fn fake_owned_usb_report() -> dormant_core::doctor::DoctorReport {
         use dormant_core::doctor::{Check, CheckStatus, DoctorReport};
         DoctorReport {
@@ -1728,6 +1732,7 @@ mod tests {
     /// (`probe_all_offline`, which calls `probe_usb`) is NOT entered.
     /// The seam counter is the red-green evidence: with the old code it
     /// would be `>= 1` because the bare path always ran offline.
+    #[cfg(unix)]
     #[test]
     fn doctor_uses_live_daemon() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1800,6 +1805,8 @@ mod tests {
     /// in the wild when they run `dormantctl doctor` on a host with no
     /// config at all). The test only cares that the fallback was
     /// ENTERED — not what the offline probes themselves return.
+    // Unix-only: drives the unix-socket IPC client.
+    #[cfg(unix)]
     #[test]
     fn doctor_falls_back_to_offline_when_daemon_unreachable() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1845,6 +1852,7 @@ mod tests {
     /// client's `read_line` returns `Ok(0)` (EOF); the subsequent
     /// `from_str("")` fails the parse — a textbook
     /// `PostConnectError` on the client side.
+    #[cfg(unix)]
     fn spawn_doctor_daemon_that_drops(
         socket_path: &Path,
     ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
@@ -1888,6 +1896,7 @@ mod tests {
         (stop_tx, handle)
     }
 
+    #[cfg(unix)]
     #[test]
     fn doctor_does_not_fall_back_on_post_connect_error() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1929,6 +1938,7 @@ mod tests {
         let _ = daemon_handle.join();
     }
 
+    #[cfg(unix)]
     #[test]
     fn doctor_does_not_fall_back_when_daemon_returns_ok_without_report() {
         let dir = tempfile::tempdir().expect("tempdir");

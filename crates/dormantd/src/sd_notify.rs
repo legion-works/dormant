@@ -183,7 +183,12 @@ impl SdNotify {
         Self
     }
 
-    #[cfg(any(test, feature = "test-util"))]
+    // Unix-only: the seam takes a `std::os::unix::net::SocketAddr` and every
+    // caller binds a `UnixDatagram`. The module itself cannot be
+    // `#[cfg(target_os = "linux")]` — this non-Linux stub is production code
+    // on macOS and Windows (`SdNotify::from_env()` is called unconditionally
+    // in `app.rs`/`main.rs`/`boot_guard.rs`).
+    #[cfg(all(any(test, feature = "test-util"), unix))]
     #[must_use]
     pub fn from_socket_for_test(_addr: &std::os::unix::net::SocketAddr) -> Self {
         Self

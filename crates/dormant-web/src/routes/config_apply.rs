@@ -307,17 +307,21 @@ fn write_temp(dir: &Path, content: &str) -> Result<PathBuf, WebError> {
 }
 
 /// fsync a regular file (data + metadata).
-#[cfg(unix)]
+///
+/// The handle is opened for WRITE, not with `File::open`. `sync_all` is
+/// `FlushFileBuffers` on Windows, which is documented to require the
+/// `GENERIC_WRITE` access right and fails a read-only handle with
+/// `ERROR_ACCESS_DENIED`; `fsync(2)` on a read-only fd succeeds on Unix, so
+/// the defect was invisible until the Windows job ran the suite. Every other
+/// atomic write in the workspace already syncs through the handle it wrote
+/// with — this reopen was the lone outlier.
+///
+/// `.write(true)` alone: no `create`, no `truncate`. The file must already
+/// exist and its contents must survive.
 fn sync_file(path: &Path) -> Result<(), WebError> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| WebError::ConfigReadError(format!("cannot open for fsync: {e}")))?;
-    file.sync_all()
-        .map_err(|e| WebError::ConfigReadError(format!("fsync failed: {e}")))
-}
-
-#[cfg(not(unix))]
-fn sync_file(path: &Path) -> Result<(), WebError> {
-    let file = std::fs::File::open(path)
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
         .map_err(|e| WebError::ConfigReadError(format!("cannot open for fsync: {e}")))?;
     file.sync_all()
         .map_err(|e| WebError::ConfigReadError(format!("fsync failed: {e}")))
@@ -332,6 +336,14 @@ fn sync_dir(dir: &Path) -> Result<(), WebError> {
         .map_err(|e| WebError::ConfigReadError(format!("dir fsync failed: {e}")))
 }
 
+// The infallible body is the point: Windows cannot open a directory as a
+// `File`, so there is nothing to fsync. The `Result` is kept because the
+// single caller is shared with the Unix arm and propagates with `?`;
+// diverging the signature per platform would push the cfg into the caller.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "signature is fixed by the Unix arm this shares a caller with"
+)]
 #[cfg(not(unix))]
 fn sync_dir(_dir: &Path) -> Result<(), WebError> {
     // Non-Unix: rename durability is up to the filesystem.

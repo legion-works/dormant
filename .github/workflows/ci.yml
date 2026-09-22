@@ -153,14 +153,33 @@ jobs:
 
   windows-portability:
     runs-on: windows-latest
-    timeout-minutes: 20
+    # 40, not the old 20: build+test+clippy is roughly 3-4x the compile work of
+    # the single `cargo check` it replaces, and Windows runners are slower than
+    # the Linux jobs with a colder cache. Headroom for a cold-cache run without
+    # hiding a real hang.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v6
       - name: Reject same-SHA reruns
         run: bash scripts/ci/reject_required_rerun.sh
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace
+      # `--all-features` is deliberately NOT used: dormantd's `render` feature
+      # pulls Wayland/libmpv, which cannot build on Windows. `web-ui` is the
+      # maximal Windows-valid production feature (verified to cross-check clean
+      # for x86_64-pc-windows-gnu); the remaining features are test-only seams
+      # enabled automatically via dev-dependencies.
+      - run: cargo build --workspace --features web-ui
+      # --no-fail-fast: cargo stops at the first failing test BINARY, so a
+      # workspace with unix assumptions in several crates surfaces one crate
+      # per CI round. Report them all in one run instead.
+      - run: cargo test --workspace --features web-ui --no-fail-fast
+      # Through the shared gate script, not a raw `cargo clippy`: the lint
+      # contract (-D warnings, pedantic, --all-targets) lives in exactly one
+      # place, and scripts/ci/check_gate_parity.py enforces that.
+      - run: bash scripts/gates/clippy.sh
+        env:
+          DORMANT_GATE_FEATURES: --features web-ui
 
   macos-test:
     runs-on: macos-14

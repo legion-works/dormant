@@ -59,7 +59,15 @@ pub mod hotkey_linux;
 /// macOS global hotkey registration through Carbon.
 #[cfg(target_os = "macos")]
 pub mod hotkey_macos;
-#[cfg(any(target_os = "macos", test))]
+// Consumed by macOS production (`hotkey_macos`) and by its own pure Carbon
+// tests, which run on linux/macos. Bare `test` compiled it on Windows, where
+// its `crate::hotkey` dependency is gated out. The inner predicate matches
+// `hotkey`'s own gate (explicit linux/macos, not `unix` — see the `dispatch`
+// note above on BSD/Solaris).
+#[cfg(any(
+    target_os = "macos",
+    all(test, any(target_os = "linux", target_os = "macos"))
+))]
 mod hotkey_macos_common;
 pub mod icon;
 pub mod menu;

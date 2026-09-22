@@ -785,7 +785,22 @@ mod tests {
             serde_json::json!(env!("CARGO_PKG_VERSION"))
         );
         assert!(body["started_epoch_s"].as_u64().unwrap() > 0);
-        assert!(body["socket"].as_str().unwrap().ends_with("dormant.sock"));
+        // The socket field carries whatever `resolve_socket_path` derives for
+        // this platform. Each arm asserts its own full-strength shape rather
+        // than relaxing to a lowest common denominator: Unix resolves a
+        // `dormant.sock` socket file, Windows a `\\.\pipe\dormant-<user>`
+        // named pipe.
+        let socket = body["socket"].as_str().unwrap();
+        #[cfg(unix)]
+        assert!(
+            socket.ends_with("dormant.sock"),
+            "unix socket path must end with dormant.sock: {socket}"
+        );
+        #[cfg(windows)]
+        assert!(
+            socket.starts_with(r"\\.\pipe\dormant-"),
+            r"windows socket path must be a \\.\pipe\dormant- named pipe: {socket}"
+        );
     }
 
     /// `GET /api/daemon` with a foreign `Host` header is rejected — the

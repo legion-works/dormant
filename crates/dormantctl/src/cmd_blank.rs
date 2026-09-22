@@ -97,15 +97,20 @@ pub fn run_wake(socket_path: &Path, display: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use dormant_core::ipc_proto::IpcResponse;
+    #[cfg(unix)]
     use std::os::unix::net::UnixListener;
+    #[cfg(unix)]
     use std::sync::{Arc, Mutex};
+    #[cfg(unix)]
     use std::thread;
 
     /// Capture the wire request received by a single-shot fake daemon so a
     /// test can assert what `dormantctl blank` actually sent.  The listener
     /// accepts exactly one connection, reads one JSON line, replies with a
     /// canned `IpcResponse::ok`, and exits.
+    #[cfg(unix)]
     fn spawn_fake_daemon(
         socket_path: &Path,
         captured: Arc<Mutex<Option<IpcRequest>>>,
@@ -140,6 +145,7 @@ mod tests {
     /// no `mode` field — the legacy wire shape the new daemons still
     /// accept and that legacy daemons treat as `Soft`.  This is the
     /// issue-#124 safety default.
+    #[cfg(unix)]
     #[test]
     fn run_blank_default_soft_sends_legacy_no_mode_frame() {
         let dir = tempfile::tempdir().unwrap();
@@ -172,6 +178,7 @@ mod tests {
 
     /// `dormantctl blank --hard --yes` MUST serialize the request with
     /// `mode: "hard"` and must NOT prompt on stdin (the bypass path).
+    #[cfg(unix)]
     #[test]
     fn run_blank_hard_with_yes_sends_hard_mode() {
         let dir = tempfile::tempdir().unwrap();

@@ -33,10 +33,10 @@ pub fn probe_wear_sampling(
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (display_bound, status);
-        return ProbeResult::not_supported(
+        ProbeResult::not_supported(
             "wear-sampling",
             "active sampling is unavailable on this platform",
-        );
+        )
     }
 
     #[cfg(target_os = "linux")]
@@ -96,7 +96,7 @@ pub fn probe_wear_sampling_per_display(
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (live_display_ids, statuses);
-        return configured_display_ids
+        configured_display_ids
             .iter()
             .map(|display| {
                 ProbeResult::not_supported(
@@ -106,7 +106,7 @@ pub fn probe_wear_sampling_per_display(
                 .with_category("platform")
                 .with_subject(display.clone())
             })
-            .collect();
+            .collect()
     }
 
     #[cfg(target_os = "linux")]

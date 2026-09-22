@@ -335,6 +335,17 @@ fn classify_response(resp: IpcResponse) -> IpcOutcome {
 /// cancellable via `tokio::time::timeout` so this module can bound the IPC
 /// attempt at 2 seconds.  On non-Unix this returns the same `E_IPC` error
 /// as the sync version.
+// On non-Unix the whole body is cfg'd out, leaving no await — but the
+// function is awaited by a shared caller, so `async` has to stay. Scoped to
+// `not(unix)` so Linux and macOS keep enforcing the lint; the Windows
+// named-pipe transport (#265) puts real awaits here and retires this.
+#[cfg_attr(
+    not(unix),
+    allow(
+        clippy::unused_async,
+        reason = "async is fixed by the shared caller; the non-Unix arm has no transport yet"
+    )
+)]
 async fn send_request_async(socket_path: &Path, request: &IpcRequest) -> Result<IpcResponse> {
     #[cfg(unix)]
     {
@@ -643,7 +654,9 @@ mod gamma_restore_ordering_tests {
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg(unix)]
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+    #[cfg(unix)]
     use tokio::net::UnixListener;
 
     #[derive(Clone, Default)]
@@ -739,6 +752,7 @@ mod gamma_restore_ordering_tests {
     /// strings — the restore seam has no way to know "pre" vs "post" from
     /// inside a single `restore_all()` call; the fake IPC server pushes the
     /// middle marker itself, from the same shared trace).
+    #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn emergency_wake_repeats_local_restore_after_daemon_ipc_success() {
         let dir = tempfile::tempdir().unwrap();
@@ -808,6 +822,7 @@ mod gamma_restore_ordering_tests {
     /// time past `IPC_TIMEOUT` lets `tokio::time::timeout` inside
     /// `try_ipc_emergency_wake` actually fire deterministically, without a
     /// real multi-second sleep.
+    #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn emergency_wake_times_out_wedged_ipc_then_runs_direct_and_final_restore() {
         let dir = tempfile::tempdir().unwrap();
@@ -877,6 +892,7 @@ mod tests {
     /// daemon's report and does NOT take the fallback.  We drive a fake
     /// server with a single `EmergencyWake` request and assert the
     /// outcome is the structured report (not an error).
+    #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn ipc_success_uses_daemon_report_not_fallback() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};

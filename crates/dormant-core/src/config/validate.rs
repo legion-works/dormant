@@ -4990,6 +4990,7 @@ password = "test-pass"
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn credentials_mode_0400_rejected() {
         use std::os::unix::fs::PermissionsExt;

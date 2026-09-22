@@ -681,7 +681,18 @@ fn vcp_display_info_from_ddc_info(info: &ddc_hi::DisplayInfo) -> VcpDisplayInfo 
 /// ddc-hi's `DisplayInfo::from_edid` populates on the Linux i²c path (via
 /// edid-rs) but leaves empty on macOS when the vendored `ddc-macos` fork's
 /// `edid()` bytes fail edid-rs parsing.
-#[cfg(any(target_os = "macos", test))]
+///
+/// Gated `any(macos, all(test, linux|macos))`: consumed by macOS production
+/// (`backfill_edid_identity_from_macos`) and by the EDID tests, which are
+/// themselves gated to linux/macos. Bare `test` left the whole cluster dead
+/// on Windows.
+#[cfg(any(
+    target_os = "macos",
+    all(
+        test,
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    )
+))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EdidIdentity {
     manufacturer: Option<String>,
@@ -705,7 +716,13 @@ struct EdidIdentity {
 /// Returns `None` only for a structurally too-short EDID (< 128 bytes); a
 /// present-but-empty descriptor yields `EdidIdentity` with `None` fields,
 /// which [`VcpDisplayInfo::claim_identity`] collapses to `None` (honest).
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(
+    target_os = "macos",
+    all(
+        test,
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    )
+))]
 fn parse_edid_identity(edid: &[u8]) -> Option<EdidIdentity> {
     // The base block is 128 bytes; the four 18-byte descriptor slots live at
     // offsets 54..126. Extension blocks do not carry base identity.
@@ -724,7 +741,13 @@ fn parse_edid_identity(edid: &[u8]) -> Option<EdidIdentity> {
 /// Decode the 3-letter EDID manufacturer PNP id from the two header bytes
 /// (big-endian u16, three 5-bit groups, 1–26 → 'A'–'Z'). A 0 group means
 /// "unused" and is skipped rather than fabricated into a partial id.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(
+    target_os = "macos",
+    all(
+        test,
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    )
+))]
 fn decode_pnp_manufacturer(high: u8, low: u8) -> Option<String> {
     let id = u16::from_be_bytes([high, low]);
     let groups = [(id >> 10) & 0x1F, (id >> 5) & 0x1F, id & 0x1F];
@@ -747,7 +770,13 @@ fn decode_pnp_manufacturer(high: u8, low: u8) -> Option<String> {
 /// (byte 4 is reserved zero). The AOC's panel on this Mac puts the tag at
 /// byte 3 — the previous code checked byte 2, which is always zero, and
 /// so never matched any descriptor.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(
+    target_os = "macos",
+    all(
+        test,
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    )
+))]
 fn parse_monitor_descriptors(slots: &[u8]) -> (Option<String>, Option<String>) {
     let mut model = None;
     let mut serial = None;
@@ -769,7 +798,13 @@ fn parse_monitor_descriptors(slots: &[u8]) -> (Option<String>, Option<String>) {
 /// Extract a null/LF-terminated, space-padded ASCII string from a descriptor
 /// data range. Trailing whitespace is trimmed; a non-UTF8 or empty result is
 /// `None`.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(
+    target_os = "macos",
+    all(
+        test,
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    )
+))]
 fn descriptor_string(data: &[u8]) -> Option<String> {
     let end = data
         .iter()
@@ -1282,7 +1317,9 @@ impl VcpOps for FakeVcp {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use std::time::Instant;
 
     use super::*;
     use crate::ddc_lock::PanelLocks;

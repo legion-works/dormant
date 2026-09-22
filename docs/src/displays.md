@@ -42,9 +42,35 @@ modes = ["power_off"]
 
 Set `modes` to declare which blank modes your commands support. dormant cannot auto-detect this for shell commands, so you must be honest — declaring a mode your commands don't actually deliver leaves the screen on.
 
+**The shell is platform-specific.** Commands run through `sh -c` on Linux and
+macOS, and through `cmd /C` on Windows — write them in the syntax of the host
+they run on. A Windows config carrying POSIX text (`printf X >> file`,
+`test -e`, `;` as a separator) parses as something else entirely:
+
+```toml
+# Windows
+[displays.escape]
+controllers = ["command"]
+blank_mode = "power_off"
+blank_command = "nircmd.exe monitor off"
+wake_command = "nircmd.exe monitor on"
+modes = ["power_off"]
+```
+
 ### `ddcci` — DDC/CI (monitor control)
 
-Controls PC monitors via DDC/CI over I2C (`/dev/i2c-*`). Always supports brightness-zero; supports power-off when the monitor exposes VCP `0xD6`.
+Controls PC monitors via DDC/CI. Always supports brightness-zero; supports power-off when the monitor exposes VCP `0xD6`.
+
+The transport differs per platform, the VCP semantics do not: `/dev/i2c-*` on
+Linux, the `ddc-macos` fork on macOS, and `ddc-winapi`'s Monitor Configuration
+API on Windows. Linux is the only one needing the udev rule below.
+
+On Windows this is the **only** local blanking controller, and the whole
+blanking story — there is no `kwin-dpms` equivalent, no software-blank render
+fallback, and deliberately no `SC_MONITORPOWER` path (it would tear down the
+output and take audio with it). A Windows display without working DDC/CI
+cannot be blanked locally; drive it over the network with `samsung-tizen` or
+`ha-passthrough`, or accept that it stays on.
 
 ```toml
 [displays.main]
@@ -311,6 +337,13 @@ Two controllers blank without touching the output, preserving audio:
 
 1. If the display has DDC/CI and supports VCP D6 → use `ddcci` power_off.
 2. If the display is a Samsung Tizen TV → use `samsung-tizen` picture-off.
+
+**On Windows the ladder is shorter.** `ddcci` and the network controllers are
+all there is: no `kwin-dpms`, no `macos-*` controllers, and no `render_black`
+fallback, because the render sink is a Wayland layer-shell surface. If DDC/CI
+fails on a Windows display, the ladder runs out and the screen stays on.
+That is the intended failure direction — a screen left on is recoverable, a
+screen that will not wake is not.
 3. If the display has no DDC/CI and no audio → `kwin-dpms` is fine.
 4. If the display has audio but neither DDC/CI nor Tizen → use a `command`
    controller with an audio-safe external command (e.g. a TV-specific IR

@@ -2,9 +2,10 @@
 
 ## Prerequisites
 
-- Linux (x86_64 or aarch64) with a desktop environment (X11 or Wayland), **or**
+- Linux (x86_64 or aarch64) with a desktop environment (X11 or Wayland),
   macOS (arm64 or x86_64) — see [macOS (M1)](#macos-m1) below for the
-  macOS-specific install path
+  macOS-specific install path — **or** Windows 10/11 x86_64, with the caveats
+  in [Windows](#windows) below
 - Rust 1.88+ (MSRV) if installing from source
 - Build dependencies for the full daemon (Linux only — macOS needs nothing
   beyond Xcode Command Line Tools): `sudo apt install libudev-dev libwayland-dev libmpv-dev libpipewire-0.3-dev pkg-config`
@@ -181,6 +182,107 @@ When upgrading from a unit that used `Type=simple`, install the new
 `dormantd` binary before copying or reloading the new unit. Then run
 `systemctl --user daemon-reload` and `systemctl --user restart app-dormant.service`.
 See [Watchdog + last-known-good rollback](./watchdog-rollback.md).
+
+## Windows
+
+Windows support is newer than the Linux and macOS paths and narrower on
+purpose. Everything below is what the daemon actually does today, including
+what it does not do.
+
+### What works
+
+- **Blanking via DDC/CI.** `ddcci` is backed by `ddc-winapi`'s Monitor
+  Configuration API. This is the same audio-safe VCP `0xD6` mechanism the
+  Linux setup relies on: the monitor blanks its own panel and the OS output
+  stays up, so audio survives.
+- **Sensors.** MQTT, Home Assistant WebSocket, and USB-serial mmWave radar all
+  work; serial ports are named `COM3` rather than `/dev/ttyUSB0`.
+- **The daemon, CLI, and Web UI**, including config apply and reload.
+- **User-activity inhibition**, via `GetLastInputInfo`. `idle_source = "auto"`
+  selects it; `"windows"` forces it.
+
+### What is absent
+
+- **No tray applet.** `dormant-tray` has Linux and macOS backends only. The Web
+  UI covers the same surface.
+- **No render ladder.** `render_black` and `render_screensaver` are Wayland
+  layer-shell stages with no Windows equivalent, so there is **no software-blank
+  fallback and no screensaver**. If every display controller fails, the ladder
+  has nowhere left to go.
+- **No `kwin-dpms` or `macos-*` controllers,** and deliberately no
+  `SC_MONITORPOWER` equivalent. A DPMS-style blank tears down the output and
+  takes the audio device with it, which is the one thing this project exists to
+  avoid. Shipping no local fallback is better than shipping one that breaks the
+  guarantee.
+- **No service supervision** (see below).
+- **No wedged-daemon watchdog.** The `WATCHDOG=1` engine-liveness ping is
+  systemd-only, exactly as on macOS. Crash-loop detection and last-known-good
+  rollback still work — they count process starts from dormant's own state
+  files, not from a supervisor.
+- **Samsung TV tokens do not survive a restart.** Token persistence is
+  fail-closed on Windows pending an exercised file lock, so pairing is
+  re-requested after each daemon start.
+
+The available controllers are exactly `command`, `ddcci`, `ha-passthrough`, and
+`samsung-tizen`. Config validation rejects anything else, so a Linux config
+copied across fails at startup rather than silently doing nothing.
+
+### Paths
+
+Windows does not use XDG layout:
+
+| | |
+|---|---|
+| Config | `%APPDATA%\dormant\config.toml` |
+| Credentials | `%APPDATA%\dormant\credentials.toml` |
+| State (wear ledgers, last-known-good) | `%LOCALAPPDATA%\dormant\state\` |
+| IPC | named pipe `\\.\pipe\dormant-<username>` |
+
+`%XDG_CONFIG_HOME%` is honoured first if you set it, then `%APPDATA%`, then
+`%PROGRAMDATA%` — first existing file wins. There is no `chmod 600` step: the
+credentials-permission check is a Unix mode check and does not apply.
+
+### Running it
+
+There is no installer and no service unit yet. Run the daemon from a terminal:
+
+```powershell
+dormantd.exe
+```
+
+It runs in the foreground and exits when the console closes.
+
+To survive logout, register a **Scheduled Task** with an "At log on" trigger
+and "Restart on failure". Use Task Scheduler rather than a Windows service: a
+service runs in session 0 with no access to the interactive desktop, which
+breaks DDC/CI monitor enumeration outright.
+
+Only one daemon can run per user — a second start fails with `pipe
+'\\.\pipe\dormant-<user>' is already in use by a running daemon`, backed by a
+`LockFileEx` lock on the state directory.
+
+### Shell commands
+
+The `command` controller runs through `cmd /C` on Windows, not `sh -c`. Write
+`blank_command` and `wake_command` in cmd syntax:
+
+```toml
+[displays.monitor]
+controllers = ["command"]
+blank_command = "nircmd.exe monitor off"
+wake_command = "nircmd.exe monitor on"
+```
+
+A config carrying POSIX shell text (`printf X >> file`, `test -e`, `&&`) will
+not do what it says.
+
+### Known limitation of idle detection
+
+`GetLastInputInfo` reports input for the calling session only, and a
+non-elevated process cannot see input directed at elevated windows. If you work
+primarily in an elevated application, dormant may consider you idle while you
+are typing. Raise `grace_period`, or rely on a presence sensor rather than
+user activity, if that affects you.
 
 ## Configuration file location
 

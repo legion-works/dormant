@@ -2239,9 +2239,12 @@ mod tests {
     /// operator-facing "already in use by a running daemon" message rather than
     /// leaking a raw OS error — the half most likely to break silently if the
     /// error-code check is ever edited.
+    // `#[tokio::test]`, not `#[test]`: `ServerOptions::create` registers the
+    // pipe handle with the Tokio reactor, so it panics with "there is no
+    // reactor running" outside a runtime context.
     #[cfg(windows)]
-    #[test]
-    fn windows_second_daemon_gets_the_already_running_error() {
+    #[tokio::test]
+    async fn windows_second_daemon_gets_the_already_running_error() {
         let pipe_name = unique_pipe_name("already-running");
         let name = std::ffi::OsString::from(&pipe_name);
 

@@ -426,6 +426,8 @@ mod tests {
         assert!(flag_path.exists());
     }
 
+    // Unix-only: resolves the stub through PATH; Rust's Command on Windows only tries the bare name and `.exe`, never PATHEXT, so a `.cmd` stub is unreachable by PATH lookup (real `gh` is `gh.exe`, so production lookup is unaffected).
+    #[cfg(unix)]
     #[tokio::test]
     async fn post_star_route_returns_starred_true_with_stub_injected() {
         // Uses the test-only PATH override on GhStar (via star_test_path

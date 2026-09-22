@@ -1348,6 +1348,9 @@ pub struct HookSlotsSnapshot<'a> {
 mod tests {
     use super::*;
     use dormant_core::config::schema::HookMqtt;
+    // Only `real_argv_hook_timeout_kills_process_group` uses the bare name,
+    // and that test is unix-only; the other caller is fully qualified.
+    #[cfg(unix)]
     use std::time::Instant;
 
     type ScriptedPublishes = Vec<Result<(), String>>;
@@ -1799,6 +1802,8 @@ mod tests {
 
     // ── argv + real process: env vars land in /usr/bin/env output ───────────
 
+    // Unix-only: spawns /usr/bin/env.
+    #[cfg(unix)]
     #[tokio::test]
     async fn real_argv_hook_sees_all_seven_dormant_env_vars() {
         // /usr/bin/env with no args dumps the environment to stdout. We
@@ -1873,6 +1878,8 @@ mod tests {
 
     // ── argv + real process: timeout kills the process group ────────────────
 
+    // Unix-only: spawns /bin/sleep and asserts POSIX process-group kill.
+    #[cfg(unix)]
     #[tokio::test]
     async fn real_argv_hook_timeout_kills_process_group() {
         // /bin/sleep 5 — a child that will outlive our 200 ms timeout. The
@@ -2187,6 +2194,8 @@ mod tests {
     /// daemon was launched with a non-standard PATH (here we set it
     /// explicitly to something distinctive inside the test), the child
     /// sees `HOOK_CHILD_PATH` only.
+    // Unix-only: spawns /usr/bin/env.
+    #[cfg(unix)]
     #[tokio::test]
     async fn hook_child_path_is_fixed_not_daemon_path() {
         let original_path = std::env::var_os("PATH");
@@ -2252,6 +2261,8 @@ mod tests {
     /// reaches the hook child.  Routes through the production
     /// [`run_argv_command`] path — `/usr/bin/printenv VAR` exits 0 when
     /// VAR is set, non-zero otherwise.
+    // Unix-only: spawns /usr/bin/env.
+    #[cfg(unix)]
     #[tokio::test]
     async fn allowlisted_env_var_reaches_child_via_production_path() {
         let test_var = "WAYLAND_DISPLAY";
@@ -2290,6 +2301,8 @@ mod tests {
     /// hook child.  Also exercises the allowlist loop with a second var
     /// (`XDG_RUNTIME_DIR`) so this test is mutation-sensitive: disabling
     /// the passthrough loop makes the allowlisted-var check fail.
+    // Unix-only: spawns /usr/bin/env.
+    #[cfg(unix)]
     #[tokio::test]
     async fn non_allowlisted_env_var_does_not_leak_and_allowlisted_var_reaches_child() {
         // --- non-allowlisted: must NOT leak ---

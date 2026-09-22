@@ -1067,6 +1067,8 @@ mod tests {
         );
     }
 
+    // Unix-only: asserts unix permission-mode handling.
+    #[cfg(unix)]
     #[test]
     fn load_credentials_resilient_perms_error() {
         let path = make_temp_path("perms");
@@ -1803,6 +1805,8 @@ mod tests {
     /// in the wild when they run `dormantctl doctor` on a host with no
     /// config at all). The test only cares that the fallback was
     /// ENTERED — not what the offline probes themselves return.
+    // Unix-only: drives the unix-socket IPC client.
+    #[cfg(unix)]
     #[test]
     fn doctor_falls_back_to_offline_when_daemon_unreachable() {
         let dir = tempfile::tempdir().expect("tempdir");

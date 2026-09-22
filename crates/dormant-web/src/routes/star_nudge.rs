@@ -223,20 +223,34 @@ mod tests {
 
     /// Create a stub executable at `dir/gh` that exits 0 and prints nothing.
     /// Returns the path to the stub.
+    /// A stub `gh` that exits 0, in the form the host can actually execute:
+    /// a `#!/bin/sh` script marked 0o755 on Unix, a `.cmd` batch file on
+    /// Windows (which has no shebang mechanism and dispatches on extension).
+    /// The scaffolding is platform-specific so the assertion does not have
+    /// to be.
     fn write_stub_gh(dir: &std::path::Path) -> std::path::PathBuf {
-        let stub = dir.join("gh");
-        let mut f = std::fs::File::create(&stub).unwrap();
-        writeln!(f, "#!/bin/sh").unwrap();
-        writeln!(f, "exit 0").unwrap();
-        drop(f);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+
+            let stub = dir.join("gh");
+            let mut f = std::fs::File::create(&stub).unwrap();
+            writeln!(f, "#!/bin/sh").unwrap();
+            writeln!(f, "exit 0").unwrap();
+            drop(f);
             let mut perms = std::fs::metadata(&stub).unwrap().permissions();
             perms.set_mode(0o755);
             std::fs::set_permissions(&stub, perms).unwrap();
+            stub
         }
-        stub
+        #[cfg(not(unix))]
+        {
+            let stub = dir.join("gh.cmd");
+            let mut f = std::fs::File::create(&stub).unwrap();
+            writeln!(f, "@exit /b 0").unwrap();
+            drop(f);
+            stub
+        }
     }
 
     // ── Dismiss tests ────────────────────────────────────────────────────

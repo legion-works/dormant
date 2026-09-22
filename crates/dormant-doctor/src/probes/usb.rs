@@ -11,7 +11,7 @@
 //! path belongs to on-target doctor acceptance rather than this PTY fake.
 
 use crate::types::ProbeResult;
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use dormant_core::types::SensorState;
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 use dormant_sensors::usb_ld2410::FrameParser;

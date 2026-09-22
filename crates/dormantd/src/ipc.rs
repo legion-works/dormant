@@ -1662,10 +1662,18 @@ mod tests {
         let response: dormant_core::ipc_proto::IpcResponse = {
             let mut reader = BufReader::new(&mut client);
             let mut line = String::new();
-            reader
-                .read_line(&mut line)
-                .await
-                .expect("read response over duplex");
+            // Hang detector, not a latency budget: the duplex pair is
+            // in-memory, so a real response lands in microseconds. Without
+            // the bound, a handler that stops responding parks this test
+            // until the harness-level timeout minutes later instead of
+            // failing here with a readable message.
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                reader.read_line(&mut line),
+            )
+            .await
+            .expect("handler must answer over the duplex transport within 10s")
+            .expect("read response over duplex");
             serde_json::from_str(line.trim()).expect("response is valid JSON")
         };
         assert!(

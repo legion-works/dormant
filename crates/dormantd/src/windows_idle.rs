@@ -28,7 +28,7 @@
 //! count that wraps every ~49.7 days. The idle duration is
 //! `GetTickCount().wrapping_sub(dwTime)` — a plain subtraction underflows
 //! across a wrap (panic in debug, a garbage multi-week idle in release, which
-//! would blank a display mid-use). [`idle_millis_from_ticks`] is the single
+//! would blank a display mid-use). `idle_millis_from_ticks` is the single
 //! place that arithmetic lives, and it is tested on Linux. `GetTickCount64`
 //! is deliberately NOT used: mixing a 64-bit `now` with the 32-bit `dwTime`
 //! reintroduces exactly the wrap bug.

@@ -1,16 +1,21 @@
-//! Unix-domain socket IPC server for `dormantctl` communication.
+//! IPC server for `dormantctl` communication.
 //!
-//! Listens on a Unix socket (path from config, with an XDG-based default
-//! chain), accepts line-delimited JSON [`IpcRequest`]s, dispatches them to
+//! Listens on a Unix-domain socket (path from config, with an XDG-based
+//! default chain) on Unix, or a Windows named pipe (`\\.\pipe\dormant-<user>`)
+//! on Windows.  Accepts line-delimited JSON [`IpcRequest`]s, dispatches them to
 //! the engine via [`ControlMsg`] channels, and writes [`IpcResponse`]s (or
-//! `DaemonEvent` streams) back.
+//! `DaemonEvent` streams) back.  The connection handler is transport-generic;
+//! only the accept loop differs per platform.
 
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+#[cfg(unix)]
+use anyhow::Context;
+use anyhow::Result;
 use dormant_core::ipc_proto::{
     BlankRequestMode, IpcRequest, IpcResponse, WearSamplingStatus, WearSamplingStatusMapEntry,
 };
@@ -19,7 +24,10 @@ use dormant_core::reload::ReloadRequester;
 use dormant_core::rules::{ControlMsg, DaemonEvent};
 use dormant_doctor::DoctorService;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::UnixListener;
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -36,11 +44,13 @@ const WEAR_SAMPLING_CONSENT_BUSY: &str = "wear_sampling_consent_busy";
 type SelectedDisplays = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
 type CompositorOutputResolver = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
+#[cfg(unix)]
 struct SocketSetupGuard<'a> {
     socket_path: &'a Path,
     armed: bool,
 }
 
+#[cfg(unix)]
 impl<'a> SocketSetupGuard<'a> {
     fn new(socket_path: &'a Path) -> Self {
         Self {
@@ -54,6 +64,7 @@ impl<'a> SocketSetupGuard<'a> {
     }
 }
 
+#[cfg(unix)]
 impl Drop for SocketSetupGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
@@ -62,6 +73,7 @@ impl Drop for SocketSetupGuard<'_> {
     }
 }
 
+#[cfg(unix)]
 fn bind_socket(socket_path: &Path) -> Result<UnixListener> {
     let old_umask = unsafe { libc::umask(0o077) };
     let listener = UnixListener::bind(socket_path)
@@ -70,6 +82,7 @@ fn bind_socket(socket_path: &Path) -> Result<UnixListener> {
     listener
 }
 
+#[cfg(unix)]
 fn finish_socket_setup(
     listener: UnixListener,
     socket_path: &Path,
@@ -84,6 +97,73 @@ fn finish_socket_setup(
         .with_context(|| format!("set socket permissions '{}'", socket_path.display()))?;
     socket_setup.disarm();
     Ok(listener)
+}
+
+/// Unix-only listener setup: stale-socket recovery, parent-directory permission
+/// checks, umask-guarded bind, and explicit `0o600`.
+#[cfg(unix)]
+fn bind_unix_listener(socket_path: &Path) -> Result<UnixListener> {
+    use std::os::unix::fs::MetadataExt;
+
+    // Stale-socket recovery: connect-test before bind so we never silently
+    // replace a live daemon's socket.
+    if socket_path.exists() {
+        match std::os::unix::net::UnixStream::connect(socket_path) {
+            Ok(_) => {
+                anyhow::bail!(
+                    "socket '{}' is already in use by a running daemon",
+                    socket_path.display()
+                );
+            }
+            Err(_) => {
+                let _ = std::fs::remove_file(socket_path);
+            }
+        }
+    }
+
+    // Ensure parent directory exists with 0o700 permissions.
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create socket parent directory '{}'", parent.display()))?;
+        // Refuse if group/world-writable or not owned by us.
+        let meta = std::fs::metadata(parent)
+            .with_context(|| format!("stat parent directory '{}'", parent.display()))?;
+        let mode = meta.permissions().mode();
+        // Check the write bits specifically (0o022 = group-write, 0o002 =
+        // world-write).  Read/execute for group/world is acceptable (e.g.
+        // /tmp with 0o1777 has the sticky bit but is world-writable — we
+        // still reject that; the daemon should use a private subdir).
+        if mode & 0o022 != 0 {
+            anyhow::bail!(
+                "socket parent directory '{}' has permissions {:#o}; \
+                 group/world-writable directories are not allowed",
+                parent.display(),
+                mode & 0o777,
+            );
+        }
+        let uid = unsafe { libc::geteuid() };
+        if meta.uid() != uid {
+            anyhow::bail!(
+                "socket parent directory '{}' is owned by uid {} but we are {}",
+                parent.display(),
+                meta.uid(),
+                uid,
+            );
+        }
+    }
+
+    // Use umask to ensure the socket is created 0o600 even before the
+    // explicit set_permissions call.  At this point no concurrent
+    // file-creating tasks are running — the engine and sensor sources open
+    // sockets and serial ports, not files.  Umask is process-wide, so the
+    // narrow window is safe.  The post-bind set_permissions is kept as
+    // belt-and-braces.
+    let listener = bind_socket(socket_path)?;
+
+    // Explicit 0o600 after bind (belt-and-braces — umask already narrowed).
+    finish_socket_setup(listener, socket_path, |path, permissions| {
+        std::fs::set_permissions(path, permissions)
+    })
 }
 
 #[derive(Clone)]
@@ -142,23 +222,29 @@ impl Drop for ConsentGateLease {
 
 /// Spawn the IPC server on a background task.
 ///
-/// Binds `socket_path` with `0o600` permissions (umask-guarded to avoid a
-/// race between `bind` and `set_permissions`), and accepts connections in a
-/// loop until `cancel` is triggered.  Each connection is handled by a spawned
-/// per-connection task.
+/// On Unix, binds `socket_path` with `0o600` permissions (umask-guarded to
+/// avoid a race between `bind` and `set_permissions`).  If the socket file
+/// already exists, attempts to connect to it first — if the connection
+/// succeeds the old daemon is alive and we error out; if it fails (dead
+/// daemon) we unlink and bind fresh.
 ///
-/// If the socket file already exists, attempts to connect to it first — if
-/// the connection succeeds the old daemon is alive and we error out; if it
-/// fails (dead daemon) we unlink and bind fresh.
+/// On Windows, `socket_path` carries the named-pipe name
+/// (`\\.\pipe\dormant-<user>`).  The first pipe instance is created with
+/// `first_pipe_instance(true)`; if another daemon already holds it, creation
+/// fails with `ERROR_ACCESS_DENIED` and we error out — the named-pipe analogue
+/// of the Unix connect-test guard.
+///
+/// Either way, connections are accepted in a loop until `cancel` is triggered,
+/// and each connection is handled by a spawned per-connection task.
 ///
 /// `doctor_service` is intercepted by the connection handler for
 /// [`IpcRequest::Doctor`] (a non-engine path — see the module docstring).
 ///
 /// # Errors
 ///
-/// - Bind failure (address in use by a live daemon, permission denied, …).
-/// - Permission set failure.
-/// - Parent directory is group/world-writable or not owned by us.
+/// - Bind/create failure (address in use by a live daemon, permission denied, …).
+/// - Unix only: permission set failure, or a parent directory that is
+///   group/world-writable or not owned by us.
 #[allow(
     clippy::too_many_arguments,
     reason = "IPC server dependencies are explicit at the daemon lifecycle boundary; grouping them into a context type would obscure ownership and is not worth the indirection for this single-call surface."
@@ -174,102 +260,134 @@ pub fn spawn(
     selected_displays: SelectedDisplays,
     compositor_output: CompositorOutputResolver,
 ) -> Result<JoinHandle<()>> {
-    // Stale-socket recovery: connect-test before bind so we never silently
-    // replace a live daemon's socket.
-    if socket_path.exists() {
-        match std::os::unix::net::UnixStream::connect(socket_path) {
-            Ok(_) => {
-                anyhow::bail!(
-                    "socket '{}' is already in use by a running daemon",
-                    socket_path.display()
-                );
-            }
-            Err(_) => {
-                let _ = std::fs::remove_file(socket_path);
-            }
-        }
-    }
-
-    // Ensure parent directory exists with 0o700 permissions.
-    if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create socket parent directory '{}'", parent.display()))?;
-        // Refuse if group/world-writable or not owned by us.
-        let meta = std::fs::metadata(parent)
-            .with_context(|| format!("stat parent directory '{}'", parent.display()))?;
-        let mode = meta.permissions().mode();
-        // Check the write bits specifically (0o022 = group-write, 0o002 =
-        // world-write).  Read/execute for group/world is acceptable (e.g.
-        // /tmp with 0o1777 has the sticky bit but is world-writable — we
-        // still reject that; the daemon should use a private subdir).
-        if mode & 0o022 != 0 {
-            anyhow::bail!(
-                "socket parent directory '{}' has permissions {:#o}; \
-                 group/world-writable directories are not allowed",
-                parent.display(),
-                mode & 0o777,
-            );
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let uid = unsafe { libc::geteuid() };
-            if meta.uid() != uid {
-                anyhow::bail!(
-                    "socket parent directory '{}' is owned by uid {} but we are {}",
-                    parent.display(),
-                    meta.uid(),
-                    uid,
-                );
-            }
-        }
-    }
-
-    // Use umask to ensure the socket is created 0o600 even before the
-    // explicit set_permissions call.  At this point no concurrent
-    // file-creating tasks are running — the engine and sensor sources open
-    // sockets and serial ports, not files.  Umask is process-wide, so the
-    // narrow window is safe.  The post-bind set_permissions is kept as
-    // belt-and-braces.
-    let listener = bind_socket(socket_path)?;
-
-    // Explicit 0o600 after bind (belt-and-braces — umask already narrowed).
-    let listener = finish_socket_setup(listener, socket_path, |path, permissions| {
-        std::fs::set_permissions(path, permissions)
-    })?;
-
-    tracing::info!(event = "ipc_listening", socket = %socket_path.display());
-
-    let socket_owned = socket_path.to_path_buf();
     let wear_sampling = WearSamplingControls {
         sampler_registry,
         selected_displays,
         compositor_output,
         consent_gate: ConsentGate::default(),
     };
-    let handle = tokio::spawn(async move {
-        run(
-            listener,
+
+    #[cfg(unix)]
+    {
+        let listener = bind_unix_listener(socket_path)?;
+        tracing::info!(event = "ipc_listening", socket = %socket_path.display());
+        let socket_owned = socket_path.to_path_buf();
+        Ok(tokio::spawn(async move {
+            run_unix(
+                listener,
+                ctl_tx,
+                reload_requester,
+                doctor_service,
+                direct_switch,
+                cancel,
+                &socket_owned,
+                wear_sampling,
+            )
+            .await;
+        }))
+    }
+
+    #[cfg(windows)]
+    {
+        let pipe_name = socket_path.as_os_str().to_os_string();
+        let first = create_first_pipe_instance(&pipe_name)?;
+        tracing::info!(event = "ipc_listening", pipe = %pipe_name.to_string_lossy());
+        Ok(tokio::spawn(async move {
+            run_pipe(
+                first,
+                pipe_name,
+                ctl_tx,
+                reload_requester,
+                doctor_service,
+                direct_switch,
+                cancel,
+                wear_sampling,
+            )
+            .await;
+        }))
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (
+            socket_path,
             ctl_tx,
             reload_requester,
             doctor_service,
             direct_switch,
             cancel,
-            &socket_owned,
             wear_sampling,
-        )
-        .await;
-    });
-
-    Ok(handle)
+        );
+        anyhow::bail!("IPC server is unsupported on this platform");
+    }
 }
 
-/// The accept loop — runs until cancelled.
+/// Create the first named-pipe instance, mapping the "another daemon already
+/// owns the first instance" failure to the same error shape the Unix path
+/// produces for a live daemon.
+#[cfg(windows)]
+fn create_first_pipe_instance(pipe_name: &std::ffi::OsStr) -> Result<NamedPipeServer> {
+    // ERROR_ACCESS_DENIED (Win32 error 5) is what `CreateNamedPipe` returns
+    // when `first_pipe_instance(true)` is requested but another process already
+    // holds the first instance — the named-pipe analogue of a live daemon's
+    // socket.
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    ServerOptions::new()
+        .first_pipe_instance(true)
+        // SECURITY: the default named-pipe DACL is NOT equivalent to the Unix
+        // socket's 0600 mode — it grants access to the local Users group, not
+        // just the owning user.  A per-user security descriptor is NOT yet
+        // applied; tightening the pipe ACL is tracked as follow-up work.
+        // `reject_remote_clients(true)` is tokio's default, but it is set
+        // explicitly here so a future edit cannot silently drop it.
+        .reject_remote_clients(true)
+        .create(pipe_name)
+        .map_err(|e| {
+            if e.raw_os_error() == Some(ERROR_ACCESS_DENIED) {
+                anyhow::anyhow!(
+                    "pipe '{}' is already in use by a running daemon",
+                    pipe_name.to_string_lossy()
+                )
+            } else {
+                anyhow::Error::new(e).context(format!(
+                    "create named pipe '{}'",
+                    pipe_name.to_string_lossy()
+                ))
+            }
+        })
+}
+
+/// Spawn a per-connection handler task, cloning the shared dependencies.
+///
+/// Shared by the Unix and Windows accept loops so the connection path is
+/// identical across transports.
+fn spawn_connection<S>(
+    stream: S,
+    ctl_tx: &mpsc::Sender<ControlMsg>,
+    reload_requester: &ReloadRequester,
+    doctor_service: &DoctorService,
+    direct_switch: &Arc<DirectSwitchHandle>,
+    wear_sampling: &WearSamplingControls,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(handle_connection(
+        stream,
+        ctl_tx.clone(),
+        reload_requester.clone(),
+        doctor_service.clone(),
+        direct_switch.clone(),
+        wear_sampling.clone(),
+    ));
+}
+
+/// The Unix accept loop — runs until cancelled.
+#[cfg(unix)]
 #[allow(
     clippy::too_many_arguments,
     reason = "IPC dependencies remain explicit at the daemon lifecycle boundary."
 )]
-async fn run(
+async fn run_unix(
     listener: UnixListener,
     ctl_tx: mpsc::Sender<ControlMsg>,
     reload_requester: ReloadRequester,
@@ -290,18 +408,74 @@ async fn run(
             accept = listener.accept() => {
                 match accept {
                     Ok((stream, addr)) => {
-                        let ctl = ctl_tx.clone();
-                        let reload = reload_requester.clone();
-                        let doctor = doctor_service.clone();
-                        let ds = direct_switch.clone();
-                        let wear_sampling = wear_sampling.clone();
-                        tokio::spawn(handle_connection(stream, ctl, reload, doctor, ds, wear_sampling));
+                        spawn_connection(stream, &ctl_tx, &reload_requester, &doctor_service, &direct_switch, &wear_sampling);
                         let _ = addr; // Unix socket peer address (debug).
                     }
                     Err(e) => {
                         tracing::error!(event = "ipc_accept_error", error = %e);
                     }
                 }
+            }
+        }
+    }
+}
+
+/// The Windows named-pipe accept loop — runs until cancelled.
+///
+/// Named pipes have no listener object: each instance is created, then waited
+/// on for a client.  After a client connects, the connected instance is handed
+/// to a per-connection task and the NEXT instance is created immediately, so a
+/// client arriving while the previous connection is still being served is not
+/// refused with `ERROR_PIPE_BUSY`.
+#[cfg(windows)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "IPC dependencies remain explicit at the daemon lifecycle boundary."
+)]
+async fn run_pipe(
+    mut server: NamedPipeServer,
+    pipe_name: std::ffi::OsString,
+    ctl_tx: mpsc::Sender<ControlMsg>,
+    reload_requester: ReloadRequester,
+    doctor_service: DoctorService,
+    direct_switch: Arc<DirectSwitchHandle>,
+    cancel: CancellationToken,
+    wear_sampling: WearSamplingControls,
+) {
+    loop {
+        let connected = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                tracing::info!(event = "ipc_shutdown", pipe = %pipe_name.to_string_lossy());
+                // Unlike the Unix socket, there is no filesystem entry to
+                // unlink on shutdown: a named pipe vanishes once its last
+                // handle closes, so dropping `server` is the whole cleanup.
+                break;
+            }
+            result = server.connect() => result,
+        };
+
+        match connected {
+            Ok(()) => {
+                let connected_server = server;
+                spawn_connection(
+                    connected_server,
+                    &ctl_tx,
+                    &reload_requester,
+                    &doctor_service,
+                    &direct_switch,
+                    &wear_sampling,
+                );
+                server = match ServerOptions::new().create(&pipe_name) {
+                    Ok(next) => next,
+                    Err(e) => {
+                        tracing::error!(event = "ipc_pipe_create_error", error = %e);
+                        break;
+                    }
+                };
+            }
+            Err(e) => {
+                tracing::error!(event = "ipc_accept_error", error = %e);
             }
         }
     }
@@ -1102,6 +1276,7 @@ where
 #[cfg(test)]
 mod tests {
     use indexmap::IndexMap;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1536,6 +1711,7 @@ mod tests {
         assert!(!p.as_os_str().is_empty());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn parent_dir_group_writable_rejected() {
         let dir = tempfile::tempdir().unwrap();
@@ -1570,6 +1746,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn parent_dir_plain_tempdir_ok() {
         let dir = tempfile::tempdir().unwrap();
@@ -1598,6 +1775,7 @@ mod tests {
         cancel.cancel();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn socket_is_unlinked_when_permission_setup_fails_after_bind() {
         use std::os::unix::fs::FileTypeExt as _;
@@ -1945,5 +2123,114 @@ mod tests {
             let handler = tokio::spawn(async move { handle_exercise(&ctl_tx, "missing").await });
             assert_missing_snapshot_rejects(ctl_rx, handler).await;
         }
+    }
+
+    // ── Windows named-pipe transport ─────────────────────────────────────
+
+    /// Unique pipe name per test so parallel runs cannot collide.
+    #[cfg(windows)]
+    fn unique_pipe_name(tag: &str) -> String {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        format!(r"\\.\pipe\dormant-test-{tag}-{}-{n}", std::process::id())
+    }
+
+    /// Round-trip over a real Windows named pipe: create a server instance,
+    /// connect a client, send a request, and read the response.  The handler
+    /// is the same generic `handle_connection` the Unix path uses.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_named_pipe_round_trip() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+
+        let pipe_name = unique_pipe_name("round-trip");
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe_name)
+            .expect("create first pipe instance");
+
+        let (ctl_tx, _cancel) = fake_engine();
+        let (reload_tx, _reload_rx) = mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
+        let doctor = fake_doctor(ctl_tx.clone());
+        let ds = fake_direct_switch(ctl_tx.clone());
+        let wear_sampling = super::WearSamplingControls {
+            sampler_registry: Arc::new(std::sync::RwLock::new(
+                std::collections::BTreeMap::default(),
+            )),
+            selected_displays: std::sync::Arc::new(Vec::new),
+            compositor_output: std::sync::Arc::new(|_| None),
+            consent_gate: ConsentGate::default(),
+        };
+
+        let server_task = tokio::spawn(async move {
+            server.connect().await.expect("client connects to the pipe");
+            super::handle_connection(
+                server,
+                ctl_tx,
+                dormant_core::reload::ReloadRequester::new(reload_tx),
+                doctor,
+                ds,
+                wear_sampling,
+            )
+            .await;
+        });
+
+        let mut client = ClientOptions::new()
+            .open(&pipe_name)
+            .expect("open named-pipe client");
+        client
+            .write_all(b"{\"req\":\"status\"}\n")
+            .await
+            .expect("write request over the pipe");
+        let response: dormant_core::ipc_proto::IpcResponse = {
+            let mut reader = BufReader::new(&mut client);
+            let mut line = String::new();
+            // Hang detector, not a latency budget: without the bound a handler
+            // that stops responding parks this test until the harness timeout.
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                reader.read_line(&mut line),
+            )
+            .await
+            .expect("handler must answer over the named pipe within 10s")
+            .expect("read response over the pipe");
+            serde_json::from_str(line.trim()).expect("response is valid JSON")
+        };
+        assert!(
+            !response.ok,
+            "a dropped engine must yield an error response over the named pipe"
+        );
+
+        drop(client);
+        server_task
+            .await
+            .expect("server task completes on disconnect");
+    }
+
+    /// The single-instance guarantee: a second `first_pipe_instance(true)`
+    /// create on the same name must fail with `ERROR_ACCESS_DENIED` while the
+    /// first instance is held.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_second_first_pipe_instance_is_refused() {
+        use tokio::net::windows::named_pipe::ServerOptions;
+
+        let pipe_name = unique_pipe_name("single-instance");
+        let _first = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe_name)
+            .expect("first pipe instance is created");
+
+        let second = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe_name);
+        let error = second.expect_err("a second first-instance create must be refused");
+        assert_eq!(
+            error.raw_os_error(),
+            Some(5),
+            "the refusal must be ERROR_ACCESS_DENIED (5): {error}"
+        );
     }
 }

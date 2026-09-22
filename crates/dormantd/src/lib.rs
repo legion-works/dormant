@@ -24,7 +24,6 @@ pub mod idle_observation;
 pub mod idle_source;
 pub mod inhibit_activity;
 pub mod inhibit_audio;
-#[cfg(unix)]
 pub mod ipc;
 pub mod logging;
 #[cfg(target_os = "macos")]

@@ -43,7 +43,7 @@
 // Widest consumer is the `#[cfg(unix)]` sampler-registry construction in
 // `start` (project rule #2584: an import must be equal-or-wider than every
 // consumer). Linux-only would compile here and break the macOS build.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::collections::BTreeMap;
 #[cfg(target_os = "linux")]
 use std::collections::BTreeSet;
@@ -3014,7 +3014,7 @@ impl App {
 
         let latest_grids = crate::active_sampler::new_latest_grids();
         let sampler_statuses = crate::active_sampler::new_sampler_statuses();
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let sampler_registry: crate::active_sampler::SharedSamplerRegistry =
             Arc::new(std::sync::RwLock::new(BTreeMap::new()));
         #[cfg(target_os = "linux")]
@@ -3138,7 +3138,7 @@ impl App {
             None,
         );
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let ipc_handle = if self.disable_ipc {
             None
         } else {
@@ -3183,7 +3183,7 @@ impl App {
                 .context("spawn IPC server")?,
             )
         };
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         let ipc_handle: Option<tokio::task::JoinHandle<()>> = None;
 
         // ── Web UI spawn (non-critical — bind failure logs and continues) ──

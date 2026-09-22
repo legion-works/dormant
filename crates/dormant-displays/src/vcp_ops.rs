@@ -115,19 +115,19 @@
 //! by [`crate::ddcci::DdcciController`]'s
 //! [`read_state`](dormant_core::traits::DisplayController::read_state)).
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::sync::PoisonError;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use ddc_hi::Ddc;
 
 use crate::ddc_lock::PanelLock;
@@ -314,7 +314,7 @@ fn acquire(lock: &PanelLock, prio: VcpPriority) -> Result<crate::ddc_lock::Panel
 /// A panel swapped on the same connector could be driven under the old ident;
 /// 5 min bounds the stale-identity window. Mid-window swaps are caught by
 /// error-invalidation when a 2 s poll lands during the physical swap gap.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 const CACHE_REVALIDATE_AFTER: Duration = Duration::from_secs(300);
 
 /// Process-wide gate serializing ALL physical DDC/CI traffic — every VCP
@@ -333,14 +333,14 @@ const CACHE_REVALIDATE_AFTER: Duration = Duration::from_secs(300);
 /// panicked transaction leaves nothing to distrust — acquisitions recover
 /// unconditionally rather than wedging all DDC access for the life of the
 /// process.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 static DDC_PHYSICAL_GATE: std::sync::OnceLock<StdMutex<()>> = std::sync::OnceLock::new();
 
 /// Acquire the process-wide physical-DDC gate. The returned guard is held
 /// until the caller drops it — the entire transaction (checkout →
 /// resolve-if-miss → op → reinsert → drops) runs inside. Called only inside
 /// `spawn_blocking` (blocking context).
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn ddc_gate() -> std::sync::MutexGuard<'static, ()> {
     DDC_PHYSICAL_GATE
         .get_or_init(|| StdMutex::new(()))
@@ -357,7 +357,7 @@ fn ddc_gate() -> std::sync::MutexGuard<'static, ()> {
 /// ddc-macos error strings: `"MacOS kernel I/O error:"`, `"Core Graphics
 /// error:"`, `"Service not found"`, `"Display location not found"` are
 /// transport; `"DDC/CI error:"` is protocol.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub(crate) fn is_transport_error(err_msg: &str) -> bool {
     // If it's specifically a DDC/CI protocol error (not I2C), the handle is
     // healthy — only the feature is absent.
@@ -371,7 +371,7 @@ pub(crate) fn is_transport_error(err_msg: &str) -> bool {
 
 /// Generic cache of resolved handles, parameterized over the handle type for
 /// unit-testability. Production use is `HandleCache<ddc_hi::Display>`.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 struct HandleCache<H> {
     /// Map from ident string to `(handle, resolved_at)`. `resolved_at` is the
     /// **absolute** instant the handle was freshly enumerated — stamped once
@@ -392,7 +392,7 @@ struct HandleCache<H> {
     now_fn: fn() -> Instant,
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 impl<H> HandleCache<H> {
     fn new(
         resolve_fn: fn(ident: &str) -> Result<(String, H), String>,
@@ -503,23 +503,43 @@ impl<H> HandleCache<H> {
 /// enumeration. Samplers that lose the panel-lock race skip BEFORE any
 /// hardware touch.
 ///
-/// Available on Linux (I²C-dev) and macOS (the vendored, path-patched
-/// `ddc-macos` fork — see `vendor/ddc-macos/README.dormant.md`). On both
-/// platforms `ddc_hi::Display` hides the backend behind one enum `Handle`,
-/// so every method below is identical code for both — there is no
-/// macOS-specific branch here.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+/// Available on Linux (I²C-dev), macOS (the vendored, path-patched
+/// `ddc-macos` fork — see `vendor/ddc-macos/README.dormant.md`), and Windows
+/// (`ddc-winapi`'s Monitor Configuration API). On every platform
+/// `ddc_hi::Display` hides the backend behind one enum `Handle`, so every
+/// method below is identical code for all three — there is no
+/// platform-specific branch here.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub struct RealVcp {
     state: Arc<RealVcpState>,
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+/// Cached ddc-hi handle, asserting `Send`.
+///
+/// `ddc_hi::Display` is `!Send` on Windows: its `Handle::WinApi` variant
+/// holds a `PHYSICAL_MONITOR` (a raw `*mut c_void`) and its `Handle::Nvapi`
+/// variant an `Rc<PhysicalGpu>`. Both are process-wide OS resources with no
+/// thread affinity, and every access to a cached handle is serialized by
+/// `DDC_PHYSICAL_GATE` — the handle is removed from the cache, used, and
+/// returned/dropped all while the gate is held — so the sole owner is never
+/// observed on two threads at once and moving it between `spawn_blocking`
+/// threads is sound. On Linux/macOS the inner type is already `Send`, so
+/// this wrapper is a no-op there.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+struct SendDisplay(ddc_hi::Display);
+
+// SAFETY: see `SendDisplay` docs — access is gate-serialized and the handle
+// has no thread affinity.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+unsafe impl Send for SendDisplay {}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 struct RealVcpState {
-    cache: HandleCache<ddc_hi::Display>,
+    cache: HandleCache<SendDisplay>,
 }
 
 // Clone is cheap — only the Arc reference count is bumped.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 impl Clone for RealVcp {
     fn clone(&self) -> Self {
         Self {
@@ -535,7 +555,7 @@ impl Clone for RealVcp {
 /// tolerated (rare, ms-scale, and the old generation is already retired from
 /// service). Lock order matches `vcp_transaction`: gate (outer) → cache
 /// mutex (innermost).
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 impl Drop for RealVcpState {
     fn drop(&mut self) {
         let _gate = ddc_gate();
@@ -545,7 +565,7 @@ impl Drop for RealVcpState {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 impl RealVcp {
     /// Create a new `RealVcp` with an empty cache.
     #[must_use]
@@ -564,11 +584,11 @@ impl RealVcp {
     /// non-target `Display` handles drop at the end of this fn, still inside
     /// the gate, so the `/dev/i2c-*` closes (NVIDIA RM teardown) are
     /// serialized too.
-    fn resolve_display(ident: &str) -> Result<(String, ddc_hi::Display), String> {
+    fn resolve_display(ident: &str) -> Result<(String, SendDisplay), String> {
         let displays: Vec<ddc_hi::Display> = ddc_hi::Display::enumerate();
-        let mapped: Vec<(String, ddc_hi::Display)> = displays
+        let mapped: Vec<(String, SendDisplay)> = displays
             .into_iter()
-            .map(|d| (d.info.to_string(), d))
+            .map(|d| (d.info.to_string(), SendDisplay(d)))
             .collect();
         mapped
             .into_iter()
@@ -583,7 +603,7 @@ impl RealVcp {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 impl Default for RealVcp {
     fn default() -> Self {
         Self::new()
@@ -609,7 +629,7 @@ impl Default for RealVcp {
 /// with a fake handle and a fake `resolve_fn` — no DDC hardware required
 /// (see the `cache_*` tests below). Production calls it with
 /// `H = ddc_hi::Display`.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn vcp_transaction<H, T>(
     cache: &HandleCache<H>,
     ident: &str,
@@ -647,7 +667,7 @@ fn vcp_transaction<H, T>(
 /// pure, no I/O, so the EDID → claim-identity path is testable with a fixture
 /// `DisplayInfo` instead of real hardware. The `ident_string` stays ddc-hi's
 /// `Display::info` `to_string()` (the bus-prefixed panel-lock key, unchanged).
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn vcp_display_info_from_ddc_info(info: &ddc_hi::DisplayInfo) -> VcpDisplayInfo {
     VcpDisplayInfo {
         ident_string: info.to_string(),
@@ -769,7 +789,7 @@ fn descriptor_string(data: &[u8]) -> Option<String> {
 /// ddc-hi's `from_edid` left it empty (the F5 gap: `claim_identity` derived
 /// `None` on macOS). The `ident_string` is always ddc-hi's `Display::info`
 /// `to_string()`, so the panel-lock key and cache resolution are unchanged.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn vcp_display_info_from_display(d: &ddc_hi::Display) -> VcpDisplayInfo {
     // `mut` only for the macOS backfill below; on Linux the backfill is
     // cfg'd out, so suppress the otherwise-unused `mut` there.
@@ -804,7 +824,7 @@ fn backfill_edid_identity_from_macos(vcp: &mut VcpDisplayInfo, handle: &ddc_hi::
     vcp.serial = id.serial;
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 #[async_trait]
 impl VcpOps for RealVcp {
     async fn list_displays(&self) -> Vec<VcpDisplayInfo> {
@@ -840,6 +860,7 @@ impl VcpOps for RealVcp {
             let _guard = acquire(&lock, prio)?;
             vcp_transaction(&me.state.cache, &ident, |display| {
                 let vcp = display
+                    .0
                     .handle
                     .get_vcp_feature(code)
                     .map_err(|e| format!("get_vcp(0x{code:02X}) failed: {e}"))?;
@@ -865,6 +886,7 @@ impl VcpOps for RealVcp {
             let _guard = acquire(&lock, prio)?;
             vcp_transaction(&me.state.cache, &ident, |display| {
                 display
+                    .0
                     .handle
                     .set_vcp_feature(code, value)
                     .map_err(|e| format!("set_vcp(0x{code:02X}, {value}) failed: {e}"))
@@ -888,6 +910,7 @@ impl VcpOps for RealVcp {
             let _guard = acquire(&lock, prio)?;
             vcp_transaction(&me.state.cache, &ident, |display| {
                 let vcp = display
+                    .0
                     .handle
                     .get_vcp_feature(code)
                     .map_err(|e| format!("get_vcp_raw(0x{code:02X}) failed: {e}"))?;
@@ -1346,7 +1369,7 @@ mod tests {
     /// `vcp_display_info_from_ddc_info` maps the EDID text fields a Linux
     /// i2c-dev backend exposes onto [`VcpDisplayInfo`], so `claim_identity`
     /// is derivable from a real enumeration without parsing `ident_string`.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn vcp_display_info_from_ddc_info_maps_edid_fields_i2c() {
         let mut info = ddc_hi::DisplayInfo::new(ddc_hi::Backend::I2cDevice, "7".into());
@@ -1363,7 +1386,7 @@ mod tests {
     /// macOS `IOKit` backend: the same EDID fields produce the SAME
     /// `claim_identity` as the Linux i2c-dev case — the bus-independence
     /// property at the mapper level (F5 pre-implementation gate, unit form).
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn vcp_display_info_from_ddc_info_maps_edid_fields_macos() {
         let mut info = ddc_hi::DisplayInfo::new(ddc_hi::Backend::MacOS, "4".into());
@@ -1382,7 +1405,7 @@ mod tests {
 
     /// Recompute the EDID base-block checksum (byte 127) so a mutated fixture
     /// stays descriptor-correct.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn recompute_checksum(e: &mut [u8]) {
         let sum: u32 = e[..127].iter().copied().map(u32::from).sum();
         e[127] = u8::try_from((256 - (sum % 256)) % 256).expect("checksum is 0..=255");
@@ -1391,7 +1414,7 @@ mod tests {
     /// Build a 128-byte base EDID block for the AOC AG326UZD (serial
     /// XK2R9JA000013) with a valid checksum — a descriptor-correct fixture for
     /// `parse_edid_identity` (T1 fix, Leg 2).
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn ag326uzd_edid() -> Vec<u8> {
         let mut e = vec![0u8; 128];
         e[0..8].copy_from_slice(&[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
@@ -1425,7 +1448,7 @@ mod tests {
         e
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn parse_edid_identity_extracts_aoc_ag326uzd_serial() {
         let id = parse_edid_identity(&ag326uzd_edid()).expect("128-byte EDID parses");
@@ -1437,7 +1460,7 @@ mod tests {
     /// The whole point of F5: the macOS EDID-derived identity must be
     /// byte-identical to the Linux i²c path's, so the claim broadcast matches
     /// the same physical panel across machines.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn parse_edid_identity_matches_linux_claim_identity_byte_for_byte() {
         let id = parse_edid_identity(&ag326uzd_edid()).expect("128-byte EDID parses");
@@ -1454,7 +1477,7 @@ mod tests {
         );
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn parse_edid_identity_absent_serial_descriptor_drops_serial() {
         let mut e = ag326uzd_edid();
@@ -1473,7 +1496,7 @@ mod tests {
         assert_eq!(vcp.claim_identity().as_deref(), Some("AOC:AG326UZD"));
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn parse_edid_identity_absent_model_descriptor_yields_none_claim() {
         let mut e = ag326uzd_edid();
@@ -1494,7 +1517,7 @@ mod tests {
         );
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn parse_edid_identity_too_short_returns_none() {
         assert!(parse_edid_identity(&[0u8; 64]).is_none());
@@ -1509,7 +1532,7 @@ mod tests {
     /// surfaced a 128+256-byte EDID where the monitor descriptors put the
     /// tag at byte 3 (EDID 1.4 §3.10.4), not byte 2 as v1's parser
     /// assumed.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn parse_real_mac_arm_edid_byte_identical_to_desktop() {
         let edid = include_bytes!("fixtures/aoc-ag326uzd-mac.edid");
@@ -1530,7 +1553,7 @@ mod tests {
         );
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn decode_pnp_manufacturer_aoc_and_del() {
         assert_eq!(decode_pnp_manufacturer(0x05, 0xE3).as_deref(), Some("AOC"));
@@ -1814,7 +1837,7 @@ mod tests {
     // only transport errors do).
 
     /// Fake resolved handle for the hardware-free cache tests.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[derive(Debug, Clone, PartialEq)]
     struct TestHandle(u32);
 
@@ -1824,7 +1847,7 @@ mod tests {
     /// The `Result` wrapping is required by the `HandleCache::resolve_fn`
     /// signature contract (`fn(&str) -> Result<(String, H), String>`), not by
     /// this helper's logic — it never fails.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[allow(clippy::unnecessary_wraps)]
     fn test_resolve(ident: &str) -> Result<(String, TestHandle), String> {
         Ok((ident.to_string(), TestHandle(0)))
@@ -1832,7 +1855,7 @@ mod tests {
 
     /// Two sequential ops against the same ident cause exactly ONE resolve —
     /// the second op hits the cache.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn cache_sequential_hit_one_resolve_per_two_ops() {
         let cache: HandleCache<TestHandle> = HandleCache::new(test_resolve, CACHE_REVALIDATE_AFTER);
@@ -1852,7 +1875,7 @@ mod tests {
     /// A transport/I2C error invalidates the cache entry — the next op
     /// re-resolves. The error-bearing op itself hits the cache (it does not
     /// re-resolve); invalidation happens after the op, by dropping the handle.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn cache_transport_error_invalidates() {
         let cache: HandleCache<TestHandle> = HandleCache::new(test_resolve, CACHE_REVALIDATE_AFTER);
@@ -1883,7 +1906,7 @@ mod tests {
     /// A protocol error (unsupported VCP code, checksum mismatch) does NOT
     /// invalidate — the handle is healthy, only the feature is absent. The
     /// next op hits the cache.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn cache_protocol_error_does_not_invalidate() {
         let cache: HandleCache<TestHandle> = HandleCache::new(test_resolve, CACHE_REVALIDATE_AFTER);
@@ -1912,7 +1935,7 @@ mod tests {
 
     /// A panic inside the op invalidates the cache entry — the next op
     /// re-resolves.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn cache_panic_invalidates() {
         let cache: HandleCache<TestHandle> = HandleCache::new(test_resolve, CACHE_REVALIDATE_AFTER);
@@ -1943,7 +1966,7 @@ mod tests {
     /// `resolve_count` must stay 1 until total elapsed crosses the absolute
     /// deadline, then go to 2 — never before. This fails against a reinsert
     /// that re-stamps `now()` (the deadline would slide and never fire).
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn cache_max_age_absolute_deadline_survives_steady_polling() {
         // Fake clock: a fixed base (captured once) plus a test-advanced offset.
@@ -2002,7 +2025,7 @@ mod tests {
     /// or cache touch — `enumeration_count` stays zero. Hardware-free: the
     /// skip happens before `resolve_display` is ever called, so no DDC device
     /// is needed.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[tokio::test]
     async fn sampler_skip_before_enumeration() {
         let vcp = RealVcp::new();
@@ -2031,7 +2054,7 @@ mod tests {
     /// closure must return `WouldBlock`. No timing, no threads — if the gate
     /// were NOT acquired, `try_lock` would succeed and the assertion would
     /// fail. Uses the HandleCache/fake-handle seam (no DDC hardware).
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn cached_op_acquires_physical_gate() {
         let cache = HandleCache::<TestHandle>::new(test_resolve, CACHE_REVALIDATE_AFTER);
@@ -2065,7 +2088,7 @@ mod tests {
     // ── RealVcp cache tests (require DDC-capable display) ────────────────────
 
     /// Test seam: read the hardware-enumeration counter inside `RealVcp`.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn real_vcp_enum_count(vcp: &RealVcp) -> usize {
         vcp.enumeration_count()
     }
@@ -2073,7 +2096,7 @@ mod tests {
     /// Enumerate once to discover the ident of the first DDC display.
     /// Returns `None` if no display is available (CI / headless). Runs under
     /// the physical-DDC gate like every other enumerate call site.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn first_display_ident() -> Option<String> {
         let _gate = ddc_gate();
         ddc_hi::Display::enumerate()
@@ -2085,7 +2108,7 @@ mod tests {
     /// exactly ONE hardware enumeration — the second call hits the cache.
     ///
     /// RED baseline (before the cache): 2 enumerations for 2 calls.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[ignore = "superseded by the hardware-free cache_sequential_hit_one_resolve_per_two_ops; run on hardware via --ignored"]
     #[tokio::test]
     async fn cache_hit_avoids_re_enumeration() {
@@ -2135,7 +2158,7 @@ mod tests {
     /// issue a `set_vcp` with a likely-unsupported code (`0xDF`) to trigger
     /// a ddc-hi error.  The error must invalidate the cache, so the
     /// subsequent `get_vcp(0x10)` enumerates fresh.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[ignore = "superseded by the hardware-free cache_transport_error_invalidates / cache_protocol_error_does_not_invalidate; run on hardware via --ignored"]
     #[tokio::test]
     async fn error_invalidates_cache_entry() {
@@ -2198,7 +2221,7 @@ mod tests {
     ///
     /// On hardware where the unsupported-code write succeeds (rare), the
     /// test vacuously passes (nothing to invalidate).
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[ignore = "superseded by the hardware-free cache_panic_invalidates; run on hardware via --ignored"]
     #[tokio::test]
     async fn panic_path_invalidates_cache() {

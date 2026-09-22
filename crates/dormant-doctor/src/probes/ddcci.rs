@@ -26,23 +26,23 @@
 //! command-runner seam and [`format_second_opinion`] for how each outcome
 //! is rendered.
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use std::time::Duration;
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use crate::types::ProbeResult;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use dormant_displays::ddc_lock::PanelLocks;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use dormant_displays::vcp_ops::RealVcp;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use dormant_displays::vcp_ops::{INPUT_SOURCE_SKIPPED, VCP_SKIPPED, VcpOps, VcpPriority};
 
 /// Bounded budget for the advisory `ddcutil detect --brief` second opinion.
 /// `ddcutil` walks I²C buses too, so a hung/rogue bus must never stall the
 /// doctor probe waiting on it — the probe always resolves within this
 /// budget plus the `ddc-hi` reads above it.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 const DDCUTIL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Outcome of one bounded `ddcutil detect --brief` invocation.
@@ -50,9 +50,9 @@ const DDCUTIL_TIMEOUT: Duration = Duration::from_secs(5);
 /// Every variant is advisory input to [`format_second_opinion`]; none of
 /// them ever flip [`probe_ddcci_with`]'s pass/fail verdict, which is decided
 /// from the `ddc-hi` reads alone.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
 enum DdcutilOutcome {
     /// The `ddcutil` executable is not on `PATH` (`io::ErrorKind::NotFound`).
     /// The overwhelmingly common case: `ddcutil` is an optional package most
@@ -76,9 +76,9 @@ enum DdcutilOutcome {
 /// Seam over invoking `ddcutil` as an external process, so tests can script
 /// every branch of the command-runner matrix without a real binary or I²C
 /// bus. [`RealDdcutil`] is the only production implementation.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 #[async_trait::async_trait]
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
 trait DdcutilOps: Send + Sync {
     /// Run `ddcutil detect --brief`, bounded by `timeout`.
     async fn detect_brief(&self, timeout: Duration) -> DdcutilOutcome;
@@ -91,8 +91,8 @@ trait DdcutilOps: Send + Sync {
 /// [`DdcutilOutcome::Completed`], classified as an advisory disagreement by
 /// [`format_second_opinion`]; it is never retried with different arguments
 /// or through a shell.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
 struct RealDdcutil {
     /// Program name/path passed to `Command::new`. Production code always
     /// uses the default `"ddcutil"` (a bare name resolved via `PATH` at
@@ -102,8 +102,8 @@ struct RealDdcutil {
     program: std::path::PathBuf,
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
 impl RealDdcutil {
     /// Production constructor: resolves `ddcutil` via `PATH` at spawn time,
     /// exactly as before this seam existed.
@@ -124,9 +124,9 @@ impl RealDdcutil {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 #[async_trait::async_trait]
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
 impl DdcutilOps for RealDdcutil {
     async fn detect_brief(&self, timeout: Duration) -> DdcutilOutcome {
         let child = tokio::process::Command::new(&self.program)
@@ -153,8 +153,8 @@ impl DdcutilOps for RealDdcutil {
 /// into a hard doctor failure, and never rescues a real `ddc-hi` failure
 /// either; it only gives the operator a second view of the bus so a
 /// phantom display (one tool sees it, the other doesn't) is easy to spot.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
 fn format_second_opinion(outcome: &DdcutilOutcome) -> String {
     match outcome {
         DdcutilOutcome::NotInstalled => "ddcutil: not installed".to_string(),
@@ -186,7 +186,7 @@ fn format_second_opinion(outcome: &DdcutilOutcome) -> String {
 ///
 /// Delegates to `probe_ddcci_with` with the real `ddc-hi`- and
 /// `ddcutil`-backed implementations; tests inject fakes for both instead.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub async fn probe_ddcci() -> ProbeResult {
     let vcp = RealVcp::new();
     probe_ddcci_with(&vcp, &RealDdcutil::new(), DDCUTIL_TIMEOUT).await
@@ -198,7 +198,7 @@ pub async fn probe_ddcci() -> ProbeResult {
 /// The pass/fail verdict is decided from `ops` (`ddc-hi`) alone, exactly as
 /// before #35; `ddcutil`'s outcome is only ever appended to the detail
 /// string, never consulted for the verdict.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 async fn probe_ddcci_with(
     ops: &impl VcpOps,
     ddcutil: &impl DdcutilOps,
@@ -208,8 +208,11 @@ async fn probe_ddcci_with(
     probe_ddcci_with_locks(ops, ddcutil, ddcutil_timeout, &panel_locks).await
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[cfg_attr(target_os = "macos", allow(unused_variables))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[cfg_attr(
+    any(target_os = "macos", target_os = "windows"),
+    allow(unused_variables)
+)]
 async fn probe_ddcci_with_locks(
     ops: &impl VcpOps,
     ddcutil: &impl DdcutilOps,
@@ -218,7 +221,7 @@ async fn probe_ddcci_with_locks(
 ) -> ProbeResult {
     let displays = ops.list_displays().await;
 
-    #[cfg_attr(target_os = "macos", allow(unused_mut))]
+    #[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(unused_mut))]
     let (all_ok, mut detail) = if displays.is_empty() {
         (false, "no DDC/CI displays detected".to_string())
     } else {
@@ -318,7 +321,10 @@ async fn probe_ddcci_with_locks(
 // `cargo test` run fails to compile, then production code is added to make
 // it pass.
 
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    test,
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 mod tests {
     use super::*;
     use crate::types::ProbeStatus;

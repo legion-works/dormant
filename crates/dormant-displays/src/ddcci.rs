@@ -1,12 +1,13 @@
 //! `ddcci` display controller — blanks monitors via DDC/CI VCP commands.
 //!
 //! Platform-neutral by design (Task 6): this is the ONE `ddcci` controller,
-//! not a parallel Linux/macOS pair. It talks to displays exclusively
+//! not a parallel per-OS family. It talks to displays exclusively
 //! through [`crate::vcp_ops::VcpOps`]; only that trait's `RealVcp`
-//! implementation is platform-gated (Linux I²C-dev vs. macOS's vendored
-//! `ddc-macos` fork — see `vendor/ddc-macos/README.dormant.md`). Every
-//! byte this module sends or interprets (VCP 0x10, 0xD6, 0xC0, the
-//! saved-brightness/rollback state machine below) is identical on both.
+//! implementation is platform-gated (Linux I²C-dev, macOS's vendored
+//! `ddc-macos` fork — see `vendor/ddc-macos/README.dormant.md` — and
+//! Windows's `ddc-winapi` Monitor Configuration API). Every byte this
+//! module sends or interprets (VCP 0x10, 0xD6, 0xC0, the
+//! saved-brightness/rollback state machine below) is identical on all three.
 //!
 //! The controller exposes two blank modes:
 //!
@@ -35,7 +36,7 @@ use dormant_core::traits::{DisplayController, InputSourceReadback, InputSourceTa
 use dormant_core::types::{BlankMode, CmdFailure};
 
 use crate::ddc_lock::{PanelLock, PanelLocks};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use crate::vcp_ops::RealVcp;
 use crate::vcp_ops::{INPUT_SOURCE_SKIPPED, VCP_SKIPPED, VcpOps, VcpPriority};
 
@@ -147,9 +148,10 @@ impl DdcciController {
     /// generation so the same physical panel always resolves to the same
     /// `Arc<PanelLock>`.
     ///
-    /// Available on Linux (I²C-dev) and macOS (the vendored `ddc-macos`
-    /// fork backing `RealVcp` — see `vendor/ddc-macos/README.dormant.md`).
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    /// Available on Linux (I²C-dev), macOS (the vendored `ddc-macos` fork
+    /// backing `RealVcp` — see `vendor/ddc-macos/README.dormant.md`), and
+    /// Windows (`ddc-winapi`).
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[must_use]
     pub fn new(
         matcher: Option<String>,

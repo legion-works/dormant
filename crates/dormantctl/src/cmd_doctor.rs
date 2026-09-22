@@ -213,13 +213,13 @@ async fn run_async(args: &DoctorArgs) -> Result<DoctorOutcome> {
 
     match &args.subcommand {
         Some(DoctorSubcommand::Ddcci) => {
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             {
                 let results = vec![dormant_doctor::probe_ddcci().await];
                 print_table(&results);
                 Ok(outcome(&results))
             }
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
             {
                 Ok(DoctorOutcome::NotSupported("ddcci".into()))
             }

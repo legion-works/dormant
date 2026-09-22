@@ -710,6 +710,7 @@ mod tests {
 
     /// Router-level: `POST /api/switch` with `{"display":"shared"}`
     /// sends `SwitchToLocal` and returns `{"status":"ok"}` on success.
+    #[cfg(unix)]
     #[tokio::test]
     async fn switch_sends_switch_to_local_and_returns_ok() {
         let snap = snapshot_with_displays(&["shared"]);
@@ -753,6 +754,7 @@ mod tests {
     }
 
     /// Router-level: `POST /api/switch` surfaces a daemon error as HTTP 400.
+    #[cfg(unix)]
     #[tokio::test]
     async fn switch_surfaces_failed_write() {
         let snap = snapshot_with_displays(&["shared"]);
@@ -817,6 +819,7 @@ mod tests {
 
     /// Router-level: `POST /api/push` with `{"display":"shared"}`
     /// sends `SwitchToPeer` (NOT `SwitchToLocal`) and returns `{"status":"ok"}` on success.
+    #[cfg(unix)]
     #[tokio::test]
     async fn push_sends_switch_to_peer_and_returns_ok() {
         let snap = snapshot_with_displays(&["shared"]);
@@ -864,6 +867,7 @@ mod tests {
     }
 
     /// Router-level: `POST /api/push` surfaces a daemon error as HTTP 400.
+    #[cfg(unix)]
     #[tokio::test]
     async fn push_surfaces_failed_write() {
         let snap = snapshot_with_displays(&["shared"]);

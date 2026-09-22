@@ -72,12 +72,23 @@ impl CommandController {
         }
     }
 
-    /// Run `command` via `sh -c`, honoring `timeout` and draining stderr
-    /// concurrently so a verbose failure doesn't deadlock on the OS pipe
-    /// buffer.
+    /// Run `command` through the platform shell, honoring `timeout` and
+    /// draining stderr concurrently so a verbose failure doesn't deadlock on
+    /// the OS pipe buffer.
+    ///
+    /// `sh -c` on Unix, `cmd /C` on Windows. The shell is chosen per platform
+    /// rather than hard-coded: `sh` does not exist on a stock Windows install,
+    /// so a `command` controller there previously validated fine and then
+    /// failed every blank and wake with a spawn error. Operators write commands
+    /// in their own platform's shell syntax either way.
     async fn run_shell(&self, command: &str) -> Result<(), CmdFailure> {
-        let mut child = tokio::process::Command::new("sh")
-            .arg("-c")
+        #[cfg(windows)]
+        let (shell, shell_flag) = ("cmd", "/C");
+        #[cfg(not(windows))]
+        let (shell, shell_flag) = ("sh", "-c");
+
+        let mut child = tokio::process::Command::new(shell)
+            .arg(shell_flag)
             .arg(command)
             .stdin(Stdio::null())
             .stdout(Stdio::null())

@@ -1,3 +1,12 @@
+#![cfg(unix)]
+//! Unix-only: the fixtures drive the daemon's `command` display controller
+//! with POSIX shell text — `printf X >> 'file'`, `test -e`, `true`/`false` —
+//! and observe behaviour by counting marker bytes those commands append.
+//! `cmd /C` has no equivalent spelling, so the suite needs a platform-aware
+//! fixture helper before it can run on Windows. Tracked in the Windows
+//! support issue (#265); the IPC transport that previously blocked it is
+//! done (#371, #373).
+//!
 //! Integration tests for `dormantd::boot` (T5, spec §5.1): `prepare()` +
 //! `boot()` driven end to end with real tempdir state, real (per-test)
 //! sockets, and the production `App::build`/`App::start` path — `boot()` is

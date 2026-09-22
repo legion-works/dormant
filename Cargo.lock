@@ -1255,6 +1255,7 @@ dependencies = [
  "tracing-subscriber",
  "wayland-client",
  "wayland-protocols",
+ "windows-sys 0.61.2",
  "zbus",
 ]
 

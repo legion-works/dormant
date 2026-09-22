@@ -12,20 +12,18 @@
 //! The kernel releases the lock when the process exits (even crash), so there
 //! is no stale-lock cleanup problem.
 
-#[cfg(unix)]
 use std::io::Write;
-
 use std::path::Path;
 
-#[cfg(unix)]
 use anyhow::Context;
 
 /// RAII guard holding an exclusive advisory lock on the per-user-session lock
-/// file. Dropping the guard releases the lock (kernel-enforced on process exit
-/// as well — crash-safe).
+/// file. Dropping the guard releases the lock; the OS also releases it when the
+/// process exits, even on crash — on unix the kernel drops the `flock` with the
+/// fd, on Windows closing the handle releases the `LockFileEx` byte-range lock.
+/// Either way there is no stale-lock cleanup problem.
 #[derive(Debug)]
 pub struct SingleInstanceLock {
-    #[cfg(unix)]
     _file: std::fs::File,
 }
 
@@ -90,58 +88,102 @@ fn acquire_impl(lock_path: &Path) -> anyhow::Result<SingleInstanceLock> {
     Ok(SingleInstanceLock { _file: file })
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn acquire_impl(lock_path: &Path) -> anyhow::Result<SingleInstanceLock> {
-    // Windows has no flock; dormantd's real runtime is unix. This stub keeps
-    // cross-compile green — the guard is a no-op.
-    let _ = lock_path;
-    tracing::warn!(
-        event = "single_instance_lock_unavailable",
-        "single-instance lock is not available on this platform",
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, HANDLE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    // Ensure parent directory exists (mirrors the unix arm).
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create lock parent directory '{}'", parent.display()))?;
+    }
+
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock_path)
+        .with_context(|| format!("open lock file '{}'", lock_path.display()))?;
+
+    let handle: HANDLE = file.as_raw_handle().cast();
+    // SAFETY: `handle` is a valid open file handle owned by `file`, which
+    // outlives this call. `overlapped` is a zeroed, stack-local OVERLAPPED that
+    // stays alive for the duration of the call.
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        LockFileEx(
+            handle,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            &mut overlapped,
+        )
+    };
+    if rc == 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+            anyhow::bail!(
+                "another dormant instance is already running for this user session (lock held on '{}')",
+                lock_path.display()
+            );
+        }
+        return Err(err)
+            .with_context(|| format!("acquire LockFileEx on lock file '{}'", lock_path.display()));
+    }
+
+    // Write PID into the lock file — best-effort (the byte-range lock is the
+    // real guard). A truncated file is harmless; the lock still holds.
+    let _ = writeln!(&file, "{}", std::process::id());
+
+    tracing::info!(
+        event = "single_instance_locked",
+        path = %lock_path.display(),
     );
-    Ok(SingleInstanceLock {})
+
+    Ok(SingleInstanceLock { _file: file })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
-    mod unix_tests {
-        use super::*;
+    #[test]
+    fn acquire_succeeds_on_empty_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("dormant.lock");
+        let guard = acquire(&lock_path).unwrap();
+        assert!(lock_path.exists());
+        drop(guard);
+    }
 
-        #[test]
-        fn acquire_succeeds_on_empty_path() {
-            let dir = tempfile::tempdir().unwrap();
-            let lock_path = dir.path().join("dormant.lock");
-            let guard = acquire(&lock_path).unwrap();
-            assert!(lock_path.exists());
-            drop(guard);
-        }
+    #[test]
+    fn second_acquire_fails_while_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("dormant.lock");
+        let _guard = acquire(&lock_path).unwrap();
+        let result = acquire(&lock_path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("already running"),
+            "expected 'already running' in error, got: {err}"
+        );
+    }
 
-        #[test]
-        fn second_acquire_fails_while_held() {
-            let dir = tempfile::tempdir().unwrap();
-            let lock_path = dir.path().join("dormant.lock");
-            let _guard = acquire(&lock_path).unwrap();
-            let result = acquire(&lock_path);
-            assert!(result.is_err());
-            let err = result.unwrap_err().to_string();
-            assert!(
-                err.contains("already running"),
-                "expected 'already running' in error, got: {err}"
-            );
-        }
-
-        #[test]
-        fn acquire_succeeds_after_guard_dropped() {
-            let dir = tempfile::tempdir().unwrap();
-            let lock_path = dir.path().join("dormant.lock");
-            let guard = acquire(&lock_path).unwrap();
-            drop(guard);
-            // Should succeed — lock released on drop.
-            let guard2 = acquire(&lock_path).unwrap();
-            drop(guard2);
-        }
+    #[test]
+    fn acquire_succeeds_after_guard_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("dormant.lock");
+        let guard = acquire(&lock_path).unwrap();
+        drop(guard);
+        // Should succeed — lock released on drop.
+        let guard2 = acquire(&lock_path).unwrap();
+        drop(guard2);
     }
 }

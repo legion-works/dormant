@@ -4,10 +4,10 @@ pub mod source_gate;
 
 use async_trait::async_trait;
 use dormant_core::config::schema::{ActiveSamplingConfig, Config, StreamMode};
-// Only `into_ipc_status` (below) consumes this, and that fn is `#[cfg(unix)]`
-// to match its sole caller `ipc.rs`; gate the import the same way so it is
-// not unused on Windows.
-#[cfg(unix)]
+// Only `into_ipc_status` (below) consumes this, and that fn is
+// `#[cfg(any(unix, windows))]` to match its sole caller `ipc.rs`; gate the
+// import the same way so it is not unused on other targets.
+#[cfg(any(unix, windows))]
 use dormant_core::ipc_proto::WearSamplingStatus;
 use dormant_core::rules::{ControlMsg, DaemonEvent};
 use dormant_core::spatial_grid::LumaGrid;
@@ -150,10 +150,10 @@ pub enum ConsentFlowStatus {
 }
 
 impl ConsentFlowStatus {
-    // Sole caller is `ipc.rs`, which is `#[cfg(unix)]` at the module
-    // declaration — matching that cfg keeps this equal-or-wider than its
-    // only consumer (project rule #2584) instead of dead on Windows.
-    #[cfg(unix)]
+    // Sole caller is `ipc.rs`, which is compiled on Unix and Windows —
+    // matching that cfg keeps this equal-or-wider than its only consumer
+    // (project rule #2584) instead of dead on other targets.
+    #[cfg(any(unix, windows))]
     pub(crate) fn into_ipc_status(self) -> WearSamplingStatus {
         match self {
             Self::AwaitingConsent => {
@@ -359,7 +359,7 @@ impl ActiveSamplerHandle {
             .map_err(|_| SamplerError::CommandChannelClosed)
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(all(test, any(unix, windows)))]
     pub(crate) fn test_handle() -> (Self, mpsc::Receiver<SamplerCommand>) {
         let (handle, command_rx, _status_tx) = Self::new(SamplerStatus {
             state: SamplingState::NeedsConsent,

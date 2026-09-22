@@ -2233,4 +2233,31 @@ mod tests {
             "the refusal must be ERROR_ACCESS_DENIED (5): {error}"
         );
     }
+
+    /// The test above proves the OS primitive refuses a second first-instance.
+    /// This one proves the PRODUCTION function translates that refusal into the
+    /// operator-facing "already in use by a running daemon" message rather than
+    /// leaking a raw OS error — the half most likely to break silently if the
+    /// error-code check is ever edited.
+    #[cfg(windows)]
+    #[test]
+    fn windows_second_daemon_gets_the_already_running_error() {
+        let pipe_name = unique_pipe_name("already-running");
+        let name = std::ffi::OsString::from(&pipe_name);
+
+        let _first =
+            super::create_first_pipe_instance(&name).expect("first daemon creates the pipe");
+
+        let error = super::create_first_pipe_instance(&name)
+            .expect_err("a second daemon must be refused the pipe");
+        let rendered = format!("{error}");
+        assert!(
+            rendered.contains("already in use by a running daemon"),
+            "a second daemon must get the already-running message, got: {rendered}"
+        );
+        assert!(
+            rendered.contains(&pipe_name),
+            "the error must name the pipe so the operator can identify it, got: {rendered}"
+        );
+    }
 }

@@ -684,6 +684,10 @@ fn ensure_token_state_parent(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+// Sole caller is `with_token_state_file_lock`'s `#[cfg(unix)]` arm; matching
+// that gate keeps this equal-or-wider than its only consumer (project rule
+// #2584) instead of dead on Windows.
+#[cfg(unix)]
 fn token_state_lock_path(path: &Path) -> PathBuf {
     let file_name = path
         .file_name()

@@ -4,6 +4,10 @@ pub mod source_gate;
 
 use async_trait::async_trait;
 use dormant_core::config::schema::{ActiveSamplingConfig, Config, StreamMode};
+// Only `into_ipc_status` (below) consumes this, and that fn is `#[cfg(unix)]`
+// to match its sole caller `ipc.rs`; gate the import the same way so it is
+// not unused on Windows.
+#[cfg(unix)]
 use dormant_core::ipc_proto::WearSamplingStatus;
 use dormant_core::rules::{ControlMsg, DaemonEvent};
 use dormant_core::spatial_grid::LumaGrid;

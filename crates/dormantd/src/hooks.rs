@@ -71,6 +71,9 @@
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
+// Only the `#[cfg(unix)]` timeout-kill arm uses `io::Error::last_os_error()`;
+// gate the import to match so it is not unused on Windows.
+#[cfg(unix)]
 use std::io;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, RwLock};

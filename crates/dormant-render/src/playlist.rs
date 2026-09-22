@@ -490,6 +490,9 @@ mod tests {
         assert!(u[2].ends_with("top.jpg"));
     }
 
+    // Symlink creation is unix-only here (`std::os::unix::fs::symlink`); the
+    // production skip logic it exercises is cross-platform.
+    #[cfg(unix)]
     #[test]
     fn symlinks_are_skipped() {
         let tmp = make_tree(&["real.jpg", "sub/"]);

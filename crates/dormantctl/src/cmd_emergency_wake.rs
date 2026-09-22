@@ -335,6 +335,17 @@ fn classify_response(resp: IpcResponse) -> IpcOutcome {
 /// cancellable via `tokio::time::timeout` so this module can bound the IPC
 /// attempt at 2 seconds.  On non-Unix this returns the same `E_IPC` error
 /// as the sync version.
+// On non-Unix the whole body is cfg'd out, leaving no await — but the
+// function is awaited by a shared caller, so `async` has to stay. Scoped to
+// `not(unix)` so Linux and macOS keep enforcing the lint; the Windows
+// named-pipe transport (#265) puts real awaits here and retires this.
+#[cfg_attr(
+    not(unix),
+    allow(
+        clippy::unused_async,
+        reason = "async is fixed by the shared caller; the non-Unix arm has no transport yet"
+    )
+)]
 async fn send_request_async(socket_path: &Path, request: &IpcRequest) -> Result<IpcResponse> {
     #[cfg(unix)]
     {

@@ -300,6 +300,11 @@ pub struct EventShutdown {
 #[cfg(not(unix))]
 impl EventShutdown {
     /// No-op on non-Unix — IPC is not supported there.
+    ///
+    /// # Errors
+    ///
+    /// Never returns an error. The `Result` exists so the signature matches
+    /// the Unix arm, whose callers propagate with `?`.
     pub fn shutdown(&self) -> std::io::Result<()> {
         Ok(())
     }

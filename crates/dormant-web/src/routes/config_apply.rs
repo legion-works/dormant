@@ -336,6 +336,14 @@ fn sync_dir(dir: &Path) -> Result<(), WebError> {
         .map_err(|e| WebError::ConfigReadError(format!("dir fsync failed: {e}")))
 }
 
+// The infallible body is the point: Windows cannot open a directory as a
+// `File`, so there is nothing to fsync. The `Result` is kept because the
+// single caller is shared with the Unix arm and propagates with `?`;
+// diverging the signature per platform would push the cfg into the caller.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "signature is fixed by the Unix arm this shares a caller with"
+)]
 #[cfg(not(unix))]
 fn sync_dir(_dir: &Path) -> Result<(), WebError> {
     // Non-Unix: rename durability is up to the filesystem.

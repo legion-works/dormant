@@ -115,6 +115,7 @@ fn acquire_impl(lock_path: &Path) -> anyhow::Result<SingleInstanceLock> {
     // outlives this call. `overlapped` is a zeroed, stack-local OVERLAPPED that
     // stays alive for the duration of the call.
     let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    let overlapped_ptr = std::ptr::from_mut(&mut overlapped);
     let rc = unsafe {
         LockFileEx(
             handle,
@@ -122,12 +123,14 @@ fn acquire_impl(lock_path: &Path) -> anyhow::Result<SingleInstanceLock> {
             0,
             1,
             0,
-            &mut overlapped,
+            overlapped_ptr,
         )
     };
     if rc == 0 {
         let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+        // ERROR_LOCK_VIOLATION is 33; the `try_from` can never fail, but an
+        // `as` cast here is a wrapping cast clippy rightly rejects.
+        if err.raw_os_error() == i32::try_from(ERROR_LOCK_VIOLATION).ok() {
             anyhow::bail!(
                 "another dormant instance is already running for this user session (lock held on '{}')",
                 lock_path.display()

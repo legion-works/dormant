@@ -27,6 +27,17 @@ pub use crate::idle_source::ActivityRule;
 /// Returns `None` (spawning nothing) when no rule declares `user-activity`.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
+// `filtered_tx` is consumed only by the Linux/macOS filtered-source arm; on
+// other targets that arm is cfg'd out, so the parameter looks unconsumed.
+// Taking it by reference instead would change the signature for the
+// platforms that DO move it.
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos")),
+    allow(
+        clippy::needless_pass_by_value,
+        reason = "consumed by the filtered-source arm, which is cfg'd out here"
+    )
+)]
 pub fn spawn(
     rules: Vec<ActivityRule>,
     poll_interval: Duration,

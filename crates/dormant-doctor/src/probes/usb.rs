@@ -104,9 +104,9 @@ async fn probe_usb_with_observer(
 
 /// USB serial probing is only supported on Linux and macOS in this release.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub async fn probe_usb(_port: &str, _baud: u32) -> ProbeResult {
+pub async fn probe_usb(port: &str, _baud: u32) -> ProbeResult {
     ProbeResult::not_supported(
-        format!("usb {_port}"),
+        format!("usb {port}"),
         "USB serial is only supported on Linux and macOS in this release",
     )
 }

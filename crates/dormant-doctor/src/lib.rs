@@ -23,7 +23,7 @@ pub use types::{ProbeResult, ProbeStatus};
 
 // Re-export probe functions the CLI dispatches per-subcommand.
 pub use probes::config::probe_config_inner;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub use probes::ddcci::probe_ddcci;
 pub use probes::ha::probe_ha_all;
 pub use probes::input_filter::probe_input_filter;
@@ -161,16 +161,16 @@ pub async fn probe_all_offline(cfg: &Config, creds: &Credentials) -> Vec<ProbeRe
             .values()
             .any(|d| d.controllers.iter().any(|c| c == "ddcci"));
         if has_ddcci {
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             {
                 results.push(probes::ddcci::probe_ddcci().await.with_category("display"));
             }
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
             {
                 results.push(
                     ProbeResult::not_supported(
                         "ddcci",
-                        "DDC/CI is only supported on Linux and macOS in this release",
+                        "DDC/CI is only supported on Linux, macOS, and Windows in this release",
                     )
                     .with_category("display"),
                 );

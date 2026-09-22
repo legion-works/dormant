@@ -26,7 +26,7 @@ use dormant_core::types::BlankMode;
 use crate::blank_owner::BlankOwnerRegistry;
 use crate::command::CommandController;
 use crate::ddc_lock::PanelLocks;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 use crate::ddcci::DdcciController;
 #[cfg(target_os = "macos")]
 use crate::gamma_breadcrumb::GammaBreadcrumb;
@@ -242,8 +242,16 @@ pub const CONTROLLER_TYPES: &[&str] = &[
 ];
 /// Every `DisplayConfig.controllers[]` entry MUST be one of these literals.
 ///
+/// Windows advertises `ddcci` (backed by `ddc-winapi`'s Monitor
+/// Configuration API — see `crate::ddcci` module docs) plus the portable
+/// backends. It has no local compositor/Quartz controller, so `kwin-dpms`
+/// and the `macos-*` controllers stay absent.
+#[cfg(target_os = "windows")]
+pub const CONTROLLER_TYPES: &[&str] = &["command", "ddcci", "ha-passthrough", "samsung-tizen"];
+/// Every `DisplayConfig.controllers[]` entry MUST be one of these literals.
+///
 /// Other platforms advertise only portable controller backends.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub const CONTROLLER_TYPES: &[&str] = &["command", "ha-passthrough", "samsung-tizen"];
 
 /// Static candidate modes per controller type.
@@ -263,7 +271,7 @@ pub const CONTROLLER_TYPES: &[&str] = &["command", "ha-passthrough", "samsung-ti
 pub fn capabilities() -> HashMap<String, Vec<BlankMode>> {
     let mut m: HashMap<String, Vec<BlankMode>> = HashMap::new();
     m.insert("command".to_string(), Vec::new());
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     m.insert(
         "ddcci".to_string(),
         vec![BlankMode::BrightnessZero, BlankMode::PowerOff],
@@ -296,11 +304,11 @@ pub fn capabilities() -> HashMap<String, Vec<BlankMode>> {
 /// Controller type names that can read a panel's active-input VCP.
 #[must_use]
 pub fn input_source_readers() -> HashSet<String> {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     let mut readers = HashSet::new();
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     let readers = HashSet::new();
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     readers.insert("ddcci".to_string());
     readers
 }
@@ -343,7 +351,7 @@ pub fn claim_identity_providers() -> HashSet<String> {
 /// daemon-lifetime state to serialize).
 #[allow(clippy::too_many_lines)]
 #[cfg_attr(
-    not(any(target_os = "linux", target_os = "macos")),
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
     allow(unused_variables)
 )]
 pub fn build_controllers(
@@ -356,7 +364,7 @@ pub fn build_controllers(
 
     for name in &cfg.controllers {
         match name.as_str() {
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             "ddcci" => {
                 // Normalize empty matcher to None so the controller auto-selects
                 // the single detected display instead of trying to match "".
@@ -620,7 +628,7 @@ mod tests {
     // rather than silently accepting it and failing later at controller
     // build time — there is no `RealVcp` backend for these targets.
     #[test]
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     fn controller_types_excludes_ddcci_elsewhere() {
         assert!(
             !CONTROLLER_TYPES.contains(&"ddcci"),

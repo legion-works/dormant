@@ -365,8 +365,8 @@ impl EventShutdown {
 /// An iterator over [`DaemonEvent`] JSON lines from the event stream.
 ///
 /// Generic over the reader so tests can drive the parsing/line-length logic
-/// against an in-memory buffer instead of a real `UnixStream`; production
-/// code always uses the default `R = UnixStream` (via [`EventStream::from_reader`]
+/// against an in-memory buffer instead of a real transport; production
+/// code always uses the default `R = Transport` (via [`EventStream::from_reader`]
 /// / [`connect_events`]).
 #[cfg(any(unix, windows))]
 pub struct EventStream<R = Transport> {

@@ -37,3 +37,4 @@ pub mod single_instance;
 pub mod state_publisher;
 mod watchdog_schedule;
 pub mod wear_tracker;
+pub mod windows_idle;

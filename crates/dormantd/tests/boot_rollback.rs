@@ -1,10 +1,3 @@
-#![cfg(unix)]
-//! Unix-only: these drive the daemon end to end, and `dormantd::ipc` — the
-//! IPC server the daemon exposes and these tests talk to — is `#[cfg(unix)]`
-//! (`dormantd/src/lib.rs:27`). There is no Windows transport yet, so the
-//! daemon cannot be exercised there. The Windows named-pipe transport
-//! un-gates this file; see issue #265.
-//!
 //! Integration tests for `dormantd::boot` (T5, spec §5.1): `prepare()` +
 //! `boot()` driven end to end with real tempdir state, real (per-test)
 //! sockets, and the production `App::build`/`App::start` path — `boot()` is

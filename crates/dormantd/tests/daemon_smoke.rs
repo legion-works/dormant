@@ -1,10 +1,3 @@
-#![cfg(unix)]
-//! Unix-only: these drive the daemon end to end, and `dormantd::ipc` — the
-//! IPC server the daemon exposes and these tests talk to — is `#[cfg(unix)]`
-//! (`dormantd/src/lib.rs:27`). There is no Windows transport yet, so the
-//! daemon cannot be exercised there. The Windows named-pipe transport
-//! un-gates this file; see issue #265.
-//!
 //! Real-time daemon smoke tests.
 //!
 //! These wire a full [`App`] over a tempdir config with `command` display

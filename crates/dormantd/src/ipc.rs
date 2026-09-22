@@ -18,7 +18,7 @@ use dormant_core::observation::ReloadSource;
 use dormant_core::reload::ReloadRequester;
 use dormant_core::rules::{ControlMsg, DaemonEvent};
 use dormant_doctor::DoctorService;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -314,14 +314,16 @@ async fn run(
     clippy::too_many_lines,
     reason = "IPC variants deliberately remain visible in one exhaustive dispatch match."
 )]
-async fn handle_connection(
-    stream: tokio::net::UnixStream,
+async fn handle_connection<S>(
+    stream: S,
     ctl_tx: mpsc::Sender<ControlMsg>,
     reload_requester: ReloadRequester,
     doctor_service: DoctorService,
     direct_switch: Arc<DirectSwitchHandle>,
     wear_sampling: WearSamplingControls,
-) {
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
     let WearSamplingControls {
@@ -871,10 +873,10 @@ async fn handle_exercise(ctl_tx: &mpsc::Sender<ControlMsg>, display: &str) -> Ip
 
 /// Subscribe to the event stream and write events as JSON lines until the
 /// client disconnects or the stream lags.
-async fn handle_events(
-    ctl_tx: &mpsc::Sender<ControlMsg>,
-    writer: &mut tokio::io::WriteHalf<tokio::net::UnixStream>,
-) {
+async fn handle_events<W>(ctl_tx: &mpsc::Sender<ControlMsg>, writer: &mut W)
+where
+    W: AsyncWrite + Unpin,
+{
     let (tx, rx) = oneshot::channel();
     let msg = ControlMsg::SubscribeEvents(tx);
     if ctl_tx.send(msg).await.is_err() {
@@ -1035,9 +1037,10 @@ async fn validate_display_name(ctl_tx: &mpsc::Sender<ControlMsg>, display: &str)
 ///
 /// Returns `Ok(None)` on EOF, `Ok(Some(line))` on success, or an error if the
 /// line content (excluding the trailing newline) exceeds the cap.
-async fn read_line_bounded(
-    reader: &mut BufReader<tokio::io::ReadHalf<tokio::net::UnixStream>>,
-) -> Result<Option<String>> {
+async fn read_line_bounded<R>(reader: &mut BufReader<R>) -> Result<Option<String>>
+where
+    R: AsyncRead + Unpin,
+{
     let mut buf = Vec::with_capacity(4096);
     loop {
         // Check if we already have a complete line in buf (from a prior read).
@@ -1070,19 +1073,20 @@ async fn read_line_bounded(
 }
 
 /// Serialize a value as a JSON line and write it to the stream.
-async fn write_json<T: serde::Serialize>(
-    writer: &mut tokio::io::WriteHalf<tokio::net::UnixStream>,
-    value: &T,
-) -> Result<()> {
+async fn write_json<W, T>(writer: &mut W, value: &T) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+    T: serde::Serialize,
+{
     let line = serde_json::to_string(value)?;
     write_line(writer, &line).await
 }
 
 /// Write a line (plus newline) to the stream.
-async fn write_line(
-    writer: &mut tokio::io::WriteHalf<tokio::net::UnixStream>,
-    line: &str,
-) -> Result<()> {
+async fn write_line<W>(writer: &mut W, line: &str) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     if line.len() > MAX_LINE_BYTES {
         anyhow::bail!("response line exceeds maximum length of {MAX_LINE_BYTES} bytes");
     }
@@ -1619,6 +1623,66 @@ mod tests {
             !socket_path.exists(),
             "the bound socket must be unlinked when permission setup fails"
         );
+    }
+
+    /// The connection handler is transport-generic: driving it over a
+    /// `tokio::io::duplex` pair (not a `UnixStream`) proves the bound is real
+    /// and is the seam the Windows named-pipe transport reuses.
+    #[tokio::test]
+    async fn handle_connection_is_transport_generic_over_duplex() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let (mut client, server) = tokio::io::duplex(4096);
+        let (ctl_tx, _cancel) = fake_engine();
+        let (reload_tx, _reload_rx) = mpsc::channel::<dormant_core::reload::ReloadRequest>(8);
+        let doctor = fake_doctor(ctl_tx.clone());
+        let ds = fake_direct_switch(ctl_tx.clone());
+        let wear_sampling = super::WearSamplingControls {
+            sampler_registry: Arc::new(std::sync::RwLock::new(
+                std::collections::BTreeMap::default(),
+            )),
+            selected_displays: std::sync::Arc::new(Vec::new),
+            compositor_output: std::sync::Arc::new(|_| None),
+            consent_gate: ConsentGate::default(),
+        };
+
+        let handler = tokio::spawn(super::handle_connection(
+            server,
+            ctl_tx,
+            dormant_core::reload::ReloadRequester::new(reload_tx),
+            doctor,
+            ds,
+            wear_sampling,
+        ));
+
+        client
+            .write_all(b"{\"req\":\"status\"}\n")
+            .await
+            .expect("write request over duplex");
+        let response: dormant_core::ipc_proto::IpcResponse = {
+            let mut reader = BufReader::new(&mut client);
+            let mut line = String::new();
+            // Hang detector, not a latency budget: the duplex pair is
+            // in-memory, so a real response lands in microseconds. Without
+            // the bound, a handler that stops responding parks this test
+            // until the harness-level timeout minutes later instead of
+            // failing here with a readable message.
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                reader.read_line(&mut line),
+            )
+            .await
+            .expect("handler must answer over the duplex transport within 10s")
+            .expect("read response over duplex");
+            serde_json::from_str(line.trim()).expect("response is valid JSON")
+        };
+        assert!(
+            !response.ok,
+            "a dropped engine must yield an error response over the duplex transport"
+        );
+
+        drop(client);
+        handler.await.expect("handler task completes on disconnect");
     }
 
     // ── Fix C (#138): exit code stability ─────────────────────────────────

@@ -224,7 +224,7 @@ pub enum HookOutcome {
     /// The slot finished without an aborting failure. Entries after the total
     /// hook deadline may be counted as failures without being started.
     Completed {
-        /// Total entries started (blocking + non-blocking).
+        /// Total entries processed (including actions skipped because displays were awake).
         started: usize,
         /// Entries that returned a failure or were skipped by the total hook
         /// deadline (failure-on-non-blocking does NOT abort).
@@ -370,6 +370,14 @@ async fn run_slot_with_probe(
             // `abort_on_failure`. No boxing, no spawn.
             let remaining = slot.deadline.saturating_duration_since(Instant::now());
             let action_timeout = decision.timeout.min(remaining);
+            log_action_start(
+                decision.index,
+                &label,
+                &decision.action,
+                true,
+                decision.timeout,
+            );
+            let started_at = Instant::now();
             let outcome = run_one(decision, &env, runner.as_ref(), action_timeout).await;
             if outcome
                 .as_ref()
@@ -383,7 +391,7 @@ async fn run_slot_with_probe(
                     spawned,
                 );
             }
-            log_outcome(decision, &label, &outcome);
+            log_outcome(decision, &label, &outcome, started_at.elapsed());
             match outcome {
                 Ok(()) => {}
                 Err(reason) => {
@@ -444,6 +452,8 @@ fn spawn_nonblocking(
     let index = decision.index;
     let runner = Arc::clone(runner);
     tokio::spawn(async move {
+        log_action_start(index, &label, &action, false, action.timeout);
+        let started_at = Instant::now();
         let outcome = dispatch_action(&action, &env, timeout_, runner.as_ref()).await;
         if deadline_limited
             && outcome
@@ -453,7 +463,7 @@ fn spawn_nonblocking(
         {
             log_slot_timeout(&label, index, 1);
         } else {
-            log_spawned_outcome(index, &label, &action, &outcome);
+            log_spawned_outcome(index, &label, &action, &outcome, started_at.elapsed());
         }
     });
 }
@@ -558,8 +568,13 @@ async fn dispatch_action(
     }
 }
 
-fn log_outcome(decision: &HookDecision, label: &str, outcome: &Result<(), String>) {
-    log_decision_outcome(decision, label, outcome);
+fn log_outcome(
+    decision: &HookDecision,
+    label: &str,
+    outcome: &Result<(), String>,
+    elapsed: Duration,
+) {
+    log_decision_outcome(decision, label, outcome, elapsed);
 }
 
 /// Saturating cast — per-entry timeouts are bounded by validation
@@ -579,8 +594,10 @@ fn log_spawned_outcome(
     label: &str,
     action: &HookAction,
     outcome: &Result<(), String>,
+    elapsed: Duration,
 ) {
     let kind = action_kind(action);
+    let elapsed_ms = timeout_ms(elapsed);
     let timeout_ms = timeout_ms(action.timeout);
     match outcome {
         Ok(()) => info!(
@@ -588,6 +605,7 @@ fn log_spawned_outcome(
             slot = %label,
             index,
             kind = %kind,
+            elapsed_ms,
         ),
         Err(reason) if is_timeout_error(reason) => warn!(
             event = "hook_timeout",
@@ -595,6 +613,7 @@ fn log_spawned_outcome(
             index,
             kind = %kind,
             timeout_ms,
+            elapsed_ms,
             reason = %reason,
         ),
         Err(reason) => warn!(
@@ -602,6 +621,7 @@ fn log_spawned_outcome(
             slot = %label,
             index,
             kind = %kind,
+            elapsed_ms,
             reason = %reason,
         ),
     }
@@ -648,15 +668,14 @@ fn log_action_start(
     );
 }
 
-fn log_decision_outcome(decision: &HookDecision, label: &str, outcome: &Result<(), String>) {
-    log_action_start(
-        decision.index,
-        label,
-        &decision.action,
-        decision.blocking,
-        decision.timeout,
-    );
+fn log_decision_outcome(
+    decision: &HookDecision,
+    label: &str,
+    outcome: &Result<(), String>,
+    elapsed: Duration,
+) {
     let kind = action_kind(&decision.action);
+    let elapsed_ms = timeout_ms(elapsed);
     let timeout_ms = timeout_ms(decision.timeout);
     match outcome {
         Ok(()) => info!(
@@ -664,6 +683,7 @@ fn log_decision_outcome(decision: &HookDecision, label: &str, outcome: &Result<(
             slot = %label,
             index = decision.index,
             kind = %kind,
+            elapsed_ms,
         ),
         Err(reason) if is_timeout_error(reason) => warn!(
             event = "hook_timeout",
@@ -671,6 +691,7 @@ fn log_decision_outcome(decision: &HookDecision, label: &str, outcome: &Result<(
             index = decision.index,
             kind = %kind,
             timeout_ms,
+            elapsed_ms,
             reason = %reason,
         ),
         Err(reason) => warn!(
@@ -678,6 +699,7 @@ fn log_decision_outcome(decision: &HookDecision, label: &str, outcome: &Result<(
             slot = %label,
             index = decision.index,
             kind = %kind,
+            elapsed_ms,
             reason = %reason,
         ),
     }
@@ -1666,6 +1688,83 @@ mod tests {
     async fn hook_without_flag_ignores_probe() {
         let (_, calls, _) = check_awake_hook(Ok(vec![false]), false).await;
         assert_eq!(calls, 1);
+    }
+
+    struct StartCheckingRunner(Arc<Mutex<Vec<String>>>);
+
+    #[async_trait]
+    impl HookRunner for StartCheckingRunner {
+        async fn run_command(
+            &self,
+            _env: &EnvList,
+            _argv: &[String],
+            _timeout_: Duration,
+        ) -> HookIoResult {
+            if self
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|line| line.contains("hook_started"))
+            {
+                Ok(())
+            } else {
+                Err("hook_started was not logged before execution".into())
+            }
+        }
+
+        async fn publish_mqtt(
+            &self,
+            _topic: &str,
+            _payload: &str,
+            _timeout_: Duration,
+        ) -> HookIoResult {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn hook_started_precedes_outcome_with_elapsed_ms() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let writer = CaptureWriter(captured.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let actions = [make_command_action(
+            vec!["echo".into()],
+            Duration::from_secs(5),
+            Some(true),
+            false,
+        )];
+        let outcome = run_slot(
+            HookSlot {
+                context: ctx_for(Phase::Before, Direction::Acquire),
+                actions: &actions,
+                deadline: test_deadline(),
+            },
+            Arc::new(StartCheckingRunner(captured.clone())),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            HookOutcome::Completed {
+                started: 1,
+                failed: 0,
+                spawned: 0
+            }
+        );
+        let logs = captured.lock().unwrap();
+        let start = logs
+            .iter()
+            .position(|line| line.contains("hook_started"))
+            .unwrap();
+        let ok = logs
+            .iter()
+            .position(|line| line.contains("hook_ok") && line.contains("elapsed_ms"))
+            .expect("hook_ok includes elapsed_ms");
+        assert!(start < ok);
     }
 
     // ── Pure sequencing ─────────────────────────────────────────────────────

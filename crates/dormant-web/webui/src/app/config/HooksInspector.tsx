@@ -4,7 +4,7 @@
  *
  * When `hookEditEnabled` is true (§BG-6), each slot renders an inline
  * array editor reusing the ScreensaverEditor pattern: per-action cards
- * with command/mqtt/timeout/blocking/abort_on_failure fields, plus
+ * with the HookAction fields, plus
  * add/remove buttons.  When false (the default), hooks stay read-only and
  * the footer states they are edited in the file.
  */

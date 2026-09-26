@@ -1908,6 +1908,15 @@ mod tests {
         assert_eq!(env["DORMANT_PHASE"], "before");
     }
 
+    #[test]
+    fn wake_slot_labels_and_environment_use_wake_after() {
+        let context = ctx_for(Phase::After, Direction::Wake);
+        let env: std::collections::HashMap<String, String> = context.env().into_iter().collect();
+        assert_eq!(env["DORMANT_DIRECTION"], "wake");
+        assert_eq!(env["DORMANT_PHASE"], "after");
+        assert_eq!(slot_label(&context), "wake/after/monitor");
+    }
+
     // ── run_slot: order, blocking, abort, non-blocking-failure ──────────────
 
     #[tokio::test]
@@ -2272,6 +2281,7 @@ mod tests {
         assert_eq!(Direction::Acquire.as_str(), "acquire");
         assert_eq!(Direction::ObservedLoss.as_str(), "observed_loss");
         assert_eq!(Direction::ObservedGain.as_str(), "observed_gain");
+        assert_eq!(Direction::Wake.as_str(), "wake");
         assert_eq!(Phase::Before.as_str(), "before");
         assert_eq!(Phase::After.as_str(), "after");
     }

@@ -498,11 +498,7 @@ mod tests {
                 "Pause until resumed".to_string(),
                 "Resume".to_string(),
                 "──".to_string(),
-                // Issue #124 — the top-level "Force blank all…" label pins
-                // the destructive Hard semantics on the menu; a regression
-                // that reverts to "Blank all now" would silently re-enable
-                // the pre-fix soft-default ambiguity.
-                "Force blank all…".to_string(),
+                "Force blank all".to_string(),
                 "Wake all now".to_string(),
                 "──".to_string(),
                 "Open web UI".to_string(),
@@ -565,8 +561,7 @@ mod tests {
     fn blank_actions_use_display_off_glyph() {
         let snap = snap(vec![disp("monitor", "active")]);
         let menu = build_menu(Some(&snap), false, 8137);
-        // Top-level "Force blank all…" (issue #124 — renamed from "Blank all now").
-        let entry = find_action(&menu, "Force blank all…").expect("Force blank all…");
+        let entry = find_action(&menu, "Force blank all").expect("Force blank all");
         match entry {
             MenuEntry::Action { icon, action, .. } => {
                 assert_eq!(*icon, Glyph::DisplayOff);

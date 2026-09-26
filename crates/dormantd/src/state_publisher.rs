@@ -1194,6 +1194,7 @@ fn discovery_payload_sensor(cfg: &Config, instance: &str, sensor_id: &str) -> se
         "state_topic": topic_sensor_state(&base, &instance, &sensor_id),
         "payload_on": "ON",
         "payload_off": "OFF",
+        "device_class": "occupancy",
         "availability": [
             {
                 "topic": avail_topic,
@@ -1224,6 +1225,7 @@ fn discovery_payload_zone(cfg: &Config, instance: &str, zone_id: &str) -> serde_
         "state_topic": topic_zone_state(&base, &instance, &zone_id),
         "payload_on": "ON",
         "payload_off": "OFF",
+        "device_class": "occupancy",
         "availability": [
             {
                 "topic": avail_topic,
@@ -1929,6 +1931,30 @@ mod tests {
         assert!(topics.contains(&"homeassistant/binary_sensor/office-pc/sensor_desk/config"));
         assert!(topics.contains(&"homeassistant/binary_sensor/office-pc/zone_office/config"));
         assert!(topics.contains(&"homeassistant/sensor/office-pc/display_main/config"));
+    }
+
+    #[test]
+    fn discovery_records_exact_occupancy_json_for_zone_and_sensor() {
+        let cfg = enabled_cfg();
+        let inv = EntityInventory::from_config(&cfg);
+        let records = discovery_records(&cfg, &inv, "office-pc");
+        for (topic, expected) in [
+            (
+                "homeassistant/binary_sensor/office-pc/zone_office/config",
+                json!({"name":"dormant office zone", "unique_id":"dormant_office-pc_zone_office", "object_id":"dormant_office-pc_zone_office", "state_topic":"dormant/office-pc/zone/office/state", "payload_on":"ON", "payload_off":"OFF", "device_class":"occupancy", "availability":[{"topic":"dormant/office-pc/availability", "payload_available":"online", "payload_not_available":"offline"}], "device":{"identifiers":["dormant_office-pc"], "name":"dormant office-pc", "manufacturer":"dormant", "model":"presence", "sw_version":env!("CARGO_PKG_VERSION")}}),
+            ),
+            (
+                "homeassistant/binary_sensor/office-pc/sensor_desk/config",
+                json!({"name":"dormant desk presence", "unique_id":"dormant_office-pc_sensor_desk", "object_id":"dormant_office-pc_sensor_desk", "state_topic":"dormant/office-pc/sensor/desk/state", "payload_on":"ON", "payload_off":"OFF", "device_class":"occupancy", "availability":[{"topic":"dormant/office-pc/availability", "payload_available":"online", "payload_not_available":"offline"}, {"topic":"dormant/office-pc/sensor/desk/availability", "payload_available":"online", "payload_not_available":"offline"}], "availability_mode":"all", "device":{"identifiers":["dormant_office-pc"], "name":"dormant office-pc", "manufacturer":"dormant", "model":"presence", "sw_version":env!("CARGO_PKG_VERSION")}}),
+            ),
+        ] {
+            let actual = records.iter().find(|record| record.topic == topic).unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&actual.payload).unwrap(),
+                expected,
+                "{topic}"
+            );
+        }
     }
 
     #[test]

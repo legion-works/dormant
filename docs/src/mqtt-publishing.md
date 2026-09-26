@@ -102,6 +102,10 @@ zone id `office`, display id `main`:
 | `homeassistant/binary_sensor/office-pc/zone_office/config`    | 1   | yes    | HA discovery                                        |
 | `homeassistant/sensor/office-pc/display_main/config`         | 1   | yes    | HA discovery (`sensor`)                            |
 
+The zone and sensor discovery entities are binary sensors with
+`device_class: occupancy` (`ON` means occupied). Display phase is a
+generic sensor because its value is a daemon phase, not occupancy.
+
 The `display/.../phase` payload is a JSON object so HA's
 `value_template: "{{ value_json.phase }}"` parses the literal phase
 straight out of the published topic. Available literals:

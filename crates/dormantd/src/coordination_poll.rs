@@ -30,7 +30,7 @@ pub struct CoordinationPollDeps {
     pub state: CoordinationHandle,
     /// Daemon-lifetime cancellation token.
     pub cancel: CancellationToken,
-    /// Direct switch handle for firing post-hoc observed-loss hooks.
+    /// Direct switch handle for firing post-hoc observed ownership hooks.
     /// `None` in tests that don't need hook firing.
     pub direct_switch: Option<Arc<DirectSwitchHandle>>,
 }
@@ -307,11 +307,14 @@ async fn poll_once(
                         degraded: false,
                     }))
                     .await;
-                // Post-hoc observed-loss hook: fires only on a committed
-                // LOSS (previous_owned == true).  Gain emits no acquire
-                // hook — the poll has no write authority.
-                if previous_owned && let Some(ref ds) = deps.direct_switch {
-                    ds.notify_observed_loss(&display_id).await;
+                // Hooks observe committed ownership only; the poller cannot
+                // write the panel input or retry a failed hook.
+                if let Some(ref ds) = deps.direct_switch {
+                    if previous_owned {
+                        ds.notify_observed_loss(&display_id).await;
+                    } else if owned {
+                        ds.notify_observed_gain(&display_id).await;
+                    }
                 }
             }
         } else {
@@ -345,6 +348,8 @@ async fn poll_once(
 #[cfg(test)]
 mod tests {
     use super::{CoordinationPollDeps, poll_once, spawn};
+    use crate::direct_switch::{DirectSwitchHandle, SwitchOutcome, SwitchReason};
+    use crate::hooks::{EnvList, HookEngine, HookIoResult, HookRunner};
     use std::collections::{HashMap, VecDeque};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -356,7 +361,7 @@ mod tests {
     use dormant_core::config::{Config, CoordinationConfig};
     use dormant_core::coordination::{COORD_POLL_FAILING_LOG_INTERVAL, CoordinationHandle};
     use dormant_core::rules::{ControlMsg, ControllerHealth};
-    use dormant_core::traits::{CommandSink, PanelState, PowerState};
+    use dormant_core::traits::{CommandSink, InputSourceTarget, PanelState, PowerState};
     use dormant_core::types::{BlankMode, CmdFailure, DisplayId};
     use dormant_core::wear::PanelType;
     use indexmap::IndexMap;
@@ -382,6 +387,7 @@ mod tests {
         state_reads: Mutex<u32>,
         reprobes: Mutex<u32>,
         cache_probe: Mutex<Option<CoordinationHandle>>,
+        writes: Mutex<u32>,
     }
 
     impl ScriptedSink {
@@ -458,6 +464,87 @@ mod tests {
             *self.state_reads.lock().unwrap() += 1;
             self.states.lock().unwrap().pop_front().unwrap_or(None)
         }
+
+        async fn write_input_source(&self, _target: InputSourceTarget) -> Result<(), CmdFailure> {
+            *self.writes.lock().unwrap() += 1;
+            Ok(())
+        }
+    }
+
+    struct RecordingHookRunner(Arc<Mutex<Vec<String>>>);
+
+    #[async_trait::async_trait]
+    impl HookRunner for RecordingHookRunner {
+        async fn run_command(
+            &self,
+            _env: &EnvList,
+            argv: &[String],
+            _timeout: Duration,
+        ) -> HookIoResult {
+            self.0.lock().unwrap().push(argv[0].clone());
+            Ok(())
+        }
+
+        async fn publish_mqtt(
+            &self,
+            _topic: &str,
+            _payload: &str,
+            _timeout: Duration,
+        ) -> HookIoResult {
+            Ok(())
+        }
+    }
+
+    fn hook_action(label: &str) -> dormant_core::config::HookAction {
+        dormant_core::config::HookAction {
+            command: Some(vec![label.to_string()]),
+            mqtt: None,
+            timeout: Duration::from_secs(1),
+            blocking: Some(true),
+            abort_on_failure: false,
+            skip_if_display_awake: false,
+        }
+    }
+
+    fn hooked_poller(
+        cfg: Config,
+        sink: Arc<ScriptedSink>,
+    ) -> (
+        TestHarness,
+        Arc<DirectSwitchHandle>,
+        Arc<Mutex<Vec<String>>>,
+    ) {
+        let (config_tx, config_rx) = watch::channel(Arc::new(cfg));
+        let display = DisplayId("shared".to_string());
+        let executors = HashMap::from([(display.clone(), sink as Arc<dyn CommandSink>)]);
+        let (executors_tx, executors_rx) = watch::channel(Arc::new(executors));
+        let (ctl_tx, ctl_rx) = mpsc::channel(32);
+        let state = CoordinationHandle::new([display]);
+        let cancel = CancellationToken::new();
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let hooks = Arc::new(HookEngine::with_runner(Arc::new(RecordingHookRunner(
+            Arc::clone(&commands),
+        ))));
+        let handle = Arc::new(DirectSwitchHandle::new(
+            executors_rx.clone(),
+            config_rx.clone(),
+            hooks,
+            ctl_tx.clone(),
+            Some(state.clone()),
+        ));
+        let _task = spawn(CoordinationPollDeps {
+            config_rx,
+            ctl_tx,
+            executors_rx,
+            state: state.clone(),
+            cancel: cancel.clone(),
+            direct_switch: Some(Arc::clone(&handle)),
+        });
+        (
+            (config_tx, executors_tx, ctl_rx, state, cancel),
+            handle,
+            commands,
+        )
     }
 
     fn config() -> Config {
@@ -1395,6 +1482,105 @@ mod tests {
         ));
         tick().await; // fourth tick: already not owned, no further poke
         assert!(ctl_rx.try_recv().is_err());
+        cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn committed_gain_fires_observed_gain_hook() {
+        let mut cfg = config();
+        cfg.displays
+            .get_mut("shared")
+            .unwrap()
+            .hooks
+            .on_observed_gain = vec![hook_action("gain")];
+        cfg.displays
+            .get_mut("shared")
+            .unwrap()
+            .hooks
+            .on_observed_loss = vec![hook_action("loss")];
+        let sink = Arc::new(ScriptedSink::with_inputs([
+            Ok(Some(0x12)),
+            Ok(Some(0x12)),
+            Ok(Some(0x12)),
+            Ok(Some(0x11)),
+            Ok(Some(0x11)),
+            Ok(Some(0x11)),
+        ]));
+        let ((_config_tx, _executors_tx, _ctl_rx, state, cancel), _handle, calls) =
+            hooked_poller(cfg, sink);
+        for _ in 0..6 {
+            tick().await;
+        }
+        assert!(state.snapshot()[&DisplayId("shared".into())].owned);
+        assert_eq!(*calls.lock().unwrap(), ["loss", "gain"]);
+        cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn committed_loss_fires_only_observed_loss_hook() {
+        let mut cfg = config();
+        cfg.displays
+            .get_mut("shared")
+            .unwrap()
+            .hooks
+            .on_observed_gain = vec![hook_action("gain")];
+        cfg.displays
+            .get_mut("shared")
+            .unwrap()
+            .hooks
+            .on_observed_loss = vec![hook_action("loss")];
+        let sink = Arc::new(ScriptedSink::with_inputs([
+            Ok(Some(0x12)),
+            Ok(Some(0x12)),
+            Ok(Some(0x12)),
+        ]));
+        let ((_config_tx, _executors_tx, _ctl_rx, state, cancel), _handle, calls) =
+            hooked_poller(cfg, sink);
+        for _ in 0..3 {
+            tick().await;
+        }
+        assert!(!state.snapshot()[&DisplayId("shared".into())].owned);
+        assert_eq!(*calls.lock().unwrap(), ["loss"]);
+        cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pull_does_not_fire_observed_gain_hook() {
+        let mut cfg = config();
+        cfg.displays
+            .get_mut("shared")
+            .unwrap()
+            .hooks
+            .on_observed_gain = vec![hook_action("gain")];
+        let sink = Arc::new(ScriptedSink::with_inputs([
+            Ok(Some(0x12)),
+            Ok(Some(0x12)),
+            Ok(Some(0x12)),
+            Ok(Some(0x11)),
+            Ok(Some(0x11)),
+            Ok(Some(0x11)),
+        ]));
+        let ((_config_tx, _executors_tx, _ctl_rx, state, cancel), handle, calls) =
+            hooked_poller(cfg, Arc::clone(&sink));
+        for _ in 0..3 {
+            tick().await;
+        }
+        assert!(!state.snapshot()[&DisplayId("shared".into())].owned);
+        assert_eq!(
+            handle
+                .pull(DisplayId("shared".into()), SwitchReason::Cli, false)
+                .await,
+            SwitchOutcome::Switched
+        );
+        assert_eq!(*sink.writes.lock().unwrap(), 1);
+        for _ in 0..3 {
+            tick().await;
+        }
+        assert!(state.snapshot()[&DisplayId("shared".into())].owned);
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "initiated pull must not fire observed gain"
+        );
         cancel.cancel();
     }
 }

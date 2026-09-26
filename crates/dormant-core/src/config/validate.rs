@@ -295,6 +295,7 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "before_acquire",
             "after_acquire",
             "on_observed_loss",
+            "on_observed_gain",
         ],
     ),
     (
@@ -352,12 +353,27 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "skip_if_display_awake",
         ],
     ),
+    (
+        "displays..hooks.on_observed_gain",
+        &[
+            "command",
+            "mqtt",
+            "timeout",
+            "blocking",
+            "abort_on_failure",
+            "skip_if_display_awake",
+        ],
+    ),
     ("displays..hooks.before_release.mqtt", &["topic", "payload"]),
     ("displays..hooks.after_release.mqtt", &["topic", "payload"]),
     ("displays..hooks.before_acquire.mqtt", &["topic", "payload"]),
     ("displays..hooks.after_acquire.mqtt", &["topic", "payload"]),
     (
         "displays..hooks.on_observed_loss.mqtt",
+        &["topic", "payload"],
+    ),
+    (
+        "displays..hooks.on_observed_gain.mqtt",
         &["topic", "payload"],
     ),
     (
@@ -2405,6 +2421,7 @@ fn validate_hooks(
         ("before_acquire", &display.hooks.before_acquire),
         ("after_acquire", &display.hooks.after_acquire),
         ("on_observed_loss", &display.hooks.on_observed_loss),
+        ("on_observed_gain", &display.hooks.on_observed_gain),
     ];
     if display.hooks.timeout < Duration::from_millis(100) {
         errors.push(ValidationError {
@@ -3034,6 +3051,23 @@ gracee_period = "60s"
                 .iter()
                 .any(|error| error.what == crate::error::E_CONFIG_INVALID
                     && error.detail.contains("has hooks but is not shared"))
+        );
+    }
+
+    #[test]
+    fn observed_gain_slot_obeys_hook_rules_and_strict_keys() {
+        let prefix = "config_version = 1\n[displays.main]\ncontrollers = [\"ddcci\"]\nscope = \"shared\"\nshared_input_code = 1\nblank_mode = \"power_off\"\n[displays.main.hooks]\n";
+        let valid =
+            format!("{prefix}on_observed_gain = [{{ command = [\"true\"], timeout = \"5s\" }}]\n");
+        let cfg = load_str_strict(&valid).expect("observed gain must be a known slot");
+        assert_eq!(cfg.0.displays["main"].hooks.on_observed_gain.len(), 1);
+        let invalid = format!("{prefix}on_observed_gain = [{{ command = [] }}]\n");
+        let errors = validate_str(&invalid);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.detail.contains("command argv must not be empty")),
+            "{errors:?}"
         );
     }
 

@@ -156,11 +156,15 @@ export function SettingsForm({ config: initialConfig, onNavigationGuard, tab, kv
     if (unsafeHits.length > 0) {
       const lines = unsafeHits
         .map((h) => {
-          if ("path" in h.patch) {
-            return `• ${h.patch.path.join(".")} = ${JSON.stringify(h.patch.value)} — ${h.consequence}`;
+          const p = h.patch;
+          if (p.op === "set") {
+            return `• ${p.path.join(".")} = ${JSON.stringify(p.value)} — ${h.consequence}`;
           }
-          const createPatch = h.patch as Extract<typeof h.patch, { op: "create_entity" }>;
-          return `• create zones "${createPatch.id}" with unavailable_policy = "${(createPatch.value as Record<string, unknown>).unavailable_policy}" — ${h.consequence}`;
+          if (p.op === "create_entity") {
+            const v = p.value as Record<string, unknown>;
+            return `• create zones "${p.id}" with unavailable_policy = "${String(v.unavailable_policy)}" — ${h.consequence}`;
+          }
+          return `• ${JSON.stringify(p)} — ${h.consequence}`;
         })
         .join("\n");
       const accepted = await confirmUnsafe({
@@ -236,7 +240,7 @@ export function SettingsForm({ config: initialConfig, onNavigationGuard, tab, kv
     } finally {
       setApplying(false);
     }
-  }, [config.fingerprint, store]);
+  }, [config.fingerprint, store, confirmUnsafe]);
 
   // beforeunload guard — registered while dirty, removed when clean
   // Must be declared after handleDiscard (it's a dependency of the next effect).

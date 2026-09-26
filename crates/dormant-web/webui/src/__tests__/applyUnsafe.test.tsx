@@ -59,7 +59,7 @@ const BASE_CONFIG: ConfigResponse = {
   redacted_paths: [],
 };
 
-const REPLIED: ApplyResponse = { reload: "reloaded" };
+const REPLIED: ApplyResponse = { reload: "reloaded", applied: true };
 
 function findZoneField(zone: HTMLElement, label: string) {
   return zone.querySelector(`#${CSS.escape(`zones.office.${label}`)}`) as HTMLSelectElement | null;

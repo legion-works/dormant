@@ -207,7 +207,7 @@ export default function CreateEntityForm({
               label="add to zone (optional)"
               value={addToZone}
               locked={false}
-              onEdit={(_p, v) => setAddToZone(v)}
+              onEdit={(_p, v) => setAddToZone(typeof v === "string" ? v : "")}
               options={["", ...zoneIds]}
               help="If set, the new sensor is appended to this zone's members. The create patch and the members patch are tracked together; safe with concurrent edits (last-write-wins)."
             />

@@ -16,6 +16,7 @@ import { describe, it, expect, afterEach } from "vitest";
 import { render, screen, fireEvent, cleanup, within } from "@testing-library/react";
 import CreateEntityForm from "../app/config/CreateEntityForm";
 import { FIELD_HELP, FIELD_EXAMPLE, CREATABLE_FIELDS, CRUD_COLLECTIONS } from "../app/config/entityCrud";
+import type { ConfigPatch } from "../api/types";
 
 afterEach(() => cleanup());
 

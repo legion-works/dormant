@@ -280,6 +280,121 @@ export function detectUnsafePatches(patches: readonly ConfigPatch[]): UnsafePatc
   return hits;
 }
 
+/**
+ * One-line guidance for every creatable config field, grounded in
+ * `docs/src/configuration.md` (the section-table descriptions) plus
+ * `sensors.md`/`displays.md` where they elaborate a single field.
+ *
+ * Each entry is short on purpose — a per-field hint that disappears when
+ * the operator already knows the meaning.  Keys are EXACTLY the field
+ * names from [`CREATABLE_FIELDS`], so a new creatable field with no
+ * `FIELD_HELP` entry will be flagged by the test below as a docs gap
+ * rather than silently rendering a bare input.
+ */
+export const FIELD_HELP: Record<CrudCollection, Record<string, string>> = {
+  sensors: {
+    // From docs/src/configuration.md:36 — the discriminator.
+    type: "Sensor backend: mqtt (broker subscriber), ha (Home Assistant WebSocket), or usb-ld2410 (USB-serial radar).",
+    // From docs/src/configuration.md:42-44 — common fields.
+    kind: "Sensor semantics: \"presence\" (binary occupied/vacant) or \"motion\" (transient, stretched by hold_time).",
+    hold_time: "How long occupancy persists after the sensor's last on — an off inside the window is deferred. \u20140s\u201D disables.",
+    stale_timeout: "How long before no data means the sensor is unavailable.",
+    // docs/src/configuration.md:50-58 — mqtt.
+    broker_url: "MQTT broker URL the sensor connects to (e.g., tcp://localhost:1883).",
+    topic: "MQTT topic to subscribe to for this sensor's state.",
+    field: "JSON pointer (RFC 6901) into the MQTT payload that holds the on/off value (default: /occupancy).",
+    payload_on: "Override for the on payload value (default: JSON true). Use when the broker publishes raw text like ON.",
+    payload_off: "Override for the off payload value (default: JSON false).",
+    // docs/src/configuration.md:91-93 — ha.
+    url: "Home Assistant WebSocket URL (e.g., ws://ha.local:8123/api/websocket).",
+    entity: "HA entity id to track (e.g., binary_sensor.couch_presence).",
+    // docs/src/configuration.md:107-109 — usb-ld2410.
+    port: "Serial port path the LD2410 is attached to (e.g., /dev/ttyUSB0).",
+    baud: "Serial baud rate (default 256000).",
+  },
+  zones: {
+    mode: "Fusion mode: any (any member present) / all (all members present) / quorum (N members) / weighted (weight fraction).",
+    members: "Sensor/zone ids in this zone. Prefix zone ids with \"zone:\" to nest zones.",
+    unavailable_policy: "How unavailable members are treated. present (default, fail-safe) keeps the room on when blind; absent blanks on sensor failure \u2014 confirm to opt in.",
+    weights: "Per-member float weights for \"weighted\" mode (the member weight when present).",
+  },
+  displays: {
+    controllers: "Ordered list of controllers to try \u2014 first one that supports the requested blank mode wins.",
+    blank_mode: "Primary blank mode: screen_off_audio_on / power_off / brightness_zero.",
+    output: "Display selector: KWin output name (e.g., \"DP-1\" for kwin-dpms); \"cg:<uuid>\" for macos-gamma-black; omit for macos-display-sleep.",
+    ddc_display: "DDC/CI display identifier (e.g., \"1\" for the first monitor /dev/i2c-1).",
+    host: "Hostname or IP for network-controllable displays (Samsung, HA passthrough).",
+    wol_mac: "MAC address for Wake-on-LAN when the display's network stack supports it.",
+    samsung_restore_backlight: "Samsung IP Control G2 backlight (1\u201350) restored when no saved value exists.",
+    restore_brightness: "DDC/CI brightness (1\u2013100) restored on wake.",
+    treat_unreachable_as_blanked: "True (fail-safe): if a controller is unreachable, assume the display is blanked.",
+    command_timeout: "Timeout for a single blank/wake command (default 10s).",
+    shared_input_code: "VCP input-source hex code this machine reads when the display is shared.",
+    shared_input_write_code: "Optional VCP input-source hex code this machine writes to claim the display.",
+    shared_peer_input_code: "Optional VCP code the peer reads when displaying on this machine.",
+    shared_peer_input_write_code: "Optional VCP code the peer writes when claiming this machine.",
+  },
+  rules: {
+    zone: "Zone id whose state drives this rule.",
+    displays: "Display ids this rule blanks/wakes.",
+    grace_period: "Time the zone must stay stable in its target state before blanking/waking (default 60s).",
+    min_blank_time: "Minimum time a display stays blanked before waking (debounces on/off cycling, default 10s).",
+    min_wake_time: "Minimum time a display stays awake before blanking (default 10s).",
+    inhibitors: "Hold the blank while any listed inhibitor is active \u2014 user-activity, audio-playback, call, manual-pause (no-op).",
+    activity_idle_threshold: "How long without input before user-activity inhibitor considers the user idle (default 2m).",
+    activity_poll_interval: "How often to poll activity state (default 5s).",
+    wake_retries: "Number of wake retries before escalating (default 3).",
+    wake_retry_backoff: "Backoff before the first wake retry (default 2s).",
+    wake_retry_interval: "Interval between successive wake retries (default 60s).",
+  },
+};
+
+/**
+ * Per-field placeholder / example values, shown in the form's text
+ * inputs as a hint.  Numbers and durations use their TOML form
+ * (humantime for durations: "2s", "1m 30s").  Sensors/displays look
+ * the same as in `docs/src/configuration.md` so a README-style
+ * example reads directly into the field.
+ */
+export const FIELD_EXAMPLE: Record<CrudCollection, Record<string, string>> = {
+  sensors: {
+    hold_time: "2s",
+    stale_timeout: "300s",
+    broker_url: "mqtt://host:1883",
+    topic: "zigbee2mqtt/desk-sensor",
+    field: "/occupancy",
+    payload_on: "ON",
+    payload_off: "OFF",
+    url: "ws://ha.local:8123/api/websocket",
+    entity: "binary_sensor.couch_presence",
+    port: "/dev/ttyUSB0",
+    baud: "256000",
+  },
+  zones: {
+    members: "[\"desk_mmwave\", \"living_motion\"]",
+  },
+  displays: {
+    blank_mode: "power_off",
+    output: "DP-1",
+    ddc_display: "1",
+    host: "192.0.2.10",
+    wol_mac: "00:11:22:33:44:55",
+    samsung_restore_backlight: "30",
+    restore_brightness: "80",
+    command_timeout: "10s",
+  },
+  rules: {
+    grace_period: "60s",
+    min_blank_time: "10s",
+    min_wake_time: "10s",
+    activity_idle_threshold: "2m",
+    activity_poll_interval: "5s",
+    wake_retries: "3",
+    wake_retry_backoff: "2s",
+    wake_retry_interval: "60s",
+  },
+};
+
 /** Minimal inventory shape `referencingEntities` needs — a subset of `ConfigInventory`. */
 export interface CrudInventoryRefs {
   zones: Record<string, { members?: string[] }>;

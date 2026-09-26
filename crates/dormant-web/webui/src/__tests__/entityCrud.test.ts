@@ -18,6 +18,8 @@ import {
   RESERVED_ENTITY_IDS,
   VALID_INHIBITORS,
   SAMSUNG_TIZEN_CONTROLLER,
+  FIELD_HELP,
+  FIELD_EXAMPLE,
   validateEntityId,
   isEntityCrudEnabled,
   isPairingEnabled,
@@ -154,6 +156,40 @@ describe("daemon CRUD flags — default true when absent", () => {
   it("isPairingEnabled defaults to true when absent, reads explicit false", () => {
     expect(isPairingEnabled({})).toBe(true);
     expect(isPairingEnabled({ pairing_enabled: false })).toBe(false);
+  });
+});
+
+describe("FIELD_HELP / FIELD_EXAMPLE — guided-entity-creation guidance maps", () => {
+  it("FIELD_HELP covers every creatable field in every collection", () => {
+    for (const collection of CRUD_COLLECTIONS) {
+      for (const field of CREATABLE_FIELDS[collection]) {
+        expect(FIELD_HELP[collection][field], `missing FIELD_HELP for ${collection}.${field}`).toBeTypeOf("string");
+        expect(FIELD_HELP[collection][field].length, `empty FIELD_HELP for ${collection}.${field}`).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it("FIELD_HELP does not advertise fields outside the creatable set (anti-drift guard)", () => {
+    for (const collection of CRUD_COLLECTIONS) {
+      const stray = Object.keys(FIELD_HELP[collection]).filter((k) => !CREATABLE_FIELDS[collection].includes(k));
+      expect(stray, `FIELD_HELP stray keys for ${collection}`).toEqual([]);
+    }
+  });
+
+  it("FIELD_EXAMPLE only supplies examples for fields in the creatable set (anti-drift guard)", () => {
+    for (const collection of CRUD_COLLECTIONS) {
+      const stray = Object.keys(FIELD_EXAMPLE[collection]).filter((k) => !CREATABLE_FIELDS[collection].includes(k));
+      expect(stray, `FIELD_EXAMPLE stray keys for ${collection}`).toEqual([]);
+    }
+  });
+
+  it("every FIELD_EXAMPLE entry is a non-empty string", () => {
+    for (const collection of CRUD_COLLECTIONS) {
+      for (const [field, value] of Object.entries(FIELD_EXAMPLE[collection])) {
+        expect(typeof value, `${collection}.${field}`).toBe("string");
+        expect(value.length, `${collection}.${field}`).toBeGreaterThan(0);
+      }
+    }
   });
 });
 

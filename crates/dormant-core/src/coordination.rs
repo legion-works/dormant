@@ -127,6 +127,15 @@ pub struct InputObservationOutcome {
     pub observed_return: bool,
 }
 
+/// Whether a peer input was seen before this display lost its owned verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerSighting {
+    /// No uncommitted peer sighting is pending.
+    NotSeen,
+    /// A peer sighting awaits confirmation that the panel has returned.
+    Seen,
+}
+
 /// Last known ownership and readback state for one shared display.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CoordRecord {
@@ -149,7 +158,7 @@ pub struct CoordRecord {
     /// the transition; differing codes reset the count to 1.
     pub pending_transition_code: Option<u8>,
     /// Whether the peer input was observed while this record remained owned.
-    pub peer_seen_while_owned: bool,
+    pub peer_seen_while_owned: PeerSighting,
     /// Consecutive local input readings since the most recent peer sighting.
     pub return_confirm_count: u32,
     /// Last successful observation's raw input code; used to detect
@@ -173,7 +182,7 @@ impl CoordRecord {
             consecutive_failures: 0,
             pending_transition_count: 0,
             pending_transition_code: None,
-            peer_seen_while_owned: false,
+            peer_seen_while_owned: PeerSighting::NotSeen,
             return_confirm_count: 0,
             last_observed_code: None,
             contested: false,
@@ -189,6 +198,38 @@ fn record_success_state(record: &mut CoordRecord, observed: u8, panel_state: Opt
     record.panel_state = panel_state;
     record.consecutive_failures = 0;
     record.last_observed_code = Some(observed);
+}
+
+fn record_local_return(
+    record: &mut CoordRecord,
+    confirmations: u32,
+    outcome: &mut InputObservationOutcome,
+) {
+    if record.peer_seen_while_owned == PeerSighting::Seen {
+        record.return_confirm_count = record.return_confirm_count.saturating_add(1);
+        if record.return_confirm_count >= confirmations.max(1) {
+            // A confirmed panel return after a peer sighting is observable
+            // even when debounce never committed the brief ownership loss.
+            outcome.observed_return = true;
+            record.peer_seen_while_owned = PeerSighting::NotSeen;
+            record.return_confirm_count = 0;
+        }
+    }
+}
+
+fn record_disagreement(
+    record: &mut CoordRecord,
+    observed: u8,
+    outcome: &mut InputObservationOutcome,
+) {
+    // Different raw codes cannot collude to commit a pending transition.
+    if let Some(previous_code) = record.last_observed_code
+        && previous_code != observed
+    {
+        outcome.disagreement_with = Some(previous_code);
+        record.pending_transition_count = 0;
+        record.pending_transition_code = None;
+    }
 }
 
 fn record_contested_observation(
@@ -218,7 +259,7 @@ fn record_contested_observation(
         record.pending_transition_code = None;
         outcome.settled = true;
     }
-    record.peer_seen_while_owned = false;
+    record.peer_seen_while_owned = PeerSighting::NotSeen;
     record.return_confirm_count = 0;
     record_success_state(record, observed, panel_state);
     outcome
@@ -354,18 +395,7 @@ impl CoordinationHandle {
         let classification = aliases.classify(observed);
         let is_local = matches!(classification, InputSourceObservation::Local);
 
-        // Disagreement: freshly observed raw code differs from the last
-        // successful observation. This resets any pending transition — two
-        // different codes in a row cannot collude to commit a transition.
-        // The pending-transition code and count are cleared so the next
-        // observation (if it initiates a new transition) starts from 1.
-        if let Some(previous_code) = record.last_observed_code
-            && previous_code != observed
-        {
-            outcome.disagreement_with = Some(previous_code);
-            record.pending_transition_count = 0;
-            record.pending_transition_code = None;
-        }
+        record_disagreement(record, observed, &mut outcome);
 
         match (prior_owned, is_local) {
             (false, false) => {
@@ -377,16 +407,7 @@ impl CoordinationHandle {
             (true, true) => {
                 record.pending_transition_count = 0;
                 record.pending_transition_code = None;
-                if record.peer_seen_while_owned {
-                    record.return_confirm_count = record.return_confirm_count.saturating_add(1);
-                    if record.return_confirm_count >= confirmations.max(1) {
-                        // A confirmed panel return after a peer sighting is observable
-                        // even when debounce never committed the brief ownership loss.
-                        outcome.observed_return = true;
-                        record.peer_seen_while_owned = false;
-                        record.return_confirm_count = 0;
-                    }
-                }
+                record_local_return(record, confirmations, &mut outcome);
             }
             (false, true) => {
                 // Candidate GAIN — heading toward owned.
@@ -410,9 +431,9 @@ impl CoordinationHandle {
             (true, false) => {
                 // Candidate LOSS — heading toward not-owned.
                 if matches!(classification, InputSourceObservation::Peer) {
-                    record.peer_seen_while_owned = true;
+                    record.peer_seen_while_owned = PeerSighting::Seen;
                 }
-                if record.peer_seen_while_owned {
+                if record.peer_seen_while_owned == PeerSighting::Seen {
                     record.return_confirm_count = 0;
                 }
                 if record.pending_transition_code == Some(observed) {
@@ -425,7 +446,7 @@ impl CoordinationHandle {
                 let threshold = confirmations.max(1);
                 if record.pending_transition_count >= threshold {
                     record.owned = false;
-                    record.peer_seen_while_owned = false;
+                    record.peer_seen_while_owned = PeerSighting::NotSeen;
                     record.return_confirm_count = 0;
                     record.pending_transition_count = 0;
                     record.pending_transition_code = None;
@@ -450,7 +471,7 @@ impl CoordinationHandle {
                 record.last_raw_change = Some(now);
                 record.pending_transition_count = 0;
                 record.pending_transition_code = None;
-                record.peer_seen_while_owned = false;
+                record.peer_seen_while_owned = PeerSighting::NotSeen;
                 record.return_confirm_count = 0;
                 outcome.entered_contested = true;
                 if !prior_owned {
@@ -508,7 +529,7 @@ impl CoordinationHandle {
             // agreeing reads don't double-fire or register a disagreement.
             record.pending_transition_count = 0;
             record.pending_transition_code = None;
-            record.peer_seen_while_owned = false;
+            record.peer_seen_while_owned = PeerSighting::NotSeen;
             record.return_confirm_count = 0;
             record.consecutive_failures = 0;
             // Set to the verified local code so the next observation of the
@@ -941,7 +962,10 @@ mod tests {
             assert!(!result.observed_return);
             assert_eq!(result.committed_prior_owned, (n == 2).then_some(true));
         }
-        assert!(!handle.snapshot()[&aoc].peer_seen_while_owned);
+        assert_eq!(
+            handle.snapshot()[&aoc].peer_seen_while_owned,
+            super::PeerSighting::NotSeen
+        );
         assert_eq!(handle.snapshot()[&aoc].return_confirm_count, 0);
         for n in 3..6 {
             let result = observe_at(
@@ -1034,7 +1058,10 @@ mod tests {
             );
             assert!(!result.observed_return);
         }
-        assert!(!handle.snapshot()[&aoc].peer_seen_while_owned);
+        assert_eq!(
+            handle.snapshot()[&aoc].peer_seen_while_owned,
+            super::PeerSighting::NotSeen
+        );
     }
 
     /// A Local reading with a different raw code (e.g. 0x15 write alias vs

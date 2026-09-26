@@ -307,8 +307,8 @@ async fn poll_once(
                         degraded: false,
                     }))
                     .await;
-                // Hooks observe committed ownership only; the poller cannot
-                // write the panel input or retry a failed hook.
+                // Committed-transition hooks do not write the panel input or
+                // retry a failed hook.
                 if let Some(ref ds) = deps.direct_switch {
                     if previous_owned {
                         ds.notify_observed_loss(&display_id).await;

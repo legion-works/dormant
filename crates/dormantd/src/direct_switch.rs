@@ -357,19 +357,7 @@ impl DirectSwitchHandle {
             return SwitchOutcome::HookAborted { reason };
         }
 
-        let display_name = &display.0;
-        match tokio::time::timeout(Duration::from_secs(2), executor.ensure_powered_on()).await {
-            Ok(Ok(true)) => {
-                tracing::info!(event = "switch_panel_powered_on", display_name = %display_name);
-            }
-            Ok(Ok(false)) => {}
-            Ok(Err(error)) => {
-                warn!(event = "switch_panel_power_check_failed", display_name = %display_name, %error);
-            }
-            Err(error) => {
-                warn!(event = "switch_panel_power_check_failed", display_name = %display_name, %error);
-            }
-        }
+        power_on_if_standby(executor.as_ref(), &display).await;
 
         // Write the local input-source command through the controller chain.
         match executor.write_input_source(target).await {
@@ -542,19 +530,7 @@ impl DirectSwitchHandle {
             };
         }
 
-        let display_name = &display.0;
-        match tokio::time::timeout(Duration::from_secs(2), executor.ensure_powered_on()).await {
-            Ok(Ok(true)) => {
-                tracing::info!(event = "switch_panel_powered_on", display_name = %display_name);
-            }
-            Ok(Ok(false)) => {}
-            Ok(Err(error)) => {
-                warn!(event = "switch_panel_power_check_failed", display_name = %display_name, %error);
-            }
-            Err(error) => {
-                warn!(event = "switch_panel_power_check_failed", display_name = %display_name, %error);
-            }
-        }
+        power_on_if_standby(executor.as_ref(), &display).await;
 
         match executor.write_input_source(target).await {
             Ok(()) => {
@@ -844,6 +820,27 @@ impl DirectSwitchHandle {
             deadline: tokio::time::Instant::now() + timeout,
         };
         let _ = self.hooks.run_slot(slot).await;
+    }
+}
+
+/// Power on a panel in DDC standby before a switch writes its input.
+///
+/// Shared by `pull` and `push` so the two paths cannot drift. Only ever powers
+/// the panel on. A failed or timed-out check is logged and the switch
+/// continues: a switch must not be lost because the wake check could not run.
+async fn power_on_if_standby(executor: &dyn CommandSink, display: &DisplayId) {
+    let display_name = &display.0;
+    match tokio::time::timeout(Duration::from_secs(2), executor.ensure_powered_on()).await {
+        Ok(Ok(true)) => {
+            tracing::info!(event = "switch_panel_powered_on", display_name = %display_name);
+        }
+        Ok(Ok(false)) => {}
+        Ok(Err(error)) => {
+            warn!(event = "switch_panel_power_check_failed", display_name = %display_name, %error);
+        }
+        Err(error) => {
+            warn!(event = "switch_panel_power_check_failed", display_name = %display_name, %error);
+        }
     }
 }
 

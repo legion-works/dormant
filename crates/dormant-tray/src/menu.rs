@@ -268,13 +268,9 @@ pub fn build_menu(
     entries.push(MenuEntry::Separator);
 
     // ── Blank all / Wake all ──────────────────────────────────────────────
-    // Issue #124 — the tray's blank action always emits `Hard` (operator
-    // override).  The label must read as destructive so the operator doesn't
-    // confuse the safe-default "Blank" verb with the destructive PowerOff
-    // path the tray actually triggers.  Trailing "…" matches the rest of
-    // the menu's confirm-dialog pattern.
+    // Issue #124 — the tray's blank action always emits `Hard` (operator override).
     entries.push(MenuEntry::Action {
-        label: "Force blank all…".into(),
+        label: "Force blank all".into(),
         enabled: can_blank_all,
         icon: glyph_for(&Action::BlankAll),
         action: Action::BlankAll,
@@ -298,12 +294,9 @@ pub fn build_menu(
 
         for (id, d) in sorted {
             let label = submenu_label(id, d);
-            // Issue #124 — tray blank actions always emit `Hard`.  Renamed
-            // from "Blank now" / "Blank shared panel — affects all connected
-            // machines" to "Force blank now" / "Force blank shared panel…"
-            // so the destructive semantics are visible on the menu itself.
+            // Issue #124 — tray blank actions always emit `Hard`.
             let blank_label = if d.scope == DisplayScope::Shared {
-                "Force blank shared panel…"
+                "Force blank shared panel — affects all connected machines"
             } else {
                 "Force blank now"
             };
@@ -861,13 +854,10 @@ mod tests {
         let MenuEntry::Submenu { entries, .. } = submenu else {
             unreachable!("expected shared display submenu");
         };
-        // Issue #124 — the shared "Force blank shared panel…" label
-        // preserves the all-machines warning while making the destructive
-        // Hard semantics visible.
         assert!(matches!(
             entries.first(),
             Some(MenuEntry::Action { label, .. })
-                if label == "Force blank shared panel…"
+                if label == "Force blank shared panel — affects all connected machines"
         ));
     }
 

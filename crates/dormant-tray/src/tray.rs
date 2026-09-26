@@ -447,7 +447,7 @@ mod tests {
         );
         assert!(
             menu.iter().any(|entry| {
-                matches!(entry, MenuItem::Standard(item) if item.label == "Force blank all…" && !item.enabled)
+                matches!(entry, MenuItem::Standard(item) if item.label == "Force blank all" && !item.enabled)
             }),
             "a real unreachable state should disable mutations"
         );

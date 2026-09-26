@@ -873,14 +873,13 @@ pub struct DisplaySnapshot {
     pub stage: Option<StageInfo>,
     /// Ids of the rules that drive this display (the rule whose
     /// `displays` list includes this one), sorted and deduplicated.
-    /// Sourced from the same `cfg.rules` enumeration
-    /// [`Self::effective_zone_presence`] /
-    /// [`Self::effective_input_wake_hold`] consult, so a consumer of
-    /// the snapshot never needs to re-derive "which rules drive this
-    /// display" from the config. Empty for manual-only displays that no
-    /// rule references — a display with no rule is never blanked on its
-    /// own, so the tray tooltip and the CLI status report mark it
-    /// accordingly.
+    /// Sourced from the same `cfg.rules` enumeration the engine
+    /// consults for effective zone presence and input-wake hold, so a
+    /// consumer of the snapshot never needs to re-derive "which rules
+    /// drive this display" from the config. Empty for manual-only
+    /// displays that no rule references — a display with no rule is
+    /// never blanked on its own, so the tray tooltip and the CLI
+    /// status report mark it accordingly.
     ///
     /// Wire shape: always serialised as a (possibly empty) JSON array
     /// — legacy snapshots without the key still deserialize to `[]`

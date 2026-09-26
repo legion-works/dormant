@@ -415,7 +415,7 @@ export default function Overview() {
     { label: "Displays", value: displays.length, sub: `${activeDisplays} active \u00b7 ${blankedDisplays} blanked`, dotColor: dotGreen },
     { label: "Sensors", value: `${onlineSensors}/${sensors.length}`, sub: unavailableSensors > 0 ? `${unavailableSensors} unavailable` : "all online", dotColor: unavailableSensors > 0 ? dotAmber : dotGreen },
     { label: "Zones", value: `${occupiedZones}/${zones.length}`, sub: `${occupiedZones} occupied \u00b7 ${vacantZones} vacant`, dotColor: "var(--blue-400)" },
-    { label: "Protected", value: protectedCount, sub: `${manualOnly} manual-only`, dotColor: protectedCount > 0 ? dotGreen : "var(--text-muted)" },
+    { label: "Rule-covered", value: protectedCount, sub: "displays with an automatic blank rule", dotColor: protectedCount > 0 ? dotGreen : "var(--text-muted)" },
   ];
 
   const sensorTypeLabel = (sensor: SensorSnapshot): string => {

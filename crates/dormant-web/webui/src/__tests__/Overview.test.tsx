@@ -102,7 +102,7 @@ afterEach(() => {
 });
 
 describe("Overview", () => {
-  it("renders Protected stat tile from display_rules", async () => {
+  it("renders Rule-covered stat tile from display_rules", async () => {
     render(
       <LiveStateProvider>
         <EventLogContext.Provider value={eventLogFixture()}>
@@ -112,7 +112,7 @@ describe("Overview", () => {
     );
 
     await waitFor(() => {
-      expect(screen.getByText("Protected")).toBeInTheDocument();
+      expect(screen.getByText("Rule-covered")).toBeInTheDocument();
     });
 
     // studio and shared-oled both have rules → 2 protected.
@@ -326,8 +326,8 @@ describe("Overview — panel tiles and signal flow", () => {
     expect(threes.length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText("2/3")).toBeInTheDocument();
     expect(screen.getByText("1/2")).toBeInTheDocument();
-    // Overview shows "Protected" stat card instead of "OLED guard Active".
-    expect(screen.getByText("Protected")).toBeInTheDocument();
+    // Overview shows "Rule-covered" stat card instead of "OLED guard Active".
+    expect(screen.getByText("Rule-covered")).toBeInTheDocument();
   });
 
   it("renders sensor rows with correct state labels", async () => {

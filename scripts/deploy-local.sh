@@ -21,7 +21,7 @@ WEBUI_DIR="$REPO_ROOT/crates/dormant-web/webui"
 INSTALL_DIR="${DORMANT_INSTALL_DIR:-$HOME/.local/bin}"
 SERVICE="app-dormant.service"
 TRAY_SERVICE="dormant-tray.service"
-SKIPPED=""
+FAILED=""
 
 RESTART=1
 DRY_RUN=0
@@ -189,18 +189,30 @@ else
   TRAY_STOPPED=0
 fi
 
+# Install through a temp file in the same directory and rename it over the
+# target. Writing into a binary that another process is executing fails with
+# "Text file busy"; a rename does not, because the running process keeps the old
+# inode. A failure here is fatal, but only after the services are restarted
+# below, so a failed install never leaves the daemon down.
+install_bin() {
+  local src=$1 dst=$2 tmp
+  tmp="$(mktemp "$(dirname "$dst")/.$(basename "$dst").new.XXXXXX")" || return 1
+  if cp "$src" "$tmp" && chmod 0755 "$tmp" && mv -f "$tmp" "$dst"; then
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
 for bin in dormantd dormantctl dormant-tray; do
   if [ -f "$INSTALL_DIR/$bin" ]; then
     cp "$INSTALL_DIR/$bin" "$BACKUP_DIR/$bin"
   fi
-  # A still-running binary yields "Text file busy". Both services are stopped
-  # above; anything else holding one open (a hand-started tray) is reported and
-  # skipped rather than aborting mid-install with the daemon down.
-  if cp "$(exe_path "$bin")" "$INSTALL_DIR/$bin" 2>/dev/null; then
+  if install_bin "$(exe_path "$bin")" "$INSTALL_DIR/$bin"; then
     echo "    installed $bin"
   else
-    echo "    WARN: could not replace $bin (still running?) -- left as-is" >&2
-    SKIPPED="$SKIPPED $bin"
+    echo "    ERROR: could not install $bin" >&2
+    FAILED="$FAILED $bin"
   fi
 done
 echo "    previous binaries backed up to $BACKUP_DIR"
@@ -223,8 +235,19 @@ if [ "$TRAY_STOPPED" -eq 1 ]; then
   systemctl --user start "$TRAY_SERVICE"
 fi
 
-if [ -n "$SKIPPED" ]; then
-  echo "WARN: not replaced:$SKIPPED (still running)" >&2
+if [ "$STOPPED" -eq 1 ]; then
+  # "active" alone does not prove the new binary is the one running.
+  pid="$(systemctl --user show -p MainPID --value "$SERVICE")"
+  if [ -z "$pid" ] || [ "$pid" = 0 ] || ! cmp -s "/proc/$pid/exe" "$INSTALL_DIR/dormantd"; then
+    echo "ERROR: $SERVICE (pid ${pid:-none}) is not running $INSTALL_DIR/dormantd" >&2
+    exit 1
+  fi
+  echo "    $SERVICE runs the installed binary (pid $pid)"
+fi
+
+if [ -n "$FAILED" ]; then
+  echo "ERROR: not installed:$FAILED -- the previous binaries are still in place" >&2
+  exit 1
 fi
 
 echo "==> Done. Roll back with:"

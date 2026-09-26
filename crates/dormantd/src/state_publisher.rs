@@ -1311,8 +1311,8 @@ pub fn global_online_record(cfg: &Config, instance: &str) -> Option<PublishRecor
 /// Returned records are ordered sensors → zones → displays, and
 /// within each kind in config-order. First-wins collisions are
 /// resolved by [`detect_and_warn_collisions`]: a collision drops
-/// every record after the first for that sanitized id and emits
-/// one `publish_id_collision` WARN per colliding pair.
+/// every record after the first for that sanitized id. The startup
+/// flush performs collision detection once before building these records.
 #[must_use]
 pub fn discovery_records(
     cfg: &Config,
@@ -1968,7 +1968,7 @@ mod tests {
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
         let (record_tx, _record_rx) = mpsc::channel(64);
-        let (_ctl_tx, ctl_rx) = mpsc::channel(1);
+        let (ctl_tx, ctl_rx) = mpsc::channel(1);
         drop(ctl_rx);
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut snapshot = snapshot_one_of_each();
@@ -1978,7 +1978,7 @@ mod tests {
             snapshot: &mut snapshot,
             instance: "office-pc",
             record_tx: &record_tx,
-            ctl_tx: &_ctl_tx,
+            ctl_tx: &ctl_tx,
             cancel: &cancel,
             request_fresh_snapshot: false,
             event_label: "test_startup_flush",

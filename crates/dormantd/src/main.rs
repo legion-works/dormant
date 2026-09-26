@@ -157,7 +157,10 @@ fn main() -> ExitCode {
             {
                 Ok(rt) => rt,
                 Err(e) => {
-                    tracing::error!(event = "runtime_init_failed", error = %e);
+                    tracing::error!(
+                        event = "runtime_init_failed",
+                        error = %format_error_chain(&anyhow::Error::from(e)),
+                    );
                     return ExitCode::FAILURE;
                 }
             };

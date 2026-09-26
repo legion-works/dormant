@@ -285,7 +285,23 @@ async fn config_apply_full_loop() {
     // The config watcher uses RecursiveMode::NonRecursive.  Writes to the
     // `backups/` subdirectory must not trigger a reload — the subdirectory
     // is the whole reason backups live there (spec §11.3).
+    //
+    // The apply we just performed can schedule a reload on a debounce
+    // timer (config `reload_debounce = 50ms`); if that reload fires AFTER
+    // the subscribe but BEFORE the backup write completes, the
+    // verification window below catches it and the test fails. Drain
+    // any pending apply reload first so the window only counts reloads
+    // that the backup write itself would trigger.
     let mut reloads = handle.subscribe_reload();
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    while tokio::time::Instant::now() < drain_deadline {
+        if tokio::time::timeout(Duration::from_millis(100), reloads.recv())
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
     fs::write(backups_dir.join("junk"), "should be ignored").unwrap();
     let outcome = tokio::time::timeout(Duration::from_secs(1), reloads.recv()).await;
     assert!(

@@ -1974,13 +1974,24 @@ mod tests {
         }
         assert!(got_first, "failed to get first frame");
 
-        let mut drain_buf = vec![0x00u8; (320 * 4 * 180) as usize];
-        while player.render_frame_into(&mut drain_buf).expect("render") {
-            first_buf.copy_from_slice(&drain_buf);
-        }
-
+        // mpv's internal render thread can set `MPV_RENDER_UPDATE_FRAME`
+        // between two of our calls, so the call that follows the drain
+        // is not guaranteed to land on Ok(false). Re-drain into the same
+        // buffer we will compare against: each Ok(true) refreshes
+        // `first_buf`, and the Ok(false) we break on is the one whose
+        // drawn pixels we verify against the latest picture.
         let mut second_buf = vec![0x00u8; (320 * 4 * 180) as usize];
-        let res = player.render_frame_into(&mut second_buf).expect("render");
+        let mut res = player.render_frame_into(&mut second_buf).expect("render");
+        let mut retries: u32 = 0;
+        while res {
+            first_buf.copy_from_slice(&second_buf);
+            res = player.render_frame_into(&mut second_buf).expect("render");
+            retries += 1;
+            assert!(
+                retries < 16,
+                "mpv keeps delivering frames; cannot stabilize for Ok(false) verification"
+            );
+        }
         assert!(!res, "expected Ok(false) after draining");
         assert_eq!(
             first_buf, second_buf,

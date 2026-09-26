@@ -82,6 +82,12 @@ and no cross-host protocol. Every switch is a **direct local DDC write** on the
 acting machine's own bus — the machine writes an input code and the panel
 moves.
 
+Before writing the input code, a switch powers on a panel in DDC standby.
+An operator switch also counts as input for waking a locally blanked display,
+even when the requested input is already selected. The existing input-wake hold
+applies; if the room remains vacant after the hold, the display returns to its
+normal blanking cycle.
+
 ### PULL — write my input code
 
 `dormantctl switch <display>`, the tray hotkey, the tray "Switch to here"
@@ -106,7 +112,7 @@ dormantctl switch shared_oled --to-peer
 `shared_peer_input_write_code` is configured** on the display; without it the
 CLI returns "not configured" and the web affordance is absent.
 
-Push is deliberately minimal — no wake, no retry. If the peer's output is
+Push is deliberately minimal: no peer-side wake, no retry. If the peer's output is
 not driving signal, the write is ACKed by the DDC bus but the panel silently
 ignores it (see [Signal-presence law](#signal-presence-law)). Push is for the
 common case: both machines are awake and the operator wants to switch away

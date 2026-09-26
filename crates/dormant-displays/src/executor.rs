@@ -864,6 +864,21 @@ impl CommandSink for DisplayExecutor {
         }
     }
 
+    async fn ensure_powered_on(&self) -> Result<bool, String> {
+        let mut last_error = None;
+        for controller in &self.chain {
+            match controller.ensure_powered_on().await {
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(error) => last_error = Some(format!("{}: {error}", controller.name())),
+            }
+        }
+        match last_error {
+            Some(error) => Err(error),
+            None => Ok(false),
+        }
+    }
+
     /// Re-probe every controller in the chain once so a stale transport handle
     /// can be rebuilt without issuing a blank or wake command.
     async fn reprobe(&self) -> Result<(), String> {
@@ -1000,6 +1015,7 @@ mod tests {
         input_sources: VecDeque<Result<Option<u8>, String>>,
         /// Scripted [`DisplayController::write_input_source`] responses.
         input_source_writes: VecDeque<Result<(), CmdFailure>>,
+        power_checks: VecDeque<Result<bool, String>>,
     }
 
     impl FakeController {
@@ -1208,6 +1224,12 @@ mod tests {
                 .input_sources
                 .pop_front()
                 .unwrap_or(Ok(None))
+        }
+
+        async fn ensure_powered_on(&self) -> Result<bool, String> {
+            let mut state = self.inner.lock().unwrap();
+            state.log.push((self.name.to_string(), "ensure_powered_on"));
+            state.power_checks.pop_front().unwrap_or(Ok(false))
         }
 
         async fn write_input_source(&self, _target: InputSourceTarget) -> Result<(), CmdFailure> {
@@ -1944,6 +1966,17 @@ mod tests {
         let a = FakeController::new("A", vec![BlankMode::PowerOff]);
         let (exec, _) = executor_with(vec![a], default_retry());
         assert_eq!(exec.read_usage_hours().await, None);
+    }
+
+    #[tokio::test]
+    async fn power_on_chain_walk_reaches_ddcci_after_gamma() {
+        let gamma = FakeController::new("macos-gamma-black", vec![BlankMode::BrightnessZero]);
+        let ddcci = FakeController::new("ddcci", vec![BlankMode::PowerOff]);
+        ddcci.inner.lock().unwrap().power_checks.push_back(Ok(true));
+        let (executor, _) = executor_with(vec![gamma.clone(), ddcci.clone()], default_retry());
+        assert_eq!(executor.ensure_powered_on().await, Ok(true));
+        assert_eq!(gamma.count_op("ensure_powered_on"), 1);
+        assert_eq!(ddcci.count_op("ensure_powered_on"), 1);
     }
 
     #[tokio::test]

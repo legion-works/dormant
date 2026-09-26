@@ -710,6 +710,30 @@ impl DisplayController for DdcciController {
             .and_then(|raw| decode_input_source(raw).map(Some))
     }
 
+    async fn ensure_powered_on(&self) -> Result<bool, String> {
+        let (ident, lock) = {
+            let state = self.state.lock().unwrap();
+            if !state.d6_supported {
+                return Ok(false);
+            }
+            match (&state.matched_ident, &state.panel_lock) {
+                (Some(id), Some(lock)) => (id.clone(), Arc::clone(lock)),
+                _ => return Ok(false),
+            }
+        };
+        let current = self
+            .ops
+            .get_vcp(&ident, VCP_POWER, &lock, VcpPriority::Command)
+            .await?;
+        if current == D6_ON {
+            return Ok(false);
+        }
+        self.ops
+            .set_vcp(&ident, VCP_POWER, D6_ON, &lock, VcpPriority::Command)
+            .await?;
+        Ok(true)
+    }
+
     /// Select the active input source with VCP `0x60` at command priority.
     ///
     /// `CoreDisplay` can report an acknowledged I²C write that the panel ignores. Success is
@@ -2408,6 +2432,60 @@ mod tests {
         assert_eq!(
             fake.take_call_log(),
             vec![format!("get_vcp_raw({ident}, 0x{VCP_INPUT_SOURCE:02X})")]
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_powered_on_writes_d6_on_only_when_in_standby() {
+        let ident = "i2c-dev:56 DEL DELL U2723QE";
+        let fake = Arc::new(single_display_vcp());
+        fake.expect_get(ident, VCP_POWER, Ok(D6_ON));
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::PowerOff,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &PanelLocks::new(),
+        );
+        ctrl.probe().await.unwrap();
+        let _ = fake.take_call_log();
+        fake.expect_get(ident, VCP_POWER, Ok(D6_OFF));
+        fake.expect_set(ident, VCP_POWER, D6_ON, Ok(()));
+        assert_eq!(ctrl.ensure_powered_on().await, Ok(true));
+        assert_eq!(
+            fake.set_calls(),
+            vec![(VCP_POWER, D6_ON, VcpPriority::Command)]
+        );
+        fake.expect_get(ident, VCP_POWER, Ok(D6_ON));
+        fake.expect_set(ident, VCP_POWER, D6_ON, Ok(()));
+        assert_eq!(ctrl.ensure_powered_on().await, Ok(false));
+        assert_eq!(fake.set_calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ensure_powered_on_never_writes_standby() {
+        let ident = "i2c-dev:56 DEL DELL U2723QE";
+        let fake = Arc::new(single_display_vcp());
+        fake.expect_get(ident, VCP_POWER, Ok(D6_ON));
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::PowerOff,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &PanelLocks::new(),
+        );
+        ctrl.probe().await.unwrap();
+        for value in [D6_OFF, 0x02, D6_ON] {
+            fake.expect_get(ident, VCP_POWER, Ok(value));
+            if value != D6_ON {
+                fake.expect_set(ident, VCP_POWER, D6_ON, Ok(()));
+            }
+            let _ = ctrl.ensure_powered_on().await;
+        }
+        assert!(
+            fake.set_calls()
+                .iter()
+                .all(|(code, value, _)| *code != VCP_POWER || *value == D6_ON)
         );
     }
 

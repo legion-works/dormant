@@ -1672,7 +1672,7 @@ impl RulesEngine {
                 }
             }
             SensorState::Unavailable => {
-                hold.armed_until = None;
+                // Preserve the original deadline, but discard deferred absence while data is unavailable.
                 hold.pending_absent = None;
                 Some(ev)
             }
@@ -2663,8 +2663,8 @@ impl RulesEngine {
         let Some(hold) = self.holds.get_mut(sensor_id) else {
             return;
         };
-        // Disarmed by an Unavailable event (or never armed) — nothing to
-        // do, and any stray pending_absent should be discarded.
+        // An unavailable edge clears pending_absent but preserves an armed deadline, so
+        // expiry during the outage cannot emit an absence without fresh sensor data.
         let Some(armed_until) = hold.armed_until else {
             hold.pending_absent = None;
             return;
@@ -4567,6 +4567,99 @@ mod tests {
                 .any(|event| matches!(event, DaemonEvent::ZoneChanged { present: false, .. })),
             "hold expiry must emit the deferred zone-clear event"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hold_survives_unavailable_then_absent() {
+        let hold = Duration::from_secs(30);
+        let (mut engine, zone, mut events) = presence_hold_engine("desk", hold);
+        let sensor = SensorId("desk".into());
+        engine.handle_presence_event(PresenceEvent::new(
+            sensor.clone(),
+            SensorState::Present,
+            Timestamp::now(),
+        ));
+        tokio::time::advance(Duration::from_secs(10)).await;
+        engine.handle_presence_event(PresenceEvent::new(
+            sensor.clone(),
+            SensorState::Absent,
+            Timestamp::now(),
+        ));
+        engine.handle_presence_event(PresenceEvent::new(
+            sensor.clone(),
+            SensorState::Unavailable,
+            Timestamp::now(),
+        ));
+        tokio::time::advance(Duration::from_secs(5)).await;
+        engine.handle_presence_event(PresenceEvent::new(
+            sensor,
+            SensorState::Absent,
+            Timestamp::now(),
+        ));
+        assert!(engine.zone_engine.is_present(&zone).unwrap_or(false));
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(event, DaemonEvent::ZoneChanged { present: false, .. }),
+                "zone cleared before original hold deadline"
+            );
+        }
+        tokio::time::advance(Duration::from_secs(15)).await;
+        engine.fire_due_timers(Tick::now());
+        assert!(!engine.zone_engine.is_present(&zone).unwrap_or(true));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hold_expiring_while_unavailable_emits_no_absent() {
+        let hold = Duration::from_secs(30);
+        let (mut engine, zone, mut events) = presence_hold_engine("desk", hold);
+        let sensor = SensorId("desk".into());
+        engine.handle_presence_event(PresenceEvent::new(
+            sensor.clone(),
+            SensorState::Present,
+            Timestamp::now(),
+        ));
+        engine.handle_presence_event(PresenceEvent::new(
+            sensor.clone(),
+            SensorState::Absent,
+            Timestamp::now(),
+        ));
+        engine.handle_presence_event(PresenceEvent::new(
+            sensor,
+            SensorState::Unavailable,
+            Timestamp::now(),
+        ));
+        tokio::time::advance(hold + Duration::from_secs(1)).await;
+        engine.fire_due_timers(Tick::now());
+        assert!(engine.zone_engine.is_present(&zone).unwrap_or(false));
+        assert!(
+            !std::iter::from_fn(|| events.try_recv().ok())
+                .any(|event| matches!(event, DaemonEvent::ZoneChanged { present: false, .. }))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn absent_after_unavailable_with_expired_hold_passes_immediately() {
+        let hold = Duration::from_secs(30);
+        let (mut engine, zone, _events) = presence_hold_engine("desk", hold);
+        let sensor = SensorId("desk".into());
+        engine.handle_presence_event(PresenceEvent::new(
+            sensor.clone(),
+            SensorState::Present,
+            Timestamp::now(),
+        ));
+        tokio::time::advance(hold + Duration::from_secs(1)).await;
+        engine.fire_due_timers(Tick::now());
+        engine.handle_presence_event(PresenceEvent::new(
+            sensor.clone(),
+            SensorState::Unavailable,
+            Timestamp::now(),
+        ));
+        engine.handle_presence_event(PresenceEvent::new(
+            sensor,
+            SensorState::Absent,
+            Timestamp::now(),
+        ));
+        assert!(!engine.zone_engine.is_present(&zone).unwrap_or(true));
     }
 
     #[tokio::test(start_paused = true)]

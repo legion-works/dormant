@@ -886,6 +886,8 @@ pub struct DisplaySnapshot {
     /// because of `#[serde(default)]`, but the key is never omitted on
     /// the wire because a consumer that treated an absent key as "no
     /// data" instead of "empty list" caused a blank-dashboard bug.
+    ///
+    /// Populated when the engine assembles a [`StateSnapshot`].
     #[serde(default)]
     pub rules: Vec<String>,
 }

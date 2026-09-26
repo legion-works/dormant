@@ -2988,15 +2988,16 @@ mod tests {
         cancel.cancel();
         task.await.expect("subscriber exited");
 
+        let empty_runner = CapturingHookRunner::new();
+        let empty_commands = Arc::clone(&empty_runner.commands);
         let empty = build_handle(
             display_config(),
             Arc::new(FakeSink::new("ddcci")),
-            Arc::new(HookEngine::with_runner(
-                Arc::new(CapturingHookRunner::new()),
-            )),
+            Arc::new(HookEngine::with_runner(Arc::new(empty_runner))),
             mpsc::channel(8).0,
         );
         empty.notify_wake(&display_id()).await;
+        assert!(empty_commands.lock().unwrap().is_empty());
     }
 
     /// Regression guard: the initiator blocking `before_acquire` still

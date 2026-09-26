@@ -6778,6 +6778,12 @@ fn spawn_generation(
         producer_handles.push(handle);
     }
 
+    producer_handles.push(crate::wake_hooks::spawn(
+        ctl_tx.clone(),
+        Arc::clone(direct_switch),
+        producer_token.clone(),
+    ));
+
     // Desktop wake/blank-failure notifier (spec §4.4) — `notifier::spawn`
     // returns `None` (no-op) when `[notifications] enabled = false`,
     // mirroring `inhibit_activity::spawn`'s own None-returning precedent.

@@ -102,6 +102,8 @@ pub enum Direction {
     ObservedLoss,
     /// Post-hoc observation: the poll detected the panel switched to this host.
     ObservedGain,
+    /// Post-hoc wake of a dark display, independent of the panel switch.
+    Wake,
 }
 
 impl Direction {
@@ -113,6 +115,7 @@ impl Direction {
             Self::Acquire => "acquire",
             Self::ObservedLoss => "observed_loss",
             Self::ObservedGain => "observed_gain",
+            Self::Wake => "wake",
         }
     }
 }
@@ -408,6 +411,7 @@ async fn run_slot_with_probe(
                             Direction::Acquire => "claim_acquire_aborted",
                             Direction::ObservedLoss => "observed_loss_aborted",
                             Direction::ObservedGain => "observed_gain_aborted",
+                            Direction::Wake => "wake_hook_aborted",
                         };
                         warn!(
                             event = %event,
@@ -2434,12 +2438,16 @@ mod tests {
             let release_event = match Direction::Release {
                 Direction::Release => "claim_release_aborted",
                 Direction::Acquire => "claim_acquire_aborted",
-                Direction::ObservedLoss | Direction::ObservedGain => unreachable!(),
+                Direction::ObservedLoss | Direction::ObservedGain | Direction::Wake => {
+                    unreachable!()
+                }
             };
             let acquire_event = match Direction::Acquire {
                 Direction::Release => "claim_release_aborted",
                 Direction::Acquire => "claim_acquire_aborted",
-                Direction::ObservedLoss | Direction::ObservedGain => unreachable!(),
+                Direction::ObservedLoss | Direction::ObservedGain | Direction::Wake => {
+                    unreachable!()
+                }
             };
             captured.lock().unwrap().push(release_event.to_string());
             captured.lock().unwrap().push(acquire_event.to_string());

@@ -209,6 +209,13 @@ pub trait DisplayController: Any + Send + Sync {
         Ok(None)
     }
 
+    /// Power on a standby panel before selecting its input. Never power it off.
+    /// Returns `true` only when this controller issued a power-on command;
+    /// controllers without a power-control surface return `false`.
+    async fn ensure_powered_on(&self) -> Result<bool, String> {
+        Ok(false)
+    }
+
     /// Select the active input-source code.
     ///
     /// Controllers without an input-source write surface return the stable
@@ -343,6 +350,12 @@ pub trait CommandSink: Send + Sync {
     /// command priority.
     async fn read_input_source(&self) -> Result<Option<u8>, String> {
         Ok(None)
+    }
+
+    /// Walk the display's power-control-capable controllers before switching
+    /// input. An error means the check failed, not that switching must stop.
+    async fn ensure_powered_on(&self) -> Result<bool, String> {
+        Ok(false)
     }
 
     /// Re-probe the composed controller chain after sustained input-read

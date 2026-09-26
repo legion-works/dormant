@@ -352,6 +352,20 @@ impl DirectSwitchHandle {
             return SwitchOutcome::HookAborted { reason };
         }
 
+        let display_name = &display.0;
+        match tokio::time::timeout(Duration::from_secs(2), executor.ensure_powered_on()).await {
+            Ok(Ok(true)) => {
+                tracing::info!(event = "switch_panel_powered_on", display_name = %display_name);
+            }
+            Ok(Ok(false)) => {}
+            Ok(Err(error)) => {
+                warn!(event = "switch_panel_power_check_failed", display_name = %display_name, %error);
+            }
+            Err(error) => {
+                warn!(event = "switch_panel_power_check_failed", display_name = %display_name, %error);
+            }
+        }
+
         // Write the local input-source command through the controller chain.
         match executor.write_input_source(target).await {
             Ok(()) => {
@@ -516,6 +530,20 @@ impl DirectSwitchHandle {
             return SwitchOutcome::HookAborted {
                 reason: hook_reason,
             };
+        }
+
+        let display_name = &display.0;
+        match tokio::time::timeout(Duration::from_secs(2), executor.ensure_powered_on()).await {
+            Ok(Ok(true)) => {
+                tracing::info!(event = "switch_panel_powered_on", display_name = %display_name);
+            }
+            Ok(Ok(false)) => {}
+            Ok(Err(error)) => {
+                warn!(event = "switch_panel_power_check_failed", display_name = %display_name, %error);
+            }
+            Err(error) => {
+                warn!(event = "switch_panel_power_check_failed", display_name = %display_name, %error);
+            }
         }
 
         match executor.write_input_source(target).await {
@@ -840,6 +868,8 @@ mod tests {
     struct FakeSinkInner {
         write_result: Option<Result<(), CmdFailure>>,
         input_read_result: Option<Result<Option<u8>, String>>,
+        power_result: Option<Result<bool, String>>,
+        calls: Vec<&'static str>,
         last_target: Option<InputSourceTarget>,
         write_calls: usize,
     }
@@ -851,6 +881,8 @@ mod tests {
                 inner: Arc::new(Mutex::new(FakeSinkInner {
                     write_result: Some(Ok(())),
                     input_read_result: Some(Ok(None)),
+                    power_result: Some(Ok(true)),
+                    calls: vec![],
                     last_target: None,
                     write_calls: 0,
                 })),
@@ -859,6 +891,14 @@ mod tests {
 
         fn set_write_result(&self, result: Result<(), CmdFailure>) {
             self.inner.lock().unwrap().write_result = Some(result);
+        }
+
+        fn set_power_result(&self, result: Result<bool, String>) {
+            self.inner.lock().unwrap().power_result = Some(result);
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.inner.lock().unwrap().calls.clone()
         }
 
         fn last_target(&self) -> Option<InputSourceTarget> {
@@ -897,12 +937,61 @@ mod tests {
                 .unwrap_or(Ok(None))
         }
 
+        async fn ensure_powered_on(&self) -> Result<bool, String> {
+            let mut inner = self.inner.lock().unwrap();
+            inner.calls.push("ensure_powered_on");
+            inner.power_result.take().unwrap_or(Ok(false))
+        }
+
         async fn write_input_source(&self, target: InputSourceTarget) -> Result<(), CmdFailure> {
             let mut inner = self.inner.lock().unwrap();
+            inner.calls.push("write_input_source");
             inner.last_target = Some(target);
             inner.write_calls += 1;
             inner.write_result.take().unwrap_or(Ok(()))
         }
+    }
+
+    #[tokio::test]
+    async fn pull_powers_on_standby_panel_before_input_write() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        let (tx, _rx) = mpsc::channel(8);
+        let handle = build_handle(display_config(), sink.clone(), noop_hook_engine(), tx);
+        assert_eq!(
+            handle.pull(display_id(), SwitchReason::Cli, false).await,
+            SwitchOutcome::Switched
+        );
+        assert_eq!(sink.calls(), ["ensure_powered_on", "write_input_source"]);
+    }
+
+    #[tokio::test]
+    async fn pull_continues_when_power_check_fails() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        sink.set_power_result(Err("ddc read failed".into()));
+        let (tx, _rx) = mpsc::channel(8);
+        let handle = build_handle(display_config(), sink.clone(), noop_hook_engine(), tx);
+        assert_eq!(
+            handle.pull(display_id(), SwitchReason::Cli, false).await,
+            SwitchOutcome::Switched
+        );
+        assert_eq!(sink.calls(), ["ensure_powered_on", "write_input_source"]);
+    }
+
+    #[tokio::test]
+    async fn push_powers_on_standby_panel_before_input_write() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        let mut dc = display_config();
+        dc.shared_peer_input_write_code = Some(PEER_WRITE);
+        dc.shared_peer_input_code = Some(PEER_READ);
+        let (tx, _rx) = mpsc::channel(8);
+        let handle = build_handle(dc, sink.clone(), noop_hook_engine(), tx);
+        assert_eq!(
+            handle
+                .push(display_id(), SwitchReason::Release, false)
+                .await,
+            SwitchOutcome::Switched
+        );
+        assert_eq!(sink.calls(), ["ensure_powered_on", "write_input_source"]);
     }
 
     /// A no-op hook runner — all commands succeed.

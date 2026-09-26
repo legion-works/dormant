@@ -864,6 +864,21 @@ impl CommandSink for DisplayExecutor {
         }
     }
 
+    async fn ensure_powered_on(&self) -> Result<bool, String> {
+        let mut last_error = None;
+        for controller in &self.chain {
+            match controller.ensure_powered_on().await {
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(error) => last_error = Some(format!("{}: {error}", controller.name())),
+            }
+        }
+        match last_error {
+            Some(error) => Err(error),
+            None => Ok(false),
+        }
+    }
+
     /// Re-probe every controller in the chain once so a stale transport handle
     /// can be rebuilt without issuing a blank or wake command.
     async fn reprobe(&self) -> Result<(), String> {

@@ -44,7 +44,7 @@ When the feature is enabled, these daemon config keys control the web server:
 | `daemon.entity_crud_enabled` | `true` | Allow creating/deleting sensors, zones, displays, and rules from the Settings form ([Entity create/delete](#entity-createdelete)) |
 | `daemon.pairing_enabled` | `true` | Allow the Samsung pairing wizard ([Pairing wizard](#pairing-wizard)) |
 | `daemon.pair_timeout` | `"120s"` | How long the pairing wizard waits for the TV to accept before giving up (`30s`..`300s`) |
-| `daemon.hook_edit_enabled` | `false` | Allow editing hook slots (including `on_observed_loss` and `on_observed_gain`) in the Settings form. When `false` hooks are always read-only. |
+| `daemon.hook_edit_enabled` | `false` | Allow editing hook slots (including `on_observed_loss`, `on_observed_gain`, and `on_wake`) in the Settings form. When `false` hooks are always read-only. |
 
 Example:
 
@@ -183,7 +183,7 @@ The Settings form presents the running config as editable sections, one per tab.
 - Leaf string, number, and duration values across every section (e.g. `grace_period`, `startup_holdoff`, `hold_time`, coordination timeouts, keymap entries, input-filter patterns).
 - Whole arrays (e.g. a rule's `displays` list, the `ladder` array-of-tables, screensaver `source` lists, coordination `keymap` entries). Setting an array replaces it wholesale.
 - A limited set of optional keys can be *removed* via the Remove op: `blank_mode`, `degraded_mode`, `dwell`, `order`, `image_duration`, `scale_mode`, `transition`, `transition_duration`, `hold_time`, `stale_timeout`, `ddc_display`, `output`, `wol_mac`, `host`.
-- Hook slots (including `on_observed_loss` and `on_observed_gain`) — editing is gated behind `daemon.hook_edit_enabled = true` (default: off); when disabled, hooks are displayed read-only.
+- Hook slots (including `on_observed_loss`, `on_observed_gain`, and `on_wake`) — editing is gated behind `daemon.hook_edit_enabled = true` (default: off); when disabled, hooks are displayed read-only. Non-empty hook slots require a shared display.
 
 **File-only:**
 - Display command strings (`wake_command`, `blank_command`) are not rendered in the Settings form.

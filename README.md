@@ -205,6 +205,7 @@ Then:
 dormantctl validate     # check the config
 dormantd                # start the daemon
 dormantctl status       # watch the pipeline
+dormantctl status --json # snapshot the daemon state as JSON for scripts/dashboards
 dormantctl doctor       # diagnose sensors and displays against your hardware
 dormantctl doctor exercise monitor  # verify a real blank → wake control path
 ```

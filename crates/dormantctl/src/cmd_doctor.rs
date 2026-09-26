@@ -320,10 +320,18 @@ async fn run_async(args: &DoctorArgs) -> Result<DoctorOutcome> {
 /// unreachable-daemon fallback). Mirrors the `probe_usb` contract spelled
 /// out in the Task 12 plan.
 #[cfg(test)]
-pub(crate) static BARE_DOCTOR_OFFLINE_INVOCATIONS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+type OfflineInvocationCounter = std::sync::atomic::AtomicUsize;
 
 pub fn run_bare_with_socket(args: &DoctorArgs, socket_path: &Path) -> Result<DoctorOutcome> {
+    run_bare_with_socket_inner(args, socket_path, None)
+}
+
+fn run_bare_with_socket_inner(
+    args: &DoctorArgs,
+    socket_path: &Path,
+    #[cfg(test)] offline_counter: Option<&OfflineInvocationCounter>,
+    #[cfg(not(test))] _offline_counter: Option<&()>,
+) -> Result<DoctorOutcome> {
     // 1. Try the live daemon. A `Doctor` request goes to the
     //    `DoctorService` which reports owned USB / DDC / etc from the
     //    live `StateSnapshot` (never re-opens the port).
@@ -373,13 +381,20 @@ pub fn run_bare_with_socket(args: &DoctorArgs, socket_path: &Path) -> Result<Doc
         }
     }
 
-    run_bare_offline(args)
+    run_bare_offline(
+        args,
+        #[cfg(test)]
+        offline_counter,
+    )
 }
 
-fn run_bare_offline(args: &DoctorArgs) -> Result<DoctorOutcome> {
+fn run_bare_offline(
+    args: &DoctorArgs,
+    #[cfg(test)] offline_counter: Option<&OfflineInvocationCounter>,
+) -> Result<DoctorOutcome> {
     #[cfg(test)]
-    {
-        BARE_DOCTOR_OFFLINE_INVOCATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if let Some(counter) = offline_counter {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
     // Clone the args so the future owns its inputs (the future may be
     // moved to a worker thread when the caller is inside an existing
@@ -1807,10 +1822,13 @@ mod tests {
             dormant_core::ipc_proto::IpcResponse::doctor(fake_owned_usb_report()),
         );
 
-        // Snapshot the seam counter before — every other test in this
-        // module that touches the bare path bumps it.
-        let before =
-            super::BARE_DOCTOR_OFFLINE_INVOCATIONS.load(std::sync::atomic::Ordering::SeqCst);
+        // Each test passes its own per-test counter; the previous
+        // design used a process-wide atomic that raced when cargo
+        // test ran multiple tests in one process (a sibling test
+        // bumped the counter between this test's snapshot and
+        // assertion). nextest hides the race by giving every test
+        // its own process.
+        let offline_counter = std::sync::atomic::AtomicUsize::new(0);
 
         let args = super::DoctorArgs {
             config: None,
@@ -1819,7 +1837,8 @@ mod tests {
             draft_feature: None,
             subcommand: None,
         };
-        let outcome = super::run_bare_with_socket(&args, &socket).expect("run_bare_with_socket ok");
+        let outcome = super::run_bare_with_socket_inner(&args, &socket, Some(&offline_counter))
+            .expect("run_bare_with_socket ok");
 
         // By the time the client has read the daemon's reply, the
         // request is already appended to `captured` (the daemon
@@ -1838,15 +1857,12 @@ mod tests {
             requests[0]
         );
 
-        // Live path was taken: no fallback, so the seam counter is
-        // unchanged from the snapshot.
-        let after =
-            super::BARE_DOCTOR_OFFLINE_INVOCATIONS.load(std::sync::atomic::Ordering::SeqCst);
+        // Live path was taken: no fallback, so the per-test counter
+        // is zero.
+        let after = offline_counter.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(
-            after,
-            before,
-            "offline path was invoked {delta} times despite a reachable daemon",
-            delta = after.saturating_sub(before),
+            after, 0,
+            "offline path was invoked {after} times despite a reachable daemon",
         );
 
         // The owned-USB report is rendered as a table; the live path
@@ -1878,8 +1894,7 @@ mod tests {
         let socket = dir.path().join("does-not-exist.sock");
         let missing_config = dir.path().join("definitely-missing.toml");
 
-        let before =
-            super::BARE_DOCTOR_OFFLINE_INVOCATIONS.load(std::sync::atomic::Ordering::SeqCst);
+        let offline_counter = std::sync::atomic::AtomicUsize::new(0);
 
         let args = super::DoctorArgs {
             config: Some(missing_config),
@@ -1893,13 +1908,11 @@ mod tests {
         // running bare doctor on a host with no config. The point of
         // this test is that the FALLBACK RAN — not the offline probe
         // result.
-        let _ = super::run_bare_with_socket(&args, &socket);
+        let _ = super::run_bare_with_socket_inner(&args, &socket, Some(&offline_counter));
 
-        let after =
-            super::BARE_DOCTOR_OFFLINE_INVOCATIONS.load(std::sync::atomic::Ordering::SeqCst);
+        let after = offline_counter.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(
-            after.saturating_sub(before),
-            1,
+            after, 1,
             "offline fallback must run exactly once when the daemon is unreachable"
         );
     }
@@ -1968,8 +1981,7 @@ mod tests {
         let socket = dir.path().join("dormant.sock");
         let (stop_tx, daemon_handle) = spawn_doctor_daemon_that_drops(&socket);
 
-        let before =
-            super::BARE_DOCTOR_OFFLINE_INVOCATIONS.load(std::sync::atomic::Ordering::SeqCst);
+        let offline_counter = std::sync::atomic::AtomicUsize::new(0);
 
         let args = super::DoctorArgs {
             config: None,
@@ -1978,17 +1990,16 @@ mod tests {
             draft_feature: None,
             subcommand: None,
         };
-        let outcome = super::run_bare_with_socket(&args, &socket)
+        let outcome = super::run_bare_with_socket_inner(&args, &socket, Some(&offline_counter))
             .expect("run_bare_with_socket returns Ok even on a daemon-side error");
 
         // The offline fallback MUST NOT have been entered. A
         // post-connect error means the daemon is reachable and
         // likely owns the sensor; running the cold probe set
         // would re-introduce the #202 frame-steal.
-        let after =
-            super::BARE_DOCTOR_OFFLINE_INVOCATIONS.load(std::sync::atomic::Ordering::SeqCst);
+        let after = offline_counter.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(
-            after, before,
+            after, 0,
             "post-connect error must not trigger the offline fallback (would reopen the daemon-owned port; issue #202)"
         );
 
@@ -2010,8 +2021,7 @@ mod tests {
         let socket = dir.path().join("dormant.sock");
         let (captured, stop_tx, daemon_handle) =
             spawn_one_shot_doctor_daemon(&socket, dormant_core::ipc_proto::IpcResponse::ok(None));
-        let before =
-            super::BARE_DOCTOR_OFFLINE_INVOCATIONS.load(std::sync::atomic::Ordering::SeqCst);
+        let offline_counter = std::sync::atomic::AtomicUsize::new(0);
         let args = super::DoctorArgs {
             config: None,
             credentials: None,
@@ -2020,14 +2030,11 @@ mod tests {
             subcommand: None,
         };
 
-        let outcome = super::run_bare_with_socket(&args, &socket).expect("doctor should return");
+        let outcome = super::run_bare_with_socket_inner(&args, &socket, Some(&offline_counter))
+            .expect("doctor should return");
         assert_eq!(outcome, super::DoctorOutcome::SomeFailed);
-        let after =
-            super::BARE_DOCTOR_OFFLINE_INVOCATIONS.load(std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(
-            after, before,
-            "ok-without-report must not reopen offline probes"
-        );
+        let after = offline_counter.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(after, 0, "ok-without-report must not reopen offline probes");
         assert_eq!(captured.lock().unwrap().len(), 1);
         let _ = stop_tx.send(());
         let _ = daemon_handle.join();

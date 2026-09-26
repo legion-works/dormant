@@ -224,7 +224,7 @@ pub enum HookOutcome {
     /// The slot finished without an aborting failure. Entries after the total
     /// hook deadline may be counted as failures without being started.
     Completed {
-        /// Total entries started (blocking + non-blocking).
+        /// Total entries processed (including actions skipped because displays were awake).
         started: usize,
         /// Entries that returned a failure or were skipped by the total hook
         /// deadline (failure-on-non-blocking does NOT abort).
@@ -284,6 +284,39 @@ pub trait HookRunner: Send + Sync {
     async fn publish_mqtt(&self, topic: &str, payload: &str, timeout_: Duration) -> HookIoResult;
 }
 
+/// Read the asleep state of each online local display (`true` means asleep).
+#[async_trait]
+pub trait DisplayAwakeProbe: Send + Sync {
+    /// Return one asleep bit per online display, or an error when unknown.
+    async fn online_sleep_states(&self) -> Result<Vec<bool>, String>;
+}
+
+/// Production display sleep-state readback.
+pub struct RealDisplayAwakeProbe;
+
+#[async_trait]
+impl DisplayAwakeProbe for RealDisplayAwakeProbe {
+    async fn online_sleep_states(&self) -> Result<Vec<bool>, String> {
+        #[cfg(target_os = "macos")]
+        {
+            use dormant_displays::macos_display_sleep::DisplaySleepTransport;
+            use dormant_displays::macos_power::RealDisplaySleepTransport;
+            tokio::task::spawn_blocking(|| {
+                RealDisplaySleepTransport
+                    .online_sleep_states()
+                    .map(|states| states.into_iter().map(|(_, asleep)| asleep).collect())
+                    .map_err(|err| err.to_string())
+            })
+            .await
+            .map_err(|err| err.to_string())?
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err("display sleep-state probe unsupported on this platform".into())
+        }
+    }
+}
+
 /// Convenience wrapper around the env list — `Vec<(String, String)>` in
 /// insertion order (matches `HookContext::env()` output).
 pub type EnvList = Vec<(String, String)>;
@@ -300,6 +333,14 @@ pub type EnvList = Vec<(String, String)>;
 /// into the spawned task — the spawn requires `'static` and `Send`, which a
 /// borrowed `&dyn HookRunner` cannot satisfy.
 pub async fn run_slot(slot: HookSlot<'_>, runner: Arc<dyn HookRunner>) -> HookOutcome {
+    run_slot_with_probe(slot, runner, Arc::new(RealDisplayAwakeProbe)).await
+}
+
+async fn run_slot_with_probe(
+    slot: HookSlot<'_>,
+    runner: Arc<dyn HookRunner>,
+    probe: Arc<dyn DisplayAwakeProbe>,
+) -> HookOutcome {
     let decisions = decide_slot(&slot);
     let env = slot.context.env();
     let label = slot_label(&slot.context);
@@ -320,11 +361,23 @@ pub async fn run_slot(slot: HookSlot<'_>, runner: Arc<dyn HookRunner>) -> HookOu
         }
         started += 1;
 
+        if skip_awake_action(decision, &label, probe.as_ref()).await {
+            continue;
+        }
+
         if decision.blocking {
             // Awaited in-place: the slot observes the outcome and reacts to
             // `abort_on_failure`. No boxing, no spawn.
             let remaining = slot.deadline.saturating_duration_since(Instant::now());
             let action_timeout = decision.timeout.min(remaining);
+            log_action_start(
+                decision.index,
+                &label,
+                &decision.action,
+                true,
+                decision.timeout,
+            );
+            let started_at = Instant::now();
             let outcome = run_one(decision, &env, runner.as_ref(), action_timeout).await;
             if outcome
                 .as_ref()
@@ -338,7 +391,7 @@ pub async fn run_slot(slot: HookSlot<'_>, runner: Arc<dyn HookRunner>) -> HookOu
                     spawned,
                 );
             }
-            log_outcome(decision, &label, &outcome);
+            log_outcome(decision, &label, &outcome, started_at.elapsed());
             match outcome {
                 Ok(()) => {}
                 Err(reason) => {
@@ -372,30 +425,7 @@ pub async fn run_slot(slot: HookSlot<'_>, runner: Arc<dyn HookRunner>) -> HookOu
             // failure must NOT abort the slot, because the slot has already
             // progressed past it (spec invariant).
             spawned += 1;
-            let action = decision.action.clone();
-            let remaining = slot.deadline.saturating_duration_since(Instant::now());
-            let timeout_ = decision.timeout.min(remaining);
-            let deadline_limited = timeout_ < decision.timeout;
-            let deadline = slot.deadline;
-            let label_for_task = label.clone();
-            let env_for_task = env.clone();
-            let index = decision.index;
-            let runner_for_task = Arc::clone(&runner);
-            tokio::spawn(async move {
-                let outcome =
-                    dispatch_action(&action, &env_for_task, timeout_, runner_for_task.as_ref())
-                        .await;
-                if deadline_limited
-                    && outcome
-                        .as_ref()
-                        .is_err_and(|reason| is_timeout_error(reason))
-                    && Instant::now() >= deadline
-                {
-                    log_slot_timeout(&label_for_task, index, 1);
-                } else {
-                    log_spawned_outcome(index, &label_for_task, &action, &outcome);
-                }
-            });
+            spawn_nonblocking(decision, slot.deadline, &label, &env, &runner);
         }
     }
 
@@ -404,6 +434,68 @@ pub async fn run_slot(slot: HookSlot<'_>, runner: Arc<dyn HookRunner>) -> HookOu
         failed,
         spawned,
     }
+}
+
+fn spawn_nonblocking(
+    decision: &HookDecision,
+    deadline: Instant,
+    label: &str,
+    env: &EnvList,
+    runner: &Arc<dyn HookRunner>,
+) {
+    let action = decision.action.clone();
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let timeout_ = decision.timeout.min(remaining);
+    let deadline_limited = timeout_ < decision.timeout;
+    let label = label.to_string();
+    let env = env.clone();
+    let index = decision.index;
+    let runner = Arc::clone(runner);
+    tokio::spawn(async move {
+        log_action_start(index, &label, &action, false, action.timeout);
+        let started_at = Instant::now();
+        let outcome = dispatch_action(&action, &env, timeout_, runner.as_ref()).await;
+        if deadline_limited
+            && outcome
+                .as_ref()
+                .is_err_and(|reason| is_timeout_error(reason))
+            && Instant::now() >= deadline
+        {
+            log_slot_timeout(&label, index, 1);
+        } else {
+            log_spawned_outcome(index, &label, &action, &outcome, started_at.elapsed());
+        }
+    });
+}
+
+async fn skip_awake_action(
+    decision: &HookDecision,
+    label: &str,
+    probe: &dyn DisplayAwakeProbe,
+) -> bool {
+    if !decision.action.skip_if_display_awake {
+        return false;
+    }
+    // A mistaken skip silently prevents the input switch; an unnecessary wake only costs time.
+    let states = match probe.online_sleep_states().await {
+        Ok(states) => states,
+        Err(reason) => {
+            warn!(event = "hook_skip_probe_failed", slot = %label, index = decision.index, reason = %reason);
+            return false;
+        }
+    };
+    if states.is_empty() || states.iter().any(|&asleep| asleep) {
+        debug!(
+            event = "hook_skip_declined",
+            slot = %label,
+            index = decision.index,
+            displays = states.len(),
+            asleep = states.iter().filter(|&&asleep| asleep).count(),
+        );
+        return false;
+    }
+    info!(event = "hook_skipped", slot = %label, index = decision.index, reason = "display_awake");
+    true
 }
 
 fn slot_label(context: &HookContext<'_>) -> String {
@@ -487,8 +579,13 @@ async fn dispatch_action(
     }
 }
 
-fn log_outcome(decision: &HookDecision, label: &str, outcome: &Result<(), String>) {
-    log_decision_outcome(decision, label, outcome);
+fn log_outcome(
+    decision: &HookDecision,
+    label: &str,
+    outcome: &Result<(), String>,
+    elapsed: Duration,
+) {
+    log_decision_outcome(decision, label, outcome, elapsed);
 }
 
 /// Saturating cast — per-entry timeouts are bounded by validation
@@ -508,8 +605,10 @@ fn log_spawned_outcome(
     label: &str,
     action: &HookAction,
     outcome: &Result<(), String>,
+    elapsed: Duration,
 ) {
     let kind = action_kind(action);
+    let elapsed_ms = timeout_ms(elapsed);
     let timeout_ms = timeout_ms(action.timeout);
     match outcome {
         Ok(()) => info!(
@@ -517,6 +616,7 @@ fn log_spawned_outcome(
             slot = %label,
             index,
             kind = %kind,
+            elapsed_ms,
         ),
         Err(reason) if is_timeout_error(reason) => warn!(
             event = "hook_timeout",
@@ -524,6 +624,7 @@ fn log_spawned_outcome(
             index,
             kind = %kind,
             timeout_ms,
+            elapsed_ms,
             reason = %reason,
         ),
         Err(reason) => warn!(
@@ -531,6 +632,7 @@ fn log_spawned_outcome(
             slot = %label,
             index,
             kind = %kind,
+            elapsed_ms,
             reason = %reason,
         ),
     }
@@ -546,16 +648,21 @@ fn log_slot_timeout(label: &str, index: usize, expired_entries: usize) {
     );
 }
 
-fn log_decision_outcome(decision: &HookDecision, label: &str, outcome: &Result<(), String>) {
-    let kind = action_kind(&decision.action);
-    let argv0 = match &decision.action {
+fn log_action_start(
+    index: usize,
+    label: &str,
+    action: &HookAction,
+    blocking: bool,
+    timeout: Duration,
+) {
+    let argv0 = match action {
         HookAction {
             command: Some(argv),
             ..
         } => argv.first().map(String::as_str).unwrap_or_default(),
         _ => "",
     };
-    let topic = match &decision.action {
+    let topic = match action {
         HookAction {
             mqtt: Some(mqtt), ..
         } => mqtt.topic.as_str(),
@@ -564,12 +671,22 @@ fn log_decision_outcome(decision: &HookDecision, label: &str, outcome: &Result<(
     info!(
         event = "hook_started",
         slot = %label,
-        index = decision.index,
+        index,
         argv0 = %argv0,
         topic = %topic,
-        blocking = decision.blocking,
-        timeout_ms = timeout_ms(decision.timeout),
+        blocking,
+        timeout_ms = timeout_ms(timeout),
     );
+}
+
+fn log_decision_outcome(
+    decision: &HookDecision,
+    label: &str,
+    outcome: &Result<(), String>,
+    elapsed: Duration,
+) {
+    let kind = action_kind(&decision.action);
+    let elapsed_ms = timeout_ms(elapsed);
     let timeout_ms = timeout_ms(decision.timeout);
     match outcome {
         Ok(()) => info!(
@@ -577,6 +694,7 @@ fn log_decision_outcome(decision: &HookDecision, label: &str, outcome: &Result<(
             slot = %label,
             index = decision.index,
             kind = %kind,
+            elapsed_ms,
         ),
         Err(reason) if is_timeout_error(reason) => warn!(
             event = "hook_timeout",
@@ -584,6 +702,7 @@ fn log_decision_outcome(decision: &HookDecision, label: &str, outcome: &Result<(
             index = decision.index,
             kind = %kind,
             timeout_ms,
+            elapsed_ms,
             reason = %reason,
         ),
         Err(reason) => warn!(
@@ -591,6 +710,7 @@ fn log_decision_outcome(decision: &HookDecision, label: &str, outcome: &Result<(
             slot = %label,
             index = decision.index,
             kind = %kind,
+            elapsed_ms,
             reason = %reason,
         ),
     }
@@ -1275,6 +1395,7 @@ impl HookRunner for ScriptedHookRunner {
 /// shared across the lifetime of the daemon.
 pub struct HookEngine {
     runner: RwLock<Arc<dyn HookRunner>>,
+    probe: Arc<dyn DisplayAwakeProbe>,
     mqtt_config: RwLock<(String, Option<MqttCredential>)>,
 }
 
@@ -1282,9 +1403,19 @@ impl HookEngine {
     /// Build an engine with a real (production) runner.
     #[must_use]
     pub fn new(publisher: Arc<MqttPublisher>) -> Self {
+        Self::new_with_probe(publisher, Arc::new(RealDisplayAwakeProbe))
+    }
+
+    /// Build a production runner with an injected display sleep-state probe.
+    #[must_use]
+    pub fn new_with_probe(
+        publisher: Arc<MqttPublisher>,
+        probe: Arc<dyn DisplayAwakeProbe>,
+    ) -> Self {
         Self {
             mqtt_config: RwLock::new(publisher.config()),
             runner: RwLock::new(Arc::new(RealHookRunner::new(publisher))),
+            probe,
         }
     }
 
@@ -1312,9 +1443,19 @@ impl HookEngine {
     /// Build an engine with a custom runner (test seam).
     #[must_use]
     pub fn with_runner(runner: Arc<dyn HookRunner>) -> Self {
+        Self::with_runner_and_probe(runner, Arc::new(RealDisplayAwakeProbe))
+    }
+
+    /// Build an engine with injected hook and display-state I/O.
+    #[must_use]
+    pub fn with_runner_and_probe(
+        runner: Arc<dyn HookRunner>,
+        probe: Arc<dyn DisplayAwakeProbe>,
+    ) -> Self {
         Self {
             runner: RwLock::new(runner),
             mqtt_config: RwLock::new((String::new(), None)),
+            probe,
         }
     }
 
@@ -1332,7 +1473,7 @@ impl HookEngine {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        run_slot(slot, runner).await
+        run_slot_with_probe(slot, runner, Arc::clone(&self.probe)).await
     }
 }
 
@@ -1431,6 +1572,7 @@ mod tests {
             timeout,
             blocking,
             abort_on_failure,
+            skip_if_display_awake: false,
         }
     }
 
@@ -1450,6 +1592,7 @@ mod tests {
             timeout,
             blocking,
             abort_on_failure,
+            skip_if_display_awake: false,
         }
     }
 
@@ -1468,6 +1611,171 @@ mod tests {
 
     fn test_deadline() -> tokio::time::Instant {
         tokio::time::Instant::now() + Duration::from_secs(60)
+    }
+
+    struct FakeAwakeProbe {
+        result: Result<Vec<bool>, String>,
+    }
+
+    #[async_trait]
+    impl DisplayAwakeProbe for FakeAwakeProbe {
+        async fn online_sleep_states(&self) -> Result<Vec<bool>, String> {
+            self.result.clone()
+        }
+    }
+
+    async fn check_awake_hook(
+        result: Result<Vec<bool>, String>,
+        flag: bool,
+    ) -> (HookOutcome, usize, Vec<String>) {
+        let runner = Arc::new(ScriptedHookRunner::new());
+        runner.push_command(Ok(()));
+        let mut action = make_command_action(
+            vec!["echo".into()],
+            Duration::from_secs(5),
+            Some(true),
+            true,
+        );
+        action.skip_if_display_awake = flag;
+        let actions = [action];
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let writer = CaptureWriter(captured.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let engine =
+            HookEngine::with_runner_and_probe(runner.clone(), Arc::new(FakeAwakeProbe { result }));
+        let outcome = engine
+            .run_slot(HookSlot {
+                context: ctx_for(Phase::Before, Direction::Acquire),
+                actions: &actions,
+                deadline: test_deadline(),
+            })
+            .await;
+        let calls = runner.command_argvs().len();
+        let logs = captured.lock().unwrap().clone();
+        (outcome, calls, logs)
+    }
+
+    #[tokio::test]
+    async fn hook_skipped_when_all_displays_awake() {
+        let (outcome, calls, logs) = check_awake_hook(Ok(vec![false, false]), true).await;
+        assert_eq!(calls, 0);
+        assert_eq!(
+            outcome,
+            HookOutcome::Completed {
+                started: 1,
+                failed: 0,
+                spawned: 0
+            }
+        );
+        assert!(
+            logs.iter()
+                .any(|line| line.contains("hook_skipped") && line.contains("display_awake"))
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_runs_when_any_display_asleep() {
+        let (_, calls, _) = check_awake_hook(Ok(vec![false, true]), true).await;
+        assert_eq!(calls, 1);
+    }
+
+    #[tokio::test]
+    async fn hook_runs_when_display_probe_fails() {
+        let (_, calls, _) = check_awake_hook(Err("probe failed".into()), true).await;
+        assert_eq!(calls, 1);
+    }
+
+    #[tokio::test]
+    async fn hook_runs_when_no_displays_reported() {
+        let (_, calls, _) = check_awake_hook(Ok(vec![]), true).await;
+        assert_eq!(calls, 1);
+    }
+
+    #[tokio::test]
+    async fn hook_without_flag_ignores_probe() {
+        let (_, calls, _) = check_awake_hook(Ok(vec![false]), false).await;
+        assert_eq!(calls, 1);
+    }
+
+    struct StartCheckingRunner(Arc<Mutex<Vec<String>>>);
+
+    #[async_trait]
+    impl HookRunner for StartCheckingRunner {
+        async fn run_command(
+            &self,
+            _env: &EnvList,
+            _argv: &[String],
+            _timeout_: Duration,
+        ) -> HookIoResult {
+            if self
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|line| line.contains("hook_started"))
+            {
+                Ok(())
+            } else {
+                Err("hook_started was not logged before execution".into())
+            }
+        }
+
+        async fn publish_mqtt(
+            &self,
+            _topic: &str,
+            _payload: &str,
+            _timeout_: Duration,
+        ) -> HookIoResult {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn hook_started_precedes_outcome_with_elapsed_ms() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let writer = CaptureWriter(captured.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let actions = [make_command_action(
+            vec!["echo".into()],
+            Duration::from_secs(5),
+            Some(true),
+            false,
+        )];
+        let outcome = run_slot(
+            HookSlot {
+                context: ctx_for(Phase::Before, Direction::Acquire),
+                actions: &actions,
+                deadline: test_deadline(),
+            },
+            Arc::new(StartCheckingRunner(captured.clone())),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            HookOutcome::Completed {
+                started: 1,
+                failed: 0,
+                spawned: 0
+            }
+        );
+        let logs = captured.lock().unwrap();
+        let start = logs
+            .iter()
+            .position(|line| line.contains("hook_started"))
+            .unwrap();
+        let ok = logs
+            .iter()
+            .position(|line| line.contains("hook_ok") && line.contains("elapsed_ms"))
+            .expect("hook_ok includes elapsed_ms");
+        assert!(start < ok);
     }
 
     // ── Pure sequencing ─────────────────────────────────────────────────────

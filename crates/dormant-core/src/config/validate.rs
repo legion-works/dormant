@@ -299,23 +299,58 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
     ),
     (
         "displays..hooks.before_release",
-        &["command", "mqtt", "timeout", "blocking", "abort_on_failure"],
+        &[
+            "command",
+            "mqtt",
+            "timeout",
+            "blocking",
+            "abort_on_failure",
+            "skip_if_display_awake",
+        ],
     ),
     (
         "displays..hooks.after_release",
-        &["command", "mqtt", "timeout", "blocking", "abort_on_failure"],
+        &[
+            "command",
+            "mqtt",
+            "timeout",
+            "blocking",
+            "abort_on_failure",
+            "skip_if_display_awake",
+        ],
     ),
     (
         "displays..hooks.before_acquire",
-        &["command", "mqtt", "timeout", "blocking", "abort_on_failure"],
+        &[
+            "command",
+            "mqtt",
+            "timeout",
+            "blocking",
+            "abort_on_failure",
+            "skip_if_display_awake",
+        ],
     ),
     (
         "displays..hooks.after_acquire",
-        &["command", "mqtt", "timeout", "blocking", "abort_on_failure"],
+        &[
+            "command",
+            "mqtt",
+            "timeout",
+            "blocking",
+            "abort_on_failure",
+            "skip_if_display_awake",
+        ],
     ),
     (
         "displays..hooks.on_observed_loss",
-        &["command", "mqtt", "timeout", "blocking", "abort_on_failure"],
+        &[
+            "command",
+            "mqtt",
+            "timeout",
+            "blocking",
+            "abort_on_failure",
+            "skip_if_display_awake",
+        ],
     ),
     ("displays..hooks.before_release.mqtt", &["topic", "payload"]),
     ("displays..hooks.after_release.mqtt", &["topic", "payload"]),
@@ -2419,6 +2454,14 @@ fn validate_hook_action(
     has_mqtt_broker: bool,
     errors: &mut Vec<ValidationError>,
 ) {
+    if action.skip_if_display_awake && !cfg!(target_os = "macos") {
+        errors.push(ValidationError {
+            what: crate::error::E_CONFIG_INVALID.into(),
+            detail: format!(
+                "display '{display_id}' hooks.{slot}[{index}] skip_if_display_awake is macOS-only"
+            ),
+        });
+    }
     if action.command.is_some() == action.mqtt.is_some() {
         errors.push(ValidationError {
             what: crate::error::E_CONFIG_INVALID.into(),
@@ -2599,6 +2642,49 @@ fn check_valid(parent: &str, remaining: &[&str]) -> bool {
 #[allow(clippy::uninlined_format_args)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hook_skip_flag_round_trips_and_defaults_false() {
+        let enabled: HookAction =
+            toml::from_str("command = ['caffeinate']\nskip_if_display_awake = true").unwrap();
+        let defaulted: HookAction = toml::from_str("command = ['caffeinate']").unwrap();
+        assert!(enabled.skip_if_display_awake);
+        assert!(!defaulted.skip_if_display_awake);
+        let encoded = toml::to_string(&enabled).unwrap();
+        assert!(encoded.contains("skip_if_display_awake = true"));
+        assert!(
+            !toml::to_string(&defaulted)
+                .unwrap()
+                .contains("skip_if_display_awake")
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn skip_if_display_awake_rejected_off_macos() {
+        let action: HookAction =
+            toml::from_str("command = ['caffeinate']\nskip_if_display_awake = true").unwrap();
+        let mut errors = Vec::new();
+        validate_hook_action(
+            "panel",
+            "before_acquire",
+            0,
+            &action,
+            Duration::from_secs(30),
+            false,
+            &mut errors,
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.what == crate::error::E_CONFIG_INVALID
+                    && e.detail.contains("skip_if_display_awake")
+                    && e.detail.contains("macOS-only")),
+            "{errors:?}"
+        );
+        let value: toml::Value = toml::from_str("[displays.panel.hooks]\nbefore_acquire = [{ command = ['caffeinate'], skip_if_display_awake = true }]").unwrap();
+        assert!(collect_unknown_keys(&value).is_empty());
+    }
     use crate::config::DaemonConfig;
     use crate::config::MqttCredential;
     use crate::config::PublishConfig;

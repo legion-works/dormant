@@ -1997,7 +1997,10 @@ fn build_hook_publisher(cfg: &Config, creds: &Credentials) -> Arc<MqttPublisher>
 }
 
 fn build_hook_engine(cfg: &Config, creds: &Credentials) -> Arc<HookEngine> {
-    Arc::new(HookEngine::new(build_hook_publisher(cfg, creds)))
+    Arc::new(HookEngine::new_with_probe(
+        build_hook_publisher(cfg, creds),
+        Arc::new(crate::hooks::RealDisplayAwakeProbe),
+    ))
 }
 
 #[cfg(test)]

@@ -4,7 +4,7 @@
  *
  * When `hookEditEnabled` is true (§BG-6), each slot renders an inline
  * array editor reusing the ScreensaverEditor pattern: per-action cards
- * with command/mqtt/timeout/blocking/abort_on_failure fields, plus
+ * with the HookAction fields, plus
  * add/remove buttons.  When false (the default), hooks stay read-only and
  * the footer states they are edited in the file.
  */
@@ -53,6 +53,7 @@ function formatAction(a: HookAction, slot: SlotDef): string {
   const blocking = a.blocking ?? slot.defaultBlocking;
   if (blocking) parts.push("blocking");
   if (a.abort_on_failure) parts.push("abort on failure");
+  if (a.skip_if_display_awake) parts.push("skip if display awake");
   if (parts.length === 0) return "(empty)";
   return parts.join(" · ");
 }
@@ -189,7 +190,19 @@ export default function HooksInspector({ hooks, displayId, hookEditEnabled, stor
                                 help={`Wait for hook completion before proceeding. Default for ${slot.label}: ${slot.defaultBlocking}.`}
                               />
                               <BoolField
-                                path={[...actPath, "abort_on_failure"]}
+                                path={[...actPath, "skip_if_display_awake"]}
+                                label="skip_if_display_awake"
+                                value={a.skip_if_display_awake ?? false}
+                                locked={false}
+                                onEdit={(_p, v) => {
+                                  const next = [...actions];
+                                  next[i] = { ...next[i], skip_if_display_awake: v as boolean };
+                                  emitSlot(slot.key, next);
+                                }}
+                                help="macOS only. Skip if every online display is awake; run on failed or empty probes."
+                              />
+                              <BoolField
+                                 path={[...actPath, "abort_on_failure"]}
                                 label="abort_on_failure"
                                 value={a.abort_on_failure ?? false}
                                 locked={false}

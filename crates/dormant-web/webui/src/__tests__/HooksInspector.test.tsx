@@ -94,6 +94,15 @@ describe("HooksInspector", () => {
     expect(screen.getByText(/abort on failure/)).toBeInTheDocument();
   });
 
+  it("shows the macOS skip flag in read-only and edit modes", () => {
+    const hooks: HookSlots = { before_acquire: [{ command: ["caffeinate"], skip_if_display_awake: true }] };
+    render(<HooksInspector hooks={hooks} displayId="tv" />);
+    expect(screen.getByText(/skip if display awake/)).toBeInTheDocument();
+    cleanup();
+    render(<HooksInspector hooks={hooks} displayId="tv" hookEditEnabled store={mockStore()} onDirty={() => {}} />);
+    expect(screen.getByText("skip_if_display_awake")).toBeInTheDocument();
+  });
+
   // ── Edit-mode tests (BG-6 / S1) ────────────────────────────────────────
 
   /** Minimal mock PatchStore that records edits. */

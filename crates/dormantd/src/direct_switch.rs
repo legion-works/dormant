@@ -1007,6 +1007,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             blocking: Some(true),
             abort_on_failure: true,
+            skip_if_display_awake: false,
         }
     }
 
@@ -1018,6 +1019,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             blocking: Some(true),
             abort_on_failure: true,
+            skip_if_display_awake: false,
         }
     }
 
@@ -1028,6 +1030,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             blocking: Some(true),
             abort_on_failure,
+            skip_if_display_awake: false,
         }
     }
 
@@ -1505,6 +1508,7 @@ mod tests {
                     timeout: Duration::from_secs(1),
                     blocking: Some(true),
                     abort_on_failure: false,
+                    skip_if_display_awake: false,
                 }],
                 after_acquire: vec![cs::HookAction {
                     command: Some(vec!["echo".into(), "after_acquire".into()]),
@@ -1512,6 +1516,7 @@ mod tests {
                     timeout: Duration::from_secs(1),
                     blocking: Some(false),
                     abort_on_failure: false,
+                    skip_if_display_awake: false,
                 }],
                 before_release: vec![cs::HookAction {
                     command: Some(vec!["echo".into(), "before_release".into()]),
@@ -1519,6 +1524,7 @@ mod tests {
                     timeout: Duration::from_secs(1),
                     blocking: Some(true),
                     abort_on_failure: false,
+                    skip_if_display_awake: false,
                 }],
                 after_release: vec![cs::HookAction {
                     command: Some(vec!["echo".into(), "after_release".into()]),
@@ -1526,6 +1532,7 @@ mod tests {
                     timeout: Duration::from_secs(1),
                     blocking: Some(false),
                     abort_on_failure: false,
+                    skip_if_display_awake: false,
                 }],
                 ..cs::HookSlots::default()
             },
@@ -1933,6 +1940,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             blocking: Some(true),
             abort_on_failure: false,
+            skip_if_display_awake: false,
         }
     }
 
@@ -2196,6 +2204,7 @@ mod tests {
                     timeout: Duration::from_secs(1),
                     blocking: Some(true),
                     abort_on_failure: false,
+                    skip_if_display_awake: false,
                 }],
                 after_acquire: vec![cs::HookAction {
                     command: Some(vec!["echo".into(), "after_acquire".into()]),
@@ -2203,6 +2212,7 @@ mod tests {
                     timeout: Duration::from_secs(1),
                     blocking: Some(false),
                     abort_on_failure: false,
+                    skip_if_display_awake: false,
                 }],
                 ..cs::HookSlots::default()
             },
@@ -2488,6 +2498,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             blocking: Some(true),
             abort_on_failure: false,
+            skip_if_display_awake: false,
         }
     }
 

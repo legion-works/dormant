@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, screen, waitFor, cleanup, fireEvent } from "@testing-library/react";
+import { render, screen, waitFor, cleanup, fireEvent, act } from "@testing-library/react";
 import Config from "../app/views/Config";
 
 
@@ -136,10 +136,30 @@ describe("Config", () => {
     const scrollIntoView = vi.fn();
     Element.prototype.scrollIntoView = scrollIntoView;
 
-    render(<Config />);
-
-    await waitFor(() => expect(screen.getByText("web port")).toBeInTheDocument(), { timeout: 500 });
-    expect(scrollIntoView).toHaveBeenCalled();
+    // The SettingsForm mock simulates a 300ms-delayed mount via
+    // setTimeout; the wall-clock waitFor(…, { timeout: 500 }) was
+    // sensitive to CPU contention (cargo + vitest in parallel). Drive
+    // the timer deterministically so the retry path through
+    // MutationObserver fires before we assert.
+    vi.useFakeTimers();
+    try {
+      render(<Config />);
+      // Flush mount-time effects so the SettingsForm mock's
+      // setTimeout registers against the fake clock.
+      await act(async () => {
+        await Promise.resolve();
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(300);
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(screen.getByText("web port")).toBeInTheDocument();
+      expect(scrollIntoView).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("restarts navigation for a same-tab hash change", async () => {

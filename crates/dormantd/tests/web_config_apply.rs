@@ -295,9 +295,11 @@ async fn config_apply_full_loop() {
     let mut reloads = handle.subscribe_reload();
     let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
     while tokio::time::Instant::now() < drain_deadline {
-        match tokio::time::timeout(Duration::from_millis(100), reloads.recv()).await {
-            Ok(Ok(_)) => continue,
-            _ => break,
+        if tokio::time::timeout(Duration::from_millis(100), reloads.recv())
+            .await
+            .is_err()
+        {
+            break;
         }
     }
     fs::write(backups_dir.join("junk"), "should be ignored").unwrap();

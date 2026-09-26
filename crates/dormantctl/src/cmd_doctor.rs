@@ -839,8 +839,12 @@ fn format_table(results: &[ProbeResult]) -> String {
             ProbeStatus::Skip => ("-", Color::Yellow),
             ProbeStatus::NotSupported => ("N/A", Color::Yellow),
         };
+        let probe_name = r.subject.as_ref().map_or_else(
+            || r.name.clone(),
+            |subject| format!("{} ({subject})", r.name),
+        );
         table.add_row(Row::from(vec![
-            Cell::new(&r.name),
+            Cell::new(&probe_name),
             Cell::new(glyph).fg(color),
             Cell::new(&r.detail),
         ]));
@@ -1038,6 +1042,19 @@ mod tests {
             output.contains("line two"),
             "table should contain second line of multiline detail"
         );
+    }
+
+    #[test]
+    fn format_table_names_each_display_for_subject_scoped_checks() {
+        let results = vec![
+            ProbeResult::pass("wear_sampling", "fresh").with_subject("tv"),
+            ProbeResult::fail("wear_sampling", "stale").with_subject("monitor"),
+        ];
+
+        let rendered = super::format_table(&results);
+
+        assert!(rendered.contains("wear_sampling (tv)"), "{rendered}");
+        assert!(rendered.contains("wear_sampling (monitor)"), "{rendered}");
     }
 
     // ── DoctorOutcome ───────────────────────────────────────────────────────

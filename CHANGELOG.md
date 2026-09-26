@@ -19,7 +19,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - DDC power-off blanks now verify that the display applied the command instead of reporting success when the panel remains on. ([#286](https://github.com/legion-works/dormant/issues/286))
 - `dormantctl emergency-wake` no longer reports success for only the displays whose wake tasks completed when another task panics, whether it reaches the live daemon or the direct-hardware fallback. The panicked display is now listed as failed with the panic detail. ([#287](https://github.com/legion-works/dormant/issues/287))
 - `dormantctl doctor` no longer reopens USB sensors after a reachable daemon returns `ok` without a report. It now reports the malformed daemon response as failed and preserves the live daemon's ownership of the port. ([#288](https://github.com/legion-works/dormant/issues/288))
-- Motion sensors now reject hold_time values longer than their effective stale_timeout instead of silently dropping the pending absence hold. ([#282](https://github.com/legion-works/dormant/issues/282))
+- Motion sensors now reject `hold_time` values longer than their effective `stale_timeout` instead of silently dropping the pending absence hold. On upgrade, validation reports `sensor '<id>' hold_time <duration> exceeds effective stale_timeout <duration>; lower hold_time or raise stale_timeout`; raise the sensor's `stale_timeout` to at least `hold_time`, or lower `hold_time`. If `stale_timeout` is omitted, its effective default comes from `[daemon].stale_sensor_timeout` (default `5m`). ([#282](https://github.com/legion-works/dormant/issues/282))
 - Occupied driving zones no longer lose their fail-safe presence state when a shared display's input-wake hold expires. ([#275](https://github.com/legion-works/dormant/issues/275))
 - Displays could blank when one of their occupied rooms reported vacant; they now stay awake while any driving zone is occupied or unknown. ([#296](https://github.com/legion-works/dormant/issues/296))
 - Active wear sampling could misattribute translucent captured pixels because alpha was applied before sRGB linearization. The spatial luma reducer now composites over black in linear light, matching screensaver scans. ([#283](https://github.com/legion-works/dormant/issues/283))
@@ -74,7 +74,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Breaking
 
-- Disable the old `dormant.service` unit and enable `app-dormant.service` instead when upgrading ([#233](https://github.com/legion-works/dormant/issues/233), [#241](https://github.com/legion-works/dormant/pull/241)).
+- Disable the old `dormant.service` unit and enable `app-dormant.service` instead when upgrading; follow the [installation guide's migration commands](./docs/src/installation.md#upgrading-from-dormantservice-dormant-011) ([#233](https://github.com/legion-works/dormant/issues/233), [#241](https://github.com/legion-works/dormant/pull/241)).
 
 ### Highlights
 

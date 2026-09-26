@@ -346,8 +346,13 @@ blocking, `after_*` slots default to fire-and-forget
 (`hooks.rs::default_blocking_for`). `on_observed_loss`, `on_observed_gain`, and `on_wake`
 are after-only slots and therefore default to non-blocking. Entries declared `blocking = true` run
 to completion and block the next phase; non-blocking entries are spawned and
-the phase continues immediately. Hooks are bounded by their per-entry `timeout` (default `5s`),
-not cancellable mid-run. Hook commands must be idempotent — check
+the phase continues immediately. Each action is bounded by its per-entry
+`timeout` (default `5s`). The whole hook sequence for one display switch is
+separately bounded by `displays.<id>.hooks.timeout` (default `90s`). The
+aggregate deadline can expire before a later action reaches its own timeout;
+no action's per-entry timeout may exceed the aggregate timeout. Neither limit
+makes a running hook cancellable mid-command. Hook commands must be idempotent —
+check
 `DORMANT_DIRECTION` and `DORMANT_PHASE` in the environment to decide whether
 to act or skip.
 

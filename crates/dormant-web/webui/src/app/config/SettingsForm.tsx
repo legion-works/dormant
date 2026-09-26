@@ -11,6 +11,8 @@ import type { ConfigResponse, ApplyResponse, ApplyErrorBody, KvmStatus } from ".
 import { getConfig, postConfigApply, ApiError } from "../../api/client";
 import { createPatchStore } from "./patch";
 import type { PatchStore } from "./patch";
+import { detectUnsafePatches } from "./entityCrud";
+import { useConfirmDialog } from "../components";
 import DaemonSection from "./DaemonSection";
 import WearSection from "./WearSection";
 import NotificationsSection from "./NotificationsSection";
@@ -86,6 +88,7 @@ export function SettingsForm({ config: initialConfig, onNavigationGuard, tab, kv
   const [conflict, setConflict] = useState(false);
   const [fieldErrors, setFieldErrors] = useState<Record<string, string | undefined>>({});
   const [bannerErrors, setBannerErrors] = useState<string[]>([]);
+  const { confirm: confirmUnsafe, dialog: unsafeDialog } = useConfirmDialog();
   // Pairing wizard "create display?" hand-off (spec §8.3) — set when the
   // operator accepts it, consumed by DisplaysSection to auto-open its
   // create form pre-filled, then cleared so a later manual Add doesn't
@@ -140,6 +143,41 @@ export function SettingsForm({ config: initialConfig, onNavigationGuard, tab, kv
     setBannerErrors([]);
 
     const patches = store.buildPatches();
+
+    // Unsafe-setting gate (client-side UX only): a `Set` patch or a
+    // CreateEntity payload that flips a deliberate fail-safe default
+    // (e.g. zones.<id>.unavailable_policy = "absent") must be confirmed
+    // before the request goes out.  The Rust server still accepts the
+    // value normally; this exists so an operator consents at the apply
+    // bar instead of discovering the consequence during a future
+    // incident.  The detector is data-driven in `entityCrud.ts` so a
+    // future fail-unsafe value is one entry + one test.
+    const unsafeHits = detectUnsafePatches(patches);
+    if (unsafeHits.length > 0) {
+      const lines = unsafeHits
+        .map((h) => {
+          const p = h.patch;
+          if (p.op === "set") {
+            return `• ${p.path.join(".")} = ${JSON.stringify(p.value)} — ${h.consequence}`;
+          }
+          if (p.op === "create_entity") {
+            const v = p.value as Record<string, unknown>;
+            return `• create zones "${p.id}" with unavailable_policy = "${String(v.unavailable_policy)}" — ${h.consequence}`;
+          }
+          return `• ${JSON.stringify(p)} — ${h.consequence}`;
+        })
+        .join("\n");
+      const accepted = await confirmUnsafe({
+        title: "Confirm off-default safety setting",
+        description: `These changes flip a deliberate fail-safe default. Cancel keeps your edits in place; you can apply later when you've considered the consequence.\n\n${lines}`,
+        confirmLabel: "Apply anyway",
+        tone: "warm",
+      });
+      if (!accepted) {
+        setApplying(false);
+        return;
+      }
+    }
 
     try {
       const res: ApplyResponse = await postConfigApply({
@@ -202,7 +240,7 @@ export function SettingsForm({ config: initialConfig, onNavigationGuard, tab, kv
     } finally {
       setApplying(false);
     }
-  }, [config.fingerprint, store]);
+  }, [config.fingerprint, store, confirmUnsafe]);
 
   // beforeunload guard — registered while dirty, removed when clean
   // Must be declared after handleDiscard (it's a dependency of the next effect).
@@ -410,6 +448,7 @@ export function SettingsForm({ config: initialConfig, onNavigationGuard, tab, kv
         onDismissConflict={() => setConflict(false)}
       />
       </div>
+      {unsafeDialog}
     </SectionRailProvider>
   );
 }

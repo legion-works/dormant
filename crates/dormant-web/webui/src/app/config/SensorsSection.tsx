@@ -61,6 +61,23 @@ const PLACEHOLDER: Record<string, string> = {
 
 /** Sensor summary: type + port/path — imported from density.ts. */
 
+/**
+ * Each zone's member list as the editor currently sees it: a pending
+ * `zones.<id>.members` edit wins over the fetched value, so appending a new
+ * sensor to it keeps that edit instead of overwriting it.
+ */
+function effectiveZoneMembers(
+  zones: Record<string, ZoneConfig>,
+  store: PatchStore,
+): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  for (const [zoneId, zone] of Object.entries(zones)) {
+    const pending = store.getEdit(["zones", zoneId, "members"]);
+    out[zoneId] = Array.isArray(pending) ? (pending as string[]) : (zone.members ?? []);
+  }
+  return out;
+}
+
 export default function SensorsSection({
   sensors,
   store,
@@ -233,8 +250,13 @@ export default function SensorsSection({
           <CreateEntityForm
             collection="sensors"
             existingIds={ids}
-            onCreate={(id, value) => {
+            zoneIds={Object.keys(zones)}
+            zoneMembers={effectiveZoneMembers(zones, store)}
+            onCreate={(id, value, extra) => {
               store.trackCreate("sensors", id, value);
+              for (const patch of extra ?? []) {
+                if (patch.op === "set") store.trackEdit(patch.path, patch.value);
+              }
               onDirty();
               setShowCreate(false);
             }}

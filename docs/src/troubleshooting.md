@@ -97,6 +97,10 @@ Check with:
 dormantctl status
 ```
 
+Pass `--json` to dump the same snapshot (sensors, zones, displays, any
+pending reload) as pretty-printed JSON for status bars or scripts — fields
+may grow in later versions, so consumers should ignore unknown keys.
+
 Look for `unavailable` sensor states, then repair the broker, connection, or device.
 
 ### Grace period has not elapsed

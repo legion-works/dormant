@@ -1,17 +1,11 @@
+---
 kind: fix
 surfaces: [render, daemon, webui]
+issues: []
 ---
-Detail: Three intermittent tests no longer race on wall-clock or
-cross-thread frame delivery. The dormant-render screensaver test
-drains into the verification buffer instead of relying on a single
-post-drain call to land on Ok(false) — mpv's internal render thread
-can set MPV_RENDER_UPDATE_FRAME between two of our calls, and a
-single follow-up call was not guaranteed to land on the no-new-frame
-path. The web config-apply integration test drains the apply's
-debounced reload before the backup-write verification window, so a
-reload scheduled by the apply's own GET roundtrip no longer bleeds
-into the assertion that writes to backups/ must not trigger a
-reload. The webui deep-link retry test drives the SettingsForm
-mock's 300ms mount delay under fake timers, removing the wall-clock
-ordering assumption between the mock's delayed mount and the test's
-poll window that flaked under CPU contention.
+Detail: Three tests that failed intermittently under CPU load no longer depend
+on timing. The screensaver drain test re-drains until mpv reports no new frame
+before checking that the current picture is still drawn; the config-apply
+integration test drains the apply's pending reload before asserting that
+writes to `backups/` trigger none; the web deep-link retry test advances fake
+timers instead of waiting on the wall clock.

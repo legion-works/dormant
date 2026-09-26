@@ -1,4 +1,4 @@
-//! Four-slot KVM hook engine — local-only execution of operator-defined
+//! KVM hook engine — local-only execution of operator-defined
 //! `before_release` / `after_release` / `before_acquire` / `after_acquire`
 //! actions on a `scope = "shared"` display (spec §6, design §6).
 //!
@@ -100,6 +100,8 @@ pub enum Direction {
     Acquire,
     /// Post-hoc observation: the poll detected a peer pulled the panel.
     ObservedLoss,
+    /// Post-hoc observation: the poll detected the panel switched to this host.
+    ObservedGain,
 }
 
 impl Direction {
@@ -110,6 +112,7 @@ impl Direction {
             Self::Release => "release",
             Self::Acquire => "acquire",
             Self::ObservedLoss => "observed_loss",
+            Self::ObservedGain => "observed_gain",
         }
     }
 }
@@ -404,6 +407,7 @@ async fn run_slot_with_probe(
                             Direction::Release => "claim_release_aborted",
                             Direction::Acquire => "claim_acquire_aborted",
                             Direction::ObservedLoss => "observed_loss_aborted",
+                            Direction::ObservedGain => "observed_gain_aborted",
                         };
                         warn!(
                             event = %event,
@@ -2263,6 +2267,7 @@ mod tests {
         assert_eq!(Direction::Release.as_str(), "release");
         assert_eq!(Direction::Acquire.as_str(), "acquire");
         assert_eq!(Direction::ObservedLoss.as_str(), "observed_loss");
+        assert_eq!(Direction::ObservedGain.as_str(), "observed_gain");
         assert_eq!(Phase::Before.as_str(), "before");
         assert_eq!(Phase::After.as_str(), "after");
     }
@@ -2429,12 +2434,12 @@ mod tests {
             let release_event = match Direction::Release {
                 Direction::Release => "claim_release_aborted",
                 Direction::Acquire => "claim_acquire_aborted",
-                Direction::ObservedLoss => unreachable!(),
+                Direction::ObservedLoss | Direction::ObservedGain => unreachable!(),
             };
             let acquire_event = match Direction::Acquire {
                 Direction::Release => "claim_release_aborted",
                 Direction::Acquire => "claim_acquire_aborted",
-                Direction::ObservedLoss => unreachable!(),
+                Direction::ObservedLoss | Direction::ObservedGain => unreachable!(),
             };
             captured.lock().unwrap().push(release_event.to_string());
             captured.lock().unwrap().push(acquire_event.to_string());

@@ -378,6 +378,9 @@ input_wake_hold = "300s"
 # after_acquire = [
 #   { command = ["notify-send", "panel acquired"], timeout = "5s", blocking = false },
 # ]
+# # on_observed_gain makes USB follow a monitor-button or automatic input
+# # switch that occurred outside dormant. Use this host's idempotent USB target.
+# on_observed_gain = [{ mqtt = { topic = "dormant/kvm/usb-target", payload = "<this-host>" }, timeout = "5s" }]
 # # before_acquire — entries fire BEFORE the owner writes VCP 0x60.
 # # This is the REQUIRER wake-and-verify slot: wake the machine's video
 # # output so the panel will accept the input switch (see the

@@ -1695,7 +1695,7 @@ pub struct DisplayConfig {
 }
 
 /// The KVM hand-off hook slots available on a shared display, plus the
-/// post-hoc observed-loss slot for the losing machine.
+/// post-hoc observed ownership slots for either machine.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HookSlots {
     /// Maximum total time hooks may consume during one display-switch operation.
@@ -1719,6 +1719,10 @@ pub struct HookSlots {
     /// must never trigger a corrective DDC write or retry.
     #[serde(default)]
     pub on_observed_loss: Vec<HookAction>,
+    /// Actions run after a VCP 0x60 poll commits an ownership gain.
+    /// Never initiates a panel switch or corrective DDC write.
+    #[serde(default)]
+    pub on_observed_gain: Vec<HookAction>,
 }
 
 impl Default for HookSlots {
@@ -1730,6 +1734,7 @@ impl Default for HookSlots {
             before_acquire: Vec::new(),
             after_acquire: Vec::new(),
             on_observed_loss: Vec::new(),
+            on_observed_gain: Vec::new(),
         }
     }
 }

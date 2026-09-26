@@ -233,6 +233,7 @@ or an MQTT publish (QoS 1, non-retained).
 | `before_release` | Push (release) | BEFORE the peer DDC write. Blocking — a failure aborts the push. Use for USB-switch or KVMP transitions. |
 | `after_release` | Push (release) | AFTER a successful or failed push write. Fire-and-forget. |
 | `on_observed_loss` | Poll (loss) | AFTER the poller commits an ownership loss. Fire-and-forget — the poll path has no write authority and must never trigger a corrective DDC write or retry. |
+| `on_observed_gain` | Poll (gain) | AFTER the poller commits an ownership gain. Fire-and-forget — no DDC write, retry, or corrective action. A dormant-initiated pull marks ownership immediately and fires `after_acquire`, not this slot. |
 
 ### Hook causality — who gets advance notice
 
@@ -248,6 +249,11 @@ timing — blocking, local, before its own write.
 The machine that **loses** the panel to a peer's pull gets no advance
 notice — it learns from its own poll afterward and fires the
 `on_observed_loss` after-only slot. `before_release` never fires post-hoc.
+
+When the monitor changes input outside dormant (the panel button or automatic
+input selection after the other machine locks), the gaining machine fires
+`on_observed_gain` after its poll confirms the transition. This can publish
+the gaining host's USB target without pulling the panel again.
 
 ### Hook environment
 
@@ -267,7 +273,7 @@ Every hook command receives:
 | `DBUS_SESSION_BUS_ADDRESS` | daemon (if set) | User D-Bus session bus |
 | `DORMANT_DISPLAY` | context | Config display id |
 | `DORMANT_DISPLAY_IDENTITY` | context | Claim identity (`manufacturer:model[:serial]`) |
-| `DORMANT_DIRECTION` | context | `acquire` or `release` or `observed_loss` |
+| `DORMANT_DIRECTION` | context | `acquire`, `release`, `observed_loss`, or `observed_gain` |
 | `DORMANT_PHASE` | context | `before` or `after` |
 | `DORMANT_PEER` | context | Peer's instance id (not display name) |
 | `DORMANT_FALLBACK` | context | `0` or `1` — whether this slot is firing on the fallback path |
@@ -289,8 +295,8 @@ See [Signal-presence law](#signal-presence-law) for why the
 
 The `blocking` default is phase-dependent: `before_*` slots default to
 blocking, `after_*` slots default to fire-and-forget
-(`hooks.rs::default_blocking_for`). `on_observed_loss` is an `after_*` slot
-and therefore defaults to non-blocking. Entries declared `blocking = true` run
+(`hooks.rs::default_blocking_for`). `on_observed_loss` and `on_observed_gain`
+are after-only slots and therefore default to non-blocking. Entries declared `blocking = true` run
 to completion and block the next phase; non-blocking entries are spawned and
 the phase continues immediately. Hooks are bounded by their per-entry `timeout` (default `5s`),
 not cancellable mid-run. Hook commands must be idempotent — check
@@ -410,7 +416,15 @@ on_observed_loss = [
   # The poller detected a peer pull — this machine lost the panel.
   { command = ["notify-send", "panel released to peer"], timeout = "5s", blocking = false },
 ]
+on_observed_gain = [
+  # Follow a panel-button or automatic input switch with the USB KVM.
+  { mqtt = { topic = "dormant/kvm/usb-target", payload = "desktop" }, timeout = "5s" },
+]
 ```
+
+In this setup, the ESP32 changes USB only when its current owner differs from
+the requested target. The target is idempotent: if USB activity triggers a
+follow-up dormant pull, the panel is already local and that pull is a no-op.
 
 ## Limits and failure behavior
 

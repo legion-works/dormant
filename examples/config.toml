@@ -1,4 +1,13 @@
 # Example dormant configuration.
+# REFERENCE CONFIG — this file is syntactically valid, not ready to run as-is.
+# Adapt every hardware-specific value below before starting dormant: USB device
+# paths, DDC selectors/buses and VCP commands, CoreGraphics display UUIDs,
+# Home Assistant URLs/entities/services, MQTT broker/topics, and TV addresses.
+# Use `dormantctl doctor ddcci` to discover DDC targets and verify capabilities;
+# use the relevant `dormantctl doctor` probe for your sensor/display hardware.
+# Confirm command-controller VCP codes on the intended physical display before
+# use. `dormantctl validate` checks config syntax, not that these targets match
+# your hardware.
 #
 # Install to $XDG_CONFIG_HOME/dormant/config.toml (usually
 # ~/.config/dormant/config.toml) or /etc/dormant/config.toml, and keep secrets
@@ -129,7 +138,7 @@ enabled = false # opt-in switch; false = no publisher task, no connections
 startup_holdoff = "20s"
 stale_sensor_timeout = "5m"
 log_level = "info"
-socket_path = "/run/user/1000/dormant.sock"
+socket_path = "/run/user/1000/dormant.sock" # replace with this user's runtime socket path
 
 # idle_source: "auto" (default) | "wayland" | "dbus" | "macos" | "windows"
 # "macos" selects the CoreGraphics idle-time source (macOS builds only);
@@ -179,8 +188,8 @@ socket_path = "/run/user/1000/dormant.sock"
 # Desk occupancy over MQTT (e.g. an ESPresence / mmWave node publishing JSON).
 [sensors.desk]
 type = "mqtt"
-broker_url = "tcp://localhost:1883"
-topic = "dormant/desk/occupancy"
+broker_url = "tcp://localhost:1883" # replace with this host's MQTT broker
+topic = "dormant/desk/occupancy"    # replace with the sensor's published topic
 field = "/occupancy"
 # Availability (LWT) — optional. Defaults assume the Zigbee2MQTT convention:
 # topic "<topic>/availability" with payloads "online"/"offline". Override for
@@ -205,13 +214,13 @@ field = "/occupancy"
 # Couch presence via Home Assistant (requires ha_token in credentials.toml).
 [sensors.couch]
 type = "ha"
-url = "ws://homeassistant.local:8123/api/websocket"
-entity = "binary_sensor.couch_presence"
+url = "ws://homeassistant.local:8123/api/websocket" # hardware-specific HA host
+entity = "binary_sensor.couch_presence"             # replace with your HA entity id
 
 # Hallway radar over USB — motion, with a hold time so brief pulses persist.
 [sensors.hallway]
 type = "usb-ld2410"
-port = "/dev/ttyUSB0"
+port = "/dev/ttyUSB0" # replace with this host's radar device path
 kind = "motion"
 hold_time = "30s"
 
@@ -235,9 +244,9 @@ members = ["couch"]
 controllers = ["ddcci", "command"]
 blank_mode = "brightness_zero"
 degraded_mode = "power_off"
-ddc_display = "DP-1"
-blank_command = "ddcutil --display 1 setvcp 10 0"
-wake_command = "ddcutil --display 1 setvcp 10 80"
+ddc_display = "DP-1"                              # hardware-specific output name; verify with doctor ddcci
+blank_command = "ddcutil --display 1 setvcp 10 0" # hardware-specific DDC bus/VCP
+wake_command = "ddcutil --display 1 setvcp 10 80" # hardware-specific bus/value
 modes = ["brightness_zero", "power_off"]
 command_timeout = "8s"
 # panel_type = "qd-oled"        # optional: "woled" | "qd-oled" | "unknown" (default).
@@ -249,11 +258,11 @@ command_timeout = "8s"
 [displays.tv]
 controllers = ["ha-passthrough"]
 blank_mode = "power_off"
-ha_url = "http://homeassistant.local:8123"
+ha_url = "http://homeassistant.local:8123"                 # hardware-specific HA host
 blank_service = "media_player.turn_off"
-blank_data = { entity_id = "media_player.living_room_tv" }
+blank_data = { entity_id = "media_player.living_room_tv" } # replace with your HA entity id
 wake_service = "media_player.turn_on"
-wake_data = { entity_id = "media_player.living_room_tv" }
+wake_data = { entity_id = "media_player.living_room_tv" }  # replace with your HA entity id
 modes = ["power_off"]
 
 # macOS example: DDC/CI first, falling back to the audio-safe Quartz
@@ -270,7 +279,7 @@ modes = ["power_off"]
 # [displays.oled_mac]
 # controllers = ["ddcci", "macos-gamma-black", "macos-display-sleep"]
 # blank_mode = "brightness_zero"
-# output = "cg:37d8832a-2d66-02ca-b9f7-8f30a301b230"
+# output = "cg:37d8832a-2d66-02ca-b9f7-8f30a301b230" # host-specific display UUID
 # modes = ["brightness_zero", "power_off"]
 
 # Desktop monitor with a render ladder: blank the panel via DDC/CI, then
@@ -278,7 +287,7 @@ modes = ["power_off"]
 # local images if the room stays vacant.  Requires `--features render`.
 # [displays.desktop]
 # controllers = ["ddcci"]
-# output = "DP-1"
+# output = "DP-1" # replace with this host's output name
 # ladder = [
 #   { kind = "power_off", dwell = "30s" },
 #   { kind = "render_black", dwell = "5m" },
@@ -313,7 +322,7 @@ modes = ["power_off"]
 # shift_px = 2                   # pixels per shift, 0..=8 (default 2)
 # shift_interval = "120s"        # time between shifts, >= 10s (default "120s")
 # [[displays.desktop.screensaver.source]]
-# path = "/home/user/Pictures/screensaver"
+# path = "/home/user/Pictures/screensaver" # replace with a local media path
 # recurse = false
 # shuffle = true
 # image_duration = "8s"

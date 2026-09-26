@@ -232,6 +232,15 @@ output = "cg:37d8832a-2d66-02ca-b9f7-8f30a301b230"
 ddc_display = "1"
 ```
 
+> **Shared-panel warning:** Do not use `blank_mode = "power_off"` on a shared
+> USB-C DDC/CI panel unless you have tested physical recovery. The link or hub
+> can drop in standby, leaving the panel unrecoverable by software until it is
+> physically power-cycled. Prefer `brightness_zero` or put
+> `macos-gamma-black` first; see [the detailed hazard and alternatives](#macos-shared-ddcci-power-off-hazard).
+> `power_off_opt_in = true` only acknowledges tested physical recovery; it adds
+> no software recovery path.
+> `macos-display-sleep` sleeps every display on the Mac, not just this one.
+
 `ddcci` first (audio-safe, panel-internal, per-monitor); `macos-gamma-black`
 next when DDC/CI is unavailable or unsupported (also audio-safe, but only a
 color-LUT black, not a real power-off, and with the restart caveats above);

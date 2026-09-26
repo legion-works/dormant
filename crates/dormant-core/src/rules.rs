@@ -936,7 +936,7 @@ pub struct KvmStatus {
     pub activity_following: bool,
     /// Post-probe push-capable display ids — shared scope, write capable,
     /// with `shared_peer_input_write_code` configured.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub push_capable_displays: Vec<crate::types::DisplayId>,
 }
 
@@ -3963,6 +3963,15 @@ mod tests {
         };
         let json = serde_json::to_string(&snap).unwrap();
         assert!(!json.contains("stage"));
+    }
+
+    #[test]
+    fn kvm_status_serializes_empty_push_capable_displays() {
+        let status = KvmStatus::default();
+
+        let value = serde_json::to_value(status).unwrap();
+
+        assert_eq!(value["push_capable_displays"], serde_json::json!([]));
     }
 
     #[test]

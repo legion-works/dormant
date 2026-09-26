@@ -229,6 +229,7 @@ async fn publisher_publishes_retained_discovery_state_and_graceful_offline() {
                                 wake_attempts: 0,
                                 last_blank_failed: false,
                                 stage: None,
+                                rules: Vec::new(),
                             },
                         )],
                         pending_reload: None,

@@ -105,6 +105,14 @@ pub fn build_tooltip(inputs: &TooltipInputs<'_>) -> Tooltip {
         } else if d.last_blank_failed {
             phase.push_str(" (last blank failed)");
         }
+        // Coverage marker — a display that no rule drives is never blanked
+        // on its own, so the operator gets a plain "no automatic rule"
+        // suffix on its line. Displays with at least one driving rule keep
+        // the existing compact line; this only adds bytes to the
+        // uncommon-case (manual-only) display.
+        if d.rules.is_empty() {
+            phase.push_str(" (no automatic rule \u{2014} dormant won't blank it on its own)");
+        }
         parts.push(format!("{id}: {phase}"));
     }
     let detail = parts.join(" · ");
@@ -149,6 +157,7 @@ mod tests {
                         wake_attempts: 0,
                         last_blank_failed: false,
                         stage: None,
+                        rules: vec!["office".into()],
                     },
                 ),
                 (
@@ -166,6 +175,7 @@ mod tests {
                         wake_attempts: 0,
                         last_blank_failed: false,
                         stage: None,
+                        rules: vec!["office".into()],
                     },
                 ),
             ],
@@ -258,6 +268,7 @@ mod tests {
                     wake_attempts: 0,
                     last_blank_failed: false,
                     stage: None,
+                    rules: vec!["desk".into()],
                 },
             )],
             pending_reload: None,
@@ -296,6 +307,7 @@ mod tests {
                     wake_attempts: 3,
                     last_blank_failed: false,
                     stage: None,
+                    rules: vec!["desk".into()],
                 },
             )],
             pending_reload: None,
@@ -333,6 +345,7 @@ mod tests {
                     wake_attempts: 0,
                     last_blank_failed: true,
                     stage: None,
+                    rules: vec!["desk".into()],
                 },
             )],
             pending_reload: None,
@@ -370,6 +383,7 @@ mod tests {
                     wake_attempts: 2,
                     last_blank_failed: false,
                     stage: None,
+                    rules: vec!["desk".into()],
                 },
             )],
             pending_reload: None,
@@ -384,6 +398,171 @@ mod tests {
         assert_eq!(
             t.body,
             "● active · ◐ staged · ○ blanked · ⚠ unreachable\nmon: blanked (paused) (wake failing ×2)"
+        );
+    }
+
+    /// A display with at least one driving rule (`rules` non-empty) keeps
+    /// its compact line — the operator already knows dormant will blank it.
+    #[test]
+    fn displays_with_rules_hide_coverage_marker() {
+        let snap = StateSnapshot {
+            sensors: vec![],
+            zones: vec![],
+            displays: vec![(
+                "mon".into(),
+                DisplaySnapshot {
+                    phase: "active".into(),
+                    inhibited: false,
+                    paused: false,
+                    cmd_gen: 0,
+                    scope: dormant_core::config::DisplayScope::Private,
+                    owned: true,
+                    observed_input_code: None,
+                    panel_state: None,
+                    controllers: vec![],
+                    wake_attempts: 0,
+                    last_blank_failed: false,
+                    stage: None,
+                    rules: vec!["desk".into()],
+                },
+            )],
+            pending_reload: None,
+            rollback: None,
+            kvm: None,
+            wear_sampling_status: None,
+        };
+        let t = build_tooltip(&TooltipInputs {
+            snapshot: Some(&snap),
+            unreachable: false,
+        });
+        assert_eq!(
+            t.body,
+            "● active · ◐ staged · ○ blanked · ⚠ unreachable\nmon: active"
+        );
+        assert!(
+            !t.body.contains("no automatic rule"),
+            "covered displays must NOT carry the coverage marker, got: {}",
+            t.body
+        );
+    }
+
+    /// A display with `rules == []` (manual-only) carries an explicit
+    /// `no automatic rule` marker on its line so the operator knows
+    /// dormant will never blank it on its own.
+    #[test]
+    fn displays_without_rules_show_no_coverage_marker() {
+        let snap = StateSnapshot {
+            sensors: vec![],
+            zones: vec![],
+            displays: vec![(
+                "mon".into(),
+                DisplaySnapshot {
+                    phase: "active".into(),
+                    inhibited: false,
+                    paused: false,
+                    cmd_gen: 0,
+                    scope: dormant_core::config::DisplayScope::Private,
+                    owned: true,
+                    observed_input_code: None,
+                    panel_state: None,
+                    controllers: vec![],
+                    wake_attempts: 0,
+                    last_blank_failed: false,
+                    stage: None,
+                    rules: vec![],
+                },
+            )],
+            pending_reload: None,
+            rollback: None,
+            kvm: None,
+            wear_sampling_status: None,
+        };
+        let t = build_tooltip(&TooltipInputs {
+            snapshot: Some(&snap),
+            unreachable: false,
+        });
+        assert!(
+            t.body.contains("no automatic rule"),
+            "uncovered displays must carry the coverage marker, got: {}",
+            t.body
+        );
+        assert!(
+            t.body.contains("dormant won't blank it on its own"),
+            "marker must include the full explanation, got: {}",
+            t.body
+        );
+    }
+
+    /// A mixed snapshot carries the marker on the manual-only line and
+    /// keeps the covered line compact.
+    #[test]
+    fn mixed_snapshot_marks_only_uncovered_displays() {
+        let snap = StateSnapshot {
+            sensors: vec![],
+            zones: vec![],
+            displays: vec![
+                (
+                    "mon".into(),
+                    DisplaySnapshot {
+                        phase: "active".into(),
+                        inhibited: false,
+                        paused: false,
+                        cmd_gen: 0,
+                        scope: dormant_core::config::DisplayScope::Private,
+                        owned: true,
+                        observed_input_code: None,
+                        panel_state: None,
+                        controllers: vec![],
+                        wake_attempts: 0,
+                        last_blank_failed: false,
+                        stage: None,
+                        rules: vec!["desk".into()],
+                    },
+                ),
+                (
+                    "tv".into(),
+                    DisplaySnapshot {
+                        phase: "blanked".into(),
+                        inhibited: false,
+                        paused: false,
+                        cmd_gen: 0,
+                        scope: dormant_core::config::DisplayScope::Private,
+                        owned: true,
+                        observed_input_code: None,
+                        panel_state: None,
+                        controllers: vec![],
+                        wake_attempts: 0,
+                        last_blank_failed: false,
+                        stage: None,
+                        rules: vec![],
+                    },
+                ),
+            ],
+            pending_reload: None,
+            rollback: None,
+            kvm: None,
+            wear_sampling_status: None,
+        };
+        let t = build_tooltip(&TooltipInputs {
+            snapshot: Some(&snap),
+            unreachable: false,
+        });
+        assert!(
+            t.body.contains("mon: active"),
+            "covered display has no marker, got: {}",
+            t.body
+        );
+        assert!(
+            t.body.contains("tv: blanked (no automatic rule"),
+            "uncovered display carries the marker, got: {}",
+            t.body
+        );
+        // Exactly one marker (on `tv`), not two.
+        assert_eq!(
+            t.body.matches("no automatic rule").count(),
+            1,
+            "exactly one marker expected, got: {}",
+            t.body
         );
     }
 }

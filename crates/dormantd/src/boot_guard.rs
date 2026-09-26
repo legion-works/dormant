@@ -1862,6 +1862,7 @@ mod promote_tests {
             owned: true,
             observed_input_code: None,
             panel_state: None,
+            rules: Vec::new(),
         }
     }
 

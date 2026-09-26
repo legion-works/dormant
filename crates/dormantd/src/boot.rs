@@ -120,7 +120,7 @@ pub async fn boot(plan: BootPlan, inputs: BootInputs) -> Result<BootOutcome> {
                 // Spec §5.1 point 3's "if THAT also fails" branch: the LKG
                 // `prepare` already chose could not even be built. No
                 // further fallback — today's `startup_failed` behavior.
-                return Ok(BootOutcome::BuildFailed(build_err.to_string()));
+                return Ok(BootOutcome::BuildFailed(build_failure_message(&build_err)));
             }
             match immediate_rollback_eligible(&plan.chosen_config, &lkg_path) {
                 Some((current_fp, lkg_fp)) => {
@@ -166,10 +166,10 @@ pub async fn boot(plan: BootPlan, inputs: BootInputs) -> Result<BootOutcome> {
                             };
                             (app, lkg_path.clone(), true, Some(pending), Some(rollback))
                         }
-                        Err(e2) => return Ok(BootOutcome::BuildFailed(e2.to_string())),
+                        Err(e2) => return Ok(BootOutcome::BuildFailed(build_failure_message(&e2))),
                     }
                 }
-                None => return Ok(BootOutcome::BuildFailed(build_err.to_string())),
+                None => return Ok(BootOutcome::BuildFailed(build_failure_message(&build_err))),
             }
         }
     };
@@ -258,6 +258,10 @@ pub async fn boot(plan: BootPlan, inputs: BootInputs) -> Result<BootOutcome> {
     })
 }
 
+fn build_failure_message(error: &anyhow::Error) -> String {
+    format!("{error:#}")
+}
+
 /// Spec §5.1 point 3's immediate-rollback ELIGIBILITY check: an LKG file
 /// exists AND its bytes differ from `chosen`'s (direct comparison, F7; an
 /// unreadable `chosen` is treated as differing, F14 — `files_bytes_equal`
@@ -290,4 +294,18 @@ fn write_immediate_rollback_state(state_dir: &Path, failed_fp: Fingerprint) {
     state.rollback_active = true;
     state.rolled_back_from = Some(failed_fp);
     let _ = boot_guard::write_atomic_json(state_dir, boot_guard::CRASH_LOOP_FILE, &state);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_failure_message;
+
+    #[test]
+    fn build_failure_message_includes_context_and_cause() {
+        let error =
+            anyhow::anyhow!(std::io::Error::other("socket already in use")).context("start app");
+        let rendered = build_failure_message(&error);
+        assert!(rendered.contains("start app"), "{rendered}");
+        assert!(rendered.contains("socket already in use"), "{rendered}");
+    }
 }

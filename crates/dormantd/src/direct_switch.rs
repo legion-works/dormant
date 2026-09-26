@@ -675,14 +675,13 @@ impl DirectSwitchHandle {
         let Some(record) = snapshot.get(display) else {
             return false;
         };
-        let failure_threshold = self.config.borrow().coordination.loss_confirmations;
-        // A full loss-debounce window of failed reads makes the last good code
-        // too stale to suppress a wake-adjacent pull. Reusing this threshold
-        // avoids a second freshness policy knob.
+        // Any failed read since the last good one disqualifies the cache: a
+        // shared panel's DDC goes unresponsive for seconds while it changes
+        // input, so a failure streak usually means the peer just switched it.
+        // This is only a pre-filter; the caller confirms with a fresh read.
         record.owned
             && record.has_successful_input_read
             && record.consecutive_failures == 0
-            && record.consecutive_failures < failure_threshold
             && record.last_observed_code == Some(local_code)
     }
 

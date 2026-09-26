@@ -176,6 +176,10 @@ fn main() -> ExitCode {
     )
 }
 
+fn format_error_chain(error: &anyhow::Error) -> String {
+    format!("{error:#}")
+}
+
 /// `block_on(boot(plan, inputs))` plus the outcome dispatch (spec §5.1).
 ///
 /// The ordering seam wraps the whole verdict dispatch so lock/build failures,
@@ -218,13 +222,13 @@ async fn run_to_completion(plan: BootPlan, inputs: BootInputs) -> ExitCode {
                     match result {
                         Ok(()) => ExitCode::SUCCESS,
                         Err(e) => {
-                            tracing::error!(event = "daemon_failed", error = %e);
+                            tracing::error!(event = "daemon_failed", error = %format_error_chain(&e));
                             ExitCode::FAILURE
                         }
                     }
                 }
                 Err(e) => {
-                    tracing::error!(event = "daemon_failed", error = %e);
+                    tracing::error!(event = "daemon_failed", error = %format_error_chain(&e));
                     ExitCode::FAILURE
                 }
             }
@@ -308,4 +312,16 @@ fn peek_boot_options(config_path: &std::path::Path, strictness: Strictness) -> B
             lkg_rollback_enabled: cfg.watchdog.lkg_rollback_enabled,
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn format_error_chain_includes_context_and_root_cause() {
+        let error =
+            anyhow::anyhow!(std::io::Error::other("socket already in use")).context("start app");
+        let rendered = super::format_error_chain(&error);
+        assert!(rendered.contains("start app"), "{rendered}");
+        assert!(rendered.contains("socket already in use"), "{rendered}");
+    }
 }

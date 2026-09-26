@@ -409,7 +409,6 @@ export default function Overview() {
 
   // Protected count: displays referenced by ≥1 rule in config.display_rules.
   const protectedCount = Object.keys(displayRules).filter((id) => displays.some(([did]) => did === id)).length;
-  const manualOnly = displays.length - protectedCount;
 
   const stats: StatCardProps[] = [
     { label: "Displays", value: displays.length, sub: `${activeDisplays} active \u00b7 ${blankedDisplays} blanked`, dotColor: dotGreen },

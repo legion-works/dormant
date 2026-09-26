@@ -33,7 +33,15 @@ interface PairingWizardProps {
 function errorMessage(err: unknown): string {
   if (err instanceof ApiError) {
     const body = err.body as { error?: string } | null;
-    return body?.error ?? `pairing request failed (HTTP ${err.status})`;
+    if (body?.error) {
+      const messages: Record<string, string> = {
+        pairing_in_progress: "A pairing attempt is already running. Wait for it to finish.",
+        feature_disabled: "Samsung pairing is disabled in the daemon configuration.",
+        pair_not_found: "The pairing attempt was not found. Start a new attempt.",
+      };
+      return messages[body.error] ?? `Pairing request failed (HTTP ${err.status}).`;
+    }
+    return `Pairing request failed (HTTP ${err.status}).`;
   }
   return err instanceof Error ? err.message : String(err);
 }
@@ -138,7 +146,7 @@ export default function PairingWizard({
             </button>
           </div>
           <span className="cf-field__hint">
-            Starts a pairing handshake — accept the &quot;Allow&quot; prompt on the TV when it appears.
+            Starts a pairing handshake. If the TV shows an &quot;Allow&quot; prompt, accept it.
           </span>
           {error && <span className="cf-field__error">{error}</span>}
         </div>
@@ -146,7 +154,7 @@ export default function PairingWizard({
 
       {pairId && status?.state === "pairing" && (
         <p className="cf-placeholder">
-          Connecting to {pairedHost} — accept the &quot;Allow dormant&quot; prompt on your TV.
+          Connecting to {pairedHost}… If your TV shows the &quot;Allow dormant&quot; prompt, accept it. This gives up after a timeout and reports the result.
         </p>
       )}
 

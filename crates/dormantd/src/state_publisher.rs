@@ -1669,7 +1669,30 @@ mod tests {
     };
     use dormant_core::types::{DisplayId, SensorId, ZoneId};
     use indexmap::IndexMap;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    #[derive(Clone)]
+    struct TraceCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for TraceCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TraceCapture {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     // ── Test fixtures ─────────────────────────────────────────────────────
 
@@ -1929,6 +1952,45 @@ mod tests {
         assert!(topics.contains(&"homeassistant/binary_sensor/office-pc/sensor_desk/config"));
         assert!(topics.contains(&"homeassistant/binary_sensor/office-pc/zone_office/config"));
         assert!(topics.contains(&"homeassistant/sensor/office-pc/display_main/config"));
+    }
+
+    #[tokio::test]
+    async fn startup_flush_warns_once_for_a_colliding_pair() {
+        let mut cfg = enabled_cfg();
+        let sensor_cfg = cfg.sensors.get("desk").unwrap().clone();
+        cfg.sensors.insert("desk two".into(), sensor_cfg.clone());
+        cfg.sensors.insert("desk_two".into(), sensor_cfg);
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(TraceCapture(buffer.clone()))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let (record_tx, _record_rx) = mpsc::channel(64);
+        let (_ctl_tx, ctl_rx) = mpsc::channel(1);
+        drop(ctl_rx);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut snapshot = snapshot_one_of_each();
+
+        flush_full(FlushRequest {
+            cfg: &cfg,
+            snapshot: &mut snapshot,
+            instance: "office-pc",
+            record_tx: &record_tx,
+            ctl_tx: &_ctl_tx,
+            cancel: &cancel,
+            request_fresh_snapshot: false,
+            event_label: "test_startup_flush",
+        })
+        .await;
+
+        let captured = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            captured.matches("publish_id_collision").count(),
+            1,
+            "{captured}"
+        );
     }
 
     #[test]

@@ -68,7 +68,18 @@ export class ApiError extends Error {
 }
 
 export function getState(): Promise<StateSnapshot> {
-  return request<StateSnapshot>("/state");
+  return request<StateSnapshot>("/state").then(normalizeStateSnapshot);
+}
+
+export function normalizeStateSnapshot(snapshot: StateSnapshot): StateSnapshot {
+  if (!snapshot.kvm) return snapshot;
+  return {
+    ...snapshot,
+    kvm: {
+      ...snapshot.kvm,
+      push_capable_displays: snapshot.kvm.push_capable_displays ?? [],
+    },
+  };
 }
 
 export function getConfig(): Promise<ConfigResponse> {

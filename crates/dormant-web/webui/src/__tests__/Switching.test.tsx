@@ -14,7 +14,7 @@ import Switching from "../app/views/Switching";
 import { LiveStateContext, EventLogContext } from "../app/hooks/useLiveState";
 import { liveStateFixture, eventLogFixture } from "./fixtures/live-state";
 import type { LiveState } from "../app/hooks/useLiveState";
-import type { DisplaySnapshot } from "../api/types";
+import type { DisplaySnapshot, KvmStatus } from "../api/types";
 
 afterEach(() => cleanup());
 
@@ -35,8 +35,7 @@ function liveWithKvm(): LiveState {
         keymap: {},
         switch_capable_displays: ["shared_oled"],
         activity_following: false,
-        push_capable_displays: [],
-      },
+      } as unknown as KvmStatus,
     },
     config: {
       path: "/tmp/c.toml", config_version: 1, source: "last_applied",

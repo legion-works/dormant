@@ -67,6 +67,7 @@ const { SAMPLE_STATE, SAMPLE_CONFIG, mocks } = vi.hoisted(() => {
         ],
       ],
       pending_reload: null,
+      kvm: { keymap: {}, switch_capable_displays: [], activity_following: false },
     },
     SAMPLE_CONFIG: {
       path: "/tmp/config.toml",

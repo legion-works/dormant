@@ -93,6 +93,20 @@ function setState(overrides: Parameters<typeof liveStateFixture>[0]) {
 }
 
 describe("WearCard", () => {
+  it("distinguishes uniform accounting from the last spatial capture", async () => {
+    mocks.getConfig.mockResolvedValue({ inventory: { wear: { active_sampling: { enabled: true } } } });
+    mocks.getWearSamplingStatusFor.mockResolvedValue({ status: "granted" });
+    setState({ wear: { displays: [summary({
+      config_display_id: "desk",
+      display_name: "desk",
+      last_sample_at_epoch_s: Math.floor(Date.now() / 1000),
+      wear_attribution_mode: "uniform",
+      source_gate: "unknown",
+      uniform_reason: "source_unknown",
+    })] } });
+    render(<WearCard />);
+    expect(await screen.findByText(/Last spatial capture: none/i)).toBeInTheDocument();
+  });
   it("polls once after awaiting consent and stops at granted or denied", async () => {
     mocks.getConfig.mockResolvedValue({ inventory: { wear: { active_sampling: { enabled: true, sampled_display: "desk" } } } });
     mocks.getWearSamplingStatusFor

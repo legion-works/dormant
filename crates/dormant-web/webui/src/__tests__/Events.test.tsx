@@ -63,11 +63,22 @@ afterEach(() => {
 });
 
 describe("Events", () => {
+  it("separates connection state from the newest event date and age", () => {
+    const old = new Date(2024, 0, 15, 14, 30, 0);
+    mockUseEventLog.events = [{
+      time: old.toISOString(),
+      event: { event: "sensor_changed", sensor: "desk-mmwave", state: "present" },
+    }];
+    render(<Events />);
+    expect(screen.getByText("connected")).toBeInTheDocument();
+    const dateString = old.toLocaleDateString();
+    expect(screen.getAllByText((_, el) => Boolean(el?.textContent?.includes(dateString))).length).toBeGreaterThan(0);
+  });
   it("renders empty state when no events have arrived", () => {
     render(<Events />);
 
     expect(
-      screen.getByText("live · subscribed to daemon event stream"),
+      screen.getByText("connected"),
     ).toBeInTheDocument();
     expect(
       screen.getByText("Waiting for the first event…"),

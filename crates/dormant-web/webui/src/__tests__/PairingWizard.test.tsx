@@ -44,7 +44,7 @@ describe("PairingWizard — feature gating", () => {
 });
 
 describe("PairingWizard — poll loop: pairing -> paired", () => {
-  it("POSTs the host, then polls until paired, rendering the accept-on-TV copy while pairing", async () => {
+  it("POSTs the host, then polls with conditional prompt copy while pairing", async () => {
     mockedPost.mockResolvedValueOnce({ pair_id: "pid-1" });
     mockedGet
       .mockResolvedValueOnce({ state: "pairing" })
@@ -59,7 +59,9 @@ describe("PairingWizard — poll loop: pairing -> paired", () => {
     await waitFor(() => expect(mockedPost).toHaveBeenCalledWith("192.0.2.1"));
 
     await waitFor(() => {
-      expect(screen.getByText(/accept.*allow.*prompt/i)).toBeInTheDocument();
+      expect(screen.getByText(/if your TV shows the .*Allow dormant.* prompt, accept it/i)).toBeInTheDocument();
+      expect(screen.getByText(/gives up after a timeout and reports the result/i)).toBeInTheDocument();
+      expect(screen.queryByText(/accept the .* prompt on your TV\.$/i)).not.toBeInTheDocument();
     });
 
     await waitFor(
@@ -105,7 +107,7 @@ describe("PairingWizard — timeout state", () => {
     fireEvent.click(screen.getByRole("button", { name: /^pair$/i }));
 
     await waitFor(() => {
-      expect(screen.getByText(/timed out|timeout/i)).toBeInTheDocument();
+      expect(screen.getByText(/^Timed out waiting for/i)).toBeInTheDocument();
     });
     expect(screen.getByRole("button", { name: /try again/i })).toBeInTheDocument();
   });
@@ -120,7 +122,7 @@ describe("PairingWizard — error handling", () => {
     fireEvent.click(screen.getByRole("button", { name: /^pair$/i }));
 
     await waitFor(() => {
-      expect(screen.getByText(/pairing_in_progress/i)).toBeInTheDocument();
+      expect(screen.getByText(/A pairing attempt is already running\. Wait for it to finish\./i)).toBeInTheDocument();
     });
     expect(mockedGet).not.toHaveBeenCalled();
   });

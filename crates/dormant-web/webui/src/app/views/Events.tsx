@@ -114,14 +114,28 @@ export default function Events() {
     ? "stream lagged — catching up"
     : "reconnecting to daemon…";
 
+  const newestEvent = events.find(
+    (se) => (se.event as { event: string }).event !== "_history_separator",
+  );
+  const newestDate = newestEvent ? new Date(newestEvent.time) : null;
+  const newestAgeHours =
+    newestDate && !Number.isNaN(newestDate.getTime())
+      ? Math.max(0, Math.floor((Date.now() - newestDate.getTime()) / 3600000))
+      : null;
+
   return (
     <div className="events">
       <div className="events-header">
         <div className="events-header__left">
           <span className={`events-pulse${connected ? " events-pulse--live" : ""}`} />
           <span className="events-header__label">
-            {connected ? "live · subscribed to daemon event stream" : "disconnected"}
+            {connected ? "connected" : "disconnected"}
           </span>
+          {connected && newestAgeHours !== null && (
+            <span className="events-header__label">
+              · last event {newestAgeHours}h ago
+            </span>
+          )}
         </div>
         <span className="events-header__count">{filteredEvents.length} events</span>
       </div>
@@ -212,7 +226,10 @@ export default function Events() {
                   key={`${se.time}-${i}`}
                   className={`events-row${isFailure ? " events-row--danger" : ""}${isWearAdvisory ? " events-row--warm" : ""}`}
                 >
-                  <span className="events-row__time">{se.time}</span>
+                  <span className="events-row__time">
+                    {new Date(se.time).toLocaleDateString()}{" "}
+                    {new Date(se.time).toLocaleTimeString()}
+                  </span>
                   <span
                     className="events-row__badge"
                     style={{ color: badge.color, backgroundColor: badge.bg }}

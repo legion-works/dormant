@@ -477,10 +477,21 @@ async fn skip_awake_action(
         return false;
     }
     // A mistaken skip silently prevents the input switch; an unnecessary wake only costs time.
-    let Ok(states) = probe.online_sleep_states().await else {
-        return false;
+    let states = match probe.online_sleep_states().await {
+        Ok(states) => states,
+        Err(reason) => {
+            warn!(event = "hook_skip_probe_failed", slot = %label, index = decision.index, reason = %reason);
+            return false;
+        }
     };
     if states.is_empty() || states.iter().any(|&asleep| asleep) {
+        debug!(
+            event = "hook_skip_declined",
+            slot = %label,
+            index = decision.index,
+            displays = states.len(),
+            asleep = states.iter().filter(|&&asleep| asleep).count(),
+        );
         return false;
     }
     info!(event = "hook_skipped", slot = %label, index = decision.index, reason = "display_awake");

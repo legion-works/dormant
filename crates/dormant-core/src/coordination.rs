@@ -122,6 +122,9 @@ pub struct InputObservationOutcome {
     pub entered_contested: bool,
     /// `true` only on the observation that cleared a settled contested state.
     pub settled: bool,
+    /// `true` once when a confirmed local input returns after a peer sighting
+    /// that did not last long enough to commit an ownership loss.
+    pub observed_return: bool,
 }
 
 /// Last known ownership and readback state for one shared display.
@@ -145,6 +148,10 @@ pub struct CoordRecord {
     /// `None` when no transition is pending. Repeated identical codes confirm
     /// the transition; differing codes reset the count to 1.
     pub pending_transition_code: Option<u8>,
+    /// Whether the peer input was observed while this record remained owned.
+    pub peer_seen_while_owned: bool,
+    /// Consecutive local input readings since the most recent peer sighting.
+    pub return_confirm_count: u32,
     /// Last successful observation's raw input code; used to detect
     /// disagreements between consecutive successful reads (issue #134).
     pub last_observed_code: Option<u8>,
@@ -166,6 +173,8 @@ impl CoordRecord {
             consecutive_failures: 0,
             pending_transition_count: 0,
             pending_transition_code: None,
+            peer_seen_while_owned: false,
+            return_confirm_count: 0,
             last_observed_code: None,
             contested: false,
             last_raw_change: None,
@@ -209,6 +218,8 @@ fn record_contested_observation(
         record.pending_transition_code = None;
         outcome.settled = true;
     }
+    record.peer_seen_while_owned = false;
+    record.return_confirm_count = 0;
     record_success_state(record, observed, panel_state);
     outcome
 }
@@ -357,11 +368,25 @@ impl CoordinationHandle {
         }
 
         match (prior_owned, is_local) {
-            (false, false) | (true, true) => {
+            (false, false) => {
                 // Verdict already matches the observation — no transition
                 // candidate. Reset any pending state.
                 record.pending_transition_count = 0;
                 record.pending_transition_code = None;
+            }
+            (true, true) => {
+                record.pending_transition_count = 0;
+                record.pending_transition_code = None;
+                if record.peer_seen_while_owned {
+                    record.return_confirm_count = record.return_confirm_count.saturating_add(1);
+                    if record.return_confirm_count >= confirmations.max(1) {
+                        // A confirmed panel return after a peer sighting is observable
+                        // even when debounce never committed the brief ownership loss.
+                        outcome.observed_return = true;
+                        record.peer_seen_while_owned = false;
+                        record.return_confirm_count = 0;
+                    }
+                }
             }
             (false, true) => {
                 // Candidate GAIN — heading toward owned.
@@ -384,6 +409,12 @@ impl CoordinationHandle {
             }
             (true, false) => {
                 // Candidate LOSS — heading toward not-owned.
+                if matches!(classification, InputSourceObservation::Peer) {
+                    record.peer_seen_while_owned = true;
+                }
+                if record.peer_seen_while_owned {
+                    record.return_confirm_count = 0;
+                }
                 if record.pending_transition_code == Some(observed) {
                     record.pending_transition_count =
                         record.pending_transition_count.saturating_add(1);
@@ -394,6 +425,8 @@ impl CoordinationHandle {
                 let threshold = confirmations.max(1);
                 if record.pending_transition_count >= threshold {
                     record.owned = false;
+                    record.peer_seen_while_owned = false;
+                    record.return_confirm_count = 0;
                     record.pending_transition_count = 0;
                     record.pending_transition_code = None;
                     outcome.committed_prior_owned = Some(prior_owned);
@@ -417,6 +450,8 @@ impl CoordinationHandle {
                 record.last_raw_change = Some(now);
                 record.pending_transition_count = 0;
                 record.pending_transition_code = None;
+                record.peer_seen_while_owned = false;
+                record.return_confirm_count = 0;
                 outcome.entered_contested = true;
                 if !prior_owned {
                     // A gain that tripped the limiter is net no ownership change:
@@ -473,6 +508,8 @@ impl CoordinationHandle {
             // agreeing reads don't double-fire or register a disagreement.
             record.pending_transition_count = 0;
             record.pending_transition_code = None;
+            record.peer_seen_while_owned = false;
+            record.return_confirm_count = 0;
             record.consecutive_failures = 0;
             // Set to the verified local code so the next observation of the
             // same code correctly sees "no change" rather than a disagreement.
@@ -797,6 +834,207 @@ mod tests {
         assert_eq!(outcome.committed_prior_owned, Some(false));
         assert_eq!(outcome.deferred_gain_count, None);
         assert!(handle.snapshot()[&aoc].owned);
+    }
+
+    #[test]
+    fn brief_peer_tenure_then_confirmed_return_reports_observed_return() {
+        let aoc = display("aoc");
+        let handle = CoordinationHandle::new([aoc.clone()]);
+        let al = InputCodeAliases {
+            peer_read: Some(0x12),
+            ..aliases(0x11)
+        };
+        let now = Instant::now();
+        let peer = observe_at(&handle, &aoc, 0x12, &al, 3, flap_policy(8), now);
+        assert!(!peer.observed_return);
+        assert_eq!(peer.committed_prior_owned, None);
+        assert!(handle.snapshot()[&aoc].owned);
+
+        for reading in 1..=4 {
+            let outcome = observe_at(
+                &handle,
+                &aoc,
+                0x11,
+                &al,
+                3,
+                flap_policy(8),
+                now + Duration::from_secs(reading),
+            );
+            assert_eq!(
+                outcome.observed_return,
+                reading == 3,
+                "local reading {reading}"
+            );
+            assert_eq!(outcome.committed_prior_owned, None);
+            assert!(handle.snapshot()[&aoc].owned);
+        }
+    }
+
+    #[test]
+    fn unknown_code_does_not_arm_observed_return() {
+        let aoc = display("aoc");
+        let handle = CoordinationHandle::new([aoc.clone()]);
+        let al = InputCodeAliases {
+            peer_read: Some(0x12),
+            ..aliases(0x11)
+        };
+        let now = Instant::now();
+        let _ = observe_at(&handle, &aoc, 0xff, &al, 3, flap_policy(8), now);
+        for n in 1..=4 {
+            let result = observe_at(
+                &handle,
+                &aoc,
+                0x11,
+                &al,
+                3,
+                flap_policy(8),
+                now + Duration::from_secs(n),
+            );
+            assert!(!result.observed_return);
+        }
+    }
+
+    #[test]
+    fn mark_owned_immediate_clears_pending_observed_return() {
+        let aoc = display("aoc");
+        let handle = CoordinationHandle::new([aoc.clone()]);
+        let al = InputCodeAliases {
+            peer_read: Some(0x12),
+            ..aliases(0x11)
+        };
+        let now = Instant::now();
+        let _ = observe_at(&handle, &aoc, 0x12, &al, 3, flap_policy(8), now);
+        handle.mark_owned_immediate(&aoc, 0x11);
+        for n in 1..=3 {
+            let result = observe_at(
+                &handle,
+                &aoc,
+                0x11,
+                &al,
+                3,
+                flap_policy(8),
+                now + Duration::from_secs(n),
+            );
+            assert!(!result.observed_return);
+        }
+    }
+
+    #[test]
+    fn committed_loss_then_gain_reports_only_the_committed_gain() {
+        let aoc = display("aoc");
+        let handle = CoordinationHandle::new([aoc.clone()]);
+        let al = InputCodeAliases {
+            peer_read: Some(0x12),
+            ..aliases(0x11)
+        };
+        let now = Instant::now();
+        for n in 0..3 {
+            let result = observe_at(
+                &handle,
+                &aoc,
+                0x12,
+                &al,
+                3,
+                flap_policy(8),
+                now + Duration::from_secs(n),
+            );
+            assert!(!result.observed_return);
+            assert_eq!(result.committed_prior_owned, (n == 2).then_some(true));
+        }
+        assert!(!handle.snapshot()[&aoc].peer_seen_while_owned);
+        assert_eq!(handle.snapshot()[&aoc].return_confirm_count, 0);
+        for n in 3..6 {
+            let result = observe_at(
+                &handle,
+                &aoc,
+                0x11,
+                &al,
+                3,
+                flap_policy(8),
+                now + Duration::from_secs(n),
+            );
+            assert!(!result.observed_return);
+            assert_eq!(result.committed_prior_owned, (n == 5).then_some(false));
+        }
+    }
+
+    #[test]
+    fn observed_return_restarts_count_when_peer_reappears() {
+        let aoc = display("aoc");
+        let handle = CoordinationHandle::new([aoc.clone()]);
+        let al = InputCodeAliases {
+            peer_read: Some(0x12),
+            ..aliases(0x11)
+        };
+        let now = Instant::now();
+        for (n, code) in [0x12, 0x11, 0x11, 0x12, 0x11, 0x11, 0x11, 0x11]
+            .into_iter()
+            .enumerate()
+        {
+            let result = observe_at(
+                &handle,
+                &aoc,
+                code,
+                &al,
+                3,
+                flap_policy(8),
+                now + Duration::from_secs(n as u64),
+            );
+            assert_eq!(result.observed_return, n == 6, "observation {n}");
+            assert_eq!(result.committed_prior_owned, None);
+            assert!(handle.snapshot()[&aoc].owned);
+        }
+    }
+
+    #[test]
+    fn contested_entry_clears_pending_observed_return() {
+        let aoc = display("aoc");
+        let handle = CoordinationHandle::new([aoc.clone()]);
+        let al = InputCodeAliases {
+            peer_read: Some(0x12),
+            ..aliases(0x11)
+        };
+        let policy = flap_policy(2);
+        let now = Instant::now();
+        for n in 0..3 {
+            let result = observe_at(
+                &handle,
+                &aoc,
+                0x12,
+                &al,
+                3,
+                policy,
+                now + Duration::from_secs(n),
+            );
+            assert!(!result.observed_return);
+        }
+        for n in 3..6 {
+            let result = observe_at(
+                &handle,
+                &aoc,
+                0x11,
+                &al,
+                3,
+                policy,
+                now + Duration::from_secs(n),
+            );
+            assert!(!result.observed_return);
+        }
+        assert!(handle.snapshot()[&aoc].contested);
+        // The contested hold must not interpret subsequent local reads as a return.
+        for n in 6..10 {
+            let result = observe_at(
+                &handle,
+                &aoc,
+                0x11,
+                &al,
+                3,
+                policy,
+                now + Duration::from_secs(n),
+            );
+            assert!(!result.observed_return);
+        }
+        assert!(!handle.snapshot()[&aoc].peer_seen_while_owned);
     }
 
     /// A Local reading with a different raw code (e.g. 0x15 write alias vs

@@ -293,6 +293,11 @@ impl DirectSwitchHandle {
                 cause = reason.as_str(),
                 "pull suppressed: panel already on local input"
             );
+            if reason != SwitchReason::Activity {
+                let _ = self
+                    .front_ctl_tx
+                    .try_send(dormant_core::rules::ControlMsg::InputWake(display.clone()));
+            }
             return SwitchOutcome::AlreadyLocal;
         }
 
@@ -416,6 +421,11 @@ impl DirectSwitchHandle {
                         degraded: false,
                     }),
                 );
+                if reason != SwitchReason::Activity {
+                    let _ = self
+                        .front_ctl_tx
+                        .try_send(dormant_core::rules::ControlMsg::InputWake(display.clone()));
+                }
                 SwitchOutcome::Switched
             }
             Err(cmd) => {
@@ -574,6 +584,11 @@ impl DirectSwitchHandle {
                         degraded,
                     }),
                 );
+                if reason != SwitchReason::Activity {
+                    let _ = self
+                        .front_ctl_tx
+                        .try_send(dormant_core::rules::ControlMsg::InputWake(display.clone()));
+                }
                 SwitchOutcome::Switched
             }
             Err(cmd) => {
@@ -992,6 +1007,125 @@ mod tests {
             SwitchOutcome::Switched
         );
         assert_eq!(sink.calls(), ["ensure_powered_on", "write_input_source"]);
+    }
+
+    fn input_wake_count(rx: &mut mpsc::Receiver<dormant_core::rules::ControlMsg>) -> usize {
+        let mut count = 0;
+        while let Ok(msg) = rx.try_recv() {
+            if let dormant_core::rules::ControlMsg::InputWake(id) = msg {
+                assert_eq!(id, display_id());
+                count += 1;
+            }
+        }
+        count
+    }
+
+    #[tokio::test]
+    async fn pull_sends_input_wake_on_switched() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let handle = build_handle(
+            display_config(),
+            Arc::new(FakeSink::new("ddcci")),
+            noop_hook_engine(),
+            tx,
+        );
+        assert_eq!(
+            handle.pull(display_id(), SwitchReason::Cli, false).await,
+            SwitchOutcome::Switched
+        );
+        assert_eq!(input_wake_count(&mut rx), 1);
+    }
+
+    #[tokio::test]
+    async fn pull_sends_input_wake_on_already_local() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        let coordination = dormant_core::coordination::CoordinationHandle::new([display_id()]);
+        let (tx, mut rx) = mpsc::channel(16);
+        let handle = build_handle_with_coordination(
+            display_config(),
+            sink.clone(),
+            noop_hook_engine(),
+            tx,
+            Some(coordination.clone()),
+        );
+        record_observation(&coordination, LOCAL_READ);
+        sink.set_input_read_result(Ok(Some(LOCAL_READ)));
+        assert_eq!(
+            handle.pull(display_id(), SwitchReason::Cli, false).await,
+            SwitchOutcome::AlreadyLocal
+        );
+        assert_eq!(input_wake_count(&mut rx), 1);
+        assert_eq!(sink.write_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn pull_does_not_send_input_wake_on_hook_abort() {
+        let runner = crate::hooks::ScriptedHookRunner::new();
+        runner.push_command(Err("hook failed".into()));
+        let mut dc = display_config();
+        dc.hooks.before_acquire = vec![abortable_before_acquire_action()];
+        let (tx, mut rx) = mpsc::channel(16);
+        let handle = build_handle(
+            dc,
+            Arc::new(FakeSink::new("ddcci")),
+            Arc::new(HookEngine::with_runner(Arc::new(runner))),
+            tx,
+        );
+        assert!(matches!(
+            handle.pull(display_id(), SwitchReason::Cli, false).await,
+            SwitchOutcome::HookAborted { .. }
+        ));
+        assert_eq!(input_wake_count(&mut rx), 0);
+    }
+
+    #[tokio::test]
+    async fn pull_does_not_send_input_wake_on_write_failure() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        sink.set_write_result(Err(CmdFailure {
+            controller: "ddcci".into(),
+            error: "write failed".into(),
+        }));
+        let (tx, mut rx) = mpsc::channel(16);
+        let handle = build_handle(display_config(), sink, noop_hook_engine(), tx);
+        assert!(matches!(
+            handle.pull(display_id(), SwitchReason::Cli, false).await,
+            SwitchOutcome::WriteFailed { .. }
+        ));
+        assert_eq!(input_wake_count(&mut rx), 0);
+    }
+
+    #[tokio::test]
+    async fn push_sends_input_wake_on_switched() {
+        let mut dc = display_config();
+        dc.shared_peer_input_code = Some(PEER_READ);
+        dc.shared_peer_input_write_code = Some(PEER_WRITE);
+        let (tx, mut rx) = mpsc::channel(16);
+        let handle = build_handle(dc, Arc::new(FakeSink::new("ddcci")), noop_hook_engine(), tx);
+        assert_eq!(
+            handle
+                .push(display_id(), SwitchReason::Release, false)
+                .await,
+            SwitchOutcome::Switched
+        );
+        assert_eq!(input_wake_count(&mut rx), 1);
+    }
+
+    #[tokio::test]
+    async fn activity_pull_does_not_duplicate_input_wake() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let handle = build_handle(
+            display_config(),
+            Arc::new(FakeSink::new("ddcci")),
+            noop_hook_engine(),
+            tx,
+        );
+        assert_eq!(
+            handle
+                .pull(display_id(), SwitchReason::Activity, false)
+                .await,
+            SwitchOutcome::Switched
+        );
+        assert_eq!(input_wake_count(&mut rx), 0);
     }
 
     /// A no-op hook runner — all commands succeed.

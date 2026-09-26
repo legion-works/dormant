@@ -2457,6 +2457,7 @@ mod tests {
             vec![(VCP_POWER, D6_ON, VcpPriority::Command)]
         );
         fake.expect_get(ident, VCP_POWER, Ok(D6_ON));
+        fake.expect_set(ident, VCP_POWER, D6_ON, Ok(()));
         assert_eq!(ctrl.ensure_powered_on().await, Ok(false));
         assert_eq!(fake.set_calls().len(), 1);
     }

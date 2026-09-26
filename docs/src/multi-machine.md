@@ -260,6 +260,9 @@ When the monitor changes input outside dormant (the panel button or automatic
 input selection after the other machine locks), the gaining machine fires
 `on_observed_gain` after its poll confirms the transition. This can publish
 the gaining host's USB target without pulling the panel again.
+The hook also fires if the panel comes back before this machine confirms losing
+it (the peer held it for less than `loss_confirmations × poll_interval`), once
+the return has the same number of confirming readings.
 
 ### Hook environment
 

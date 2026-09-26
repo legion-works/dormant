@@ -317,6 +317,12 @@ async fn poll_once(
                     }
                 }
             }
+            if outcome.observed_return {
+                tracing::info!(event = "coord_ownership_returned", display = %display_id, observed);
+                if let Some(ref ds) = deps.direct_switch {
+                    ds.notify_observed_gain(&display_id).await;
+                }
+            }
         } else {
             deps.state.record_failure(&display_id);
             let failures = deps
@@ -1513,6 +1519,40 @@ mod tests {
         }
         assert!(state.snapshot()[&DisplayId("shared".into())].owned);
         assert_eq!(*calls.lock().unwrap(), ["loss", "gain"]);
+        cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn observed_return_fires_observed_gain_hook() {
+        let mut cfg = config();
+        cfg.displays
+            .get_mut("shared")
+            .unwrap()
+            .hooks
+            .on_observed_gain = vec![hook_action("gain")];
+        cfg.displays
+            .get_mut("shared")
+            .unwrap()
+            .hooks
+            .on_observed_loss = vec![hook_action("loss")];
+        let sink = Arc::new(ScriptedSink::with_inputs([
+            Ok(Some(0x12)),
+            Ok(Some(0x11)),
+            Ok(Some(0x11)),
+            Ok(Some(0x11)),
+            Ok(Some(0x11)),
+        ]));
+        let ((_config_tx, _executors_tx, mut ctl_rx, state, cancel), _handle, calls) =
+            hooked_poller(cfg, sink);
+        for _ in 0..5 {
+            tick().await;
+        }
+        assert!(state.snapshot()[&DisplayId("shared".into())].owned);
+        assert!(
+            ctl_rx.try_recv().is_err(),
+            "no ownership transition should be published"
+        );
+        assert_eq!(*calls.lock().unwrap(), ["gain"]);
         cancel.cancel();
     }
 

@@ -239,7 +239,7 @@ or an MQTT publish (QoS 1, non-retained).
 | `before_release` | Push (release) | BEFORE the peer DDC write. Blocking — a failure aborts the push. Use for USB-switch or KVMP transitions. |
 | `after_release` | Push (release) | AFTER a successful or failed push write. Fire-and-forget. |
 | `on_observed_loss` | Poll (loss) | AFTER the poller commits an ownership loss. Fire-and-forget — the poll path has no write authority and must never trigger a corrective DDC write or retry. |
-| `on_observed_gain` | Poll (gain) | AFTER the poller commits an ownership gain. Fire-and-forget — no DDC write, retry, or corrective action. A dormant-initiated pull marks ownership immediately and fires `after_acquire`, not this slot. |
+| `on_observed_gain` | Poll (gain) | AFTER the poller commits an ownership gain or confirms a return from a brief peer sighting. Fire-and-forget, with no DDC write, retry, or corrective action. A dormant-initiated pull marks ownership immediately and fires `after_acquire`, not this slot. |
 
 ### Hook causality — who gets advance notice
 
@@ -260,6 +260,9 @@ When the monitor changes input outside dormant (the panel button or automatic
 input selection after the other machine locks), the gaining machine fires
 `on_observed_gain` after its poll confirms the transition. This can publish
 the gaining host's USB target without pulling the panel again.
+The hook also fires if the panel comes back before this machine confirms losing
+it (the peer held it for less than `loss_confirmations × poll_interval`), once
+the return has the same number of confirming readings.
 
 ### Hook environment
 

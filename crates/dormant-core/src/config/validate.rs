@@ -2523,7 +2523,10 @@ fn validate_hook_action(
         errors.push(ValidationError {
             what: crate::error::E_CONFIG_INVALID.into(),
             detail: format!(
-                "display '{display_id}' hooks.{slot}[{index}] timeout exceeds hooks.timeout"
+                "display '{display_id}' config key 'displays.{display_id}.hooks.{slot}[{index}].timeout' value {:?} exceeds aggregate config key 'displays.{display_id}.hooks.timeout' bound {:?} (default {:?})",
+                action.timeout,
+                total_timeout,
+                defaults::HOOK_TOTAL_TIMEOUT
             ),
         });
     }
@@ -3104,15 +3107,22 @@ gracee_period = "60s"
     }
 
     #[test]
-    fn kvm_hook_action_timeout_must_not_exceed_total_hook_timeout() {
+    fn kvm_hook_action_timeout_error_names_config_key_bound_and_default() {
         let errors = validate_str(
-            "config_version = 1\n[displays.main]\ncontrollers = [\"ddcci\"]\nscope = \"shared\"\nshared_input_code = 1\nblank_mode = \"power_off\"\n[displays.main.hooks]\ntimeout = \"1s\"\nbefore_release = [{ command = [\"true\"], timeout = \"2s\" }]\n",
+            "config_version = 1\n[displays.main]\ncontrollers = [\"ddcci\"]\nscope = \"shared\"\nshared_input_code = 1\nblank_mode = \"power_off\"\n[displays.main.hooks]\ntimeout = \"1s\"\nbefore_acquire = [{ command = [\"true\"], timeout = \"2s\" }]\n",
         );
         assert!(
             errors
                 .iter()
                 .any(|error| error.what == crate::error::E_CONFIG_INVALID
-                    && error.detail.contains("timeout exceeds hooks.timeout")),
+                    && error
+                        .detail
+                        .contains("displays.main.hooks.before_acquire[0].timeout")
+                    && error
+                        .detail
+                        .contains("exceeds aggregate config key 'displays.main.hooks.timeout'")
+                    && error.detail.contains("bound 1s")
+                    && error.detail.contains("default 90s")),
             "per-action timeout above the total hook timeout must be rejected: {errors:?}"
         );
     }

@@ -120,7 +120,9 @@ its source goes offline, even while the global topic is still `online`.
 ## Collisions
 
 If two distinct raw ids sanitize to the same topic id, the publisher
-emits a single `publish_id_collision` WARN per colliding pair and
+emits a single `publish_id_collision` WARN per colliding pair per
+discovery flush, including startup and each reconnect. A later flush
+may warn again. The startup flush performs collision detection once.
 publishes **only the first** in config order — never interleaves two
 entities on one topic. The collision report also surfaces in
 `dormantctl validate` output so an operator can rename the offending

@@ -1322,8 +1322,6 @@ pub fn discovery_records(
     if !cfg.publish.enabled {
         return Vec::new();
     }
-    let _ = detect_and_warn_collisions(cfg, inventory);
-
     let instance = sanitize_topic_id(instance);
     let discovery_prefix = sanitize_topic_id(&cfg.publish.discovery_prefix);
 

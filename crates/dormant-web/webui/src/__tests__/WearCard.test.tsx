@@ -105,7 +105,7 @@ describe("WearCard", () => {
       uniform_reason: "source_unknown",
     })] } });
     render(<WearCard />);
-    expect(await screen.findByText(/Last spatial capture: none/i)).toBeInTheDocument();
+    expect(await screen.findByText(/No current spatial capture/i)).toBeInTheDocument();
   });
   it("polls once after awaiting consent and stops at granted or denied", async () => {
     mocks.getConfig.mockResolvedValue({ inventory: { wear: { active_sampling: { enabled: true, sampled_display: "desk" } } } });

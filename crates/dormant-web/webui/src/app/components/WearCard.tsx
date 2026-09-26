@@ -149,10 +149,10 @@ function WearRow({
   const age = summary.last_sample_at_epoch_s;
   // WearSummary wire doesn't carry the per-display capture age (that lives
   // on the lifecycle sampler status, which WearCard does not poll). When
-  // attribution is uniform, render the spatial capture as "none" — anything
-  // fresher would falsely suggest a spatial sample is in hand.
+  // attribution is uniform, no current spatial capture feeds the heat map;
+  // showing an age would falsely suggest a spatial sample is in hand.
   const ageText = summary.wear_attribution_mode === "uniform"
-    ? "Last spatial capture: none"
+    ? "No current spatial capture"
     : age === undefined || age === null
       ? "Last sample: unavailable"
       : `Last sample: ${Math.max(0, Math.floor((Date.now() / 1000 - age) / 60))}m ago`;

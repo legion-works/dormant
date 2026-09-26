@@ -203,6 +203,12 @@ pub trait DisplayController: Any + Send + Sync {
         Ok(None)
     }
 
+    /// Read the active input-source code at command priority for an operator
+    /// switch confirmation that must not yield to sampler traffic.
+    async fn read_input_source(&self) -> Result<Option<u8>, String> {
+        Ok(None)
+    }
+
     /// Select the active input-source code.
     ///
     /// Controllers without an input-source write surface return the stable
@@ -330,6 +336,12 @@ pub trait CommandSink: Send + Sync {
     /// Returns an error when no controller read a code and the last
     /// controller that attempted the read failed.
     async fn read_input_source_sampled(&self) -> Result<Option<u8>, String> {
+        Ok(None)
+    }
+
+    /// Read the active input-source code through the controller chain at
+    /// command priority.
+    async fn read_input_source(&self) -> Result<Option<u8>, String> {
         Ok(None)
     }
 

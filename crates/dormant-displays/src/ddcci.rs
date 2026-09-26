@@ -694,6 +694,22 @@ impl DisplayController for DdcciController {
         }
     }
 
+    /// Read the active input source at command priority (VCP `0x60`).
+    async fn read_input_source(&self) -> Result<Option<u8>, String> {
+        let (ident, lock) = {
+            let state = self.state.lock().unwrap();
+            match (&state.matched_ident, &state.panel_lock) {
+                (Some(id), Some(lock)) => (id.clone(), Arc::clone(lock)),
+                _ => return Ok(None),
+            }
+        };
+
+        self.ops
+            .get_vcp_raw(&ident, VCP_INPUT_SOURCE, &lock, VcpPriority::Command)
+            .await
+            .and_then(|raw| decode_input_source(raw).map(Some))
+    }
+
     /// Select the active input source with VCP `0x60` at command priority.
     ///
     /// `CoreDisplay` can report an acknowledged I²C write that the panel ignores. Success is

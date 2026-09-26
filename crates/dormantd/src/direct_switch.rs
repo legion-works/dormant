@@ -281,7 +281,12 @@ impl DirectSwitchHandle {
             return SwitchOutcome::Unsupported;
         };
 
-        if !force && self.observation_agrees_local(&display, local_code) {
+        if !force
+            && self.observation_agrees_local(&display, local_code)
+            && tokio::time::timeout(Duration::from_secs(2), executor.read_input_source())
+                .await
+                .is_ok_and(|result| result == Ok(Some(local_code)))
+        {
             let display_name = display.0.clone();
             tracing::debug!(
                 event = "switch_noop_already_local",
@@ -459,6 +464,9 @@ impl DirectSwitchHandle {
         if !force
             && let Some(peer_code) = dc.shared_peer_input_code
             && self.observation_agrees_peer(&display, peer_code)
+            && tokio::time::timeout(Duration::from_secs(2), executor.read_input_source())
+                .await
+                .is_ok_and(|result| result == Ok(Some(peer_code)))
         {
             let display_name = display.0.clone();
             tracing::debug!(
@@ -673,6 +681,7 @@ impl DirectSwitchHandle {
         // avoids a second freshness policy knob.
         record.owned
             && record.has_successful_input_read
+            && record.consecutive_failures == 0
             && record.consecutive_failures < failure_threshold
             && record.last_observed_code == Some(local_code)
     }
@@ -690,6 +699,7 @@ impl DirectSwitchHandle {
         };
         !record.owned
             && record.has_successful_input_read
+            && record.consecutive_failures == 0
             && record.last_observed_code == Some(peer_code)
     }
 
@@ -801,6 +811,7 @@ mod tests {
 
     struct FakeSinkInner {
         write_result: Option<Result<(), CmdFailure>>,
+        input_read_result: Option<Result<Option<u8>, String>>,
         last_target: Option<InputSourceTarget>,
         write_calls: usize,
     }
@@ -811,6 +822,7 @@ mod tests {
                 _name: name,
                 inner: Arc::new(Mutex::new(FakeSinkInner {
                     write_result: Some(Ok(())),
+                    input_read_result: Some(Ok(None)),
                     last_target: None,
                     write_calls: 0,
                 })),
@@ -828,6 +840,10 @@ mod tests {
         fn write_calls(&self) -> usize {
             self.inner.lock().unwrap().write_calls
         }
+
+        fn set_input_read_result(&self, result: Result<Option<u8>, String>) {
+            self.inner.lock().unwrap().input_read_result = Some(result);
+        }
     }
 
     #[async_trait::async_trait]
@@ -842,6 +858,15 @@ mod tests {
 
         fn controller_health(&self) -> Vec<dormant_core::rules::ControllerHealth> {
             vec![]
+        }
+
+        async fn read_input_source(&self) -> Result<Option<u8>, String> {
+            self.inner
+                .lock()
+                .unwrap()
+                .input_read_result
+                .take()
+                .unwrap_or(Ok(None))
         }
 
         async fn write_input_source(&self, target: InputSourceTarget) -> Result<(), CmdFailure> {
@@ -1547,6 +1572,7 @@ mod tests {
             SwitchOutcome::Switched
         );
         record_observation(&coordination, LOCAL_READ);
+        sink.set_input_read_result(Ok(Some(LOCAL_READ)));
         let writes_before = sink.write_calls();
         let hooks_before = runner.command_count();
 
@@ -1564,6 +1590,30 @@ mod tests {
             hooks_before,
             "second pull must not run hooks"
         );
+    }
+
+    #[tokio::test]
+    async fn pull_writes_when_cached_local_but_fresh_read_shows_peer() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        let runner = Arc::new(CountingHookRunner::new());
+        let (front_ctl_tx, _front_ctl_rx) = mpsc::channel(16);
+        let coordination = dormant_core::coordination::CoordinationHandle::new([display_id()]);
+        record_observation(&coordination, LOCAL_READ);
+        sink.set_input_read_result(Ok(Some(PEER_READ)));
+        let handle = build_handle_with_coordination(
+            idempotency_display_config(),
+            sink.clone(),
+            Arc::new(HookEngine::with_runner(runner.clone())),
+            front_ctl_tx,
+            Some(coordination),
+        );
+
+        assert_eq!(
+            handle.pull(display_id(), SwitchReason::Cli, false).await,
+            SwitchOutcome::Switched
+        );
+        assert_eq!(sink.write_calls(), 1);
+        assert_eq!(runner.command_count(), 1);
     }
 
     #[tokio::test]
@@ -1619,6 +1669,7 @@ mod tests {
         );
 
         record_observation(&coordination, LOCAL_READ);
+        sink.set_input_read_result(Ok(Some(LOCAL_READ)));
         let writes_before = sink.write_calls();
         let hooks_before = runner.command_count();
         assert_eq!(
@@ -1683,6 +1734,7 @@ mod tests {
         let (front_ctl_tx, _front_ctl_rx) = mpsc::channel(16);
         let coordination = dormant_core::coordination::CoordinationHandle::new([display_id()]);
         record_observation(&coordination, PEER_READ);
+        sink.set_input_read_result(Ok(Some(PEER_READ)));
         let handle = build_handle_with_coordination(
             idempotency_display_config(),
             sink.clone(),
@@ -1697,6 +1749,101 @@ mod tests {
         );
         assert_eq!(sink.write_calls(), 0);
         assert_eq!(runner.command_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn pull_writes_when_cached_local_but_fresh_read_fails() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        let runner = Arc::new(CountingHookRunner::new());
+        let (front_ctl_tx, _front_ctl_rx) = mpsc::channel(16);
+        let coordination = dormant_core::coordination::CoordinationHandle::new([display_id()]);
+        record_observation(&coordination, LOCAL_READ);
+        sink.set_input_read_result(Err("bus unavailable".to_string()));
+        let handle = build_handle_with_coordination(
+            idempotency_display_config(),
+            sink.clone(),
+            Arc::new(HookEngine::with_runner(runner.clone())),
+            front_ctl_tx,
+            Some(coordination),
+        );
+
+        assert_eq!(
+            handle.pull(display_id(), SwitchReason::Cli, false).await,
+            SwitchOutcome::Switched
+        );
+        assert_eq!(sink.write_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn pull_suppressed_when_fresh_read_confirms_local() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        let runner = Arc::new(CountingHookRunner::new());
+        let (front_ctl_tx, _front_ctl_rx) = mpsc::channel(16);
+        let coordination = dormant_core::coordination::CoordinationHandle::new([display_id()]);
+        record_observation(&coordination, LOCAL_READ);
+        sink.set_input_read_result(Ok(Some(LOCAL_READ)));
+        let handle = build_handle_with_coordination(
+            idempotency_display_config(),
+            sink.clone(),
+            Arc::new(HookEngine::with_runner(runner.clone())),
+            front_ctl_tx,
+            Some(coordination),
+        );
+
+        assert_eq!(
+            handle.pull(display_id(), SwitchReason::Cli, false).await,
+            SwitchOutcome::AlreadyLocal
+        );
+        assert_eq!(sink.write_calls(), 0);
+        assert_eq!(runner.command_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn pull_writes_after_failed_reads_even_if_last_good_code_was_local() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        let runner = Arc::new(CountingHookRunner::new());
+        let (front_ctl_tx, _front_ctl_rx) = mpsc::channel(16);
+        let coordination = dormant_core::coordination::CoordinationHandle::new([display_id()]);
+        record_observation(&coordination, LOCAL_READ);
+        coordination.record_failure(&display_id());
+        coordination.record_failure(&display_id());
+        sink.set_input_read_result(Ok(Some(LOCAL_READ)));
+        let handle = build_handle_with_coordination(
+            idempotency_display_config(),
+            sink.clone(),
+            Arc::new(HookEngine::with_runner(runner)),
+            front_ctl_tx,
+            Some(coordination),
+        );
+
+        assert_eq!(
+            handle.pull(display_id(), SwitchReason::Cli, false).await,
+            SwitchOutcome::Switched
+        );
+        assert_eq!(sink.write_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn push_writes_when_cached_peer_but_fresh_read_shows_local() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        let runner = Arc::new(CountingHookRunner::new());
+        let (front_ctl_tx, _front_ctl_rx) = mpsc::channel(16);
+        let coordination = dormant_core::coordination::CoordinationHandle::new([display_id()]);
+        record_observation(&coordination, PEER_READ);
+        sink.set_input_read_result(Ok(Some(LOCAL_READ)));
+        let handle = build_handle_with_coordination(
+            idempotency_display_config(),
+            sink.clone(),
+            Arc::new(HookEngine::with_runner(runner)),
+            front_ctl_tx,
+            Some(coordination),
+        );
+
+        assert_eq!(
+            handle.push(display_id(), SwitchReason::Cli, false).await,
+            SwitchOutcome::Switched
+        );
+        assert_eq!(sink.write_calls(), 1);
     }
 
     #[tokio::test]

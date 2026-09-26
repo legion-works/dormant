@@ -62,6 +62,8 @@ dwell of at least `wear.short_cycle_dwell`. After `wear.advisory_after` (default
 
 The day count is also returned by `GET /api/wear`. The advisory never forces a
 rest window, blank, or state-machine transition.
+It reports time since a sufficiently long blanked dwell; it is not a pixel-refresh
+instruction and does not schedule or replace the manufacturer's panel-refresh routines.
 
 ## Ledger files
 

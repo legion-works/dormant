@@ -122,6 +122,10 @@ export interface ControllerHealth {
  * `wake_attempts` / `last_blank_failed` are `#[serde(default)]` — mirrors
  * the `stage?:` back-compat precedent: legacy wire that omits these keys
  * deserializes as `undefined` here, not a hard failure.
+ * `rules` is `#[serde(default)]` AND NOT `skip_serializing_if` — empty
+ * lists still serialise as `"rules": []`. Same back-compat pattern: an
+ * absent key deserializes as `undefined` here, the dashboard then
+ * falls back to `[]`.
  */
 export interface DisplaySnapshot {
   phase: string; // grep-stable literal: "active" | "grace" | "blanking" | "blanked" | "waking" | "render_pending" | "staged"
@@ -145,6 +149,10 @@ export interface DisplaySnapshot {
   last_blank_failed?: boolean;
   /** Present only when the display is in the `staged` phase. */
   stage?: { idx: number; kind: StageKind } | null;
+  /** Ids of the rules that drive this display (sorted, deduplicated). An
+   * empty list means "no rule drives this display" — a manual-only panel
+   * that dormant will never blank on its own. Absent on legacy wire. */
+  rules?: string[];
 }
 
 /** rust: rules.rs RollbackStatus */

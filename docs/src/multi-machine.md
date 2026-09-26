@@ -240,21 +240,24 @@ or an MQTT publish (QoS 1, non-retained).
 | `after_release` | Push (release) | AFTER a successful or failed push write. Fire-and-forget. |
 | `on_observed_loss` | Poll (loss) | AFTER the poller commits an ownership loss. Fire-and-forget — the poll path has no write authority and must never trigger a corrective DDC write or retry. |
 | `on_observed_gain` | Poll (gain) | AFTER the poller commits an ownership gain or confirms a return from a brief peer sighting. Fire-and-forget, with no DDC write, retry, or corrective action. A dormant-initiated pull marks ownership immediately and fires `after_acquire`, not this slot. |
-| `on_wake` | Display wake | AFTER dormant leaves a dark display phase. Fire-and-forget, with no extra panel write or retry. Only confirmed presence wakes fire; fail-safe availability wakes do not. |
+| `on_wake` | Display wake | AFTER an input/force wake or a confirmed presence wake. Fire-and-forget, with no extra panel write or retry. Fail-safe availability and poll-only ownership gains do not fire it. |
 
 ### Wake the source output as well as the panel
 
 `on_wake` is useful when dormant wakes the panel but the source machine's own
-compositor output is off. It fires once when a display leaves `blanked` for
-`waking`, or a render stage is torn down, due to `input_wake`, `force_wake`,
-`ownership_acquired`, or confirmed `presence_detected`. Confirmed means at least
+compositor output is off. It fires once on an `input_wake` or `force_wake`
+(including an operator wake during grace), or when confirmed `presence_detected`
+leaves `blanked` for `waking` or tears down a render stage. Confirmed means at least
 one driving zone still resolves present when unavailable sensors are treated as
 absent, including inside nested zones. A wake caused solely by fail-safe
 unknown/unavailable sensor states does **not** fire the hook: MQTT interruptions
 should not light a static lock screen on an OLED. Retries (`wake_retry`),
-`wake_completed`, a return during grace (`presence_during_grace`), and
+`wake_completed`, `ownership_acquired`, a presence return during grace
+(`presence_during_grace`), and
 transitions into dark phases do not fire it. The panel wake proceeds independently
 of the hook; the hook never gates the DDC `D6_ON` transaction.
+Ownership gain alone can result from a panel hunting inputs at night, so it must
+not light the source output; an intentional pull uses `before_acquire` instead.
 
 For a shared display on KDE, wake the local compositor output while excluding
 any other connector you deliberately keep off:

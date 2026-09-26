@@ -8,13 +8,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::direct_switch::DirectSwitchHandle;
 
-fn should_fire_on_wake(phase: &str, cause: &str, presence_confirmed: Option<bool>) -> bool {
-    if !matches!(phase, "waking" | "active") {
-        return false;
-    }
+fn should_fire_on_wake(_phase: &str, cause: &str, presence_confirmed: Option<bool>) -> bool {
     match cause {
         "presence_detected" => presence_confirmed == Some(true),
-        "input_wake" | "force_wake" | "ownership_acquired" => true,
+        "input_wake" | "force_wake" => true,
         _ => false,
     }
 }
@@ -88,11 +85,26 @@ mod tests {
     }
 
     #[test]
-    fn on_wake_fires_on_input_force_and_ownership_wakes() {
-        for cause in ["input_wake", "force_wake", "ownership_acquired"] {
+    fn on_wake_fires_on_input_and_force_wakes() {
+        for cause in ["input_wake", "force_wake"] {
             assert!(should_fire_on_wake("waking", cause, None), "{cause}");
             assert!(should_fire_on_wake("active", cause, None), "{cause}");
         }
+    }
+
+    #[test]
+    fn on_wake_fires_on_grace_return_input_wake() {
+        assert!(should_fire_on_wake("active", "input_wake", None));
+    }
+
+    #[test]
+    fn on_wake_skips_ownership_acquired() {
+        assert!(!should_fire_on_wake("waking", "ownership_acquired", None));
+        assert!(!should_fire_on_wake(
+            "active",
+            "ownership_acquired",
+            Some(true)
+        ));
     }
 
     #[test]
@@ -101,8 +113,6 @@ mod tests {
             assert!(!should_fire_on_wake("waking", cause, Some(true)), "{cause}");
             assert!(!should_fire_on_wake("active", cause, Some(true)), "{cause}");
         }
-        for phase in ["blanked", "blanking", "staged", "grace"] {
-            assert!(!should_fire_on_wake(phase, "force_wake", None), "{phase}");
-        }
+        assert!(!should_fire_on_wake("blanking", "force_blank", None));
     }
 }

@@ -9,6 +9,9 @@
 - Rust 1.88+ (MSRV) if installing from source
 - Build dependencies for the full daemon (Linux only — macOS needs nothing
   beyond Xcode Command Line Tools): `sudo apt install libudev-dev libwayland-dev libmpv-dev libpipewire-0.3-dev pkg-config`
+- On Arch Linux, install the toolchain and equivalent dependencies with
+  `sudo pacman -S base-devel rust systemd-libs pipewire wayland mpv pkgconf`;
+  `systemd-libs` supplies libudev.
 - If `pkg-config` cannot find `libudev`, set `PKG_CONFIG_PATH=/usr/lib/pkgconfig`
 
 ### Render backend
@@ -54,6 +57,12 @@ install -Dm755 target/release/dormantd ~/.local/bin/dormantd
 install -Dm755 target/release/dormantctl ~/.local/bin/dormantctl
 ```
 
+On Arch Linux, replace the `apt install` line with
+`sudo pacman -S base-devel rust systemd-libs pipewire wayland mpv pkgconf`;
+`systemd-libs` supplies libudev.
+The AUR package [`dormant-bin`](#arch-linux-aur) installs release binaries;
+use the source-build steps here when you need to compile locally.
+
 Binaries land in `~/.local/bin/` — make sure this is on your `PATH`.
 
 ### Tray applet
@@ -69,6 +78,21 @@ install -Dm755 target/release/dormant-tray ~/.local/bin/dormant-tray
 ```
 
 See [Tray autostart](#tray-autostart) below to run it on every login.
+
+For shared-display global switching, add a `[keymap]` section to your config:
+
+```toml
+[keymap]
+claim_hotkey = "Meta+F12"
+```
+
+The tray registers the accelerator only when exactly one switch-capable
+display is configured; see [Multi-machine KVM switching](./multi-machine.md).
+Tray icon states
+are Normal (all displays active), Attention (a display is in a non-active
+phase), Paused, Failure (a blank or wake command failed), and Unreachable (the
+daemon IPC socket is down). Failure outranks Paused; details are in
+[Failure notifications](./failure-notifications.md).
 
 ## From release
 
@@ -187,7 +211,8 @@ See [Watchdog + last-known-good rollback](./watchdog-rollback.md).
 
 Windows support is newer than the Linux and macOS paths and narrower on
 purpose. Everything below is what the daemon actually does today, including
-what it does not do.
+what it does not do. There are no Windows release binaries; build from source
+using the setup script below. Windows has not yet been verified on hardware.
 
 ### What works
 

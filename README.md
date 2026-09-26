@@ -137,8 +137,8 @@ The AUR package includes the pre-built binaries and systemd user units.
 **Installer scripts** (Linux x86_64 / aarch64, macOS arm64 / x86_64):
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/download/v0.4.0/dormantd-installer.sh | sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/download/v0.4.0/dormantctl-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/latest/download/dormantd-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/legion-works/dormant/releases/latest/download/dormantctl-installer.sh | sh
 ```
 
 The `dormant-tray-installer.sh` script is in the same release directory.
@@ -163,12 +163,17 @@ launchctl bootstrap gui/$UID "$HOME/Library/LaunchAgents/com.legionworks.dormant
 ```bash
 git clone https://github.com/legion-works/dormant.git
 cd dormant
-sudo apt install libudev-dev libwayland-dev libmpv-dev pkg-config
+sudo apt install libudev-dev libwayland-dev libmpv-dev libpipewire-0.3-dev pkg-config
 cargo build --release --features web-ui,render
 install -Dm755 target/release/dormantd  ~/.local/bin/dormantd
 install -Dm755 target/release/dormantctl ~/.local/bin/dormantctl
 install -Dm755 target/release/dormant-tray ~/.local/bin/dormant-tray
 ```
+
+On Arch Linux, install the build dependencies and toolchain with
+`sudo pacman -S base-devel rust systemd-libs pipewire wayland mpv pkgconf`, then
+build as above. The AUR package `dormant-bin` is an alternative that installs
+pre-built release binaries; it is not a source-build prerequisite.
 
 Write `~/.config/dormant/config.toml`:
 
@@ -218,7 +223,7 @@ The rendered book for the latest release lives at [legion-works.github.io/dorman
 
 ## Status
 
-Running in production on the author's hardware — an AOC AGON OLED monitor and a Samsung S90D — driven by real Zigbee and mmWave presence sensors. CI covers the full workspace on Linux, macOS, and Windows; macOS (M1) is a genuinely supported target as of this milestone — DDC/CI, Quartz-gamma black, and `pmset` display-sleep controllers, a CoreGraphics idle source, launchd `LaunchAgents`, and a native menu-bar tray item — while Windows remains portability-only (no native display control). The daemon caps Tokio at two workers, calls `malloc_trim` after screensaver teardown, and sets `MALLOC_ARENA_MAX=2` in the systemd unit (Linux). The shipped watchdog restarts a wedged engine on Linux via systemd's `WatchdogSec`; macOS has no equivalent wedged-daemon detection (see [Installation: LaunchAgent (macOS)](./docs/src/installation.md#launchagent-macos)). Last-known-good rollback can recover a bad boot config on both platforms — it is supervisor-agnostic.
+Running in production on the author's hardware — an AOC AGON OLED monitor and a Samsung S90D — driven by real Zigbee and mmWave presence sensors. CI covers the full workspace on Linux, macOS, and Windows; macOS (M1) is a genuinely supported target as of this milestone — DDC/CI, Quartz-gamma black, and `pmset` display-sleep controllers, a CoreGraphics idle source, launchd `LaunchAgents`, and a native menu-bar tray item. Windows supports DDC/CI through WinAPI and the `command` controller, but has no release binaries: build from source. Windows has not yet been verified on hardware; see [Installation: Windows](./docs/src/installation.md#windows) for limitations including no tray applet, no render ladder, and no service supervision. The daemon caps Tokio at two workers, calls `malloc_trim` after screensaver teardown, and sets `MALLOC_ARENA_MAX=2` in the systemd unit (Linux). The shipped watchdog restarts a wedged engine on Linux via systemd's `WatchdogSec`; macOS has no equivalent wedged-daemon detection (see [Installation: LaunchAgent (macOS)](./docs/src/installation.md#launchagent-macos)). Last-known-good rollback can recover a bad boot config on both platforms — it is supervisor-agnostic.
 
 It's a young project with one maintainer, aimed at homelabs and single-operator setups; interfaces can still shift before 1.0, and the web dashboard binds to loopback with no authentication by design.
 

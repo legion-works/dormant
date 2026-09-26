@@ -202,6 +202,51 @@ describe("SensorsSection — CRUD affordances", () => {
     ]);
   });
 
+  it("creating a sensor with Add to zone appends it to that zone's members", () => {
+    const store = renderWithCrud(true);
+    fireEvent.click(screen.getByRole("button", { name: /add sensor/i }));
+
+    const form = within(screen.getByTestId("create-sensors-form"));
+    fireEvent.change(form.getByLabelText("id"), { target: { value: "new-desk" } });
+    fireEvent.change(form.getByLabelText("broker_url"), { target: { value: "tcp://mqtt:1883" } });
+    fireEvent.change(form.getByLabelText("topic"), { target: { value: "sensors/desk" } });
+    fireEvent.change(form.getByLabelText(/add to zone/i), { target: { value: "office" } });
+    fireEvent.click(form.getByRole("button", { name: /create/i }));
+
+    const patches = store.buildPatches();
+    expect(patches).toContainEqual({
+      op: "create_entity",
+      collection: "sensors",
+      id: "new-desk",
+      value: { type: "mqtt", broker_url: "tcp://mqtt:1883", topic: "sensors/desk" },
+    });
+    expect(patches).toContainEqual({
+      op: "set",
+      path: ["zones", "office", "members"],
+      value: ["living-room", "new-desk"],
+    });
+    expect(patches).toHaveLength(2);
+  });
+
+  it("Add to zone keeps a pending members edit instead of overwriting it", () => {
+    const store = renderWithCrud(true);
+    act(() => store.trackEdit(["zones", "office", "members"], []));
+    fireEvent.click(screen.getByRole("button", { name: /add sensor/i }));
+
+    const form = within(screen.getByTestId("create-sensors-form"));
+    fireEvent.change(form.getByLabelText("id"), { target: { value: "new-desk" } });
+    fireEvent.change(form.getByLabelText("broker_url"), { target: { value: "tcp://mqtt:1883" } });
+    fireEvent.change(form.getByLabelText("topic"), { target: { value: "sensors/desk" } });
+    fireEvent.change(form.getByLabelText(/add to zone/i), { target: { value: "office" } });
+    fireEvent.click(form.getByRole("button", { name: /create/i }));
+
+    expect(store.buildPatches()).toContainEqual({
+      op: "set",
+      path: ["zones", "office", "members"],
+      value: ["new-desk"],
+    });
+  });
+
   it("rejects a reserved id in the create form before submit", () => {
     renderWithCrud(true);
     fireEvent.click(screen.getByRole("button", { name: /add sensor/i }));

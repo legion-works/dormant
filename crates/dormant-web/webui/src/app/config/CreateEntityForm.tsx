@@ -126,8 +126,8 @@ export default function CreateEntityForm({
     const extra: ConfigPatch[] = [];
     if (collection === "sensors" && addToZone && zoneMembers) {
       // Sensor create → also append the new sensor id to the chosen zone's members.
-      // The patch store's last-write-wins semantics make this safe even when
-      // the user already had a pending `zones.<id>.members` edit.
+      // Arrays transit whole, so `zoneMembers` must be the effective list
+      // (a pending members edit, if any); the caller supplies it.
       const current = zoneMembers[addToZone] ?? [];
       if (!current.includes(id)) {
         extra.push({

@@ -1,5 +1,5 @@
 /**
- * HooksInspector tests — read-only render of six hook slots,
+ * HooksInspector tests — read-only render of seven hook slots,
  * abort-gate tags, empty slots, and the footer disclaimer.
  */
 import { describe, it, expect, afterEach, vi } from "vitest";
@@ -29,10 +29,11 @@ const FULL_HOOKS: HookSlots = {
   on_observed_gain: [
     { command: ["notify-send", "panel gained"] },
   ],
+  on_wake: [{ command: ["kscreen-doctor", "--dpms", "on"] }],
 };
 
 describe("HooksInspector", () => {
-  it("renders all six slot labels", () => {
+  it("renders all seven slot labels", () => {
     render(<HooksInspector hooks={FULL_HOOKS} displayId="tv" />);
 
     expect(screen.getByText("before_release")).toBeInTheDocument();
@@ -41,6 +42,7 @@ describe("HooksInspector", () => {
     expect(screen.getByText("after_acquire")).toBeInTheDocument();
     expect(screen.getByText("on_observed_loss")).toBeInTheDocument();
     expect(screen.getByText("on_observed_gain")).toBeInTheDocument();
+    expect(screen.getByText("on_wake")).toBeInTheDocument();
   });
 
   it("renders command argv for filled slots", () => {
@@ -50,6 +52,7 @@ describe("HooksInspector", () => {
     expect(screen.getByText(/echo acquiring/)).toBeInTheDocument();
     expect(screen.getByText(/notify-send panel lost/)).toBeInTheDocument();
     expect(screen.getByText(/notify-send panel gained/)).toBeInTheDocument();
+    expect(screen.getByText(/kscreen-doctor --dpms on/)).toBeInTheDocument();
   });
 
   it("renders MQTT actions", () => {
@@ -137,9 +140,9 @@ describe("HooksInspector", () => {
       />,
     );
 
-    // Six empty slots, each with an "+ Add action" button.
+    // Seven empty slots, each with an "+ Add action" button.
     const addButtons = screen.getAllByText(/\+ Add action/);
-    expect(addButtons.length).toBe(6);
+    expect(addButtons.length).toBe(7);
     // Empty slots should NOT show "— none" when editing.
     expect(screen.queryByText("— none")).not.toBeInTheDocument();
   });

@@ -2202,6 +2202,7 @@ mod tests {
             display: DisplayId("main".into()),
             phase: "blanking".into(),
             cause: "zone_lost".into(),
+            presence_confirmed: None,
         };
         let records = event_records(&cfg, &ev, "office-pc");
         assert_eq!(records.len(), 1);
@@ -2218,6 +2219,7 @@ mod tests {
             display: DisplayId("main".into()),
             phase: phase.into(),
             cause: "zone_lost".into(),
+            presence_confirmed: None,
         };
         let event_payload: serde_json::Value =
             serde_json::from_str(&event_records(&cfg, &event, "office-pc")[0].payload).unwrap();

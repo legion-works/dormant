@@ -644,6 +644,8 @@ export interface HookSlots {
   on_observed_loss?: HookAction[];
   /** Actions run after a poll commits ownership of the panel to this machine. */
   on_observed_gain?: HookAction[];
+  /** Post-hoc command after dormant wakes a dark display. */
+  on_wake?: HookAction[];
 }
 
 /** rust: config/schema.rs SensorConfig — internally-tagged enum, tag = "type" */

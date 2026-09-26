@@ -1723,6 +1723,9 @@ pub struct HookSlots {
     /// Never initiates a panel switch or corrective DDC write.
     #[serde(default)]
     pub on_observed_gain: Vec<HookAction>,
+    /// Post-hoc actions after dormant wakes a dark display or tears down a render stage.
+    #[serde(default)]
+    pub on_wake: Vec<HookAction>,
 }
 
 impl Default for HookSlots {
@@ -1735,6 +1738,7 @@ impl Default for HookSlots {
             after_acquire: Vec::new(),
             on_observed_loss: Vec::new(),
             on_observed_gain: Vec::new(),
+            on_wake: Vec::new(),
         }
     }
 }

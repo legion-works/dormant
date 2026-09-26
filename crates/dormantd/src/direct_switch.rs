@@ -182,7 +182,7 @@ fn slot_for(
         (Direction::Acquire, Phase::Before) => &hooks.before_acquire,
         (Direction::Acquire, Phase::After) => &hooks.after_acquire,
         // Observed transitions are not initiator paths; notification owns them.
-        (Direction::ObservedLoss | Direction::ObservedGain, _) => &[],
+        (Direction::ObservedLoss | Direction::ObservedGain | Direction::Wake, _) => &[],
     }
 }
 
@@ -811,6 +811,35 @@ impl DirectSwitchHandle {
                 display: &display_name,
                 display_identity: "",
                 direction: Direction::ObservedGain,
+                phase: Phase::After,
+                peer: "",
+                fallback: false,
+                aborted: false,
+            },
+            actions: &actions,
+            deadline: tokio::time::Instant::now() + timeout,
+        };
+        let _ = self.hooks.run_slot(slot).await;
+    }
+
+    /// Fire post-hoc wake actions without writing to or retrying the panel.
+    pub async fn notify_wake(&self, display: &DisplayId) {
+        let (actions, timeout) = {
+            let config = self.config.borrow();
+            let Some(dc) = config.displays.get(&display.0) else {
+                return;
+            };
+            (dc.hooks.on_wake.clone(), dc.hooks.timeout)
+        };
+        if actions.is_empty() {
+            return;
+        }
+        let display_name = display.0.clone();
+        let slot = HookSlot {
+            context: HookContext {
+                display: &display_name,
+                display_identity: "",
+                direction: Direction::Wake,
                 phase: Phase::After,
                 peer: "",
                 fallback: false,
@@ -2708,12 +2737,14 @@ mod tests {
     /// A [`HookRunner`] that captures every command argv and succeeds.
     struct CapturingHookRunner {
         commands: Arc<Mutex<Vec<Vec<String>>>>,
+        signal: Option<mpsc::UnboundedSender<()>>,
     }
 
     impl CapturingHookRunner {
         fn new() -> Self {
             Self {
                 commands: Arc::new(Mutex::new(Vec::new())),
+                signal: None,
             }
         }
     }
@@ -2727,6 +2758,9 @@ mod tests {
             _timeout: Duration,
         ) -> crate::hooks::HookIoResult {
             self.commands.lock().unwrap().push(argv.to_vec());
+            if let Some(signal) = &self.signal {
+                let _ = signal.send(());
+            }
             Ok(())
         }
 
@@ -2882,6 +2916,88 @@ mod tests {
             .notify_observed_gain(&DisplayId("nonexistent".into()))
             .await;
         assert!(commands.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn notify_wake_fires_on_wake_slot() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        let runner = CapturingHookRunner::new();
+        let commands = runner.commands.clone();
+        let hooks = Arc::new(HookEngine::with_runner(Arc::new(runner)));
+        let mut dc = display_config();
+        dc.hooks.on_wake = vec![observed_loss_action()];
+        let (tx, _rx) = mpsc::channel(8);
+        let handle = build_handle(dc, Arc::clone(&sink), hooks, tx);
+        handle.notify_wake(&display_id()).await;
+        assert_eq!(
+            *commands.lock().unwrap(),
+            vec![vec!["observed-loss-hook".to_string()]]
+        );
+        assert_eq!(sink.write_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn notify_wake_empty_and_unknown_slots_are_noops() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        let runner = CapturingHookRunner::new();
+        let commands = runner.commands.clone();
+        let hooks = Arc::new(HookEngine::with_runner(Arc::new(runner)));
+        let (tx, _rx) = mpsc::channel(8);
+        let handle = build_handle(display_config(), sink, hooks, tx);
+        handle.notify_wake(&display_id()).await;
+        handle.notify_wake(&DisplayId("missing".into())).await;
+        assert!(commands.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn wake_event_subscriber_fires_on_wake_exactly_once_and_empty_slot_is_noop() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        let (signal_tx, mut signal_rx) = mpsc::unbounded_channel();
+        let mut runner = CapturingHookRunner::new();
+        runner.signal = Some(signal_tx);
+        let commands = runner.commands.clone();
+        let hooks = Arc::new(HookEngine::with_runner(Arc::new(runner)));
+        let mut dc = display_config();
+        dc.hooks.on_wake = vec![observed_loss_action()];
+        let (ctl_tx, mut ctl_rx) = mpsc::channel(8);
+        let handle = Arc::new(build_handle(dc, Arc::clone(&sink), hooks, ctl_tx.clone()));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let task = crate::wake_hooks::spawn(ctl_tx, Arc::clone(&handle), cancel.clone());
+        let Some(dormant_core::rules::ControlMsg::SubscribeEvents(reply)) = ctl_rx.recv().await
+        else {
+            panic!("subscriber must request the daemon event stream");
+        };
+        let (events_tx, events_rx) = tokio::sync::broadcast::channel(8);
+        reply
+            .send(events_rx)
+            .expect("subscriber receives event stream");
+        events_tx
+            .send(DaemonEvent::DisplayPhase {
+                display: display_id(),
+                phase: "waking".into(),
+                cause: "presence_detected".into(),
+                presence_confirmed: Some(true),
+            })
+            .expect("event delivered");
+        tokio::time::timeout(Duration::from_secs(2), signal_rx.recv())
+            .await
+            .expect("wake hook ran")
+            .expect("runner signaled");
+        assert_eq!(commands.lock().unwrap().len(), 1);
+        assert_eq!(sink.write_calls(), 0);
+        cancel.cancel();
+        task.await.expect("subscriber exited");
+
+        let empty_runner = CapturingHookRunner::new();
+        let empty_commands = Arc::clone(&empty_runner.commands);
+        let empty = build_handle(
+            display_config(),
+            Arc::new(FakeSink::new("ddcci")),
+            Arc::new(HookEngine::with_runner(Arc::new(empty_runner))),
+            mpsc::channel(8).0,
+        );
+        empty.notify_wake(&display_id()).await;
+        assert!(empty_commands.lock().unwrap().is_empty());
     }
 
     /// Regression guard: the initiator blocking `before_acquire` still

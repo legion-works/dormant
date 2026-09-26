@@ -102,6 +102,8 @@ pub enum Direction {
     ObservedLoss,
     /// Post-hoc observation: the poll detected the panel switched to this host.
     ObservedGain,
+    /// Post-hoc wake of a dark display, independent of the panel switch.
+    Wake,
 }
 
 impl Direction {
@@ -113,6 +115,7 @@ impl Direction {
             Self::Acquire => "acquire",
             Self::ObservedLoss => "observed_loss",
             Self::ObservedGain => "observed_gain",
+            Self::Wake => "wake",
         }
     }
 }
@@ -408,6 +411,7 @@ async fn run_slot_with_probe(
                             Direction::Acquire => "claim_acquire_aborted",
                             Direction::ObservedLoss => "observed_loss_aborted",
                             Direction::ObservedGain => "observed_gain_aborted",
+                            Direction::Wake => "wake_hook_aborted",
                         };
                         warn!(
                             event = %event,
@@ -1904,6 +1908,15 @@ mod tests {
         assert_eq!(env["DORMANT_PHASE"], "before");
     }
 
+    #[test]
+    fn wake_slot_labels_and_environment_use_wake_after() {
+        let context = ctx_for(Phase::After, Direction::Wake);
+        let env: std::collections::HashMap<String, String> = context.env().into_iter().collect();
+        assert_eq!(env["DORMANT_DIRECTION"], "wake");
+        assert_eq!(env["DORMANT_PHASE"], "after");
+        assert_eq!(slot_label(&context), "wake/after/monitor");
+    }
+
     // ── run_slot: order, blocking, abort, non-blocking-failure ──────────────
 
     #[tokio::test]
@@ -2268,6 +2281,7 @@ mod tests {
         assert_eq!(Direction::Acquire.as_str(), "acquire");
         assert_eq!(Direction::ObservedLoss.as_str(), "observed_loss");
         assert_eq!(Direction::ObservedGain.as_str(), "observed_gain");
+        assert_eq!(Direction::Wake.as_str(), "wake");
         assert_eq!(Phase::Before.as_str(), "before");
         assert_eq!(Phase::After.as_str(), "after");
     }
@@ -2434,12 +2448,16 @@ mod tests {
             let release_event = match Direction::Release {
                 Direction::Release => "claim_release_aborted",
                 Direction::Acquire => "claim_acquire_aborted",
-                Direction::ObservedLoss | Direction::ObservedGain => unreachable!(),
+                Direction::ObservedLoss | Direction::ObservedGain | Direction::Wake => {
+                    unreachable!()
+                }
             };
             let acquire_event = match Direction::Acquire {
                 Direction::Release => "claim_release_aborted",
                 Direction::Acquire => "claim_acquire_aborted",
-                Direction::ObservedLoss | Direction::ObservedGain => unreachable!(),
+                Direction::ObservedLoss | Direction::ObservedGain | Direction::Wake => {
+                    unreachable!()
+                }
             };
             captured.lock().unwrap().push(release_event.to_string());
             captured.lock().unwrap().push(acquire_event.to_string());

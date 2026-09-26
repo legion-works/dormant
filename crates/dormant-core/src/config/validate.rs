@@ -296,6 +296,7 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "after_acquire",
             "on_observed_loss",
             "on_observed_gain",
+            "on_wake",
         ],
     ),
     (
@@ -364,6 +365,17 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "skip_if_display_awake",
         ],
     ),
+    (
+        "displays..hooks.on_wake",
+        &[
+            "command",
+            "mqtt",
+            "timeout",
+            "blocking",
+            "abort_on_failure",
+            "skip_if_display_awake",
+        ],
+    ),
     ("displays..hooks.before_release.mqtt", &["topic", "payload"]),
     ("displays..hooks.after_release.mqtt", &["topic", "payload"]),
     ("displays..hooks.before_acquire.mqtt", &["topic", "payload"]),
@@ -376,6 +388,7 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
         "displays..hooks.on_observed_gain.mqtt",
         &["topic", "payload"],
     ),
+    ("displays..hooks.on_wake.mqtt", &["topic", "payload"]),
     (
         "displays..sampling",
         &[
@@ -2422,6 +2435,7 @@ fn validate_hooks(
         ("after_acquire", &display.hooks.after_acquire),
         ("on_observed_loss", &display.hooks.on_observed_loss),
         ("on_observed_gain", &display.hooks.on_observed_gain),
+        ("on_wake", &display.hooks.on_wake),
     ];
     if display.hooks.timeout < Duration::from_millis(100) {
         errors.push(ValidationError {
@@ -3062,6 +3076,24 @@ gracee_period = "60s"
         let cfg = load_str_strict(&valid).expect("observed gain must be a known slot");
         assert_eq!(cfg.0.displays["main"].hooks.on_observed_gain.len(), 1);
         let invalid = format!("{prefix}on_observed_gain = [{{ command = [] }}]\n");
+        let errors = validate_str(&invalid);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.detail.contains("command argv must not be empty")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn on_wake_slot_obeys_hook_rules_and_strict_keys() {
+        let prefix = "config_version = 1\n[displays.main]\ncontrollers = [\"ddcci\"]\nscope = \"shared\"\nshared_input_code = 1\nblank_mode = \"power_off\"\n[displays.main.hooks]\n";
+        let valid = format!(
+            "{prefix}on_wake = [{{ command = [\"kscreen-doctor\", \"--dpms\", \"on\"], timeout = \"5s\" }}]\n"
+        );
+        let cfg = load_str_strict(&valid).expect("on_wake must be a known slot");
+        assert_eq!(cfg.0.displays["main"].hooks.on_wake.len(), 1);
+        let invalid = format!("{prefix}on_wake = [{{ command = [] }}]\n");
         let errors = validate_str(&invalid);
         assert!(
             errors

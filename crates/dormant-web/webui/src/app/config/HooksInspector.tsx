@@ -1,5 +1,5 @@
 /**
- * HooksInspector — inventory of the six KVM hand-off hook slots
+ * HooksInspector — inventory of the seven display hook slots
  * for a shared display.
  *
  * When `hookEditEnabled` is true (§BG-6), each slot renders an inline
@@ -37,6 +37,7 @@ const SLOTS: SlotDef[] = [
   { key: "after_acquire", label: "after_acquire", defaultBlocking: false },
   { key: "on_observed_loss", label: "on_observed_loss", defaultBlocking: false },
   { key: "on_observed_gain", label: "on_observed_gain", defaultBlocking: false },
+  { key: "on_wake", label: "on_wake", defaultBlocking: false },
 ];
 
 /** Format a HookAction as a human-readable summary line. */

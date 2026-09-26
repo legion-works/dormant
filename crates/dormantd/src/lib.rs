@@ -35,6 +35,7 @@ pub mod reload;
 pub mod sd_notify;
 pub mod single_instance;
 pub mod state_publisher;
+mod wake_hooks;
 mod watchdog_schedule;
 pub mod wear_tracker;
 pub mod windows_idle;

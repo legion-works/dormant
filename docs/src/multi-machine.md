@@ -240,6 +240,45 @@ or an MQTT publish (QoS 1, non-retained).
 | `after_release` | Push (release) | AFTER a successful or failed push write. Fire-and-forget. |
 | `on_observed_loss` | Poll (loss) | AFTER the poller commits an ownership loss. Fire-and-forget — the poll path has no write authority and must never trigger a corrective DDC write or retry. |
 | `on_observed_gain` | Poll (gain) | AFTER the poller commits an ownership gain or confirms a return from a brief peer sighting. Fire-and-forget, with no DDC write, retry, or corrective action. A dormant-initiated pull marks ownership immediately and fires `after_acquire`, not this slot. |
+| `on_wake` | Display wake | AFTER an input/force wake or a confirmed presence wake. Fire-and-forget, with no extra panel write or retry. Fail-safe availability and poll-only ownership gains do not fire it. |
+
+### Wake the source output as well as the panel
+
+`on_wake` is useful when dormant wakes the panel but the source machine's own
+compositor output is off. It fires once on an `input_wake` or `force_wake`
+(including an operator wake during grace), or when confirmed `presence_detected`
+leaves `blanked` for `waking` or tears down a render stage. Confirmed means at least
+one driving zone still resolves present when unavailable sensors are treated as
+absent, including inside nested zones. A wake caused solely by fail-safe
+unknown/unavailable sensor states does **not** fire the hook: MQTT interruptions
+should not light a static lock screen on an OLED. Retries (`wake_retry`),
+`wake_completed`, `ownership_acquired`, a presence return during grace
+(`presence_during_grace`), and
+transitions into dark phases do not fire it. The panel wake proceeds independently
+of the hook; the hook never gates the DDC `D6_ON` transaction.
+Ownership gain alone can result from a panel hunting inputs at night, so it must
+not light the source output; an intentional pull uses `before_acquire` instead.
+
+For a shared display on KDE, wake the local compositor output while excluding
+any other connector you deliberately keep off:
+
+```toml
+[displays.shared_oled.hooks]
+on_wake = [{ command = ["kscreen-doctor", "--dpms", "on", "--dpms-excluded", "HDMI-A-1"] }]
+```
+
+Replace `HDMI-A-1` with the connectors you need to exclude. KDE's
+`org.freedesktop.ScreenSaver.SimulateUserActivity` does **not** turn a
+KWin output back on after KDE turns it off, so do not use it here.
+On a shared macOS display:
+
+```toml
+[displays.shared_oled.hooks]
+on_wake = [{ command = ["/usr/bin/caffeinate", "-u", "-t", "2"], skip_if_display_awake = true }]
+```
+
+As with the existing hook slots, non-empty hooks currently require
+`scope = "shared"`; a private display's hooks are rejected by validation.
 
 ### Hook causality — who gets advance notice
 
@@ -282,7 +321,7 @@ Every hook command receives:
 | `DBUS_SESSION_BUS_ADDRESS` | daemon (if set) | User D-Bus session bus |
 | `DORMANT_DISPLAY` | context | Config display id |
 | `DORMANT_DISPLAY_IDENTITY` | context | Claim identity (`manufacturer:model[:serial]`) |
-| `DORMANT_DIRECTION` | context | `acquire`, `release`, `observed_loss`, or `observed_gain` |
+| `DORMANT_DIRECTION` | context | `acquire`, `release`, `observed_loss`, `observed_gain`, or `wake` |
 | `DORMANT_PHASE` | context | `before` or `after` |
 | `DORMANT_PEER` | context | Peer's instance id (not display name) |
 | `DORMANT_FALLBACK` | context | `0` or `1` — whether this slot is firing on the fallback path |
@@ -304,7 +343,7 @@ See [Signal-presence law](#signal-presence-law) for why the
 
 The `blocking` default is phase-dependent: `before_*` slots default to
 blocking, `after_*` slots default to fire-and-forget
-(`hooks.rs::default_blocking_for`). `on_observed_loss` and `on_observed_gain`
+(`hooks.rs::default_blocking_for`). `on_observed_loss`, `on_observed_gain`, and `on_wake`
 are after-only slots and therefore default to non-blocking. Entries declared `blocking = true` run
 to completion and block the next phase; non-blocking entries are spawned and
 the phase continues immediately. Hooks are bounded by their per-entry `timeout` (default `5s`),
@@ -428,6 +467,9 @@ on_observed_loss = [
 on_observed_gain = [
   # Follow a panel-button or automatic input switch with the USB KVM.
   { mqtt = { topic = "dormant/kvm/usb-target", payload = "desktop" }, timeout = "5s" },
+]
+on_wake = [
+  { command = ["kscreen-doctor", "--dpms", "on", "--dpms-excluded", "HDMI-A-1"] },
 ]
 ```
 

@@ -2203,6 +2203,47 @@ on_observed_gain = [{ command = ["/usr/bin/example-hook"] }]
         }
     }
 
+    #[tokio::test]
+    async fn on_wake_path_not_blocked_when_hook_edit_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = r#"
+config_version = 1
+[daemon]
+hook_edit_enabled = true
+[displays.shared_oled]
+controllers = ["ddcci"]
+blank_mode = "power_off"
+scope = "shared"
+shared_input_code = 0x0f
+[displays.shared_oled.hooks]
+on_wake = [{ command = ["/usr/bin/example-hook"] }]
+"#;
+        write_config(dir.path(), content);
+        let mut cfg = minimal_config();
+        cfg.daemon.hook_edit_enabled = true;
+        let state = test_state(dir.path(), cfg, 8080);
+        let fingerprint = get_fingerprint(&state);
+        let req = ApplyRequest {
+            fingerprint,
+            patches: vec![Patch::Set {
+                path: vec![
+                    "displays".into(),
+                    "shared_oled".into(),
+                    "hooks".into(),
+                    "on_wake".into(),
+                ],
+                value: serde_json::json!([{"command": ["/usr/bin/example-hook"]}]),
+            }],
+        };
+        if let Err(error) = post_apply(State(state), axum::Json(req)).await {
+            assert_ne!(
+                error.into_response().status(),
+                StatusCode::FORBIDDEN,
+                "on_wake Set must not be denied when hook editing is enabled"
+            );
+        }
+    }
+
     // ── entity_created / entity_deleted audit events (spec §11 invariant 8,
     // §14) ────────────────────────────────────────────────────────────────
     // These literal `event = "entity_created"` / `event = "entity_deleted"`

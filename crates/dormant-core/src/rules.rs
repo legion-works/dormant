@@ -589,6 +589,9 @@ pub enum DaemonEvent {
         phase: String,
         /// The literal cause of the transition.
         cause: String,
+        /// Whether a presence-caused wake has an explicitly present driving zone.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        presence_confirmed: Option<bool>,
     },
     /// Manual or scheduled pause state changed for a display.
     PauseChanged {
@@ -2862,6 +2865,13 @@ impl RulesEngine {
                     display: display_id.clone(),
                     phase: to.to_string(),
                     cause: cause.to_string(),
+                    presence_confirmed: (cause == "presence_detected").then(|| {
+                        self.cfg
+                            .rules
+                            .iter()
+                            .filter(|rule| rule.displays.contains(display_id))
+                            .any(|rule| self.zone_engine.has_confirmed_presence(&rule.zone))
+                    }),
                 });
             }
         }
@@ -6092,6 +6102,116 @@ fn multi_zone_presence_engine() -> (RulesEngine, DisplayId) {
     .expect("engine must be valid");
 
     (engine, display)
+}
+
+#[cfg(test)]
+fn vacant_multi_zone_engine() -> (RulesEngine, DisplayId) {
+    let (mut engine, display) = multi_zone_presence_engine();
+    for sensor in ["s1", "s2"] {
+        engine.handle_presence_event(PresenceEvent::new(
+            SensorId(sensor.into()),
+            SensorState::Absent,
+            Timestamp::now(),
+        ));
+    }
+    (engine, display)
+}
+
+#[tokio::test]
+async fn confirmed_presence_wake_reports_presence_confirmed() {
+    let (mut engine, display) = vacant_multi_zone_engine();
+    let mut events = engine.event_tx.subscribe();
+    engine.step_machine(&display, Input::ForceBlank, Tick::now());
+    let r#gen = engine.machines[&display].cmd_gen();
+    engine.step_machine(
+        &display,
+        Input::BlankResult {
+            r#gen,
+            result: Ok(()),
+        },
+        Tick::now(),
+    );
+    assert_eq!(engine.machines[&display].phase_name(), "blanked");
+    while events.try_recv().is_ok() {}
+    engine.handle_presence_event(PresenceEvent::new(
+        SensorId("s1".into()),
+        SensorState::Present,
+        Timestamp::now(),
+    ));
+    let event = std::iter::from_fn(|| events.try_recv().ok()).find(|ev| matches!(ev, DaemonEvent::DisplayPhase { phase, cause, .. } if phase == "waking" && cause == "presence_detected")).expect("confirmed presence wakes panel");
+    assert_eq!(
+        serde_json::to_value(event).unwrap()["presence_confirmed"],
+        true
+    );
+}
+
+#[tokio::test]
+async fn fail_safe_presence_wake_reports_unconfirmed() {
+    let (mut engine, display) = vacant_multi_zone_engine();
+    let mut events = engine.event_tx.subscribe();
+    engine.step_machine(&display, Input::ForceBlank, Tick::now());
+    let r#gen = engine.machines[&display].cmd_gen();
+    engine.step_machine(
+        &display,
+        Input::BlankResult {
+            r#gen,
+            result: Ok(()),
+        },
+        Tick::now(),
+    );
+    while events.try_recv().is_ok() {}
+    engine.handle_presence_event(PresenceEvent::new(
+        SensorId("s1".into()),
+        SensorState::Unavailable,
+        Timestamp::now(),
+    ));
+    let event = std::iter::from_fn(|| events.try_recv().ok()).find(|ev| matches!(ev, DaemonEvent::DisplayPhase { phase, cause, .. } if phase == "waking" && cause == "presence_detected")).expect("fail-safe presence wakes panel");
+    assert_eq!(
+        serde_json::to_value(event).unwrap()["presence_confirmed"],
+        false
+    );
+}
+
+#[tokio::test]
+async fn staged_teardown_on_confirmed_presence_reports_confirmed() {
+    use crate::state_machine::Phase;
+    let (mut engine, display) = vacant_multi_zone_engine();
+    engine.machines.insert(
+        display.clone(),
+        DisplayStateMachine::new(
+            DisplayRuntimeCfg::manual_defaults(Duration::ZERO),
+            vec![LadderStage {
+                kind: StageKind::RenderBlack,
+                dwell: Some(Duration::from_secs(30)),
+            }],
+            Tick::now(),
+        ),
+    );
+    let mut events = engine.event_tx.subscribe();
+    engine.step_machine(&display, Input::SoftBlank, Tick::now());
+    let Phase::RenderPending { r#gen, .. } = engine.machines[&display].phase() else {
+        panic!("expected render pending")
+    };
+    engine.step_machine(
+        &display,
+        Input::RenderResult {
+            r#gen: *r#gen,
+            result: Ok(()),
+        },
+        Tick::now(),
+    );
+    assert_eq!(engine.machines[&display].phase_name(), "staged");
+    while events.try_recv().is_ok() {}
+    engine.handle_presence_event(PresenceEvent::new(
+        SensorId("s1".into()),
+        SensorState::Present,
+        Timestamp::now(),
+    ));
+    let event = std::iter::from_fn(|| events.try_recv().ok()).find(|ev| matches!(ev, DaemonEvent::DisplayPhase { phase, cause, .. } if phase == "active" && cause == "presence_detected")).expect("confirmed presence tears down render stage");
+    assert_eq!(
+        serde_json::to_value(event).unwrap()["presence_confirmed"],
+        true
+    );
 }
 
 #[test]

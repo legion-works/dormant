@@ -93,7 +93,17 @@ export function useLiveState(): LiveState {
   if (!ctx) {
     throw new Error("useLiveState must be used within LiveStateProvider");
   }
-  return ctx;
+  if (!ctx.snapshot?.kvm) return ctx;
+  return {
+    ...ctx,
+    snapshot: {
+      ...ctx.snapshot,
+      kvm: {
+        ...ctx.snapshot.kvm,
+        push_capable_displays: ctx.snapshot.kvm.push_capable_displays ?? [],
+      },
+    },
+  };
 }
 
 /** Read the event log (for Events view). */

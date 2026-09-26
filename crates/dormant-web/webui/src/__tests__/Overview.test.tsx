@@ -32,7 +32,8 @@ const { SAMPLE_STATE, SAMPLE_CONFIG } = vi.hoisted(() => ({
       ],
     ],
     pending_reload: null,
-  } as StateSnapshot,
+    kvm: { keymap: {}, switch_capable_displays: [], activity_following: false },
+  } as unknown as StateSnapshot,
   SAMPLE_CONFIG: {
     path: "/tmp/config.toml",
     config_version: 1,

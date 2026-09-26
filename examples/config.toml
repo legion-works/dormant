@@ -392,6 +392,6 @@ input_wake_hold = "300s"
 #   # Linux: wake the display via KWin (needs WAYLAND_DISPLAY +
 #   # XDG_RUNTIME_DIR from the allowlisted session set)
 #   { command = ["kscreen-doctor", "output.DP-1.enable"], timeout = "5s", blocking = true },
-#   # macOS: prevent display sleep + verify CGDisplayIsAsleep returns false
-#   { command = ["caffeinate", "-u", "-t", "2"], timeout = "5s", blocking = true },
+#   # macOS: signal user activity (the hook does not verify display sleep state)
+#   { command = ["caffeinate", "-u", "-t", "2"], timeout = "5s", blocking = true, skip_if_display_awake = true },
 # ]

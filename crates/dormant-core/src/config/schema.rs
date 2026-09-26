@@ -1764,6 +1764,9 @@ pub struct HookAction {
     /// Whether a failure aborts the enclosing KVM transition.
     #[serde(default)]
     pub abort_on_failure: bool,
+    /// Skip this action when every online display is already awake (macOS only).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skip_if_display_awake: bool,
 }
 
 impl DisplayConfig {

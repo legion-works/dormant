@@ -631,6 +631,7 @@ export interface HookAction {
   timeout?: string;
   blocking?: boolean;
   abort_on_failure?: boolean;
+  skip_if_display_awake?: boolean;
 }
 
 /** rust: config/schema.rs HookSlots */

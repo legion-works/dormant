@@ -236,6 +236,12 @@ or an MQTT publish (QoS 1, non-retained).
 
 ### Hook causality — who gets advance notice
 
+On macOS, set `skip_if_display_awake = true` on a hook action to omit it only
+when the sleep-state probe finds at least one online display and all are awake.
+If any display is asleep, the probe fails, or no displays are reported, the
+action runs. This favors an unnecessary wake over silently losing a switch
+because the monitor has no live signal. The field is rejected on other hosts.
+
 The **initiating** machine gets real `before_acquire` / `after_acquire`
 timing — blocking, local, before its own write.
 

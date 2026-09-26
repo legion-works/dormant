@@ -8,6 +8,7 @@
  * drifting from the Rust source degrades the UX (a wrong hint) but can
  * never widen what the server accepts.
  */
+import type { ConfigPatch } from "../../api/types";
 
 /** rust: crates/dormant-web/src/config_patch.rs CRUD_COLLECTIONS (:474) */
 export const CRUD_COLLECTIONS = ["sensors", "zones", "displays", "rules"] as const;
@@ -191,6 +192,92 @@ export function isPairingEnabled(daemon: Record<string, unknown> | undefined): b
 export function isHookEditEnabled(daemon: Record<string, unknown> | undefined): boolean {
   const v = daemon?.["hook_edit_enabled"];
   return typeof v === "boolean" ? v : false;
+}
+
+/**
+ * Client-side UX gate for fail-unsafe config writes. The Rust server is
+ * NOT consulted (every listed value is a normal, accepted value the
+ * server validates normally) — this is purely a "you may not realise
+ * what you're doing" warning that lives at the Apply button, so an
+ * operator gets one last chance to back out before writing a value that
+ * is at odds with the daemon's deliberate defaults.
+ *
+ * Each entry is a path-pattern predicate applied to a `ConfigPatch`
+ * (see [`detectUnsafePatches`]). When the predicate matches, the
+ * matching patch is paired with a plain-language `consequence` string
+ * that the apply dialog renders verbatim.
+ *
+ * Open-ended extension point: the list is data-driven so adding a new
+ * fail-unsafe value is a one-line change with tests. Each entry should
+ * be grounded in a fail-safe design commitment in
+ * `crates/dormant-core/src/...` (e.g. zone policy, inhibitor policy) so
+ * the consequence text describes the project's deliberate default, not
+ * an opinion.
+ */
+export interface FailUnsafeSetting {
+  /** Path-pattern predicate. Set patches: walk-and-match against `path`. CreateEntity patches: walk into `value` via the same pattern. Return true to flag. */
+  matches: (path: string[]) => boolean;
+  /** Match a concrete value; the test sets the predicate and value predicate together. */
+  matchesValue: (value: unknown) => boolean;
+  /** Plain-language consequence rendered in the apply confirmation. */
+  consequence: string;
+}
+
+const FAIL_UNSAFE_SETTINGS: readonly FailUnsafeSetting[] = [
+  // zones.<id>.unavailable_policy = "absent" — fail-unsafe presence policy.
+  // Source of the fail-safe default: `crates/dormant-core/src/zone.rs:37-45`
+  // (`UnavailablePolicy::Present` is the `Default` impl); the rule is
+  // documented at docs/src/configuration.md:139-145 ("present (default,
+  // fail-safe) — treat unavailable sensors as occupied").
+  {
+    matches: (path) => path.length === 3 && path[0] === "zones" && path[2] === "unavailable_policy",
+    matchesValue: (value) => value === "absent",
+    consequence:
+      "If this zone's sensors go offline, dormant will treat the room as empty and may blank a screen while someone is there.",
+  },
+];
+
+export interface UnsafePatchHit {
+  patch: ConfigPatch;
+  consequence: string;
+}
+
+/**
+ * Walk the pending patches and return each one that sets a fail-unsafe
+ * value (config-package-agnostic — the same detector used at Apply time
+ * is used by tests that drive the form directly without the
+ * ConfigForm/SettingsForm wrapper).
+ */
+export function detectUnsafePatches(patches: readonly ConfigPatch[]): UnsafePatchHit[] {
+  const hits: UnsafePatchHit[] = [];
+  for (const patch of patches) {
+    if ("path" in patch && patch.op === "set") {
+      for (const rule of FAIL_UNSAFE_SETTINGS) {
+        if (rule.matches(patch.path) && rule.matchesValue(patch.value)) {
+          hits.push({ patch, consequence: rule.consequence });
+        }
+      }
+    } else if ("path" in patch && patch.op === "remove") {
+      // A Remove restores the daemon's default for that key — for
+      // zones.<id>.unavailable_policy that is `"present"` (fail-safe),
+      // so a Remove is never unsafe.
+    } else if (patch.op === "create_entity" && patch.collection === "zones") {
+      const valueObj = patch.value as Record<string, unknown> | null | undefined;
+      if (valueObj && "unavailable_policy" in valueObj) {
+        for (const rule of FAIL_UNSAFE_SETTINGS) {
+          // Synthesize the path the same pattern would see if the
+          // entity were being edited in place after creation.
+          const synthPath = ["zones", patch.id, "unavailable_policy"];
+          if (rule.matches(synthPath) && rule.matchesValue(valueObj["unavailable_policy"])) {
+            hits.push({ patch, consequence: rule.consequence });
+          }
+        }
+      }
+    } else if (patch.op === "delete_entity") {
+      // Deleting an entity can never introduce a fail-unsafe value.
+    }
+  }
+  return hits;
 }
 
 /** Minimal inventory shape `referencingEntities` needs — a subset of `ConfigInventory`. */

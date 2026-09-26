@@ -58,6 +58,7 @@ fn fmt_event(event: &DaemonEvent) -> String {
             display,
             phase,
             cause,
+            ..
         } => {
             format!("display {display}: {phase} ({cause})")
         }

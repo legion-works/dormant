@@ -250,6 +250,23 @@ impl ZoneEngine {
         self.zone_presence.get(id).copied()
     }
 
+    /// Whether the zone's presence has evidence beyond fail-safe availability.
+    #[must_use]
+    pub fn has_confirmed_presence(&self, id: &ZoneId) -> bool {
+        let mut confirmed = HashMap::new();
+        for zone in &self.eval_order {
+            let spec = &self.specs[zone];
+            let present = resolve_zone_with_policy(
+                spec,
+                &self.sensor_states,
+                &confirmed,
+                UnavailablePolicy::Absent,
+            );
+            confirmed.insert(zone.clone(), present);
+        }
+        confirmed.get(id).copied().unwrap_or(false)
+    }
+
     /// Read-only view of all sensor states.
     #[must_use]
     pub fn sensor_states(&self) -> &HashMap<SensorId, (SensorState, Timestamp)> {
@@ -329,6 +346,15 @@ fn resolve_zone(
     sensor_states: &HashMap<SensorId, (SensorState, Timestamp)>,
     zone_presence: &HashMap<ZoneId, bool>,
 ) -> bool {
+    resolve_zone_with_policy(spec, sensor_states, zone_presence, spec.unavailable_policy)
+}
+
+fn resolve_zone_with_policy(
+    spec: &ZoneSpec,
+    sensor_states: &HashMap<SensorId, (SensorState, Timestamp)>,
+    zone_presence: &HashMap<ZoneId, bool>,
+    unavailable_policy: UnavailablePolicy,
+) -> bool {
     if spec.members.is_empty() {
         // An empty zone has no members to assert presence.
         // This is a config smell — validation will flag it later.
@@ -339,9 +365,15 @@ fn resolve_zone(
     let member_bools: Vec<bool> = spec
         .members
         .iter()
-        .map(|member| member_effective_bool(member, spec, sensor_states, zone_presence))
+        .map(|member| {
+            member_effective_bool(member, unavailable_policy, sensor_states, zone_presence)
+        })
         .collect();
 
+    fuse_members(spec, &member_bools)
+}
+
+fn fuse_members(spec: &ZoneSpec, member_bools: &[bool]) -> bool {
     match &spec.mode {
         FusionMode::Any => member_bools.iter().any(|&b| b),
         FusionMode::All => member_bools.iter().all(|&b| b),
@@ -359,7 +391,7 @@ fn resolve_zone(
             let present_weight: f32 = spec
                 .members
                 .iter()
-                .zip(&member_bools)
+                .zip(member_bools)
                 .filter(|&(_, present)| *present)
                 .map(|(m, _)| member_weight(m, spec))
                 .sum();
@@ -371,7 +403,7 @@ fn resolve_zone(
 /// Get the effective boolean for a zone member.
 fn member_effective_bool(
     member: &ZoneMember,
-    spec: &ZoneSpec,
+    unavailable_policy: UnavailablePolicy,
     sensor_states: &HashMap<SensorId, (SensorState, Timestamp)>,
     zone_presence: &HashMap<ZoneId, bool>,
 ) -> bool {
@@ -383,7 +415,7 @@ fn member_effective_bool(
             match state {
                 SensorState::Present => true,
                 SensorState::Absent => false,
-                SensorState::Unavailable => match spec.unavailable_policy {
+                SensorState::Unavailable => match unavailable_policy {
                     UnavailablePolicy::Present => true,
                     UnavailablePolicy::Absent => false,
                 },
@@ -474,6 +506,70 @@ mod tests {
             weights: HashMap::new(),
             unavailable_policy: UnavailablePolicy::Present,
         }
+    }
+
+    #[test]
+    fn all_unavailable_zone_has_no_confirmed_presence() {
+        let engine = ZoneEngine::new(
+            vec![spec(
+                "z",
+                FusionMode::Any,
+                vec![ZoneMember::Sensor(sid("a"))],
+            )],
+            &[sid("a")],
+        )
+        .unwrap();
+        assert_eq!(engine.is_present(&zid("z")), Some(true));
+        assert!(!engine.has_confirmed_presence(&zid("z")));
+    }
+
+    #[test]
+    fn any_present_plus_unavailable_is_confirmed() {
+        let mut engine = ZoneEngine::new(
+            vec![spec(
+                "z",
+                FusionMode::Any,
+                vec![ZoneMember::Sensor(sid("a")), ZoneMember::Sensor(sid("b"))],
+            )],
+            &[sid("a"), sid("b")],
+        )
+        .unwrap();
+        engine.apply(&event("a", SensorState::Present));
+        assert!(engine.has_confirmed_presence(&zid("z")));
+    }
+
+    #[test]
+    fn all_present_plus_unavailable_is_not_confirmed() {
+        let mut engine = ZoneEngine::new(
+            vec![spec(
+                "z",
+                FusionMode::All,
+                vec![ZoneMember::Sensor(sid("a")), ZoneMember::Sensor(sid("b"))],
+            )],
+            &[sid("a"), sid("b")],
+        )
+        .unwrap();
+        engine.apply(&event("a", SensorState::Present));
+        assert_eq!(engine.is_present(&zid("z")), Some(true));
+        assert!(!engine.has_confirmed_presence(&zid("z")));
+    }
+
+    #[test]
+    fn nested_unavailable_zone_is_not_confirmed() {
+        let engine = ZoneEngine::new(
+            vec![
+                spec("inner", FusionMode::Any, vec![ZoneMember::Sensor(sid("a"))]),
+                spec(
+                    "outer",
+                    FusionMode::Any,
+                    vec![ZoneMember::Zone(zid("inner"))],
+                ),
+            ],
+            &[sid("a")],
+        )
+        .unwrap();
+        assert_eq!(engine.is_present(&zid("outer")), Some(true));
+        assert!(!engine.has_confirmed_presence(&zid("outer")));
     }
 
     // ── Tests ────────────────────────────────────────────────────────────────

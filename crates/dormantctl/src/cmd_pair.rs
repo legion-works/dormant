@@ -30,15 +30,12 @@ pub struct PairArgs {
 pub fn run(args: &PairArgs) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
 
-    println!(
-        "Connecting to {} — accept the 'Allow dormant' prompt on your TV…",
-        args.host
-    );
+    println!("{}", connecting_message(&args.host, PAIR_TIMEOUT));
 
     let token = rt
         .block_on(dormant_displays::samsung_tizen::pair(
             &args.host,
-            std::time::Duration::from_secs(60),
+            PAIR_TIMEOUT,
         ))
         .map_err(|e| anyhow::anyhow!("pairing failed: {e}"))?;
 
@@ -62,6 +59,22 @@ pub fn run(args: &PairArgs) -> anyhow::Result<()> {
 /// Write a Samsung pairing token into the credentials file.
 ///
 /// Delegates to [`dormant_core::config::upsert_samsung_token`].
+/// How long pairing waits for the TV to connect and grant a token.
+const PAIR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The line printed before pairing starts.
+///
+/// The connect step only completes once the TV has granted a token, so there
+/// is no point at which the TV is known to be showing its prompt; the message
+/// is conditional and names the timeout instead.
+fn connecting_message(host: &str, timeout: std::time::Duration) -> String {
+    format!(
+        "Connecting to {host}… If the TV shows an \"Allow dormant\" prompt, accept it \
+         (giving up after {}s).",
+        timeout.as_secs()
+    )
+}
+
 fn store_token(creds_path: &std::path::Path, host: &str, token: &str) -> anyhow::Result<()> {
     config::upsert_samsung_token(creds_path, host, token)?;
     Ok(())
@@ -70,6 +83,21 @@ fn store_token(creds_path: &std::path::Path, host: &str, token: &str) -> anyhow:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connecting_message_is_conditional_and_names_the_timeout() {
+        let msg = connecting_message("192.0.2.10", PAIR_TIMEOUT);
+        assert!(msg.contains("192.0.2.10"), "{msg}");
+        assert!(
+            msg.contains("If the TV shows an \"Allow dormant\" prompt"),
+            "the prompt must be described as conditional: {msg}"
+        );
+        assert!(msg.contains("giving up after 60s"), "{msg}");
+        assert!(
+            !msg.contains("— accept"),
+            "must not claim a prompt is already showing: {msg}"
+        );
+    }
 
     #[test]
     fn store_token_writes_samsung_entry() {

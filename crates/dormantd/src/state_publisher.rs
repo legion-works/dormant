@@ -1194,6 +1194,7 @@ fn discovery_payload_sensor(cfg: &Config, instance: &str, sensor_id: &str) -> se
         "state_topic": topic_sensor_state(&base, &instance, &sensor_id),
         "payload_on": "ON",
         "payload_off": "OFF",
+        "device_class": "occupancy",
         "availability": [
             {
                 "topic": avail_topic,
@@ -1224,6 +1225,7 @@ fn discovery_payload_zone(cfg: &Config, instance: &str, zone_id: &str) -> serde_
         "state_topic": topic_zone_state(&base, &instance, &zone_id),
         "payload_on": "ON",
         "payload_off": "OFF",
+        "device_class": "occupancy",
         "availability": [
             {
                 "topic": avail_topic,
@@ -1309,8 +1311,8 @@ pub fn global_online_record(cfg: &Config, instance: &str) -> Option<PublishRecor
 /// Returned records are ordered sensors → zones → displays, and
 /// within each kind in config-order. First-wins collisions are
 /// resolved by [`detect_and_warn_collisions`]: a collision drops
-/// every record after the first for that sanitized id and emits
-/// one `publish_id_collision` WARN per colliding pair.
+/// every record after the first for that sanitized id. The startup
+/// flush performs collision detection once before building these records.
 #[must_use]
 pub fn discovery_records(
     cfg: &Config,
@@ -1320,8 +1322,6 @@ pub fn discovery_records(
     if !cfg.publish.enabled {
         return Vec::new();
     }
-    let _ = detect_and_warn_collisions(cfg, inventory);
-
     let instance = sanitize_topic_id(instance);
     let discovery_prefix = sanitize_topic_id(&cfg.publish.discovery_prefix);
 
@@ -1669,7 +1669,30 @@ mod tests {
     };
     use dormant_core::types::{DisplayId, SensorId, ZoneId};
     use indexmap::IndexMap;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    #[derive(Clone)]
+    struct TraceCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for TraceCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TraceCapture {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     // ── Test fixtures ─────────────────────────────────────────────────────
 
@@ -1929,6 +1952,69 @@ mod tests {
         assert!(topics.contains(&"homeassistant/binary_sensor/office-pc/sensor_desk/config"));
         assert!(topics.contains(&"homeassistant/binary_sensor/office-pc/zone_office/config"));
         assert!(topics.contains(&"homeassistant/sensor/office-pc/display_main/config"));
+    }
+
+    #[tokio::test]
+    async fn startup_flush_warns_once_for_a_colliding_pair() {
+        let mut cfg = enabled_cfg();
+        let sensor_cfg = cfg.sensors.get("desk").unwrap().clone();
+        cfg.sensors.insert("desk two".into(), sensor_cfg.clone());
+        cfg.sensors.insert("desk_two".into(), sensor_cfg);
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(TraceCapture(buffer.clone()))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let (record_tx, _record_rx) = mpsc::channel(64);
+        let (ctl_tx, ctl_rx) = mpsc::channel(1);
+        drop(ctl_rx);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut snapshot = snapshot_one_of_each();
+
+        flush_full(FlushRequest {
+            cfg: &cfg,
+            snapshot: &mut snapshot,
+            instance: "office-pc",
+            record_tx: &record_tx,
+            ctl_tx: &ctl_tx,
+            cancel: &cancel,
+            request_fresh_snapshot: false,
+            event_label: "test_startup_flush",
+        })
+        .await;
+
+        let captured = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            captured.matches("publish_id_collision").count(),
+            1,
+            "{captured}"
+        );
+    }
+
+    #[test]
+    fn discovery_records_exact_occupancy_json_for_zone_and_sensor() {
+        let cfg = enabled_cfg();
+        let inv = EntityInventory::from_config(&cfg);
+        let records = discovery_records(&cfg, &inv, "office-pc");
+        for (topic, expected) in [
+            (
+                "homeassistant/binary_sensor/office-pc/zone_office/config",
+                json!({"name":"dormant office zone", "unique_id":"dormant_office-pc_zone_office", "object_id":"dormant_office-pc_zone_office", "state_topic":"dormant/office-pc/zone/office/state", "payload_on":"ON", "payload_off":"OFF", "device_class":"occupancy", "availability":[{"topic":"dormant/office-pc/availability", "payload_available":"online", "payload_not_available":"offline"}], "device":{"identifiers":["dormant_office-pc"], "name":"dormant office-pc", "manufacturer":"dormant", "model":"presence", "sw_version":env!("CARGO_PKG_VERSION")}}),
+            ),
+            (
+                "homeassistant/binary_sensor/office-pc/sensor_desk/config",
+                json!({"name":"dormant desk presence", "unique_id":"dormant_office-pc_sensor_desk", "object_id":"dormant_office-pc_sensor_desk", "state_topic":"dormant/office-pc/sensor/desk/state", "payload_on":"ON", "payload_off":"OFF", "device_class":"occupancy", "availability":[{"topic":"dormant/office-pc/availability", "payload_available":"online", "payload_not_available":"offline"}, {"topic":"dormant/office-pc/sensor/desk/availability", "payload_available":"online", "payload_not_available":"offline"}], "availability_mode":"all", "device":{"identifiers":["dormant_office-pc"], "name":"dormant office-pc", "manufacturer":"dormant", "model":"presence", "sw_version":env!("CARGO_PKG_VERSION")}}),
+            ),
+        ] {
+            let actual = records.iter().find(|record| record.topic == topic).unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&actual.payload).unwrap(),
+                expected,
+                "{topic}"
+            );
+        }
     }
 
     #[test]

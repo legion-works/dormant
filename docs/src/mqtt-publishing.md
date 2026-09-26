@@ -98,9 +98,14 @@ zone id `office`, display id `main`:
 | `dormant/office-pc/sensor/desk/availability`                  | 1   | yes    | `online` / `offline` (per-sensor broker presence)  |
 | `dormant/office-pc/zone/office/state`                         | 1   | yes    | `ON` / `OFF` (zone resolved presence)              |
 | `dormant/office-pc/display/main/phase`                        | 1   | yes    | JSON `{"phase":"active"}` (see below)              |
-| `homeassistant/binary_sensor/office-pc/sensor_desk/config`   | 1   | yes    | HA discovery (`binary_sensor`, see below)          |
-| `homeassistant/binary_sensor/office-pc/zone_office/config`    | 1   | yes    | HA discovery                                        |
-| `homeassistant/sensor/office-pc/display_main/config`         | 1   | yes    | HA discovery (`sensor`)                            |
+| `homeassistant/binary_sensor/office-pc/sensor_desk/config`   | 1   | yes    | HA binary sensor (`device_class: occupancy`)        |
+| `homeassistant/binary_sensor/office-pc/zone_office/config`    | 1   | yes    | HA binary sensor (`device_class: occupancy`)        |
+| `homeassistant/sensor/office-pc/display_main/config`         | 1   | yes    | Generic HA sensor (no device class; display phase)  |
+
+The zone and sensor discovery entities are binary sensors with
+`device_class: occupancy` (`ON` means occupied). Display phase remains
+a generic sensor without a device class because it reports a daemon
+phase, not occupancy.
 
 The `display/.../phase` payload is a JSON object so HA's
 `value_template: "{{ value_json.phase }}"` parses the literal phase
@@ -116,7 +121,9 @@ its source goes offline, even while the global topic is still `online`.
 ## Collisions
 
 If two distinct raw ids sanitize to the same topic id, the publisher
-emits a single `publish_id_collision` WARN per colliding pair and
+emits a single `publish_id_collision` WARN per colliding pair per
+discovery flush, including startup and each reconnect. A later flush
+may warn again. The startup flush performs collision detection once.
 publishes **only the first** in config order — never interleaves two
 entities on one topic. The collision report also surfaces in
 `dormantctl validate` output so an operator can rename the offending

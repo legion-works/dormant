@@ -1986,6 +1986,7 @@ mod tests {
                         wake_attempts: 0,
                         last_blank_failed: false,
                         stage: None,
+                        rules: vec![],
                     },
                 )],
                 pending_reload: None,

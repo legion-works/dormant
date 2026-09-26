@@ -1818,6 +1818,7 @@ mod tests {
                     wake_attempts: 0,
                     last_blank_failed: false,
                     stage: None,
+                    rules: Vec::new(),
                 },
             )],
             pending_reload: None,
@@ -4786,6 +4787,7 @@ mod async_tests {
                             wake_attempts: 0,
                             last_blank_failed: false,
                             stage: None,
+                            rules: Vec::new(),
                         },
                     )
                 })

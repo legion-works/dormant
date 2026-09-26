@@ -9146,6 +9146,7 @@ mod restore_tests {
             owned: true,
             observed_input_code: None,
             panel_state: None,
+            rules: Vec::new(),
         }
     }
 
@@ -9821,6 +9822,7 @@ mod gamma_reload_tests {
                     wake_attempts: 0,
                     last_blank_failed: false,
                     stage: None,
+                    rules: Vec::new(),
                 },
             )],
             pending_reload: None,

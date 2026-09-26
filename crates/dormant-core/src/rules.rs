@@ -871,6 +871,25 @@ pub struct DisplaySnapshot {
     /// omitted when `None`, byte-identical to a pre-stage snapshot).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage: Option<StageInfo>,
+    /// Ids of the rules that drive this display (the rule whose
+    /// `displays` list includes this one), sorted and deduplicated.
+    /// Sourced from the same `cfg.rules` enumeration the engine
+    /// consults for effective zone presence and input-wake hold, so a
+    /// consumer of the snapshot never needs to re-derive "which rules
+    /// drive this display" from the config. Empty for manual-only
+    /// displays that no rule references — a display with no rule is
+    /// never blanked on its own, so the tray tooltip and the CLI
+    /// status report mark it accordingly.
+    ///
+    /// Wire shape: always serialised as a (possibly empty) JSON array
+    /// — legacy snapshots without the key still deserialize to `[]`
+    /// because of `#[serde(default)]`, but the key is never omitted on
+    /// the wire because a consumer that treated an absent key as "no
+    /// data" instead of "empty list" caused a blank-dashboard bug.
+    ///
+    /// Populated when the engine assembles a [`StateSnapshot`].
+    #[serde(default)]
+    pub rules: Vec<String>,
 }
 
 const fn default_owned() -> bool {
@@ -2461,6 +2480,21 @@ impl RulesEngine {
                     ),
                     None => (DisplayScope::Private, true, None, None),
                 };
+                // Collect every rule id that drives this display from the
+                // same `cfg.rules` enumeration `effective_zone_presence`
+                // and `effective_input_wake_hold` consult, so consumers
+                // do not re-derive "which rules drive this display" from
+                // the config. Sorted and deduplicated so the wire shape
+                // is grep-stable across snapshots.
+                let mut driving: Vec<String> = self
+                    .cfg
+                    .rules
+                    .iter()
+                    .filter(|rule| rule.displays.contains(&dcfg.display))
+                    .map(|rule| rule.rule.0.clone())
+                    .collect();
+                driving.sort();
+                driving.dedup();
                 displays.push((
                     dcfg.display.0.clone(),
                     DisplaySnapshot {
@@ -2476,6 +2510,7 @@ impl RulesEngine {
                         wake_attempts: self.wake_attempts.get(&dcfg.display).copied().unwrap_or(0),
                         last_blank_failed: self.last_blank_failed.contains(&dcfg.display),
                         stage: m.current_stage().map(|(idx, kind)| StageInfo { idx, kind }),
+                        rules: driving,
                     },
                 ));
             }
@@ -3960,9 +3995,48 @@ mod tests {
             wake_attempts: 0,
             last_blank_failed: false,
             stage: None,
+            rules: vec![],
         };
         let json = serde_json::to_string(&snap).unwrap();
         assert!(!json.contains("stage"));
+    }
+
+    #[test]
+    fn display_snapshot_serializes_empty_rules_as_empty_array() {
+        // The rules field is `#[serde(default)]` (not `skip_serializing_if`) so an
+        // empty list must serialize as `"rules":[]` — a consumer that treated an
+        // absent key as "no data" instead of "empty list" caused a blank-dashboard
+        // bug.
+        let snap = DisplaySnapshot {
+            phase: "active".into(),
+            inhibited: false,
+            paused: false,
+            cmd_gen: 0,
+            scope: DisplayScope::Private,
+            owned: true,
+            observed_input_code: None,
+            panel_state: None,
+            controllers: vec![],
+            wake_attempts: 0,
+            last_blank_failed: false,
+            stage: None,
+            rules: vec![],
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(
+            json.contains(r#""rules":[]"#),
+            "empty rules must serialize as `\"rules\":[]`, got: {json}"
+        );
+    }
+
+    #[test]
+    fn display_snapshot_deserializes_legacy_without_rules() {
+        // Old daemon JSON has no "rules" key; new binary must default it to
+        // empty (serde back-compat — same pattern as controllers / wake_attempts).
+        let legacy =
+            r#"{"phase":"active","inhibited":false,"paused":false,"cmd_gen":0,"controllers":[]}"#;
+        let snap: DisplaySnapshot = serde_json::from_str(legacy).unwrap();
+        assert!(snap.rules.is_empty());
     }
 
     #[test]
@@ -3993,6 +4067,7 @@ mod tests {
                 idx: 1,
                 kind: StageKind::RenderBlack,
             }),
+            rules: vec![],
         };
         let json = serde_json::to_string(&snap).unwrap();
         // Wire shape: idx=1, kind="render_black"
@@ -4482,6 +4557,105 @@ mod tests {
         assert!(
             sensor.reported,
             "reported must stay true across subsequent state flips"
+        );
+    }
+
+    /// Snapshot `DisplaySnapshot::rules` lists the ids of every rule that
+    /// drives the display (sorted, deduplicated). Two displays in one config
+    /// — one driven by a rule, one manual-only — must surface the rule on the
+    /// driven display and `[]` on the manual-only display.
+    #[tokio::test]
+    async fn snapshot_lists_driving_rules_per_display() {
+        use crate::fakes::RecordingSink;
+        use crate::zone::{FusionMode, ZoneMember, ZoneSpec};
+
+        let sensor = SensorId("desk".into());
+        let zone = ZoneId("office".into());
+        // Every display referenced by a rule needs a real CommandSink so
+        // `RulesEngine::new` accepts the config (the manual-only display
+        // does not — it is not referenced by any rule).
+        let mut executors: HashMap<DisplayId, Arc<dyn CommandSink>> = HashMap::new();
+        executors.insert(
+            DisplayId("mon".into()),
+            Arc::new(RecordingSink::new()) as Arc<dyn CommandSink>,
+        );
+        let mut engine = RulesEngine::new(
+            RulesEngineConfig {
+                rules: vec![RuleRuntimeCfg {
+                    rule: RuleId("desk-rule".into()),
+                    zone: zone.clone(),
+                    displays: vec![DisplayId("mon".into())],
+                    input_wake_hold: Duration::ZERO,
+                }],
+                displays: vec![
+                    DisplayRuntimeCfg {
+                        display: DisplayId("mon".into()),
+                        blank_mode: BlankMode::PowerOff,
+                        ladder: vec![LadderStage {
+                            kind: StageKind::Controller(BlankMode::PowerOff),
+                            dwell: None,
+                        }],
+                        timings: DisplayRuntimeCfg::manual_defaults(Duration::ZERO),
+                    },
+                    DisplayRuntimeCfg {
+                        display: DisplayId("manual".into()),
+                        blank_mode: BlankMode::PowerOff,
+                        ladder: vec![LadderStage {
+                            kind: StageKind::Controller(BlankMode::PowerOff),
+                            dwell: None,
+                        }],
+                        timings: DisplayRuntimeCfg::manual_defaults(Duration::ZERO),
+                    },
+                ],
+                sensors: vec![SensorRuntimeCfg {
+                    sensor: sensor.clone(),
+                    kind: SensorKind::Presence,
+                    hold_time: None,
+                    stale_timeout: Duration::from_secs(3600),
+                }],
+                doctor_wake_settle: Duration::from_secs(3),
+            },
+            ZoneEngine::new(
+                vec![ZoneSpec {
+                    id: zone.clone(),
+                    mode: FusionMode::Any,
+                    members: vec![ZoneMember::Sensor(sensor.clone())],
+                    weights: HashMap::new(),
+                    unavailable_policy: crate::zone::UnavailablePolicy::Present,
+                }],
+                &[sensor],
+            )
+            .expect("one-sensor zone engine is valid"),
+            executors,
+            HashMap::new(),
+            Arc::new(crate::ownership::AlwaysOwned),
+        )
+        .expect("two-display engine config is valid");
+
+        let (tx, mut rx) = oneshot::channel();
+        engine.handle_control(ControlMsg::Snapshot(tx));
+        let snap = rx.try_recv().expect("snapshot reply sent inline");
+
+        let mon = snap
+            .displays
+            .iter()
+            .find(|(id, _)| id == "mon")
+            .expect("mon in snapshot");
+        assert_eq!(
+            mon.1.rules,
+            vec!["desk-rule".to_string()],
+            "mon is driven by the rule, snapshot.rules must list its id"
+        );
+
+        let manual = snap
+            .displays
+            .iter()
+            .find(|(id, _)| id == "manual")
+            .expect("manual in snapshot");
+        assert!(
+            manual.1.rules.is_empty(),
+            "manual-only display with no rule must surface rules == [], got {:?}",
+            manual.1.rules
         );
     }
 

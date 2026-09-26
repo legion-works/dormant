@@ -99,6 +99,7 @@ fn spawn_fake_engine() -> (
                     wake_attempts: 0,
                     last_blank_failed: false,
                     stage: None,
+                    rules: vec![],
                 },
             ),
             (
@@ -116,6 +117,7 @@ fn spawn_fake_engine() -> (
                     wake_attempts: 0,
                     last_blank_failed: false,
                     stage: None,
+                    rules: vec![],
                 },
             ),
         ],

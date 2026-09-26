@@ -849,6 +849,21 @@ impl CommandSink for DisplayExecutor {
         }
     }
 
+    async fn read_input_source(&self) -> Result<Option<u8>, String> {
+        let mut last_error = None;
+        for controller in &self.chain {
+            match controller.read_input_source().await {
+                Ok(Some(code)) => return Ok(Some(code)),
+                Ok(None) => {}
+                Err(error) => last_error = Some(error),
+            }
+        }
+        match last_error {
+            Some(error) => Err(error),
+            None => Ok(None),
+        }
+    }
+
     /// Re-probe every controller in the chain once so a stale transport handle
     /// can be rebuilt without issuing a blank or wake command.
     async fn reprobe(&self) -> Result<(), String> {

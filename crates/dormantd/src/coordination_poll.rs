@@ -1884,6 +1884,7 @@ mod tests {
     /// oneshot reply) gets a chance to make progress before the test's
     /// next tick advances paused time and trips the 1-second
     /// presence-query timeout fail-open path.
+    #[allow(dead_code)]
     async fn answer_presence(ctl_rx: &mut mpsc::Receiver<ControlMsg>, present: bool) {
         while let Ok(msg) = ctl_rx.try_recv() {
             if let ControlMsg::QueryPresenceConfirmed { reply, .. } = msg {

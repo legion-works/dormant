@@ -1884,7 +1884,6 @@ mod tests {
     /// oneshot reply) gets a chance to make progress before the test's
     /// next tick advances paused time and trips the 1-second
     /// presence-query timeout fail-open path.
-    #[allow(dead_code)]
     async fn answer_presence(ctl_rx: &mut mpsc::Receiver<ControlMsg>, present: bool) {
         while let Ok(msg) = ctl_rx.try_recv() {
             if let ControlMsg::QueryPresenceConfirmed { reply, .. } = msg {
@@ -1950,9 +1949,25 @@ mod tests {
             // tick 7 — pending-tick query: presence confirmed → release
             Some(true),
         ]);
-        for _ in 0..9 {
+        for tick_n in 1..=9 {
             tick().await;
             answer_presence_scripted(&mut ctl_rx, &mut script).await;
+            if tick_n == 6 {
+                let recorded = calls.lock().unwrap().clone();
+                assert_eq!(
+                    recorded,
+                    vec!["loss".to_string()],
+                    "the gain hook must defer while presence is unconfirmed (tick 6)"
+                );
+            }
+            if tick_n == 7 {
+                let recorded = calls.lock().unwrap().clone();
+                assert_eq!(
+                    recorded,
+                    vec!["loss".to_string(), "gain".to_string()],
+                    "the deferred gain hook must fire once presence is confirmed (tick 7)"
+                );
+            }
         }
         assert!(state.snapshot()[&DisplayId("shared".into())].owned);
         let recorded = calls.lock().unwrap().clone();
@@ -2049,9 +2064,25 @@ mod tests {
         let ((_config_tx, _executors_tx, mut ctl_rx, state, cancel), _handle, calls) =
             hooked_poller_with_ctl_rx(cfg, sink);
         let mut script = VecDeque::from([Some(false), Some(true)]);
-        for _ in 0..5 {
+        for tick_n in 1..=5 {
             tick().await;
             answer_presence_scripted(&mut ctl_rx, &mut script).await;
+            if tick_n == 4 {
+                let recorded = calls.lock().unwrap().clone();
+                assert_eq!(
+                    recorded,
+                    Vec::<String>::new(),
+                    "the observed_return hook must defer while presence is unconfirmed (tick 4)"
+                );
+            }
+            if tick_n == 5 {
+                let recorded = calls.lock().unwrap().clone();
+                assert_eq!(
+                    recorded,
+                    vec!["gain".to_string()],
+                    "the deferred observed_return hook must fire once presence is confirmed (tick 5)"
+                );
+            }
         }
         assert!(state.snapshot()[&DisplayId("shared".into())].owned);
         let recorded = calls.lock().unwrap().clone();

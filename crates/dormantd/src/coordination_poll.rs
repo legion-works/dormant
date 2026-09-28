@@ -417,10 +417,12 @@ async fn fire_observed_gain_with_presence_gate(
         return;
     }
     match query_presence_confirmed(&deps.ctl_tx, display_id).await {
-        Some(true) => {
+        // `None`: no rule drives this display, so there is no presence to
+        // gate on and the hook runs as it always has.
+        Ok(Some(true) | None) => {
             direct_switch.notify_observed_gain(display_id).await;
         }
-        Some(false) => {
+        Ok(Some(false)) => {
             tracing::info!(
                 event = "observed_gain_deferred",
                 display = %display_id,
@@ -433,7 +435,7 @@ async fn fire_observed_gain_with_presence_gate(
             // the operator flips the knob off and reloads.
             pending_observed_gain.insert(display_id.clone());
         }
-        None => {
+        Err(PresenceQueryFailed) => {
             tracing::warn!(
                 event = "observed_gain_presence_query_failed",
                 display = %display_id,
@@ -443,29 +445,30 @@ async fn fire_observed_gain_with_presence_gate(
     }
 }
 
-/// In-process query for whether a driving zone has confirmed presence. The
-/// reply is `None` when the engine's reply is missing (channel closed,
-/// sender dropped, or the bounded timeout fires); every `None` path is
-/// fail-open so a wedged engine cannot wedge the hook.
+/// The rules engine gave no answer to a presence query: the control channel
+/// is closed, the reply was dropped (a reload discarded the queued query), or
+/// the bounded timeout elapsed. Callers fail open and run the hook.
+#[derive(Debug, PartialEq, Eq)]
+struct PresenceQueryFailed;
+
+/// Ask the rules engine whether a rule driving `display_id` sees confirmed
+/// presence. `Ok(None)` means no rule drives the display, which is an answer,
+/// not a failure; only a missing reply is `Err`.
 async fn query_presence_confirmed(
     ctl_tx: &mpsc::Sender<ControlMsg>,
     display_id: &DisplayId,
-) -> Option<bool> {
+) -> Result<Option<bool>, PresenceQueryFailed> {
     let (reply_tx, reply_rx) = oneshot::channel();
-    if ctl_tx
+    ctl_tx
         .send(ControlMsg::QueryPresenceConfirmed {
             display: display_id.clone(),
             reply: reply_tx,
         })
         .await
-        .is_err()
-    {
-        return None;
-    }
+        .map_err(|_| PresenceQueryFailed)?;
     match tokio::time::timeout(OBSERVED_GAIN_PRESENCE_QUERY_TIMEOUT, reply_rx).await {
-        Ok(Ok(value)) => value,
-        Ok(Err(_dropped)) => None,
-        Err(_elapsed) => None,
+        Ok(Ok(answer)) => Ok(answer),
+        Ok(Err(_)) | Err(_) => Err(PresenceQueryFailed),
     }
 }
 
@@ -508,20 +511,22 @@ async fn drain_pending_observed_gain(
             continue;
         }
         match query_presence_confirmed(&deps.ctl_tx, &display_id).await {
-            Some(true) => {
+            Ok(Some(true) | None) => {
                 if let Some(ref ds) = deps.direct_switch {
                     ds.notify_observed_gain(&display_id).await;
                 }
                 pending_observed_gain.remove(&display_id);
                 tracing::info!(event = "observed_gain_released", display = %display_id);
             }
-            Some(false) => {
+            Ok(Some(false)) => {
                 // Stay pending.
             }
-            None => {
-                // Fail open: fire once and clear. The earlier
-                // `observed_gain_presence_query_failed` warn already
-                // surfaced from `query_presence_confirmed`'s caller path.
+            Err(PresenceQueryFailed) => {
+                // Fail open: fire once and clear.
+                tracing::warn!(
+                    event = "observed_gain_presence_query_failed",
+                    display = %display_id,
+                );
                 if let Some(ref ds) = deps.direct_switch {
                     ds.notify_observed_gain(&display_id).await;
                 }
@@ -1800,11 +1805,20 @@ mod tests {
             Ok(Some(0x11)),
             Ok(Some(0x11)),
         ]));
-        let ((_config_tx, _executors_tx, state, cancel), _handle, calls) = hooked_poller(cfg, sink);
+        let ((_config_tx, _executors_tx, mut ctl_rx, state, cancel), _handle, calls) =
+            hooked_poller_with_ctl_rx(cfg, sink);
         for _ in 0..5 {
             tick().await;
         }
         assert!(state.snapshot()[&DisplayId("shared".into())].owned);
+        // A return is not an ownership transition: the only control traffic
+        // allowed is the presence query that gates the hook.
+        while let Ok(msg) = ctl_rx.try_recv() {
+            assert!(
+                matches!(msg, ControlMsg::QueryPresenceConfirmed { .. }),
+                "no ownership transition should be published"
+            );
+        }
         assert_eq!(*calls.lock().unwrap(), ["gain"]);
         cancel.cancel();
     }
@@ -1876,29 +1890,14 @@ mod tests {
         cancel.cancel();
     }
 
-    /// Drain every pending `ControlMsg` and answer any
-    /// `QueryPresenceConfirmed` with `present`. Other message variants
-    /// (e.g. `OwnershipPoll`, `PublishDaemonEvent`) are dropped on the
-    /// floor — the poller task does not block on their replies. Yields
-    /// afterwards so a wakened poller task (parked on the in-process
-    /// oneshot reply) gets a chance to make progress before the test's
-    /// next tick advances paused time and trips the 1-second
-    /// presence-query timeout fail-open path.
-    #[allow(dead_code)]
-    async fn answer_presence(ctl_rx: &mut mpsc::Receiver<ControlMsg>, present: bool) {
-        while let Ok(msg) = ctl_rx.try_recv() {
-            if let ControlMsg::QueryPresenceConfirmed { reply, .. } = msg {
-                let _ = reply.send(Some(present));
-            }
-        }
-        tokio::task::yield_now().await;
-    }
-
-    /// Drain and answer with a scripted sequence of verdicts. Falls back
-    /// to `Some(false)` (the conservative "stay deferred" answer) once
-    /// the script is exhausted so a runaway tick cannot fire a hook that
-    /// the test is not prepared for. Yields afterwards (see
-    /// [`answer_presence`]).
+    /// Drain every pending `ControlMsg` and answer each
+    /// `QueryPresenceConfirmed` from `script`, falling back to `Some(false)`
+    /// (the conservative "stay deferred" answer) once the script is exhausted
+    /// so a runaway tick cannot fire a hook the test is not prepared for.
+    /// Other variants (`OwnershipPoll`, `PublishDaemonEvent`) are dropped.
+    /// Yields afterwards so the poller, parked on the oneshot reply, resumes
+    /// before the next tick advances paused time past the 1-second
+    /// presence-query timeout.
     async fn answer_presence_scripted(
         ctl_rx: &mut mpsc::Receiver<ControlMsg>,
         script: &mut VecDeque<Option<bool>>,
@@ -1910,6 +1909,43 @@ mod tests {
             }
         }
         tokio::task::yield_now().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn presence_query_distinguishes_no_rule_from_a_missing_reply() {
+        let display = DisplayId("shared".into());
+
+        // The engine answers `None`: no rule drives the display. That is an
+        // answer, and must not be reported as a failed query.
+        let (tx, mut rx) = mpsc::channel(1);
+        let answerer = tokio::spawn(async move {
+            if let Some(ControlMsg::QueryPresenceConfirmed { reply, .. }) = rx.recv().await {
+                let _ = reply.send(None);
+            }
+        });
+        assert_eq!(
+            super::query_presence_confirmed(&tx, &display).await,
+            Ok(None)
+        );
+        answerer.await.unwrap();
+
+        // The engine drops the reply (a reload discarded the query).
+        let (tx, mut rx) = mpsc::channel(1);
+        let dropper = tokio::spawn(async move {
+            let _ = rx.recv().await;
+        });
+        assert_eq!(
+            super::query_presence_confirmed(&tx, &display).await,
+            Err(super::PresenceQueryFailed)
+        );
+        dropper.await.unwrap();
+
+        // Nobody answers before the bounded timeout.
+        let (tx, _rx) = mpsc::channel(1);
+        assert_eq!(
+            super::query_presence_confirmed(&tx, &display).await,
+            Err(super::PresenceQueryFailed)
+        );
     }
 
     /// Add the standard `on_observed_gain`/`on_observed_loss` hook
@@ -2005,13 +2041,18 @@ mod tests {
         ]));
         let ((_config_tx, _executors_tx, mut ctl_rx, state, cancel), _handle, calls) =
             hooked_poller_with_ctl_rx(cfg, sink);
-        let mut script = VecDeque::from([
-            // tick 6 — gate query after committed gain
-            Some(false),
-        ]);
-        for _ in 0..12 {
+        // Nobody is present while the display is owned (ticks 1-9). Presence
+        // is confirmed from tick 10, after the loss has committed: a deferral
+        // that survived the loss would fire the gain hook then.
+        for tick_no in 1..=12 {
             tick().await;
-            answer_presence_scripted(&mut ctl_rx, &mut script).await;
+            let answer = Some(tick_no >= 10);
+            while let Ok(msg) = ctl_rx.try_recv() {
+                if let ControlMsg::QueryPresenceConfirmed { reply, .. } = msg {
+                    let _ = reply.send(answer);
+                }
+            }
+            tokio::task::yield_now().await;
         }
         assert!(!state.snapshot()[&DisplayId("shared".into())].owned);
         let recorded = calls.lock().unwrap().clone();

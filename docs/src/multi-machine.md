@@ -239,7 +239,7 @@ or an MQTT publish (QoS 1, non-retained).
 | `before_release` | Push (release) | BEFORE the peer DDC write. Blocking — a failure aborts the push. Use for USB-switch or KVMP transitions. |
 | `after_release` | Push (release) | AFTER a successful or failed push write. Fire-and-forget. |
 | `on_observed_loss` | Poll (loss) | AFTER the poller commits an ownership loss. Fire-and-forget — the poll path has no write authority and must never trigger a corrective DDC write or retry. |
-| `on_observed_gain` | Poll (gain) | AFTER the poller commits an ownership gain or confirms a return from a brief peer sighting. Fire-and-forget, with no DDC write, retry, or corrective action. A dormant-initiated pull marks ownership immediately and fires `after_acquire`, not this slot. |
+| `on_observed_gain` | Poll (gain) | AFTER the poller commits an ownership gain or confirms a return from a brief peer sighting. Fire-and-forget, with no DDC write, retry, or corrective action. A dormant-initiated pull marks ownership immediately and fires `after_acquire`, not this slot. **By default the hook only fires when a driving zone is confirmed present** (`observed_gain_requires_presence = true`) — a panel hunting inputs overnight cannot light downstream consumers (USB KVM, notifications). |
 | `on_wake` | Display wake | AFTER an input/force wake or a confirmed presence wake. Fire-and-forget, with no extra panel write or retry. Fail-safe availability and poll-only ownership gains do not fire it. |
 
 ### Wake the source output as well as the panel
@@ -302,6 +302,36 @@ the gaining host's USB target without pulling the panel again.
 The hook also fires if the panel comes back before this machine confirms losing
 it (the peer held it for less than `loss_confirmations × poll_interval`), once
 the return has the same number of confirming readings.
+
+#### Presence gating and deferral
+
+`on_observed_gain` is gated on confirmed presence by default
+(`observed_gain_requires_presence = true`). The poller queries the rules
+engine for whether at least one driving rule's zone resolves present at
+the moment of the gain:
+
+- `Some(true)` or no driving rule — fire as today.
+- `Some(false)` — **defer**: log `observed_gain_deferred` (reason =
+  `presence_unconfirmed`), add it to a daemon-lifetime pending set, and
+  re-evaluate on every subsequent poll tick.
+- query timeout or reply dropped — fail open (fire, log
+  `observed_gain_presence_query_failed` at warn) so a wedged engine never
+  stalls downstream consumers.
+
+The pending entry is dropped and the hook is **not** fired when any of the
+following hold:
+
+- A committed ownership loss clears the entry before it can fire on stale
+  context.
+- A contested hold forces the display not-owned (defensive catch for
+  cases where the loss never committed a transition).
+- The display's `scope` is no longer `"shared"` after a config reload.
+
+When presence becomes confirmed while the display is still owned, the
+pending entry fires once and is cleared; the operator sees
+`observed_gain_released` in the journal. Set
+`observed_gain_requires_presence = false` to recover the original
+fire-on-every-commit behaviour (the brief return path still applies).
 
 ### Hook environment
 

@@ -440,6 +440,21 @@ pub enum ControlMsg {
     /// [`crate::types::SensorState::Unavailable`] presence edge so the
     /// fail-safe path takes over immediately.
     SensorAvailability(crate::types::SensorAvailabilityEvent),
+    /// Query whether any rule driving `display` has confirmed presence at
+    /// the engine's current state. The reply carries `None` when no rule
+    /// drives `display`, otherwise `Some(bool)`. Used by the shared-display
+    /// poller to gate a post-hoc `on_observed_gain` hook on someone being
+    /// actually at the desk (issue: panel-only ownership gains overnight
+    /// from a panel hunting inputs). If the reply is dropped (the
+    /// reload-queue retention path keeps the message in a backlog rather
+    /// than forwarding it), the caller fails open — the hook fires as
+    /// today — and the absence of a verified presence check is logged.
+    QueryPresenceConfirmed {
+        /// Target display.
+        display: DisplayId,
+        /// One-shot reply channel for the verdict.
+        reply: oneshot::Sender<Option<bool>>,
+    },
 }
 
 /// Per-display outcome of an [`ControlMsg::EmergencyWake`].
@@ -1753,6 +1768,39 @@ impl RulesEngine {
             .any(|rule| self.zone_engine.is_present(&rule.zone).unwrap_or(true))
     }
 
+    /// Confirm-presence verdict across every rule that drives `display`.
+    ///
+    /// `None` when no rule drives the display — callers (the shared-display
+    /// poller) cannot gate a post-hoc hook on a missing rule, so the gate
+    /// passes through. Otherwise `Some(any)` — true when at least one
+    /// driving zone is confirmed present, false when every driving zone
+    /// resolves to known-vacant (which includes the fail-safe
+    /// unavailable-members-are-absent doctrine: a zone whose only sensors
+    /// are unavailable is confirmed absent, not absent-by-unknown).
+    ///
+    /// Distinct from `effective_zone_presence`, which treats
+    /// unknown zones as present for fail-safe display retention; this query
+    /// answers the narrower "is someone actually here?" question that
+    /// `on_observed_gain` must answer before waking downstream consumers
+    /// (a USB KVM, a notification daemon) on a panel-only ownership gain.
+    #[must_use]
+    pub fn display_confirmed_presence(&self, display: &DisplayId) -> Option<bool> {
+        let driving: Vec<&RuleRuntimeCfg> = self
+            .cfg
+            .rules
+            .iter()
+            .filter(|rule| rule.displays.contains(display))
+            .collect();
+        if driving.is_empty() {
+            return None;
+        }
+        Some(
+            driving
+                .iter()
+                .any(|rule| self.zone_engine.has_confirmed_presence(&rule.zone)),
+        )
+    }
+
     // ── Internal: control messages ─────────────────────────────────────────
 
     fn handle_control(&mut self, msg: ControlMsg) {
@@ -1846,6 +1894,9 @@ impl RulesEngine {
                 let _ = ack.send(());
             }
             ControlMsg::SensorAvailability(ev) => self.handle_sensor_availability(ev),
+            ControlMsg::QueryPresenceConfirmed { display, reply } => {
+                let _ = reply.send(self.display_confirmed_presence(&display));
+            }
         }
     }
 
@@ -2900,13 +2951,8 @@ impl RulesEngine {
                     display: display_id.clone(),
                     phase: to.to_string(),
                     cause: cause.to_string(),
-                    presence_confirmed: (cause == "presence_detected").then(|| {
-                        self.cfg
-                            .rules
-                            .iter()
-                            .filter(|rule| rule.displays.contains(display_id))
-                            .any(|rule| self.zone_engine.has_confirmed_presence(&rule.zone))
-                    }),
+                    presence_confirmed: (cause == "presence_detected")
+                        .then(|| self.display_confirmed_presence(display_id).unwrap_or(false)),
                 });
             }
         }
@@ -6395,6 +6441,45 @@ async fn staged_teardown_on_confirmed_presence_reports_confirmed() {
         serde_json::to_value(event).unwrap()["presence_confirmed"],
         true
     );
+}
+
+#[test]
+fn display_confirmed_presence_reports_none_for_undriven_display() {
+    // The display is configured but no rule references it — there is no
+    // zone to evaluate presence against, so the gate passes through.
+    let (engine, _display) = multi_zone_presence_engine();
+    let undriven = DisplayId("undriven".into());
+    assert_eq!(engine.display_confirmed_presence(&undriven), None);
+}
+
+#[test]
+fn display_confirmed_presence_reports_true_for_occupied_zone() {
+    // One of the two driving zones resolves present via sensor s1; the
+    // helper reduces to true.
+    let (mut engine, display) = multi_zone_presence_engine();
+    engine.handle_presence_event(PresenceEvent::new(
+        SensorId("s1".into()),
+        SensorState::Present,
+        Timestamp::now(),
+    ));
+    assert_eq!(engine.display_confirmed_presence(&display), Some(true));
+}
+
+#[test]
+fn display_confirmed_presence_reports_false_for_unavailable_only_zone() {
+    // Fail-safe: every driving zone resolves only through unavailable
+    // sensors — has_confirmed_presence treats them as absent, not
+    // unknown-present. The hook must therefore stay deferred until a
+    // sensor actually publishes a confirmed state.
+    let (mut engine, display) = multi_zone_presence_engine();
+    for sensor in ["s1", "s2"] {
+        engine.handle_presence_event(PresenceEvent::new(
+            SensorId(sensor.into()),
+            SensorState::Unavailable,
+            Timestamp::now(),
+        ));
+    }
+    assert_eq!(engine.display_confirmed_presence(&display), Some(false));
 }
 
 #[test]

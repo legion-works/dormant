@@ -388,7 +388,11 @@ input_wake_hold = "300s"
 #   { command = ["notify-send", "panel acquired"], timeout = "5s", blocking = false },
 # ]
 # # on_observed_gain makes USB follow a monitor-button or automatic input
-# # switch that occurred outside dormant. Use this host's idempotent USB target.
+# # switch that occurred outside dormant. Use this host's idempotent USB
+# # target. By default the hook only fires once a driving zone is
+# # confirmed present (`observed_gain_requires_presence = true`), so a
+# # panel hunting inputs overnight does not flip USB to this host while
+# # the desk is empty; set false to opt out and fire on every commit.
 # on_observed_gain = [{ mqtt = { topic = "dormant/kvm/usb-target", payload = "<this-host>" }, timeout = "5s" }]
 # # on_wake wakes this machine's KDE output after dormant wakes the panel.
 # # Replace HDMI-A-1 with the connectors you intentionally keep off.

@@ -1,6 +1,6 @@
 //! Periodic shared-display ownership polling.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,11 +12,18 @@ use dormant_core::coordination::{
 use dormant_core::rules::{ControlMsg, DaemonEvent};
 use dormant_core::traits::CommandSink;
 use dormant_core::types::DisplayId;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::direct_switch::DirectSwitchHandle;
+
+/// Bounded timeout on the in-process presence-confirmed query that gates
+/// `on_observed_gain`. The answer is a near-instant lookup on the rules
+/// engine's zone state, so a one-second ceiling is generous — the cap
+/// exists so a wedged engine (rules loop blocked on a sensor) cannot stall
+/// the poller's pending-release path indefinitely.
+const OBSERVED_GAIN_PRESENCE_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Dependencies required by the shared-display ownership poller.
 pub struct CoordinationPollDeps {
@@ -51,6 +58,7 @@ async fn run(mut deps: CoordinationPollDeps) {
     let mut last_failing_log = HashMap::new();
     let mut last_state_read: HashMap<DisplayId, Instant> = HashMap::new();
     let mut reprobe_state: HashMap<DisplayId, ReprobeState> = HashMap::new();
+    let mut pending_observed_gain: HashSet<DisplayId> = HashSet::new();
     loop {
         tokio::select! {
             () = deps.cancel.cancelled() => break,
@@ -60,7 +68,13 @@ async fn run(mut deps: CoordinationPollDeps) {
                 }
                 interval = new_interval(deps.config_rx.borrow().coordination.poll_interval);
             }
-            _ = interval.tick() => poll_once(&deps, &mut last_failing_log, &mut last_state_read, &mut reprobe_state).await,
+            _ = interval.tick() => poll_once(
+                &deps,
+                &mut last_failing_log,
+                &mut last_state_read,
+                &mut reprobe_state,
+                &mut pending_observed_gain,
+            ).await,
         }
     }
 }
@@ -133,6 +147,7 @@ async fn poll_once(
     last_failing_log: &mut HashMap<DisplayId, Instant>,
     last_state_read: &mut HashMap<DisplayId, Instant>,
     reprobe_state: &mut HashMap<DisplayId, ReprobeState>,
+    pending_observed_gain: &mut HashSet<DisplayId>,
 ) {
     let executors = deps.executors_rx.borrow().clone();
     // Reload intentionally publishes this sentinel while an old generation tears down.
@@ -141,6 +156,7 @@ async fn poll_once(
     }
 
     let config = deps.config_rx.borrow().clone();
+    drain_pending_observed_gain(deps, &config, pending_observed_gain).await;
     let state_poll_interval = config.coordination.effective_state_poll_interval();
     let now = Instant::now();
     // Snapshot once per tick: displays not due for a state read preserve their
@@ -311,16 +327,39 @@ async fn poll_once(
                 // retry a failed hook.
                 if let Some(ref ds) = deps.direct_switch {
                     if previous_owned {
+                        // Committed loss: drop any deferred hook for this
+                        // display — by the time the panel is re-claimed
+                        // (if ever), this transition is no longer the
+                        // trigger.
+                        pending_observed_gain.remove(&display_id);
                         ds.notify_observed_loss(&display_id).await;
                     } else if owned {
-                        ds.notify_observed_gain(&display_id).await;
+                        // Committed ownership gain — gate the post-hoc hook
+                        // on confirmed presence when the display opts in
+                        // (default true; a panel hunting inputs overnight
+                        // must not light downstream consumers).
+                        fire_observed_gain_with_presence_gate(
+                            deps,
+                            &config,
+                            &display_id,
+                            pending_observed_gain,
+                            ds,
+                        )
+                        .await;
                     }
                 }
             }
             if outcome.observed_return {
                 tracing::info!(event = "coord_ownership_returned", display = %display_id, observed);
                 if let Some(ref ds) = deps.direct_switch {
-                    ds.notify_observed_gain(&display_id).await;
+                    fire_observed_gain_with_presence_gate(
+                        deps,
+                        &config,
+                        &display_id,
+                        pending_observed_gain,
+                        ds,
+                    )
+                    .await;
                 }
             }
         } else {
@@ -349,6 +388,152 @@ async fn poll_once(
             }
         }
     }
+    // A display whose shared scope was removed (config reload, ownership
+    // dispute settled) keeps no carry-over pending gain — its hook either
+    // already fired or is irrelevant now.
+    pending_observed_gain.retain(|display_id| {
+        config
+            .displays
+            .get(&display_id.0)
+            .is_some_and(|dc| dc.scope == DisplayScope::Shared)
+    });
+}
+
+/// Look up the per-display knob, query confirmed presence, and either fire
+/// the hook immediately, defer to a later poll tick, or fail open.
+async fn fire_observed_gain_with_presence_gate(
+    deps: &CoordinationPollDeps,
+    config: &Config,
+    display_id: &DisplayId,
+    pending_observed_gain: &mut HashSet<DisplayId>,
+    direct_switch: &Arc<DirectSwitchHandle>,
+) {
+    let knob_enabled = config
+        .displays
+        .get(&display_id.0)
+        .is_some_and(|dc| dc.hooks.observed_gain_requires_presence);
+    if !knob_enabled {
+        direct_switch.notify_observed_gain(display_id).await;
+        return;
+    }
+    match query_presence_confirmed(&deps.ctl_tx, display_id).await {
+        // `None`: no rule drives this display, so there is no presence to
+        // gate on and the hook runs as it always has.
+        Ok(Some(true) | None) => {
+            direct_switch.notify_observed_gain(display_id).await;
+        }
+        Ok(Some(false)) => {
+            tracing::info!(
+                event = "observed_gain_deferred",
+                display = %display_id,
+                reason = "presence_unconfirmed",
+            );
+            // Defer: re-evaluate on every subsequent poll tick.
+            // `drain_pending_observed_gain` fires once presence is
+            // confirmed or the display is no longer owned. The
+            // `knob_enabled` check there ensures we never re-fire after
+            // the operator flips the knob off and reloads.
+            pending_observed_gain.insert(display_id.clone());
+        }
+        Err(PresenceQueryFailed) => {
+            tracing::warn!(
+                event = "observed_gain_presence_query_failed",
+                display = %display_id,
+            );
+            direct_switch.notify_observed_gain(display_id).await;
+        }
+    }
+}
+
+/// The rules engine gave no answer to a presence query: the control channel
+/// is closed, the reply was dropped (a reload discarded the queued query), or
+/// the bounded timeout elapsed. Callers fail open and run the hook.
+#[derive(Debug, PartialEq, Eq)]
+struct PresenceQueryFailed;
+
+/// Ask the rules engine whether a rule driving `display_id` sees confirmed
+/// presence. `Ok(None)` means no rule drives the display, which is an answer,
+/// not a failure; only a missing reply is `Err`.
+async fn query_presence_confirmed(
+    ctl_tx: &mpsc::Sender<ControlMsg>,
+    display_id: &DisplayId,
+) -> Result<Option<bool>, PresenceQueryFailed> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    ctl_tx
+        .send(ControlMsg::QueryPresenceConfirmed {
+            display: display_id.clone(),
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| PresenceQueryFailed)?;
+    match tokio::time::timeout(OBSERVED_GAIN_PRESENCE_QUERY_TIMEOUT, reply_rx).await {
+        Ok(Ok(answer)) => Ok(answer),
+        Ok(Err(_)) | Err(_) => Err(PresenceQueryFailed),
+    }
+}
+
+/// On every poll tick, for each display whose gain hook is pending, decide
+/// whether to fire-and-clear (owned + presence true/None), stay pending
+/// (owned + presence false), or just clear (no longer owned — a contested
+/// hold forced not-owned, or a config reload removed the display).
+async fn drain_pending_observed_gain(
+    deps: &CoordinationPollDeps,
+    config: &Config,
+    pending_observed_gain: &mut HashSet<DisplayId>,
+) {
+    if pending_observed_gain.is_empty() {
+        return;
+    }
+    let snapshot = deps.state.snapshot();
+    let owned_now: HashSet<DisplayId> = snapshot
+        .iter()
+        .filter_map(|(display_id, record)| record.owned.then_some(display_id.clone()))
+        .collect();
+    let to_evaluate: Vec<DisplayId> = pending_observed_gain.iter().cloned().collect();
+    for display_id in to_evaluate {
+        let Some(dc) = config.displays.get(&display_id.0) else {
+            pending_observed_gain.remove(&display_id);
+            continue;
+        };
+        if dc.scope != DisplayScope::Shared {
+            pending_observed_gain.remove(&display_id);
+            continue;
+        }
+        if !dc.hooks.observed_gain_requires_presence {
+            pending_observed_gain.remove(&display_id);
+            continue;
+        }
+        if !owned_now.contains(&display_id) {
+            // Contested hold or fresh config reload forced not-owned; the
+            // hook must not fire after the panel has been re-claimed by
+            // another machine.
+            pending_observed_gain.remove(&display_id);
+            continue;
+        }
+        match query_presence_confirmed(&deps.ctl_tx, &display_id).await {
+            Ok(Some(true) | None) => {
+                if let Some(ref ds) = deps.direct_switch {
+                    ds.notify_observed_gain(&display_id).await;
+                }
+                pending_observed_gain.remove(&display_id);
+                tracing::info!(event = "observed_gain_released", display = %display_id);
+            }
+            Ok(Some(false)) => {
+                // Stay pending.
+            }
+            Err(PresenceQueryFailed) => {
+                // Fail open: fire once and clear.
+                tracing::warn!(
+                    event = "observed_gain_presence_query_failed",
+                    display = %display_id,
+                );
+                if let Some(ref ds) = deps.direct_switch {
+                    ds.notify_observed_gain(&display_id).await;
+                }
+                pending_observed_gain.remove(&display_id);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -356,7 +541,7 @@ mod tests {
     use super::{CoordinationPollDeps, poll_once, spawn};
     use crate::direct_switch::{DirectSwitchHandle, SwitchOutcome, SwitchReason};
     use crate::hooks::{EnvList, HookEngine, HookIoResult, HookRunner};
-    use std::collections::{HashMap, VecDeque};
+    use std::collections::{HashMap, HashSet, VecDeque};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -384,6 +569,15 @@ mod tests {
         CoordinationHandle,
         CancellationToken,
     );
+
+    type HookedTestHarness = (
+        watch::Sender<Arc<Config>>,
+        watch::Sender<Arc<HashMap<DisplayId, Arc<dyn CommandSink>>>>,
+        CoordinationHandle,
+        CancellationToken,
+    );
+
+    type HookedTestHarnessWithCtl = TestHarness;
 
     #[derive(Default)]
     struct ScriptedSink {
@@ -516,7 +710,73 @@ mod tests {
         cfg: Config,
         sink: Arc<ScriptedSink>,
     ) -> (
-        TestHarness,
+        HookedTestHarness,
+        Arc<DirectSwitchHandle>,
+        Arc<Mutex<Vec<String>>>,
+    ) {
+        let (config_tx, config_rx) = watch::channel(Arc::new(cfg));
+        let display = DisplayId("shared".to_string());
+        let executors = HashMap::from([(display.clone(), sink as Arc<dyn CommandSink>)]);
+        let (executors_tx, executors_rx) = watch::channel(Arc::new(executors));
+        let (ctl_tx, ctl_rx) = mpsc::channel(32);
+        let state = CoordinationHandle::new([display]);
+        let cancel = CancellationToken::new();
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let hooks = Arc::new(HookEngine::with_runner(Arc::new(RecordingHookRunner(
+            Arc::clone(&commands),
+        ))));
+        let handle = Arc::new(DirectSwitchHandle::new(
+            executors_rx.clone(),
+            config_rx.clone(),
+            hooks,
+            ctl_tx.clone(),
+            Some(state.clone()),
+        ));
+        let _task = spawn(CoordinationPollDeps {
+            config_rx,
+            ctl_tx,
+            executors_rx,
+            state: state.clone(),
+            cancel: cancel.clone(),
+            direct_switch: Some(Arc::clone(&handle)),
+        });
+        // Tests using `hooked_poller` assert the hook fires as it always
+        // has. The presence gate defaults to true and the test configs
+        // have no rules driving the shared display, so the engine would
+        // answer the new presence query with `None`. Stand up a tiny
+        // drain task that answers with `None` so the gate fires on the
+        // same tick the gain commits, instead of waiting on the
+        // 1-second presence-query timeout (the test's `tick()` only
+        // advances 6 s of paused time per call). Tests that need
+        // scripted answers use `hooked_poller_with_ctl_rx` below.
+        let drain_cancel = cancel.clone();
+        let mut drain_rx = ctl_rx;
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = drain_cancel.cancelled() => break,
+                    msg = drain_rx.recv() => {
+                        let Some(msg) = msg else { break; };
+                        if let ControlMsg::QueryPresenceConfirmed { reply, .. } = msg {
+                            let _ = reply.send(None);
+                        }
+                    }
+                }
+            }
+        });
+        ((config_tx, executors_tx, state, cancel), handle, commands)
+    }
+
+    /// Variant of [`hooked_poller`] that exposes the control-channel
+    /// receiver so tests can script their own `QueryPresenceConfirmed`
+    /// answers. The drain task is replaced with a held receiver — the
+    /// test is responsible for answering every query (or accepting the
+    /// 1-second timeout fail-open behaviour).
+    fn hooked_poller_with_ctl_rx(
+        cfg: Config,
+        sink: Arc<ScriptedSink>,
+    ) -> (
+        HookedTestHarnessWithCtl,
         Arc<DirectSwitchHandle>,
         Arc<Mutex<Vec<String>>>,
     ) {
@@ -1159,6 +1419,7 @@ mod tests {
         let mut last_failing_log = HashMap::new();
         let mut last_state_read = HashMap::new();
         let mut reprobe_state = HashMap::new();
+        let mut pending_observed_gain = HashSet::new();
         for _ in 0..ticks {
             tokio::time::advance(Duration::from_secs(6)).await;
             poll_once(
@@ -1166,6 +1427,7 @@ mod tests {
                 &mut last_failing_log,
                 &mut last_state_read,
                 &mut reprobe_state,
+                &mut pending_observed_gain,
             )
             .await;
         }
@@ -1201,6 +1463,7 @@ mod tests {
         let mut last_failing_log = HashMap::new();
         let mut last_state_read = HashMap::new();
         let mut reprobe_state = HashMap::new();
+        let mut pending_observed_gain = HashSet::new();
         for _ in 0..ticks {
             tokio::time::advance(poll_interval).await;
             poll_once(
@@ -1208,6 +1471,7 @@ mod tests {
                 &mut last_failing_log,
                 &mut last_state_read,
                 &mut reprobe_state,
+                &mut pending_observed_gain,
             )
             .await;
         }
@@ -1512,8 +1776,7 @@ mod tests {
             Ok(Some(0x11)),
             Ok(Some(0x11)),
         ]));
-        let ((_config_tx, _executors_tx, _ctl_rx, state, cancel), _handle, calls) =
-            hooked_poller(cfg, sink);
+        let ((_config_tx, _executors_tx, state, cancel), _handle, calls) = hooked_poller(cfg, sink);
         for _ in 0..6 {
             tick().await;
         }
@@ -1543,15 +1806,19 @@ mod tests {
             Ok(Some(0x11)),
         ]));
         let ((_config_tx, _executors_tx, mut ctl_rx, state, cancel), _handle, calls) =
-            hooked_poller(cfg, sink);
+            hooked_poller_with_ctl_rx(cfg, sink);
         for _ in 0..5 {
             tick().await;
         }
         assert!(state.snapshot()[&DisplayId("shared".into())].owned);
-        assert!(
-            ctl_rx.try_recv().is_err(),
-            "no ownership transition should be published"
-        );
+        // A return is not an ownership transition: the only control traffic
+        // allowed is the presence query that gates the hook.
+        while let Ok(msg) = ctl_rx.try_recv() {
+            assert!(
+                matches!(msg, ControlMsg::QueryPresenceConfirmed { .. }),
+                "no ownership transition should be published"
+            );
+        }
         assert_eq!(*calls.lock().unwrap(), ["gain"]);
         cancel.cancel();
     }
@@ -1574,8 +1841,7 @@ mod tests {
             Ok(Some(0x12)),
             Ok(Some(0x12)),
         ]));
-        let ((_config_tx, _executors_tx, _ctl_rx, state, cancel), _handle, calls) =
-            hooked_poller(cfg, sink);
+        let ((_config_tx, _executors_tx, state, cancel), _handle, calls) = hooked_poller(cfg, sink);
         for _ in 0..3 {
             tick().await;
         }
@@ -1600,7 +1866,7 @@ mod tests {
             Ok(Some(0x11)),
             Ok(Some(0x11)),
         ]));
-        let ((_config_tx, _executors_tx, _ctl_rx, state, cancel), handle, calls) =
+        let ((_config_tx, _executors_tx, state, cancel), handle, calls) =
             hooked_poller(cfg, Arc::clone(&sink));
         for _ in 0..3 {
             tick().await;
@@ -1620,6 +1886,326 @@ mod tests {
         assert!(
             calls.lock().unwrap().is_empty(),
             "initiated pull must not fire observed gain"
+        );
+        cancel.cancel();
+    }
+
+    /// Drain every pending `ControlMsg` and answer each
+    /// `QueryPresenceConfirmed` from `script`, falling back to `Some(false)`
+    /// (the conservative "stay deferred" answer) once the script is exhausted
+    /// so a runaway tick cannot fire a hook the test is not prepared for.
+    /// Other variants (`OwnershipPoll`, `PublishDaemonEvent`) are dropped.
+    /// Yields afterwards so the poller, parked on the oneshot reply, resumes
+    /// before the next tick advances paused time past the 1-second
+    /// presence-query timeout.
+    async fn answer_presence_scripted(
+        ctl_rx: &mut mpsc::Receiver<ControlMsg>,
+        script: &mut VecDeque<Option<bool>>,
+    ) {
+        while let Ok(msg) = ctl_rx.try_recv() {
+            if let ControlMsg::QueryPresenceConfirmed { reply, .. } = msg {
+                let answer = script.pop_front().unwrap_or(Some(false));
+                let _ = reply.send(answer);
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn presence_query_distinguishes_no_rule_from_a_missing_reply() {
+        let display = DisplayId("shared".into());
+
+        // The engine answers `None`: no rule drives the display. That is an
+        // answer, and must not be reported as a failed query.
+        let (tx, mut rx) = mpsc::channel(1);
+        let answerer = tokio::spawn(async move {
+            if let Some(ControlMsg::QueryPresenceConfirmed { reply, .. }) = rx.recv().await {
+                let _ = reply.send(None);
+            }
+        });
+        assert_eq!(
+            super::query_presence_confirmed(&tx, &display).await,
+            Ok(None)
+        );
+        answerer.await.unwrap();
+
+        // The engine drops the reply (a reload discarded the query).
+        let (tx, mut rx) = mpsc::channel(1);
+        let dropper = tokio::spawn(async move {
+            let _ = rx.recv().await;
+        });
+        assert_eq!(
+            super::query_presence_confirmed(&tx, &display).await,
+            Err(super::PresenceQueryFailed)
+        );
+        dropper.await.unwrap();
+
+        // Nobody answers before the bounded timeout.
+        let (tx, _rx) = mpsc::channel(1);
+        assert_eq!(
+            super::query_presence_confirmed(&tx, &display).await,
+            Err(super::PresenceQueryFailed)
+        );
+    }
+
+    /// Add the standard `on_observed_gain`/`on_observed_loss` hook
+    /// configuration that the gating tests share.
+    fn cfg_with_gain_loss_hooks(cfg: &mut Config) {
+        let display = cfg.displays.get_mut("shared").unwrap();
+        display.hooks.on_observed_gain = vec![hook_action("gain")];
+        display.hooks.on_observed_loss = vec![hook_action("loss")];
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deferred_observed_gain_releases_when_presence_confirmed() {
+        let mut cfg = config();
+        cfg_with_gain_loss_hooks(&mut cfg);
+        // loss_confirmations = 3 (default), poll_interval = 6 s.
+        // tick 1-3: 0x12 → loss commits at tick 3 → "loss" hook fires
+        // tick 4-6: 0x11 → gain commits at tick 6 → gate → Some(false)
+        //   → defer, mark pending, log observed_gain_deferred
+        // tick 7:    no transition → drain pending → query → Some(true)
+        //   → fire "gain" hook once, clear pending, log observed_gain_released
+        // tick 8-9:  pending empty → no further fire
+        let sink = Arc::new(ScriptedSink::with_inputs([
+            Ok(Some(0x12)),
+            Ok(Some(0x12)),
+            Ok(Some(0x12)),
+            Ok(Some(0x11)),
+            Ok(Some(0x11)),
+            Ok(Some(0x11)),
+            Ok(Some(0x11)),
+            Ok(Some(0x11)),
+            Ok(Some(0x11)),
+        ]));
+        let ((_config_tx, _executors_tx, mut ctl_rx, state, cancel), _handle, calls) =
+            hooked_poller_with_ctl_rx(cfg, sink);
+        let mut script = VecDeque::from([
+            // tick 6 — gate query after committed gain
+            Some(false),
+            // tick 7 — pending-tick query: presence confirmed → release
+            Some(true),
+        ]);
+        for tick_n in 1..=9 {
+            tick().await;
+            answer_presence_scripted(&mut ctl_rx, &mut script).await;
+            if tick_n == 6 {
+                let recorded = calls.lock().unwrap().clone();
+                assert_eq!(
+                    recorded,
+                    vec!["loss".to_string()],
+                    "the gain hook must defer while presence is unconfirmed (tick 6)"
+                );
+            }
+            if tick_n == 7 {
+                let recorded = calls.lock().unwrap().clone();
+                assert_eq!(
+                    recorded,
+                    vec!["loss".to_string(), "gain".to_string()],
+                    "the deferred gain hook must fire once presence is confirmed (tick 7)"
+                );
+            }
+        }
+        assert!(state.snapshot()[&DisplayId("shared".into())].owned);
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec!["loss".to_string(), "gain".to_string()],
+            "gain must fire exactly once after the deferred release"
+        );
+        cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn committed_loss_clears_pending_observed_gain() {
+        let mut cfg = config();
+        cfg_with_gain_loss_hooks(&mut cfg);
+        // tick 1-3: 0x12 → loss commits → "loss" hook fires
+        // tick 4-6: 0x11 → gain commits → gate → Some(false) → defer
+        // tick 7-9: 0x12 → loss commits → CLEAR pending, "loss" hook fires
+        // tick 10-12: 0x12 → no transitions; pending empty; no further fire
+        // The deferred gain never fires: the committed loss cleared it.
+        let sink = Arc::new(ScriptedSink::with_inputs([
+            Ok(Some(0x12)),
+            Ok(Some(0x12)),
+            Ok(Some(0x12)),
+            Ok(Some(0x11)),
+            Ok(Some(0x11)),
+            Ok(Some(0x11)),
+            Ok(Some(0x12)),
+            Ok(Some(0x12)),
+            Ok(Some(0x12)),
+            Ok(Some(0x12)),
+            Ok(Some(0x12)),
+            Ok(Some(0x12)),
+        ]));
+        let ((_config_tx, _executors_tx, mut ctl_rx, state, cancel), _handle, calls) =
+            hooked_poller_with_ctl_rx(cfg, sink);
+        // Nobody is present while the display is owned (ticks 1-9). Presence
+        // is confirmed from tick 10, after the loss has committed: a deferral
+        // that survived the loss would fire the gain hook then.
+        for tick_no in 1..=12 {
+            tick().await;
+            let answer = Some(tick_no >= 10);
+            while let Ok(msg) = ctl_rx.try_recv() {
+                if let ControlMsg::QueryPresenceConfirmed { reply, .. } = msg {
+                    let _ = reply.send(answer);
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(!state.snapshot()[&DisplayId("shared".into())].owned);
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec!["loss".to_string(), "loss".to_string()],
+            "no observed_gain hook must fire after the pending was cleared"
+        );
+        cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn committed_gain_with_presence_true_fires_immediately() {
+        let mut cfg = config();
+        cfg_with_gain_loss_hooks(&mut cfg);
+        let sink = Arc::new(ScriptedSink::with_inputs([
+            Ok(Some(0x12)),
+            Ok(Some(0x12)),
+            Ok(Some(0x12)),
+            Ok(Some(0x11)),
+            Ok(Some(0x11)),
+            Ok(Some(0x11)),
+        ]));
+        let ((_config_tx, _executors_tx, mut ctl_rx, state, cancel), _handle, calls) =
+            hooked_poller_with_ctl_rx(cfg, sink);
+        let mut script = VecDeque::from([Some(true)]);
+        for _ in 0..6 {
+            tick().await;
+            answer_presence_scripted(&mut ctl_rx, &mut script).await;
+        }
+        assert!(state.snapshot()[&DisplayId("shared".into())].owned);
+        assert_eq!(*calls.lock().unwrap(), ["loss", "gain"]);
+        cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn observed_return_with_presence_false_deferred_then_released() {
+        let mut cfg = config();
+        cfg_with_gain_loss_hooks(&mut cfg);
+        // tick 1: 0x12 → peer sighting (owned stays true; too brief to commit)
+        // tick 2: 0x11 → observed_return = true → gate → Some(false) → defer
+        // tick 3: pending → query → Some(true) → fire "gain" hook, clear pending
+        // tick 4-5: pending empty, no fire
+        let sink = Arc::new(ScriptedSink::with_inputs([
+            Ok(Some(0x12)),
+            Ok(Some(0x11)),
+            Ok(Some(0x11)),
+            Ok(Some(0x11)),
+            Ok(Some(0x11)),
+        ]));
+        let ((_config_tx, _executors_tx, mut ctl_rx, state, cancel), _handle, calls) =
+            hooked_poller_with_ctl_rx(cfg, sink);
+        let mut script = VecDeque::from([Some(false), Some(true)]);
+        for tick_n in 1..=5 {
+            tick().await;
+            answer_presence_scripted(&mut ctl_rx, &mut script).await;
+            if tick_n == 4 {
+                let recorded = calls.lock().unwrap().clone();
+                assert_eq!(
+                    recorded,
+                    Vec::<String>::new(),
+                    "the observed_return hook must defer while presence is unconfirmed (tick 4)"
+                );
+            }
+            if tick_n == 5 {
+                let recorded = calls.lock().unwrap().clone();
+                assert_eq!(
+                    recorded,
+                    vec!["gain".to_string()],
+                    "the deferred observed_return hook must fire once presence is confirmed (tick 5)"
+                );
+            }
+        }
+        assert!(state.snapshot()[&DisplayId("shared".into())].owned);
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec!["gain".to_string()],
+            "observed_return deferred then released fires exactly once"
+        );
+        cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn knob_disabled_skips_presence_query() {
+        let mut cfg = config();
+        cfg_with_gain_loss_hooks(&mut cfg);
+        // The display opts out of the presence gate.
+        cfg.displays
+            .get_mut("shared")
+            .unwrap()
+            .hooks
+            .observed_gain_requires_presence = false;
+        let sink = Arc::new(ScriptedSink::with_inputs([
+            Ok(Some(0x12)),
+            Ok(Some(0x12)),
+            Ok(Some(0x12)),
+            Ok(Some(0x11)),
+            Ok(Some(0x11)),
+            Ok(Some(0x11)),
+        ]));
+        let ((_config_tx, _executors_tx, mut ctl_rx, _state, cancel), _handle, calls) =
+            hooked_poller_with_ctl_rx(cfg, sink);
+        for _ in 0..6 {
+            tick().await;
+        }
+        // The poller must never have sent a presence query when the knob
+        // is off — every message on ctl_rx is `OwnershipPoll`,
+        // `PublishDaemonEvent`, or some other variant, but NOT
+        // `QueryPresenceConfirmed`.
+        while let Ok(msg) = ctl_rx.try_recv() {
+            assert!(
+                !matches!(msg, ControlMsg::QueryPresenceConfirmed { .. }),
+                "knob=false must not query presence, got {msg:?}"
+            );
+        }
+        assert_eq!(*calls.lock().unwrap(), ["loss", "gain"]);
+        cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropped_query_reply_fails_open_and_fires_hook() {
+        let mut cfg = config();
+        cfg_with_gain_loss_hooks(&mut cfg);
+        let sink = Arc::new(ScriptedSink::with_inputs([
+            Ok(Some(0x12)),
+            Ok(Some(0x12)),
+            Ok(Some(0x12)),
+            Ok(Some(0x11)),
+            Ok(Some(0x11)),
+            Ok(Some(0x11)),
+            Ok(Some(0x11)),
+        ]));
+        let ((_config_tx, _executors_tx, mut ctl_rx, _state, cancel), _handle, calls) =
+            hooked_poller_with_ctl_rx(cfg, sink);
+        for _ in 0..7 {
+            tick().await;
+            // Drop every presence query's reply so the poller's
+            // `reply_rx` returns `Err` and the gate fails open.
+            while let Ok(msg) = ctl_rx.try_recv() {
+                if let ControlMsg::QueryPresenceConfirmed { reply, .. } = msg {
+                    drop(reply);
+                }
+            }
+            // Give the wakened poller task a chance to consume the
+            // dropped sender's wakeup before the next tick's advance
+            // trips the 1-second presence-query timeout fail-open path.
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["loss", "gain"],
+            "dropped reply must fail open and fire the gain hook"
         );
         cancel.cancel();
     }

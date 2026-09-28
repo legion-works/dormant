@@ -1726,6 +1726,15 @@ pub struct HookSlots {
     /// Post-hoc actions after dormant wakes a dark display or tears down a render stage.
     #[serde(default)]
     pub on_wake: Vec<HookAction>,
+    /// When true (the default), a post-hoc `on_observed_gain` hook fires
+    /// only after a driving zone is confirmed present — the daemon defers
+    /// the hook until someone is actually at the desk so a panel hunting
+    /// inputs overnight cannot wake downstream consumers (USB KVM,
+    /// notifications). When false, the hook fires on every committed gain
+    /// as it always has. The fail-safe presence doctrine is preserved:
+    /// unavailable sensors do not count as present.
+    #[serde(default = "default_observed_gain_requires_presence")]
+    pub observed_gain_requires_presence: bool,
 }
 
 impl Default for HookSlots {
@@ -1739,6 +1748,7 @@ impl Default for HookSlots {
             on_observed_loss: Vec::new(),
             on_observed_gain: Vec::new(),
             on_wake: Vec::new(),
+            observed_gain_requires_presence: default_observed_gain_requires_presence(),
         }
     }
 }
@@ -2067,6 +2077,9 @@ fn default_hook_timeout() -> Duration {
 }
 fn default_hook_total_timeout() -> Duration {
     defaults::HOOK_TOTAL_TIMEOUT
+}
+fn default_observed_gain_requires_presence() -> bool {
+    defaults::OBSERVED_GAIN_REQUIRES_PRESENCE
 }
 fn default_pair_timeout() -> Duration {
     defaults::PAIR_TIMEOUT

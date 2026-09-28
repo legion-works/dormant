@@ -24,7 +24,16 @@ export interface HooksInspectorProps {
 }
 
 interface SlotDef {
-  key: keyof HookSlots;
+  /** Restricted to the seven HookAction-array slots — excludes scalar
+   *  knobs like `timeout` and `observed_gain_requires_presence`. */
+  key:
+    | "before_release"
+    | "after_release"
+    | "before_acquire"
+    | "after_acquire"
+    | "on_observed_loss"
+    | "on_observed_gain"
+    | "on_wake";
   label: string;
   /** Default for `blocking` when absent from the TOML — per-slot fallback. */
   defaultBlocking: boolean;
@@ -66,7 +75,7 @@ export default function HooksInspector({ hooks, displayId, hookEditEnabled, stor
   const editing = Boolean(hookEditEnabled && store && onDirty);
 
   /** Emit a whole slot's action array as a single Set patch. */
-  function emitSlot(slotKey: keyof HookSlots, actions: HookAction[]) {
+  function emitSlot(slotKey: SlotDef["key"], actions: HookAction[]) {
     if (!store || !onDirty) return;
     const path = ["displays", displayId, "hooks", slotKey];
     store.trackEdit(path, actions.length === 0 ? [] : actions);

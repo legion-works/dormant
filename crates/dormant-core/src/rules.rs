@@ -1778,11 +1778,12 @@ impl RulesEngine {
     /// unavailable-members-are-absent doctrine: a zone whose only sensors
     /// are unavailable is confirmed absent, not absent-by-unknown).
     ///
-    /// Distinct from [`Self::effective_zone_presence`], which treats
+    /// Distinct from `effective_zone_presence`, which treats
     /// unknown zones as present for fail-safe display retention; this query
     /// answers the narrower "is someone actually here?" question that
     /// `on_observed_gain` must answer before waking downstream consumers
     /// (a USB KVM, a notification daemon) on a panel-only ownership gain.
+    #[must_use]
     pub fn display_confirmed_presence(&self, display: &DisplayId) -> Option<bool> {
         let driving: Vec<&RuleRuntimeCfg> = self
             .cfg

@@ -297,6 +297,7 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "on_observed_loss",
             "on_observed_gain",
             "on_wake",
+            "observed_gain_requires_presence",
         ],
     ),
     (

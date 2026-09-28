@@ -654,6 +654,12 @@ export interface HookSlots {
   on_observed_gain?: HookAction[];
   /** Post-hoc command after dormant wakes a dark display. */
   on_wake?: HookAction[];
+  /**
+   * When true (default), an `on_observed_gain` hook only fires after a driving
+   * zone is confirmed present; absent or fail-safe-unavailable zones keep the
+   * hook deferred until someone is actually at the desk.
+   */
+  observed_gain_requires_presence?: boolean;
 }
 
 /** rust: config/schema.rs SensorConfig — internally-tagged enum, tag = "type" */

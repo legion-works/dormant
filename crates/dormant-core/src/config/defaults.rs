@@ -410,3 +410,10 @@ pub const PUBLISH_INSTANCE_ID_FALLBACK: &str = "dormant";
 
 /// Whether the opt-in MQTT state-publish feature is enabled by default.
 pub const PUBLISH_ENABLED: bool = false;
+
+/// Default for [`super::schema::HookSlots::observed_gain_requires_presence`].
+/// `true` so a panel hunting inputs overnight cannot wake downstream
+/// consumers (USB KVM, notifications) until a driving zone is confirmed
+/// present — preserves the fail-safe presence doctrine by treating
+/// unavailable sensors as absent, not present.
+pub const OBSERVED_GAIN_REQUIRES_PRESENCE: bool = true;

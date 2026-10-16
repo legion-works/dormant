@@ -184,6 +184,9 @@ fn active_sampler_display_context(
         .as_ref()
         .and_then(|sampling| sampling.stream_mode);
     DisplaySamplingContext {
+        panel_expectation: crate::active_sampler::source_gate::PanelExpectation::from_display(
+            display_config,
+        ),
         display: display_exists.then(|| DisplayExpectation {
             display: display.0.clone(),
             compositor_output,
@@ -488,6 +491,7 @@ async fn spawn_active_sampler_runtime(
     let (updates, update_rx) = mpsc::channel::<SamplerUpdate>(16);
     let cancel = sampler_cancellation_token(root);
     let (handle, join) = active_sampler::spawn_with_handle(ActiveSamplerDeps {
+        panel_reader: Arc::new(dormant_displays::connector_panel::SystemConnectorPanelReader),
         initial_config: cfg.clone(),
         display_id: display_id.clone(),
         update_rx,

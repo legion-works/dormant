@@ -682,11 +682,10 @@ fn vcp_display_info_from_ddc_info(info: &ddc_hi::DisplayInfo) -> VcpDisplayInfo 
 /// edid-rs) but leaves empty on macOS when the vendored `ddc-macos` fork's
 /// `edid()` bytes fail edid-rs parsing.
 ///
-/// Gated `any(macos, all(test, linux|macos))`: consumed by macOS production
-/// (`backfill_edid_identity_from_macos`) and by the EDID tests, which are
-/// themselves gated to linux/macos. Bare `test` left the whole cluster dead
-/// on Windows.
+/// Linux connector identity and macOS backfill share the same parser; Windows
+/// uses it only in tests because its production backend supplies parsed EDID.
 #[cfg(any(
+    target_os = "linux",
     target_os = "macos",
     all(
         test,
@@ -694,10 +693,10 @@ fn vcp_display_info_from_ddc_info(info: &ddc_hi::DisplayInfo) -> VcpDisplayInfo 
     )
 ))]
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct EdidIdentity {
-    manufacturer: Option<String>,
-    model: Option<String>,
-    serial: Option<String>,
+pub(crate) struct EdidIdentity {
+    pub(crate) manufacturer: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) serial: Option<String>,
 }
 
 /// Parse the cross-machine EDID identity from raw EDID bytes: the manufacturer
@@ -717,13 +716,14 @@ struct EdidIdentity {
 /// present-but-empty descriptor yields `EdidIdentity` with `None` fields,
 /// which [`VcpDisplayInfo::claim_identity`] collapses to `None` (honest).
 #[cfg(any(
+    target_os = "linux",
     target_os = "macos",
     all(
         test,
         any(target_os = "linux", target_os = "macos", target_os = "windows")
     )
 ))]
-fn parse_edid_identity(edid: &[u8]) -> Option<EdidIdentity> {
+pub(crate) fn parse_edid_identity(edid: &[u8]) -> Option<EdidIdentity> {
     // The base block is 128 bytes; the four 18-byte descriptor slots live at
     // offsets 54..126. Extension blocks do not carry base identity.
     if edid.len() < 128 {
@@ -742,6 +742,7 @@ fn parse_edid_identity(edid: &[u8]) -> Option<EdidIdentity> {
 /// (big-endian u16, three 5-bit groups, 1–26 → 'A'–'Z'). A 0 group means
 /// "unused" and is skipped rather than fabricated into a partial id.
 #[cfg(any(
+    target_os = "linux",
     target_os = "macos",
     all(
         test,
@@ -771,6 +772,7 @@ fn decode_pnp_manufacturer(high: u8, low: u8) -> Option<String> {
 /// byte 3 — the previous code checked byte 2, which is always zero, and
 /// so never matched any descriptor.
 #[cfg(any(
+    target_os = "linux",
     target_os = "macos",
     all(
         test,
@@ -799,6 +801,7 @@ fn parse_monitor_descriptors(slots: &[u8]) -> (Option<String>, Option<String>) {
 /// data range. Trailing whitespace is trimmed; a non-UTF8 or empty result is
 /// `None`.
 #[cfg(any(
+    target_os = "linux",
     target_os = "macos",
     all(
         test,
@@ -1316,7 +1319,7 @@ impl VcpOps for FakeVcp {
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::time::Duration;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::time::Instant;
@@ -1452,7 +1455,7 @@ mod tests {
     /// XK2R9JA000013) with a valid checksum — a descriptor-correct fixture for
     /// `parse_edid_identity` (T1 fix, Leg 2).
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    fn ag326uzd_edid() -> Vec<u8> {
+    pub(crate) fn ag326uzd_edid() -> Vec<u8> {
         let mut e = vec![0u8; 128];
         e[0..8].copy_from_slice(&[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
         // manufacturer AOC = (1<<10)|(15<<5)|3 = 0x05E3 (big-endian)

@@ -13,6 +13,7 @@
 
 pub mod blank_owner;
 pub mod command;
+pub mod connector_panel;
 pub mod ddc_lock;
 pub mod ddcci;
 pub mod executor;

@@ -2818,7 +2818,11 @@ mod tests {
         handle.notify_observed_loss(&display_id()).await;
 
         let captured = commands.lock().unwrap().clone();
-        assert!(captured.is_empty(), "no hook should fire on empty slot");
+        assert_eq!(
+            captured,
+            Vec::<Vec<String>>::new(),
+            "no hook should fire on empty slot"
+        );
     }
 
     #[tokio::test]
@@ -2858,7 +2862,11 @@ mod tests {
             .await;
 
         let captured = commands.lock().unwrap().clone();
-        assert!(captured.is_empty(), "unknown display must not fire hooks");
+        assert_eq!(
+            captured,
+            Vec::<Vec<String>>::new(),
+            "unknown display must not fire hooks"
+        );
     }
 
     #[tokio::test]
@@ -3138,7 +3146,11 @@ mod tests {
         assert_eq!(outcome, SwitchOutcome::Switched);
 
         let events = drain_events(&mut front_ctl_rx);
-        assert!(!events.is_empty(), "push must emit Ownership event");
+        assert_ne!(
+            events,
+            Vec::<DaemonEvent>::new(),
+            "push must emit Ownership event"
+        );
 
         match &events[0] {
             DaemonEvent::Ownership {

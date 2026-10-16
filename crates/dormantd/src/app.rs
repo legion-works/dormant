@@ -6698,6 +6698,7 @@ fn spawn_generation(
         && let Some(state) = coordination
     {
         producer_handles.push(coordination_poll::spawn(CoordinationPollDeps {
+            panel_reader: Arc::new(dormant_displays::connector_panel::SystemConnectorPanelReader),
             config_rx,
             ctl_tx: ctl_tx.clone(),
             executors_rx,

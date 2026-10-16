@@ -130,7 +130,11 @@ blank_mode = "screen_off_audio_on"
 
         let results = probe_samsung(&cfg, &creds).await;
 
-        assert!(!results.is_empty(), "should produce probe results");
+        assert_ne!(
+            results,
+            Vec::<ProbeResult>::new(),
+            "should produce probe results"
+        );
 
         // Token present check should pass.
         let token_check = results

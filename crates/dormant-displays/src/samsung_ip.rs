@@ -1593,7 +1593,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("does-not-exist.json");
         let map = load_token_state(&path).unwrap();
-        assert!(map.is_empty());
+        assert_eq!(map, HashMap::<String, String>::new());
     }
 
     #[test]
@@ -1602,7 +1602,7 @@ mod tests {
         let path = dir.path().join("empty.json");
         std::fs::write(&path, "").unwrap();
         let map = load_token_state(&path).unwrap();
-        assert!(map.is_empty());
+        assert_eq!(map, HashMap::<String, String>::new());
     }
 
     #[test]

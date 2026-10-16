@@ -2461,7 +2461,11 @@ mod tests {
         // Blank must succeed as no-op even though TV is unreachable.
         ctrl.blank(BlankMode::ScreenOffAudioOn).await.unwrap();
         let keys = fake.take_sent_keys();
-        assert!(keys.is_empty(), "no keys should be sent when unreachable");
+        assert_eq!(
+            keys,
+            Vec::<String>::new(),
+            "no keys should be sent when unreachable"
+        );
     }
 
     #[tokio::test]
@@ -2476,7 +2480,11 @@ mod tests {
         );
         ctrl.wake().await.unwrap();
         let keys = fake.take_sent_keys();
-        assert!(keys.is_empty(), "no keys should be sent when unreachable");
+        assert_eq!(
+            keys,
+            Vec::<String>::new(),
+            "no keys should be sent when unreachable"
+        );
     }
 
     /// #193: with `WoL` configured, a TV that STAYS unreachable through the

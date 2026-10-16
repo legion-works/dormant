@@ -767,7 +767,7 @@ mod tests {
             publish: dormant_core::config::PublishConfig::default(),
         };
         let paths = redact_config_secrets(&mut cfg);
-        assert!(paths.is_empty());
+        assert_eq!(paths, Vec::<Vec<String>>::new());
     }
 
     #[test]
@@ -800,9 +800,12 @@ topic = "test""#;
         let result = get_config(State(state)).await.unwrap();
         let resp = result.0;
         assert_eq!(resp.config_version, 1);
-        assert!(!resp.raw_toml.is_empty());
+        assert_ne!(resp.raw_toml, "");
         assert!(resp.validation.ok);
-        assert!(resp.validation.errors.is_empty());
+        assert_eq!(
+            resp.validation.errors,
+            Vec::<SerializableValidationError>::new()
+        );
         assert!(resp.validation.load_error.is_none());
     }
 
@@ -1024,7 +1027,10 @@ entity = "binary_sensor.motion"
             "inventory leaked secret on error path: {inventory_json}"
         );
         // display_rules must be coherent (from last-applied inventory, not disk).
-        assert!(resp.display_rules.is_empty());
+        assert_eq!(
+            resp.display_rules,
+            HashMap::<String, DisplayRuleInfo>::new()
+        );
     }
 
     #[tokio::test]
@@ -1073,7 +1079,10 @@ field = "/val"
             resp.raw_toml
         );
         // display_rules must be from last-applied (coherent with inventory).
-        assert!(resp.display_rules.is_empty());
+        assert_eq!(
+            resp.display_rules,
+            HashMap::<String, DisplayRuleInfo>::new()
+        );
     }
 
     // ── Absent-optional serialization (#40) ────────────────────────────────

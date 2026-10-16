@@ -451,7 +451,11 @@ mod tests {
         let _router = build_router(state);
 
         let derived = registered_post_routes();
-        assert!(!derived.is_empty(), "derivation must not be empty");
+        assert_ne!(
+            derived,
+            Vec::<&'static str>::new(),
+            "derivation must not be empty"
+        );
 
         for path in &derived {
             assert!(

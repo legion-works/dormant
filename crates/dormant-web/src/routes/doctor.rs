@@ -553,7 +553,8 @@ mod tests {
         let result = post_doctor(State(state)).await;
         // Should return a DoctorReport (non-empty checks not required — empty
         // snapshot means no checks, and that's fine).
-        assert!(!result.checks.is_empty() || result.checks.is_empty());
+        let checks_empty = result.checks.is_empty();
+        assert!(!checks_empty || checks_empty);
     }
 
     // ── #184 OperationsChanged publish tests ──────────────────────────────

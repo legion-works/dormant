@@ -817,7 +817,11 @@ mod tests {
             "ambiguous targets should produce no Register calls, got: {recorded:?}"
         );
         let notifications = notif_rec.lock().unwrap();
-        assert!(!notifications.is_empty(), "ambiguous target must notify");
+        assert_ne!(
+            notifications,
+            Vec::<(String, String)>::new(),
+            "ambiguous target must notify"
+        );
     }
 
     #[tokio::test]

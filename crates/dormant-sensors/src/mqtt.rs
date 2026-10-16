@@ -1268,7 +1268,7 @@ mod tests {
             &mut warned,
             &mut warned_availability,
         );
-        assert!(events.is_empty());
+        assert_eq!(events, Vec::<PresenceEvent>::new());
         assert!(warned.contains("test/sensor"));
 
         // Second bad payload → no warn (already warned).
@@ -1278,7 +1278,7 @@ mod tests {
             &mut warned,
             &mut warned_availability,
         );
-        assert!(events.is_empty());
+        assert_eq!(events, Vec::<PresenceEvent>::new());
     }
 
     #[test]
@@ -1292,7 +1292,7 @@ mod tests {
             &mut warned,
             &mut warned_availability,
         );
-        assert!(events.is_empty());
+        assert_eq!(events, Vec::<PresenceEvent>::new());
     }
 
     // ── dispatch_publish: availability routing + warn-once (Task 2) ────────
@@ -1399,7 +1399,7 @@ mod tests {
             &mut warned,
             &mut warned_availability,
         );
-        assert!(events.is_empty());
+        assert_eq!(events, Vec::<PresenceEvent>::new());
         assert!(
             warned_availability.contains(&("shared/availability".to_string(), "a".to_string()))
         );
@@ -1414,7 +1414,7 @@ mod tests {
             &mut warned,
             &mut warned_availability,
         );
-        assert!(events.is_empty());
+        assert_eq!(events, Vec::<PresenceEvent>::new());
         assert!(
             warned_availability.contains(&("shared/availability".to_string(), "a".to_string()))
         );
@@ -1443,14 +1443,14 @@ mod tests {
             &mut warned,
             &mut warned_availability,
         );
-        assert!(events.is_empty());
+        assert_eq!(events, Vec::<PresenceEvent>::new());
         let (events, _availability) = source.dispatch_publish(
             "test/sensor/availability",
             b"garbled2",
             &mut warned,
             &mut warned_availability,
         );
-        assert!(events.is_empty());
+        assert_eq!(events, Vec::<PresenceEvent>::new());
 
         let (events, _availability) = source.dispatch_publish(
             "test/sensor/availability",

@@ -794,7 +794,7 @@ mod tests {
     #[test]
     fn empty_sources_yields_empty_playlist() {
         let playlist = build_playlist(&[], Some(42));
-        assert!(playlist.is_empty());
+        assert_eq!(playlist, Vec::<PlaylistItem>::new());
     }
 
     #[test]
@@ -809,7 +809,7 @@ mod tests {
             image_duration: None,
         };
         let playlist = build_playlist(&[source], Some(42));
-        assert!(playlist.is_empty());
+        assert_eq!(playlist, Vec::<PlaylistItem>::new());
     }
 
     #[test]

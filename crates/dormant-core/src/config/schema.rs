@@ -1543,6 +1543,12 @@ pub struct DisplayConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compositor_output: Option<String>,
 
+    /// Case-insensitive panel identity substring required on `compositor_output`,
+    /// or `output` when no compositor output is declared. Missing identity is
+    /// inconclusive; only a positively identified different panel closes the gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_panel: Option<String>,
+
     /// Compositor-sampling declaration table. Absent when the operator has
     /// not opted this display into active sampling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3499,6 +3505,7 @@ blank_mode = "power_off"
     /// is set explicitly.
     fn make_minimal_display() -> DisplayConfig {
         DisplayConfig {
+            output_panel: None,
             controllers: Vec::new(),
             scope: crate::config::schema::DisplayScope::Private,
             shared_input_code: None,

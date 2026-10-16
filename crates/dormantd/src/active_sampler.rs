@@ -2642,6 +2642,7 @@ mod tests {
         config.displays.insert(
             "oled".to_owned(),
             DisplayConfig {
+                output_panel: None,
                 controllers: vec![],
                 scope: dormant_core::config::schema::DisplayScope::default(),
                 shared_input_code: None,
@@ -5420,6 +5421,7 @@ mod tests {
         config.displays.insert(
             "tv".to_owned(),
             DisplayConfig {
+                output_panel: None,
                 controllers: vec!["samsung-tizen".to_owned()],
                 scope: DisplayScope::default(),
                 shared_input_code: None,
@@ -6751,6 +6753,7 @@ mod tests {
         config.displays.insert(
             "monitor".to_owned(),
             DisplayConfig {
+                output_panel: None,
                 controllers: vec!["ddcci".to_owned()],
                 scope: DisplayScope::default(),
                 shared_input_code: None,
@@ -6791,6 +6794,7 @@ mod tests {
         config.displays.insert(
             "tv".to_owned(),
             DisplayConfig {
+                output_panel: None,
                 controllers: vec!["samsung-tizen".to_owned()],
                 scope: DisplayScope::default(),
                 shared_input_code: None,

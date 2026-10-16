@@ -181,6 +181,7 @@ fn fake_direct_switch_with(
 
     if let Some(name) = display_name {
         let dc = dormant_core::config::schema::DisplayConfig {
+            output_panel: None,
             controllers: vec!["ddcci".into()],
             scope: DisplayScope::Shared,
             shared_input_code: Some(0x10),

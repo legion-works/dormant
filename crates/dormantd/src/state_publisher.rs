@@ -1749,6 +1749,7 @@ mod tests {
         cfg.displays.insert(
             "main".into(),
             DisplayConfig {
+                output_panel: None,
                 controllers: vec!["kwin-dpms".into()],
                 scope: DisplayScope::default(),
                 shared_input_code: None,
@@ -3338,6 +3339,7 @@ mod async_tests {
         cfg.displays.insert(
             "main".into(),
             DisplayConfig {
+                output_panel: None,
                 controllers: vec!["kwin-dpms".into()],
                 scope: DisplayScope::default(),
                 shared_input_code: None,

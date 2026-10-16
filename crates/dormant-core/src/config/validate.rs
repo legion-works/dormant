@@ -262,6 +262,7 @@ static KNOWN_KEYS: &[(&str, &[&str])] = &[
             "panel_type",
             "power_off_opt_in",
             "compositor_output",
+            "output_panel",
             "sampling",
             "hooks",
         ],
@@ -1705,6 +1706,23 @@ fn validate_display_with_input_source_readers(
             what: crate::error::E_CONFIG_INVALID.into(),
             detail: format!("display '{display_id}' compositor_output must not be empty"),
         });
+    }
+
+    if let Some(panel) = &dc.output_panel {
+        if panel.trim().is_empty() {
+            errors.push(ValidationError {
+                what: crate::error::E_CONFIG_INVALID.into(),
+                detail: format!("display '{display_id}' output_panel must not be empty"),
+            });
+        }
+        if dc.output.is_none() && dc.compositor_output.is_none() {
+            errors.push(ValidationError {
+                what: crate::error::E_CONFIG_INVALID.into(),
+                detail: format!(
+                    "display '{display_id}' output_panel requires output or compositor_output"
+                ),
+            });
+        }
     }
 
     if let Some(sampling) = &dc.sampling {
@@ -4343,6 +4361,7 @@ gracee_period = "60s"
     fn base_display_cfg() -> DisplayConfig {
         use crate::config::defaults;
         DisplayConfig {
+            output_panel: None,
             controllers: Vec::new(),
             scope: crate::config::DisplayScope::Private,
             shared_input_code: None,
@@ -5191,6 +5210,7 @@ password = "test-pass"
             displays: IndexMap::from([(
                 "main".into(),
                 DisplayConfig {
+                    output_panel: None,
                     controllers: vec!["kwin-dpms".into(), "ddcci".into()],
                     scope: crate::config::DisplayScope::Private,
                     shared_input_code: None,
@@ -5260,6 +5280,7 @@ password = "test-pass"
             displays: IndexMap::from([(
                 "blankless".into(),
                 DisplayConfig {
+                    output_panel: None,
                     controllers: vec!["command".into()],
                     scope: crate::config::DisplayScope::Private,
                     shared_input_code: None,
@@ -5408,6 +5429,7 @@ password = "test-pass"
     fn ladder_desugar_blank_mode_power_off() {
         use crate::config::defaults;
         let dc = DisplayConfig {
+            output_panel: None,
             blank_mode: Some(BlankMode::PowerOff),
             scope: crate::config::DisplayScope::Private,
             shared_input_code: None,
@@ -6509,6 +6531,7 @@ kind = "power_off"
     fn blank_display_config() -> DisplayConfig {
         use crate::config::defaults;
         DisplayConfig {
+            output_panel: None,
             blank_mode: None,
             scope: crate::config::DisplayScope::Private,
             shared_input_code: None,
@@ -6707,6 +6730,42 @@ kind = "power_off"
                 .to_string()
                 .contains("wear.active_sampling.unknown")
         );
+    }
+
+    #[test]
+    fn output_panel_validation() {
+        for (extra, expected) in [
+            (
+                "output_panel = '   '\noutput = 'HDMI-A-1'",
+                Some("must not be empty"),
+            ),
+            (
+                "output_panel = 'AG326UZD'",
+                Some("requires output or compositor_output"),
+            ),
+            ("output_panel = 'AG326UZD'\noutput = 'HDMI-A-1'", None),
+            (
+                "output_panel = 'AG326UZD'\ncompositor_output = 'HDMI-A-1'",
+                None,
+            ),
+        ] {
+            let errors = validate_str(&format!(
+                "config_version = 1\n[displays.monitor]\ncontrollers = ['ddcci']\nblank_mode = 'brightness_zero'\n{extra}\n"
+            ));
+            if let Some(expected) = expected {
+                assert_eq!(errors.len(), 1, "{errors:?}");
+                assert!(errors[0].detail.contains("monitor"));
+                assert!(errors[0].detail.contains(expected), "{errors:?}");
+            } else {
+                assert_eq!(errors.len(), 0, "{errors:?}");
+            }
+        }
+        let value: toml::Value =
+            toml::from_str("[displays.monitor]\noutput_panel = 'AOC'\noutput_panel_typo = 'typo'")
+                .unwrap();
+        let unknown = collect_unknown_keys(&value);
+        assert_eq!(unknown.len(), 1, "{unknown:?}");
+        assert_eq!(unknown[0].key_path, "displays.monitor.output_panel_typo");
     }
 
     #[test]

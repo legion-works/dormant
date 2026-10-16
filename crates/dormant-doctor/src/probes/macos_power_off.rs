@@ -125,6 +125,7 @@ mod tests {
     fn base_display_cfg() -> DisplayConfig {
         use dormant_core::config::defaults;
         DisplayConfig {
+            output_panel: None,
             controllers: Vec::new(),
             scope: DisplayScope::Private,
             shared_input_code: None,

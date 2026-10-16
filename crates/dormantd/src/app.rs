@@ -673,6 +673,7 @@ mod active_sampler_reload_tests {
     /// context helper.
     fn sample_display_config() -> DisplayConfig {
         DisplayConfig {
+            output_panel: None,
             controllers: Vec::new(),
             scope: DisplayScope::default(),
             shared_input_code: None,
@@ -7530,6 +7531,7 @@ mod render_tests {
     /// helper to avoid coupling across crates.
     fn base_display_cfg_for_test() -> dormant_core::config::schema::DisplayConfig {
         dormant_core::config::schema::DisplayConfig {
+            output_panel: None,
             scope: dormant_core::config::DisplayScope::default(),
             shared_input_code: None,
             shared_input_write_code: None,
@@ -8116,6 +8118,7 @@ mod render_tests {
                 m.insert(
                     "mon".into(),
                     dormant_core::config::schema::DisplayConfig {
+                        output_panel: None,
                         scope: dormant_core::config::DisplayScope::default(),
                         shared_input_code: None,
                         shared_input_write_code: None,
@@ -9363,6 +9366,7 @@ mod macos_gamma_black_assembly_tests {
     #[tokio::test]
     async fn chain_with_no_effective_mode_fails_assembly_as_mode_unsupported() {
         let display = DisplayConfig {
+            output_panel: None,
             scope: dormant_core::config::DisplayScope::default(),
             shared_input_code: None,
             shared_input_write_code: None,
@@ -9446,6 +9450,7 @@ mod macos_gamma_black_assembly_tests {
         use dormant_core::types::{LadderStage, StageKind};
 
         let display = DisplayConfig {
+            output_panel: None,
             scope: dormant_core::config::DisplayScope::default(),
             shared_input_code: None,
             shared_input_write_code: None,
@@ -9726,6 +9731,7 @@ mod gamma_reload_tests {
 
     fn gamma_display_cfg(controller: &str, selector: &str) -> DisplayConfig {
         DisplayConfig {
+            output_panel: None,
             scope: dormant_core::config::DisplayScope::default(),
             shared_input_code: None,
             shared_input_write_code: None,

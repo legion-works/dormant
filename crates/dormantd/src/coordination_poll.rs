@@ -818,6 +818,7 @@ mod tests {
         displays.insert(
             "shared".to_string(),
             DisplayConfig {
+                output_panel: None,
                 controllers: vec!["ddcci".to_string()],
                 scope: DisplayScope::Shared,
                 shared_input_code: Some(0x11),

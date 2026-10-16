@@ -1773,7 +1773,7 @@ mod tests {
 
         let record = &handle.snapshot()[&aoc];
         assert!(!record.contested);
-        assert!(record.transition_times.is_empty());
+        assert_eq!(record.transition_times, VecDeque::<Instant>::new());
         assert!(record.owned);
     }
 

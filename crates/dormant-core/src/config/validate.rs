@@ -18,7 +18,7 @@ use crate::zone::{ZoneEngine, ZoneSpec};
 
 use super::defaults;
 use super::schema::{
-    Config, Credentials, DisplayConfig, DisplayScope, HookAction, ValidationError,
+    Config, Credentials, DisplayConfig, DisplayScope, HookAction, ValidationError, Warning,
 };
 use crate::mqtt::parse_broker_url;
 
@@ -2743,7 +2743,7 @@ gracee_period = "60s"
 "#;
         let value: toml::Value = toml::from_str(toml_str).unwrap();
         let unknown = collect_unknown_keys(&value);
-        assert!(!unknown.is_empty());
+        assert_ne!(unknown, Vec::<UnknownKey>::new());
         assert!(
             unknown.iter().any(|u| u.key_path.contains("gracee_period")),
             "expected gracee_period to be flagged, got {:?}",
@@ -2888,7 +2888,7 @@ gracee_period = "60s"
         let path = Path::new("/tmp/dormant-nonexistent-creds.toml");
         let creds = crate::config::load_credentials(path).unwrap();
         assert!(creds.ha_token.is_none());
-        assert!(creds.samsung.is_empty());
+        assert_eq!(creds.samsung, IndexMap::<String, String>::new());
     }
 
     #[cfg(unix)]
@@ -4972,7 +4972,7 @@ typo_top = true
 ";
         let value: toml::Value = toml::from_str(toml_str).unwrap();
         let unknown = collect_unknown_keys(&value);
-        assert!(!unknown.is_empty());
+        assert_ne!(unknown, Vec::<UnknownKey>::new());
         assert!(
             unknown.iter().any(|u| u.key_path == "typo_top"),
             "expected typo_top to be flagged, got {:?}",
@@ -5392,7 +5392,7 @@ password = "test-pass"
             &std::collections::HashMap::new(),
             &Credentials::default(),
         );
-        assert!(errors.is_empty());
+        assert_eq!(errors, Vec::<ValidationError>::new());
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────
@@ -7408,7 +7408,7 @@ stream_mode = "warm"
     #[test]
     fn watchdog_defaults_when_section_absent() {
         let (cfg, warnings) = load_str("config_version = 1\n").unwrap();
-        assert!(warnings.is_empty());
+        assert_eq!(warnings, Vec::<Warning>::new());
         // Literal values, NOT the defaults:: consts — comparing against the
         // same symbol that produced the value would be tautological and
         // couldn't catch a drifted const (spec §7 pins true / true / 5m).
@@ -7423,7 +7423,7 @@ stream_mode = "warm"
     #[test]
     fn watchdog_defaults_when_section_empty() {
         let (cfg, warnings) = load_str("config_version = 1\n[watchdog]\n").unwrap();
-        assert!(warnings.is_empty());
+        assert_eq!(warnings, Vec::<Warning>::new());
         // Literal values — see watchdog_defaults_when_section_absent.
         assert!(cfg.watchdog.lkg_enabled);
         assert!(cfg.watchdog.lkg_rollback_enabled);
@@ -8330,7 +8330,11 @@ availability_payload_offline = "down"
         let errors = validate_str(
             "config_version = 1\n[displays.desk]\ncontrollers = [\"command\", \"ddcci\"]\nblank_mode = \"power_off\"\nmodes = [\"power_off\"]\nblank_command = \"true\"\nwake_command = \"true\"\nscope = \"shared\"\nshared_input_code = 15\n",
         );
-        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert_eq!(
+            errors,
+            Vec::<ValidationError>::new(),
+            "unexpected errors: {errors:?}"
+        );
     }
 
     // ── KVM direct-write config tests ───────────────────────────────────────

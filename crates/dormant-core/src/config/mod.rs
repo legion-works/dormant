@@ -543,7 +543,7 @@ password = "secret"
         let (config, warnings) =
             load_config_from_bytes(b"config_version = 1\n", Strictness::Strict).unwrap();
         assert_eq!(config.config_version, 1);
-        assert!(warnings.is_empty());
+        assert_eq!(warnings, Vec::<Warning>::new());
         assert_eq!(
             load_credentials_from_bytes(b"").unwrap(),
             Credentials::default()

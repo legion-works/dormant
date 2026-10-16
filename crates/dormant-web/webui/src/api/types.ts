@@ -813,6 +813,8 @@ export interface DisplayConfig {
   ladder?: LadderStage[];
   screensaver?: ScreensaverConfig;
   output?: string;
+  /** Expected panel identity substring on compositor_output, falling back to output. */
+  output_panel?: string | null;
   ddc_display?: string;
   host?: string;
   wol_mac?: string;

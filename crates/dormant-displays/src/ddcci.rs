@@ -63,6 +63,12 @@ const D6_ON: u16 = 0x01;
 /// D6 value: display off.
 const D6_OFF: u16 = 0x05;
 
+/// D6 values MCCS defines for a panel that is not on: 0x02 standby,
+/// 0x03 suspend, 0x04 off (DPM) and 0x05 off (hard). A panel need not report
+/// back the exact value written: an AOC AG326UZD on HDMI reads 0x04 after a
+/// 0x05 write while its panel is dark.
+const D6_OFF_STATES: std::ops::RangeInclusive<u16> = 0x02..=0x05;
+
 // ── DdcciController ────────────────────────────────────────────────────────────
 
 /// Internal mutable state discovered during [`probe`].
@@ -888,10 +894,11 @@ impl DisplayController for DdcciController {
 
 impl DdcciController {
     /// Verify a `PowerOff` write without treating a panel that stops answering
-    /// during its sleep transition as a failed blank. A successful readback
-    /// that still reports the on value is actionable evidence that the write
-    /// was `ACKed` but not applied, so it must fail and let the executor try the
-    /// next controller.
+    /// during its sleep transition as a failed blank. Any MCCS off state
+    /// ([`D6_OFF_STATES`]) confirms the write. A readback that still reports
+    /// the on value is actionable evidence that the write was `ACKed` but not
+    /// applied, and a value outside the MCCS range is no evidence of off;
+    /// both fail and let the executor try the next controller.
     async fn verify_power_off_write(
         &self,
         ident: &str,
@@ -902,7 +909,7 @@ impl DdcciController {
             .get_vcp(ident, VCP_POWER, lock, VcpPriority::Command)
             .await
         {
-            Ok(D6_OFF) => Ok(()),
+            Ok(v) if D6_OFF_STATES.contains(&v) => Ok(()),
             Ok(v) => Err(CmdFailure {
                 controller: Self::NAME.to_string(),
                 error: format!(
@@ -1997,6 +2004,58 @@ mod tests {
             ctrl.state.lock().unwrap().last_blank_mode,
             Some(BlankMode::PowerOff)
         );
+    }
+
+    #[tokio::test]
+    async fn blank_power_off_accepts_every_mccs_off_state_readback() {
+        for readback in [0x02, 0x03, 0x04] {
+            let fake = Arc::new(single_display_vcp());
+            fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, Ok(D6_ON));
+            let mut ctrl = DdcciController::with_ops(
+                None,
+                80,
+                BlankMode::PowerOff,
+                Arc::clone(&fake) as Arc<dyn VcpOps>,
+                &PanelLocks::new(),
+            );
+            ctrl.probe().await.unwrap();
+
+            fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, D6_OFF, Ok(()));
+            fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, Ok(readback));
+
+            ctrl.blank(BlankMode::PowerOff)
+                .await
+                .unwrap_or_else(|e| panic!("readback {readback:#04x} is an off state: {e}"));
+            assert_eq!(
+                ctrl.state.lock().unwrap().last_blank_mode,
+                Some(BlankMode::PowerOff),
+                "readback {readback:#04x}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn blank_power_off_fails_when_readback_is_outside_mccs_range() {
+        let fake = Arc::new(single_display_vcp());
+        fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, Ok(D6_ON));
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::PowerOff,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &PanelLocks::new(),
+        );
+        ctrl.probe().await.unwrap();
+
+        fake.expect_set("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, D6_OFF, Ok(()));
+        fake.expect_get("i2c-dev:56 DEL DELL U2723QE", VCP_POWER, Ok(0x00));
+
+        let err = ctrl.blank(BlankMode::PowerOff).await.unwrap_err();
+        assert!(
+            err.error.contains("read back 0"),
+            "an out-of-range D6 value is no evidence of off: {err}"
+        );
+        assert_eq!(ctrl.state.lock().unwrap().last_blank_mode, None);
     }
 
     #[tokio::test]

@@ -2425,6 +2425,7 @@ shared_input_write_code = 0x15
         displays.insert(
             "monitor".into(),
             dormant_core::config::schema::DisplayConfig {
+                output_panel: None,
                 controllers: vec!["ddcci".into()],
                 scope: dormant_core::config::schema::DisplayScope::Shared,
                 shared_input_code: Some(0x0f),

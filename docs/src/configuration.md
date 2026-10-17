@@ -170,6 +170,7 @@ Each display has a user-chosen `id`. The `controllers` list is an ordered fallba
 | `treat_unreachable_as_blanked` | boolean | `true` | If controller is unreachable, assume display is blanked (fail-safe) |
 | `panel_type` | string | `"unknown"` | Panel classification recorded by panel-wear tracking: `"woled"`, `"qd-oled"`, or `"unknown"` |
 | `compositor_output` | string | unset | Compositor output name the active sampler observes (e.g. `"HDMI-A-1"`). Opts a remote-only display into active wear sampling; separate from the `kwin-dpms` `output` key, which names the local render target. See [Active wear sampling](./active-wear-sampling.md) |
+| `output_panel` | string | unset | Case-insensitive substring of the panel's `MANUFACTURER:MODEL[:SERIAL]` identity on `compositor_output`, or `output` if unset. Requires one of those connector keys and a non-empty value. A positively identified different panel gates shared ownership and active wear sampling; missing identity preserves normal behaviour. For a non-shared display this only gates wear sampling. See [One connector, two panels](./multi-machine.md#one-connector-two-panels). |
 | `sampling` | table | unset | Per-display `[displays.<id>.sampling]` source-gate declaration for active sampling. See [Active wear sampling](./active-wear-sampling.md) |
 
 ### Manual-only displays

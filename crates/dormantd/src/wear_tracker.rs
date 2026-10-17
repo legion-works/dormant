@@ -1874,6 +1874,7 @@ mod tests {
         controllers: &[&str],
     ) -> dormant_core::config::schema::DisplayConfig {
         dormant_core::config::schema::DisplayConfig {
+            output_panel: None,
             scope: dormant_core::config::DisplayScope::default(),
             shared_input_code: None,
             shared_input_write_code: None,

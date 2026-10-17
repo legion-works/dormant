@@ -22,6 +22,30 @@ use tokio_util::sync::CancellationToken;
 // the runtime-side surface discoverable from one location.
 pub use dormant_displays::samsung_ip::AppVisibilityProbe;
 
+/// Panel identity required on the connector that supplies captured pixels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanelExpectation {
+    /// Compositor connector, preferring `compositor_output` over `output`.
+    pub connector: String,
+    /// Case-insensitive substring of the EDID claim identity.
+    pub expected: String,
+}
+
+impl PanelExpectation {
+    /// Build the optional gate for either private or shared sampled displays.
+    #[must_use]
+    pub fn from_display(display: &dormant_core::config::DisplayConfig) -> Option<Self> {
+        Some(Self {
+            connector: display
+                .compositor_output
+                .as_ref()
+                .or(display.output.as_ref())?
+                .clone(),
+            expected: display.output_panel.clone()?,
+        })
+    }
+}
+
 /// Whether the TV is showing the source expected for active sampling.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceGate {

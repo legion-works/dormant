@@ -1235,6 +1235,7 @@ mod tests {
     /// A minimal [`cs::DisplayConfig`] with every field set.
     fn display_config() -> cs::DisplayConfig {
         cs::DisplayConfig {
+            output_panel: None,
             controllers: vec!["ddcci".into()],
             scope: DisplayScope::Shared,
             shared_input_code: Some(LOCAL_READ),

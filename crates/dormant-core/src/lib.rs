@@ -8,6 +8,7 @@ pub mod error;
 pub mod ipc_proto;
 pub mod mqtt;
 pub mod observation;
+pub mod output_panel;
 pub mod ownership;
 pub mod paths;
 pub mod reload;

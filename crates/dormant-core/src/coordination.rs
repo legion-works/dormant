@@ -192,6 +192,38 @@ impl CoordRecord {
     }
 }
 
+fn record_flap_transition(
+    record: &mut CoordRecord,
+    outcome: &mut InputObservationOutcome,
+    policy: OwnershipFlapPolicy,
+    now: Instant,
+    prior_owned: bool,
+) {
+    record.transition_times.push_back(now);
+    while record
+        .transition_times
+        .front()
+        .is_some_and(|transition| now.saturating_duration_since(*transition) > policy.window)
+    {
+        let _ = record.transition_times.pop_front();
+    }
+    let transition_count = u32::try_from(record.transition_times.len()).unwrap_or(u32::MAX);
+    if transition_count >= policy.threshold.max(2) {
+        record.contested = true;
+        record.owned = false;
+        record.last_raw_change = Some(now);
+        record.pending_transition_count = 0;
+        record.pending_transition_code = None;
+        record.peer_seen_while_owned = PeerSighting::NotSeen;
+        record.return_confirm_count = 0;
+        outcome.entered_contested = true;
+        if !prior_owned {
+            // A gain that trips the limiter is net no ownership change.
+            outcome.committed_prior_owned = None;
+        }
+    }
+}
+
 fn record_success_state(record: &mut CoordRecord, observed: u8, panel_state: Option<PanelState>) {
     record.has_successful_input_read = true;
     record.input_code = Some(observed);
@@ -371,18 +403,56 @@ impl CoordinationHandle {
         policy: OwnershipFlapPolicy,
         now: Instant,
     ) -> InputObservationOutcome {
+        self.record_observation_at(display, Some(observation), confirmations, policy, now)
+    }
+
+    /// Feed positive connector replacement evidence through the ordinary loss
+    /// debounce without fabricating a VCP read or counting it as input flapping.
+    #[must_use]
+    pub fn record_panel_mismatch_at(
+        &self,
+        display: &DisplayId,
+        confirmations: u32,
+        now: Instant,
+    ) -> InputObservationOutcome {
+        self.record_observation_at(
+            display,
+            None,
+            confirmations,
+            OwnershipFlapPolicy::disabled(),
+            now,
+        )
+    }
+
+    fn record_observation_at(
+        &self,
+        display: &DisplayId,
+        observation: Option<InputObservation<'_>>,
+        confirmations: u32,
+        policy: OwnershipFlapPolicy,
+        now: Instant,
+    ) -> InputObservationOutcome {
         let mut records = self.records.write().unwrap_or_else(PoisonError::into_inner);
         let Some(record) = records.get_mut(display) else {
             return InputObservationOutcome::default();
         };
         let mut outcome = InputObservationOutcome::default();
-        let InputObservation {
-            observed,
-            aliases,
-            panel_state,
-        } = observation;
+        let is_input_read = observation.is_some();
+        // The token is internal debounce state only; missing input evidence
+        // must never update readback telemetry or produce a raw-code event.
+        let (observed, classification, panel_state) =
+            observation.map_or((0, InputSourceObservation::Unknown(0), None), |input| {
+                (
+                    input.observed,
+                    input.aliases.classify(input.observed),
+                    input.panel_state,
+                )
+            });
 
         if record.contested {
+            if !is_input_read {
+                return outcome;
+            }
             // Contested means the panel's reported input is not trustworthy.
             // Fail closed: retaining owned=true could power off a panel the peer
             // is actively using.
@@ -392,10 +462,11 @@ impl CoordinationHandle {
         }
 
         let prior_owned = record.owned;
-        let classification = aliases.classify(observed);
         let is_local = matches!(classification, InputSourceObservation::Local);
 
-        record_disagreement(record, observed, &mut outcome);
+        if is_input_read {
+            record_disagreement(record, observed, &mut outcome);
+        }
 
         match (prior_owned, is_local) {
             (false, false) => {
@@ -457,32 +528,13 @@ impl CoordinationHandle {
             }
         }
 
-        if outcome.committed_prior_owned.is_some() {
-            record.transition_times.push_back(now);
-            while record.transition_times.front().is_some_and(|transition| {
-                now.saturating_duration_since(*transition) > policy.window
-            }) {
-                let _ = record.transition_times.pop_front();
-            }
-            let transition_count = u32::try_from(record.transition_times.len()).unwrap_or(u32::MAX);
-            if transition_count >= policy.threshold.max(2) {
-                record.contested = true;
-                record.owned = false;
-                record.last_raw_change = Some(now);
-                record.pending_transition_count = 0;
-                record.pending_transition_code = None;
-                record.peer_seen_while_owned = PeerSighting::NotSeen;
-                record.return_confirm_count = 0;
-                outcome.entered_contested = true;
-                if !prior_owned {
-                    // A gain that tripped the limiter is net no ownership change:
-                    // the safety verdict remains false, so do not wake the ladder.
-                    outcome.committed_prior_owned = None;
-                }
-            }
+        if is_input_read && outcome.committed_prior_owned.is_some() {
+            record_flap_transition(record, &mut outcome, policy, now, prior_owned);
         }
 
-        record_success_state(record, observed, panel_state);
+        if is_input_read {
+            record_success_state(record, observed, panel_state);
+        }
         outcome
     }
 

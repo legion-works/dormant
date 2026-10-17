@@ -363,6 +363,8 @@ input_wake_hold = "300s"
 # controllers = ["ddcci"]
 # blank_mode = "power_off"
 # scope = "shared"
+# output = "HDMI-A-1"           # connector on this host
+# output_panel = "AG326UZD"     # optional EDID identity substring; protects a shared port used by different panels
 # shared_input_code = 0x0f       # doctor prints the active input in hex
 # shared_input_write_code = 0x15 # only needed when panel write differs from read
 # # macOS hosts: a power_off blank on a shared DDC/CI panel can be

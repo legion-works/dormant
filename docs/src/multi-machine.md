@@ -75,6 +75,54 @@ there is no network protocol, no peer transport, no pairing, no crypto.
    shared_peer_input_write_code = 0x15 # what setvcp 60 needs for the peer (omit if same)
    ```
 
+## One connector, two panels
+
+If a PC has one HDMI port and you swap between a shared monitor and a TV,
+the connector name stays `HDMI-A-1`. Pin each display to its panel identity
+so the monitor's screensaver and wear sampling do not follow that name onto
+the TV:
+
+```toml
+[displays.monitor]
+controllers = ["kwin-dpms", "ddcci"]
+blank_mode = "brightness_zero"
+scope = "shared"
+shared_input_code = 0x11 # replace with this panel's read-back code
+output = "HDMI-A-1"
+ddc_display = "AG326UZD"
+output_panel = "AG326UZD"
+```
+
+Find the identity with `ddcutil detect --brief`, or read the `found` field
+of an `output_panel_mismatch` or `wear_sampling_panel_mismatch` log. Linux
+reads the connected panel's EDID from `/sys/class/drm`; the identity is
+`MANUFACTURER:MODEL[:SERIAL]`. A model substring works; include the serial
+when two panels have the same model.
+
+- **Match:** the identity contains `output_panel`, ignoring case. Normal
+  input polling and capture continue.
+- **Mismatch:** a non-empty identity identifies a different panel. Shared
+  ownership commits not-owned after `loss_confirmations`, using the normal
+  loss path to stop blanking and remove the screensaver. No DDC ownership
+  read is issued on mismatch ticks. Wear captures are skipped as source
+  mismatches.
+- **Unknown:** no identity, disconnected output, short EDID, or ambiguous
+  connector across cards. Normal behaviour continues. A panel that drops
+  hot-plug while powered off must still be able to wake.
+
+The connector is `compositor_output` when set, otherwise `output`. A TV
+using `compositor_output = "HDMI-A-1"` can have its own `output_panel`
+value alongside its existing Samsung sampling source gate. For a
+**non-shared display, `output_panel` only gates wear sampling**; it does
+not gate blanking. Non-Linux platforms return Unknown. With the key
+omitted, dormant does not read connector identity.
+
+When the expected panel returns, normal local input readback re-acquires
+ownership through the existing gain path, including the presence check
+for `on_observed_gain`. The poller logs `output_panel_mismatch` once on
+entry and `output_panel_restored` once on exit, including an exit to
+Unknown. These logs describe identity evidence, not proof of ownership.
+
 ## How switching works
 
 There is no network pairing, no mDNS discovery, no cryptographic handshake,

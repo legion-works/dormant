@@ -235,6 +235,8 @@ pub struct ActiveSamplerDeps {
     pub latest_grids: LatestGrids,
     /// Platform capture implementation.
     pub source: Box<dyn CaptureSource + Send + Sync + 'static>,
+    /// Async connector identity source, consulted immediately before capture.
+    pub panel_reader: Arc<dyn dormant_displays::connector_panel::ConnectorPanelReader>,
     /// Source-gate poll reader. `None` for displays without a configured gate;
     /// the runtime then treats every capture as unconditionally matched.
     pub source_reader: Option<Arc<dyn source_gate::InputSourceReader>>,
@@ -265,6 +267,8 @@ pub(crate) fn production_env_reader(name: &str) -> Option<String> {
 /// generation management.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DisplaySamplingContext {
+    /// Optional panel identity gate, independent of shared-display ownership.
+    pub panel_expectation: Option<source_gate::PanelExpectation>,
     /// Configured sampled display, when present in the generation.
     pub display: Option<DisplayExpectation>,
     /// Current display phase.
@@ -438,6 +442,7 @@ fn initial_status(config: &Config) -> SamplerStatus {
 }
 
 struct Runtime {
+    panel_mismatch: Option<source_gate::SourceGate>,
     state: SamplingState,
     active: ActiveSamplingConfig,
     sample_interval: Duration,
@@ -498,6 +503,10 @@ impl Runtime {
             .and_then(|display| display.compositor_output.clone());
         let gate_expectation = build_gate_expectation(config, &display_id.0);
         let display = DisplaySamplingContext {
+            panel_expectation: config
+                .displays
+                .get(&display_id.0)
+                .and_then(source_gate::PanelExpectation::from_display),
             display: config
                 .wear
                 .active_sampling
@@ -538,6 +547,7 @@ impl Runtime {
         };
         let last_effective_stream_mode = display.stream_mode.unwrap_or(active.stream_mode);
         Self {
+            panel_mismatch: None,
             state,
             active,
             sample_interval: config.wear.sample_interval,
@@ -1149,6 +1159,11 @@ fn publish_status(
     reason: Option<&'static str>,
     last_capture: Option<Tick>,
 ) {
+    let reason = runtime
+        .panel_mismatch
+        .as_ref()
+        .and_then(sampling_uniform_reason)
+        .or(reason);
     let current = status_tx.borrow().clone();
     if let Some(event_tx) = &runtime.event_tx {
         if current.state != SamplingState::Streaming && runtime.state == SamplingState::Streaming {
@@ -1183,7 +1198,10 @@ fn publish_status(
             .record
             .as_ref()
             .map(|record| record.record().granted_at),
-        source_gate: runtime.gate_state.clone(),
+        source_gate: runtime
+            .panel_mismatch
+            .clone()
+            .or_else(|| runtime.gate_state.clone()),
     });
 }
 
@@ -1363,6 +1381,47 @@ fn sampling_uniform_reason(gate: &source_gate::SourceGate) -> Option<&'static st
 fn clear_latest_for(latest: &LatestGrids, display: &DisplayId) {
     if let Ok(mut grids) = latest.write() {
         grids.remove(display);
+    }
+}
+
+async fn panel_allows_capture(
+    runtime: &mut Runtime,
+    reader: &dyn dormant_displays::connector_panel::ConnectorPanelReader,
+    source: &mut dyn CaptureSource,
+    status_tx: &watch::Sender<SamplerStatus>,
+) -> bool {
+    let panel = if let Some(expected) = &runtime.display.panel_expectation {
+        let found = reader.identity(&expected.connector).await;
+        dormant_core::output_panel::classify(&expected.expected, found.as_deref())
+    } else {
+        dormant_core::output_panel::OutputPanel::Unknown
+    };
+    if let dormant_core::output_panel::OutputPanel::Mismatch { found } = panel {
+        if runtime.panel_mismatch.is_none() {
+            let expected = runtime
+                .display
+                .panel_expectation
+                .as_ref()
+                .expect("mismatch requires an expectation");
+            tracing::warn!(event = "wear_sampling_panel_mismatch", display = %runtime.display_id,
+                connector = %expected.connector, expected = %expected.expected, found = %found);
+            // Stop Linux's warm PipeWire worker so a restored connector cannot
+            // publish a buffered frame from the panel that replaced it.
+            source.reset_stream().await;
+        }
+        runtime.panel_mismatch = Some(source_gate::SourceGate::Mismatched { observed: found });
+        clear_latest_for(&runtime.latest_grids, &runtime.display_id);
+        publish_status(status_tx, runtime, Some("source_mismatch"), None);
+        false
+    } else {
+        if runtime.panel_mismatch.take().is_some() {
+            let reason = runtime
+                .gate_state
+                .as_ref()
+                .and_then(sampling_uniform_reason);
+            publish_status(status_tx, runtime, reason, None);
+        }
+        true
     }
 }
 
@@ -1602,13 +1661,21 @@ async fn run(
                 // mismatch / unknown must skip the capture even if the
                 // cadence already fired, and the wear tracker must not see
                 // a stale grid promoted to a fresh attribute.
-                let gate_skip = matches!(
-                    runtime.gate_state.as_ref(),
-                    Some(
-                        source_gate::SourceGate::Mismatched { .. }
-                            | source_gate::SourceGate::Unknown { .. },
-                    )
-                );
+                let panel_allows = panel_allows_capture(
+                    &mut runtime,
+                    deps.panel_reader.as_ref(),
+                    deps.source.as_mut(),
+                    &status_tx,
+                )
+                .await;
+                let gate_skip = !panel_allows
+                    || matches!(
+                        runtime.gate_state.as_ref(),
+                        Some(
+                            source_gate::SourceGate::Mismatched { .. }
+                                | source_gate::SourceGate::Unknown { .. },
+                        )
+                    );
                 if gate_skip {
                     clear_latest_for(&deps.latest_grids, &deps.display_id);
                     continue;
@@ -1686,6 +1753,9 @@ async fn run(
                     () = tokio::time::sleep(runtime.active.circuit_reset_after) => {
                         let transition = apply_trigger(&mut runtime, Trigger::CooldownElapsed, &status_tx);
                         debug_assert!(transition.effects.contains(&Effect::Capture), "only CooldownElapsed may schedule a cooldown retry");
+                        if !panel_allows_capture(&mut runtime, deps.panel_reader.as_ref(), deps.source.as_mut(), &status_tx).await {
+                            continue;
+                        }
                         let attempt = capture_one(&mut *deps.source, runtime.active.capture_timeout, runtime.display.stream_mode.unwrap_or(runtime.active.stream_mode), runtime.display.phase.clone(), &deps.latest_grids, &deps.display_id, &deps.cancel, &mut cadence, std::mem::take(&mut runtime.pending_stream_reset)).await;
                         match attempt {
                             CaptureOutcome::Cancelled => break,
@@ -2463,6 +2533,7 @@ mod tests {
         let transition = apply_update(
             &mut runtime,
             SamplerUpdate::DisplayContext(DisplaySamplingContext {
+                panel_expectation: None,
                 display: None,
                 phase: Phase::Active,
                 stage_active: false,
@@ -2486,6 +2557,7 @@ mod tests {
         let restored = apply_update(
             &mut runtime,
             SamplerUpdate::DisplayContext(DisplaySamplingContext {
+                panel_expectation: None,
                 display: Some(DisplayExpectation {
                     display: "oled".to_owned(),
                     compositor_output: None,
@@ -2529,6 +2601,7 @@ mod tests {
         let transition = apply_update(
             &mut runtime,
             SamplerUpdate::DisplayContext(DisplaySamplingContext {
+                panel_expectation: None,
                 display: Some(DisplayExpectation {
                     display: "oled".to_owned(),
                     compositor_output: Some("HDMI-A-2".to_owned()),
@@ -2568,6 +2641,7 @@ mod tests {
         let transition = apply_update(
             &mut runtime,
             SamplerUpdate::DisplayContext(DisplaySamplingContext {
+                panel_expectation: None,
                 display: Some(DisplayExpectation {
                     display: "other-monitor".to_owned(),
                     compositor_output: None,
@@ -2607,6 +2681,7 @@ mod tests {
         let transition = apply_update(
             &mut runtime,
             SamplerUpdate::DisplayContext(DisplaySamplingContext {
+                panel_expectation: None,
                 display: Some(DisplayExpectation {
                     display: "oled".to_owned(),
                     compositor_output: None,
@@ -2642,6 +2717,7 @@ mod tests {
         config.displays.insert(
             "oled".to_owned(),
             DisplayConfig {
+                output_panel: None,
                 controllers: vec![],
                 scope: dormant_core::config::schema::DisplayScope::default(),
                 shared_input_code: None,
@@ -2700,6 +2776,7 @@ mod tests {
         let transition = apply_update(
             &mut runtime,
             SamplerUpdate::DisplayContext(DisplaySamplingContext {
+                panel_expectation: None,
                 display: Some(DisplayExpectation {
                     display: "oled".to_owned(),
                     compositor_output: Some("HDMI-A-1".to_owned()),
@@ -2966,6 +3043,9 @@ mod tests {
         let (update_tx, update_rx) = mpsc::channel(2);
         (
             ActiveSamplerDeps {
+                panel_reader: Arc::new(
+                    dormant_displays::connector_panel::SystemConnectorPanelReader,
+                ),
                 initial_config: config,
                 display_id: DisplayId(display.to_owned()),
                 update_rx,
@@ -3007,6 +3087,68 @@ mod tests {
         cancel: CancellationToken,
     ) -> (ActiveSamplerDeps, mpsc::Sender<SamplerUpdate>, LatestGrids) {
         service_deps_for("oled", config, source, consent_path, cancel)
+    }
+
+    struct PanelReader(Mutex<Option<String>>);
+
+    impl dormant_displays::connector_panel::ConnectorPanelReader for PanelReader {
+        fn identity<'a>(
+            &'a self,
+            connector: &'a str,
+        ) -> dormant_displays::connector_panel::IdentityRead<'a> {
+            Box::pin(async move {
+                assert_eq!(connector, "HDMI-A-1");
+                self.0.lock().unwrap().clone()
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn panel_gate_skips_capture_only_on_positive_mismatch() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("panel-consent.json");
+        test_tv_consent(&path, "HDMI-A-1");
+        let mut config = (*gated_tv_config(Duration::from_secs(10))).clone();
+        let display = config.displays.get_mut("tv").unwrap();
+        display.output_panel = Some("AG326UZD".into());
+        display.sampling = None;
+        let reader = Arc::new(PanelReader(Mutex::new(Some("SAM:TV".into()))));
+        let (source, captures, _, _) = service_source([]);
+        let cancel = CancellationToken::new();
+        let (mut deps, _updates, latest) =
+            service_deps_for("tv", Arc::new(config), source, path, cancel.clone());
+        deps.panel_reader = reader.clone();
+        let (handle, join) = spawn_with_handle(deps);
+        wait_for_state(&handle, SamplingState::Streaming).await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            captures.load(Ordering::SeqCst),
+            0,
+            "panel mismatch must skip capture"
+        );
+        assert_eq!(latest.read().unwrap().len(), 0);
+        assert_eq!(
+            handle.status().borrow().uniform_reason,
+            Some("source_mismatch")
+        );
+        for (found, expected_captures) in [(Some("AOC:AG326UZD"), 1), (None, 2)] {
+            *reader.0.lock().unwrap() = found.map(str::to_owned);
+            tokio::time::advance(Duration::from_secs(10)).await;
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                captures.load(Ordering::SeqCst),
+                expected_captures,
+                "match and unknown must capture"
+            );
+            assert_eq!(handle.status().borrow().uniform_reason, None);
+        }
+        cancel.cancel();
+        join.await.unwrap();
     }
 
     fn multi_active_config(interval: Duration) -> Arc<Config> {
@@ -3430,6 +3572,7 @@ mod tests {
         let config = active_config(Duration::from_secs(10));
         let (updates_tx, updates_rx) = mpsc::channel(2);
         let deps = ActiveSamplerDeps {
+            panel_reader: Arc::new(dormant_displays::connector_panel::SystemConnectorPanelReader),
             initial_config: config.clone(),
             display_id: DisplayId("oled".to_owned()),
             update_rx: updates_rx,
@@ -3471,6 +3614,7 @@ mod tests {
 
         updates_tx
             .send(SamplerUpdate::DisplayContext(DisplaySamplingContext {
+                panel_expectation: None,
                 display: Some(DisplayExpectation {
                     display: "oled".to_owned(),
                     compositor_output: None,
@@ -4060,6 +4204,7 @@ mod tests {
         drop(update_tx);
         let cancel = CancellationToken::new();
         let (handle, join) = spawn_with_handle(ActiveSamplerDeps {
+            panel_reader: Arc::new(dormant_displays::connector_panel::SystemConnectorPanelReader),
             initial_config: config,
             display_id: DisplayId("oled".to_owned()),
             update_rx,
@@ -4480,6 +4625,7 @@ mod tests {
             connect_calls: std::sync::Arc::new(AtomicUsize::new(0)),
         };
         let (handle, join) = spawn_with_handle(ActiveSamplerDeps {
+            panel_reader: Arc::new(dormant_displays::connector_panel::SystemConnectorPanelReader),
             initial_config: config,
             display_id: DisplayId("oled".to_owned()),
             update_rx,
@@ -4602,6 +4748,7 @@ mod tests {
         drop(update_tx);
         let cancel = CancellationToken::new();
         let (handle, join) = spawn_with_handle(ActiveSamplerDeps {
+            panel_reader: Arc::new(dormant_displays::connector_panel::SystemConnectorPanelReader),
             initial_config: config,
             display_id: DisplayId("oled".to_owned()),
             update_rx,
@@ -5300,6 +5447,7 @@ mod tests {
         let config = active_config(Duration::from_secs(10));
         let (updates_tx, updates_rx) = mpsc::channel(2);
         let deps = ActiveSamplerDeps {
+            panel_reader: Arc::new(dormant_displays::connector_panel::SystemConnectorPanelReader),
             initial_config: config.clone(),
             display_id: DisplayId("oled".to_owned()),
             update_rx: updates_rx,
@@ -5376,6 +5524,7 @@ mod tests {
         let latest_grids = new_latest_grids();
         let (update_tx, update_rx) = mpsc::channel(2);
         let deps = ActiveSamplerDeps {
+            panel_reader: Arc::new(dormant_displays::connector_panel::SystemConnectorPanelReader),
             initial_config: config,
             display_id: DisplayId("oled".to_owned()),
             update_rx,
@@ -5420,6 +5569,7 @@ mod tests {
         config.displays.insert(
             "tv".to_owned(),
             DisplayConfig {
+                output_panel: None,
                 controllers: vec!["samsung-tizen".to_owned()],
                 scope: DisplayScope::default(),
                 shared_input_code: None,
@@ -5524,6 +5674,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let (updates_tx, updates_rx) = mpsc::channel(4);
         let deps = ActiveSamplerDeps {
+            panel_reader: Arc::new(dormant_displays::connector_panel::SystemConnectorPanelReader),
             initial_config: config,
             display_id: DisplayId("tv".to_owned()),
             update_rx: updates_rx,
@@ -5862,6 +6013,7 @@ mod tests {
         let latest_grids = new_latest_grids();
         let (event_tx, mut event_rx) = mpsc::channel(16);
         let deps = ActiveSamplerDeps {
+            panel_reader: Arc::new(dormant_displays::connector_panel::SystemConnectorPanelReader),
             initial_config: config,
             display_id: DisplayId("tv".to_owned()),
             update_rx: updates_rx,
@@ -5905,6 +6057,7 @@ mod tests {
         // before).
         updates_tx
             .send(SamplerUpdate::DisplayContext(DisplaySamplingContext {
+                panel_expectation: None,
                 display: Some(DisplayExpectation {
                     display: "tv".to_owned(),
                     compositor_output: Some("HDMI-A-1".to_owned()),
@@ -6005,6 +6158,7 @@ mod tests {
         let config = Arc::new(config);
         let (event_tx, mut event_rx) = mpsc::channel(16);
         let deps = ActiveSamplerDeps {
+            panel_reader: Arc::new(dormant_displays::connector_panel::SystemConnectorPanelReader),
             initial_config: config,
             display_id: DisplayId("tv".to_owned()),
             update_rx: updates_rx,
@@ -6031,6 +6185,7 @@ mod tests {
         // poller spawns.
         updates_tx
             .send(SamplerUpdate::DisplayContext(DisplaySamplingContext {
+                panel_expectation: None,
                 display: Some(DisplayExpectation {
                     display: "tv".to_owned(),
                     compositor_output: Some("HDMI-A-1".to_owned()),
@@ -6120,6 +6275,7 @@ mod tests {
         let latest_grids = new_latest_grids();
         let (event_tx, mut event_rx) = mpsc::channel(16);
         let deps = ActiveSamplerDeps {
+            panel_reader: Arc::new(dormant_displays::connector_panel::SystemConnectorPanelReader),
             initial_config: config,
             display_id: DisplayId("tv".to_owned()),
             update_rx: updates_rx,
@@ -6153,6 +6309,7 @@ mod tests {
         // poller's first poll can never land.
         updates_tx
             .send(SamplerUpdate::DisplayContext(DisplaySamplingContext {
+                panel_expectation: None,
                 display: Some(DisplayExpectation {
                     display: "tv".to_owned(),
                     compositor_output: Some("HDMI-A-1".to_owned()),
@@ -6258,6 +6415,7 @@ mod tests {
         // `update_rx.recv()` arm resolve instantly and hides the race.
         let (updates_tx, updates_rx) = mpsc::channel(4);
         let deps = ActiveSamplerDeps {
+            panel_reader: Arc::new(dormant_displays::connector_panel::SystemConnectorPanelReader),
             initial_config: config,
             display_id: DisplayId("tv".to_owned()),
             update_rx: updates_rx,
@@ -6287,6 +6445,7 @@ mod tests {
         // poll at +2s has fired, so the drain reads Matched.
         updates_tx
             .send(SamplerUpdate::DisplayContext(DisplaySamplingContext {
+                panel_expectation: None,
                 display: Some(DisplayExpectation {
                     display: "tv".to_owned(),
                     compositor_output: Some("HDMI-A-1".to_owned()),
@@ -6385,6 +6544,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let (updates_tx, updates_rx) = mpsc::channel(4);
         let deps = ActiveSamplerDeps {
+            panel_reader: Arc::new(dormant_displays::connector_panel::SystemConnectorPanelReader),
             initial_config: config,
             display_id: DisplayId("tv".to_owned()),
             update_rx: updates_rx,
@@ -6422,6 +6582,7 @@ mod tests {
         // ungated display must capture — no stale gate_state.
         updates_tx
             .send(SamplerUpdate::DisplayContext(DisplaySamplingContext {
+                panel_expectation: None,
                 display: Some(DisplayExpectation {
                     display: "tv".to_owned(),
                     compositor_output: Some("HDMI-A-1".to_owned()),
@@ -6498,6 +6659,7 @@ mod tests {
             Arc::new(ScriptedSourceReader::new(responses, default));
         let (updates_tx, updates_rx) = mpsc::channel(2);
         let deps = ActiveSamplerDeps {
+            panel_reader: Arc::new(dormant_displays::connector_panel::SystemConnectorPanelReader),
             initial_config: config,
             display_id: DisplayId("tv".to_owned()),
             update_rx: updates_rx,
@@ -6566,6 +6728,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let (updates_tx, updates_rx) = mpsc::channel(4);
         let deps_aoc = ActiveSamplerDeps {
+            panel_reader: Arc::new(dormant_displays::connector_panel::SystemConnectorPanelReader),
             initial_config: aoc_config,
             display_id: DisplayId("oled".to_owned()),
             update_rx: updates_rx,
@@ -6623,6 +6786,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let (updates_tx, updates_rx) = mpsc::channel(4);
         let deps = ActiveSamplerDeps {
+            panel_reader: Arc::new(dormant_displays::connector_panel::SystemConnectorPanelReader),
             initial_config: gated_tv_config(Duration::from_secs(60)),
             display_id: DisplayId("tv".to_owned()),
             update_rx: updates_rx,
@@ -6657,6 +6821,7 @@ mod tests {
         // (c) change `expected_source` via a DisplayContext update.
         updates_tx
             .send(SamplerUpdate::DisplayContext(DisplaySamplingContext {
+                panel_expectation: None,
                 display: Some(DisplayExpectation {
                     display: "tv".to_owned(),
                     compositor_output: Some("HDMI-A-1".to_owned()),
@@ -6680,6 +6845,7 @@ mod tests {
         // `source_gate_expectation`.
         updates_tx
             .send(SamplerUpdate::DisplayContext(DisplaySamplingContext {
+                panel_expectation: None,
                 display: Some(DisplayExpectation {
                     display: "tv".to_owned(),
                     compositor_output: Some("HDMI-A-1".to_owned()),
@@ -6751,6 +6917,7 @@ mod tests {
         config.displays.insert(
             "monitor".to_owned(),
             DisplayConfig {
+                output_panel: None,
                 controllers: vec!["ddcci".to_owned()],
                 scope: DisplayScope::default(),
                 shared_input_code: None,
@@ -6791,6 +6958,7 @@ mod tests {
         config.displays.insert(
             "tv".to_owned(),
             DisplayConfig {
+                output_panel: None,
                 controllers: vec!["samsung-tizen".to_owned()],
                 scope: DisplayScope::default(),
                 shared_input_code: None,
@@ -6922,6 +7090,7 @@ mod tests {
         let (_updates_monitor_tx, updates_monitor_rx) = mpsc::channel(4);
         let (updates_tv_tx, updates_tv_rx) = mpsc::channel(4);
         let deps_monitor = ActiveSamplerDeps {
+            panel_reader: Arc::new(dormant_displays::connector_panel::SystemConnectorPanelReader),
             initial_config: config.clone(),
             display_id: DisplayId("monitor".to_owned()),
             update_rx: updates_monitor_rx,
@@ -6935,6 +7104,7 @@ mod tests {
             event_tx: None,
         };
         let deps_tv = ActiveSamplerDeps {
+            panel_reader: Arc::new(dormant_displays::connector_panel::SystemConnectorPanelReader),
             initial_config: config.clone(),
             display_id: DisplayId("tv".to_owned()),
             update_rx: updates_tv_rx,
@@ -6977,6 +7147,7 @@ mod tests {
         // The monitor runtime must not observe any reset.
         updates_tv_tx
             .send(SamplerUpdate::DisplayContext(DisplaySamplingContext {
+                panel_expectation: None,
                 display: Some(DisplayExpectation {
                     display: "tv".to_owned(),
                     compositor_output: Some("HDMI-A-1".to_owned()),
@@ -7051,6 +7222,7 @@ mod tests {
         let monitor_resets_before_readd = monitor_resets.load(Ordering::SeqCst);
         updates_tv_tx
             .send(SamplerUpdate::DisplayContext(DisplaySamplingContext {
+                panel_expectation: None,
                 display: Some(DisplayExpectation {
                     display: "tv".to_owned(),
                     compositor_output: Some("HDMI-A-1".to_owned()),

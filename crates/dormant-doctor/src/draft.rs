@@ -632,6 +632,7 @@ mod tests {
 
     fn sample_display(controllers: Vec<&str>, host: Option<&str>) -> DisplayConfig {
         DisplayConfig {
+            output_panel: None,
             scope: dormant_core::config::DisplayScope::default(),
             shared_input_code: None,
             shared_input_write_code: None,

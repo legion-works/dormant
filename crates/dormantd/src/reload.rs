@@ -304,6 +304,7 @@ mod dispatch_gate_tests {
     /// have something to actually change.
     fn base_display_cfg() -> DisplayConfig {
         DisplayConfig {
+            output_panel: None,
             scope: dormant_core::config::DisplayScope::default(),
             shared_input_code: None,
             shared_input_write_code: None,

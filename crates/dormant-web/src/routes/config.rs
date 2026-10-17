@@ -697,6 +697,7 @@ mod tests {
             shift_heat_bias: defaults::SCREENSAVER_SHIFT_HEAT_BIAS,
         };
         DisplayConfig {
+            output_panel: None,
             scope: dormant_core::config::DisplayScope::default(),
             shared_input_code: None,
             shared_input_write_code: None,
@@ -1082,6 +1083,7 @@ field = "/val"
     /// no screensaver.
     fn display_all_optionals_absent(controller: &str) -> DisplayConfig {
         DisplayConfig {
+            output_panel: None,
             scope: dormant_core::config::DisplayScope::default(),
             shared_input_code: None,
             shared_input_write_code: None,

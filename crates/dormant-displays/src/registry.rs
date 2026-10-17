@@ -551,6 +551,7 @@ mod tests {
     /// and as a base for "missing fields" variants.
     fn command_cfg() -> DisplayConfig {
         DisplayConfig {
+            output_panel: None,
             controllers: vec!["command".into()],
             scope: dormant_core::config::DisplayScope::Private,
             shared_input_code: None,
@@ -883,6 +884,7 @@ mod tests {
         use dormant_core::types::{LadderStage, StageKind};
 
         let cfg = DisplayConfig {
+            output_panel: None,
             controllers: vec!["samsung-tizen".into()],
             scope: dormant_core::config::DisplayScope::Private,
             shared_input_code: None,

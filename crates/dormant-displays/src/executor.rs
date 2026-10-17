@@ -1106,6 +1106,7 @@ mod tests {
 
     fn chain_config() -> DisplayConfig {
         DisplayConfig {
+            output_panel: None,
             controllers: vec!["command".into()],
             scope: dormant_core::config::DisplayScope::Private,
             shared_input_code: None,

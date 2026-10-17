@@ -40,6 +40,8 @@ pub struct CoordinationPollDeps {
     /// Direct switch handle for firing post-hoc observed ownership hooks.
     /// `None` in tests that don't need hook firing.
     pub direct_switch: Option<Arc<DirectSwitchHandle>>,
+    /// Connector identity source, consulted only for configured panel gates.
+    pub panel_reader: Arc<dyn dormant_displays::connector_panel::ConnectorPanelReader>,
 }
 
 /// Spawn the shared-display ownership poller.
@@ -59,6 +61,7 @@ async fn run(mut deps: CoordinationPollDeps) {
     let mut last_state_read: HashMap<DisplayId, Instant> = HashMap::new();
     let mut reprobe_state: HashMap<DisplayId, ReprobeState> = HashMap::new();
     let mut pending_observed_gain: HashSet<DisplayId> = HashSet::new();
+    let mut panel_mismatches = HashSet::new();
     loop {
         tokio::select! {
             () = deps.cancel.cancelled() => break,
@@ -74,6 +77,7 @@ async fn run(mut deps: CoordinationPollDeps) {
                 &mut last_state_read,
                 &mut reprobe_state,
                 &mut pending_observed_gain,
+                &mut panel_mismatches,
             ).await,
         }
     }
@@ -148,6 +152,7 @@ async fn poll_once(
     last_state_read: &mut HashMap<DisplayId, Instant>,
     reprobe_state: &mut HashMap<DisplayId, ReprobeState>,
     pending_observed_gain: &mut HashSet<DisplayId>,
+    panel_mismatches: &mut HashSet<DisplayId>,
 ) {
     let executors = deps.executors_rx.borrow().clone();
     // Reload intentionally publishes this sentinel while an old generation tears down.
@@ -183,16 +188,55 @@ async fn poll_once(
             peer_write: display_config.shared_peer_input_write_code,
         };
 
+        let panel = if let Some(expected_panel) = &display_config.output_panel {
+            let connector = display_config
+                .compositor_output
+                .as_ref()
+                .or(display_config.output.as_ref());
+            let found = if let Some(connector) = connector {
+                deps.panel_reader.identity(connector).await
+            } else {
+                None
+            };
+            let panel = dormant_core::output_panel::classify(expected_panel, found.as_deref());
+            if let dormant_core::output_panel::OutputPanel::Mismatch { found } = &panel
+                && panel_mismatches.insert(display_id.clone())
+            {
+                tracing::warn!(event = "output_panel_mismatch", display = %display_id,
+                    connector = connector.map_or("", String::as_str), expected = %expected_panel, found = %found);
+            }
+            panel
+        } else {
+            dormant_core::output_panel::OutputPanel::Unknown
+        };
+        let panel_mismatch = matches!(
+            panel,
+            dormant_core::output_panel::OutputPanel::Mismatch { .. }
+        );
+        if !panel_mismatch && panel_mismatches.remove(&display_id) {
+            tracing::info!(event = "output_panel_restored", display = %display_id);
+        }
+
         // Ownership arbitration (VCP 0x60) runs every tick; panel-state cosmetics
         // (brightness/power) refresh only at the slower state_poll cadence to
         // cut per-transaction i2c traffic on cached-fd NVIDIA nodes. Hardware
         // reads may wait on controller locks; mutate the verdict cache only
         // after the input read (and, on a due tick, the state read) completes.
-        let input = executor.read_input_source_sampled().await;
+        // The mismatch arm carries no readback: `expected` only keeps the shared
+        // dispatcher below reachable, so `observed` is a placeholder there and
+        // every use of it must check `panel_mismatch` first.
+        // transition dispatcher below reachable; the core receives panel evidence.
+        let input = if panel_mismatch {
+            Ok(Some(expected))
+        } else {
+            executor.read_input_source_sampled().await
+        };
         let due = last_state_read
             .get(&display_id)
             .is_none_or(|last| now.duration_since(*last) >= state_poll_interval);
-        let panel_state = if due {
+        let panel_state = if panel_mismatch {
+            None
+        } else if due {
             let panel_state = executor.read_state_sampled().await;
             if panel_state.is_some() {
                 last_state_read.insert(display_id.clone(), now);
@@ -213,31 +257,41 @@ async fn poll_once(
             // hold the last verdict rather than feeding it through the
             // debounce, but do not re-probe a controller that did respond.
             let classification = aliases.classify(observed);
-            if matches!(classification, InputSourceObservation::Unknown(_)) {
+            if !panel_mismatch && matches!(classification, InputSourceObservation::Unknown(_)) {
                 deps.state.record_failure(&display_id);
                 continue; // `for` loop — skip the rest of this display's tick
             }
 
             let before = deps.state.snapshot();
-            let outcome = deps.state.record_input_observation_at(
-                &display_id,
-                InputObservation {
-                    observed,
-                    aliases: &aliases,
-                    panel_state,
-                },
-                config.coordination.loss_confirmations,
-                OwnershipFlapPolicy {
-                    threshold: config.coordination.flap_threshold,
-                    window: config.coordination.flap_window,
-                    settle: config.coordination.flap_settle,
-                },
-                now.into_std(),
-            );
+            let outcome = if panel_mismatch {
+                deps.state.record_panel_mismatch_at(
+                    &display_id,
+                    config.coordination.loss_confirmations,
+                    now.into_std(),
+                )
+            } else {
+                deps.state.record_input_observation_at(
+                    &display_id,
+                    InputObservation {
+                        observed,
+                        aliases: &aliases,
+                        panel_state,
+                    },
+                    config.coordination.loss_confirmations,
+                    OwnershipFlapPolicy {
+                        threshold: config.coordination.flap_threshold,
+                        window: config.coordination.flap_window,
+                        settle: config.coordination.flap_settle,
+                    },
+                    now.into_std(),
+                )
+            };
             let previous = before.get(&display_id);
-            if previous.is_some_and(|record| {
-                !record.has_successful_input_read || record.consecutive_failures > 0
-            }) {
+            if !panel_mismatch
+                && previous.is_some_and(|record| {
+                    !record.has_successful_input_read || record.consecutive_failures > 0
+                })
+            {
                 tracing::info!(event = "coord_poll_ok", display = %display_id);
             }
             last_failing_log.remove(&display_id);
@@ -281,12 +335,23 @@ async fn poll_once(
             // (issue #134). Surfacing the deferred count lets operators see the
             // debounce in flight rather than mistaking the silence for a stall.
             if let Some(pending_count) = outcome.deferred_loss_count {
-                tracing::info!(
-                    event = "coord_ownership_loss_deferred",
-                    display = %display_id,
-                    pending_count,
-                    observed,
-                );
+                if panel_mismatch {
+                    // `observed` holds the placeholder local code on a mismatch
+                    // tick; logging it would read as a local readback.
+                    tracing::info!(
+                        event = "coord_ownership_loss_deferred",
+                        display = %display_id,
+                        pending_count,
+                        cause = "output_panel_mismatch",
+                    );
+                } else {
+                    tracing::info!(
+                        event = "coord_ownership_loss_deferred",
+                        display = %display_id,
+                        pending_count,
+                        observed,
+                    );
+                }
             }
             // A potential ownership gain is held pending further confirmations
             // (symmetric debounce). Surfacing the deferred count mirrors the
@@ -300,7 +365,8 @@ async fn poll_once(
                 );
             }
             if let Some(previous_owned) = outcome.committed_prior_owned {
-                let owned = matches!(aliases.classify(observed), InputSourceObservation::Local);
+                let owned = !panel_mismatch
+                    && matches!(aliases.classify(observed), InputSourceObservation::Local);
                 tracing::info!(event = "coord_ownership_changed", display = %display_id, previous_owned, owned);
                 // Feed ownership to the rules engine first so it wakes the
                 // display before consumers see the event.
@@ -316,7 +382,7 @@ async fn poll_once(
                     .send(ControlMsg::PublishDaemonEvent(DaemonEvent::Ownership {
                         display: display_id.clone(),
                         owned,
-                        observed_input_code: Some(observed),
+                        observed_input_code: (!panel_mismatch).then_some(observed),
                         written_code: None,
                         cause: "poll".to_string(),
                         verified: None,
@@ -739,6 +805,7 @@ mod tests {
             state: state.clone(),
             cancel: cancel.clone(),
             direct_switch: Some(Arc::clone(&handle)),
+            panel_reader: Arc::new(dormant_displays::connector_panel::SystemConnectorPanelReader),
         });
         // Tests using `hooked_poller` assert the hook fires as it always
         // has. The presence gate defaults to true and the test configs
@@ -805,6 +872,7 @@ mod tests {
             state: state.clone(),
             cancel: cancel.clone(),
             direct_switch: Some(Arc::clone(&handle)),
+            panel_reader: Arc::new(dormant_displays::connector_panel::SystemConnectorPanelReader),
         });
         (
             (config_tx, executors_tx, ctl_rx, state, cancel),
@@ -818,6 +886,7 @@ mod tests {
         displays.insert(
             "shared".to_string(),
             DisplayConfig {
+                output_panel: None,
                 controllers: vec!["ddcci".to_string()],
                 scope: DisplayScope::Shared,
                 shared_input_code: Some(0x11),
@@ -884,6 +953,18 @@ mod tests {
 
     /// Like [`setup`] but accepts an explicit [`Config`].
     fn setup_with_config(cfg: Config, sink: Arc<ScriptedSink>) -> TestHarness {
+        setup_with_panel_reader(
+            cfg,
+            sink,
+            Arc::new(dormant_displays::connector_panel::SystemConnectorPanelReader),
+        )
+    }
+
+    fn setup_with_panel_reader(
+        cfg: Config,
+        sink: Arc<ScriptedSink>,
+        panel_reader: Arc<dyn dormant_displays::connector_panel::ConnectorPanelReader>,
+    ) -> TestHarness {
         let (config_tx, config_rx) = watch::channel(Arc::new(cfg));
         let display = DisplayId("shared".to_string());
         let executors = HashMap::from([(display.clone(), sink as Arc<dyn CommandSink>)]);
@@ -898,6 +979,7 @@ mod tests {
             state: state.clone(),
             cancel: cancel.clone(),
             direct_switch: None,
+            panel_reader,
         });
         (config_tx, executors_tx, ctl_rx, state, cancel)
     }
@@ -917,6 +999,7 @@ mod tests {
             state: state.clone(),
             cancel: cancel.clone(),
             direct_switch: None,
+            panel_reader: Arc::new(dormant_displays::connector_panel::SystemConnectorPanelReader),
         });
         (config_tx, executors_tx, ctl_rx, state, cancel)
     }
@@ -926,6 +1009,125 @@ mod tests {
         tokio::time::advance(Duration::from_secs(6)).await;
         tokio::task::yield_now().await;
         tokio::task::yield_now().await;
+    }
+
+    struct ScriptedPanel {
+        found: Mutex<Option<String>>,
+        calls: Mutex<u32>,
+    }
+
+    impl dormant_displays::connector_panel::ConnectorPanelReader for ScriptedPanel {
+        fn identity<'a>(
+            &'a self,
+            connector: &'a str,
+        ) -> dormant_displays::connector_panel::IdentityRead<'a> {
+            Box::pin(async move {
+                assert_eq!(connector, "HDMI-A-1");
+                *self.calls.lock().unwrap() += 1;
+                self.found.lock().unwrap().clone()
+            })
+        }
+    }
+
+    fn panel_config() -> Config {
+        let mut cfg = config();
+        let display = cfg.displays.get_mut("shared").unwrap();
+        display.output_panel = Some("AG326UZD".into());
+        display.output = Some("HDMI-A-1".into());
+        cfg
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn panel_mismatch_loses_without_ddc_reads_and_restores() {
+        let mut cfg = panel_config();
+        cfg.coordination.flap_threshold = 2;
+        cfg.displays
+            .get_mut("shared")
+            .unwrap()
+            .shared_peer_input_code = None;
+        let confirmations = cfg.coordination.loss_confirmations;
+        let panel = Arc::new(ScriptedPanel {
+            found: Mutex::new(Some("SAM:TV".into())),
+            calls: Mutex::new(0),
+        });
+        let sink = Arc::new(ScriptedSink::default());
+        let (_cfg, _exec, mut ctl, state, cancel) =
+            setup_with_panel_reader(cfg, sink.clone(), panel.clone());
+        let id = DisplayId("shared".into());
+        for n in 1..=confirmations {
+            tick().await;
+            assert_eq!(state.snapshot()[&id].owned, n < confirmations);
+            assert!(!state.snapshot()[&id].contested);
+        }
+        assert_eq!(sink.reads(), 0, "mismatch must skip VCP 0x60");
+        assert_eq!(sink.state_reads(), 0);
+        assert!(
+            !state.has_successful_read(&id),
+            "panel identity is not a VCP read"
+        );
+        assert_eq!(state.snapshot()[&id].input_code, None);
+        assert!(matches!(
+            ctl.try_recv().unwrap(),
+            ControlMsg::OwnershipPoll { .. }
+        ));
+        *panel.found.lock().unwrap() = Some("AOC:AG326UZD:serial".into());
+        for _ in 0..confirmations {
+            tick().await;
+        }
+        assert!(
+            state.snapshot()[&id].owned,
+            "matching panel reuses local gain path"
+        );
+        assert_eq!(sink.reads(), confirmations);
+        assert!(
+            !state.snapshot()[&id].contested,
+            "panel replacement is not an input flap"
+        );
+        cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn panel_unknown_preserves_readback_and_wake() {
+        let cfg = panel_config();
+        let confirmations = cfg.coordination.loss_confirmations;
+        let panel = Arc::new(ScriptedPanel {
+            found: Mutex::new(None),
+            calls: Mutex::new(0),
+        });
+        let sink = Arc::new(ScriptedSink::with_inputs(std::iter::repeat_n(
+            Ok(Some(0x12)),
+            usize::try_from(confirmations).unwrap(),
+        )));
+        let (_cfg, _exec, _ctl, state, cancel) = setup_with_panel_reader(cfg, sink.clone(), panel);
+        let id = DisplayId("shared".into());
+        tick().await;
+        assert_eq!(sink.reads(), 1, "unknown must still read VCP 0x60");
+        assert!(state.snapshot()[&id].owned);
+        for _ in 1..confirmations {
+            tick().await;
+        }
+        assert!(!state.snapshot()[&id].owned);
+        for _ in 0..confirmations {
+            tick().await;
+        }
+        assert!(state.snapshot()[&id].owned);
+        assert_eq!(sink.reads(), confirmations * 2);
+        cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn panel_unconfigured_never_reads_identity() {
+        let panel = Arc::new(ScriptedPanel {
+            found: Mutex::new(Some("SAM:TV".into())),
+            calls: Mutex::new(0),
+        });
+        let sink = Arc::new(ScriptedSink::default());
+        let (_cfg, _exec, _ctl, _state, cancel) =
+            setup_with_panel_reader(config(), sink.clone(), panel.clone());
+        tick().await;
+        assert_eq!(*panel.calls.lock().unwrap(), 0);
+        assert_eq!(sink.reads(), 1);
+        cancel.cancel();
     }
 
     #[tokio::test(start_paused = true)]
@@ -1409,6 +1611,7 @@ mod tests {
         let (executors_tx, executors_rx) = watch::channel(Arc::new(executors));
         let (ctl_tx, _ctl_rx) = mpsc::channel(64);
         let deps = CoordinationPollDeps {
+            panel_reader: Arc::new(dormant_displays::connector_panel::SystemConnectorPanelReader),
             config_rx,
             ctl_tx,
             executors_rx,
@@ -1420,6 +1623,7 @@ mod tests {
         let mut last_state_read = HashMap::new();
         let mut reprobe_state = HashMap::new();
         let mut pending_observed_gain = HashSet::new();
+        let mut panel_mismatches = HashSet::new();
         for _ in 0..ticks {
             tokio::time::advance(Duration::from_secs(6)).await;
             poll_once(
@@ -1428,6 +1632,7 @@ mod tests {
                 &mut last_state_read,
                 &mut reprobe_state,
                 &mut pending_observed_gain,
+                &mut panel_mismatches,
             )
             .await;
         }
@@ -1453,6 +1658,7 @@ mod tests {
         let (executors_tx, executors_rx) = watch::channel(Arc::new(executors));
         let (ctl_tx, _ctl_rx) = mpsc::channel(64);
         let deps = CoordinationPollDeps {
+            panel_reader: Arc::new(dormant_displays::connector_panel::SystemConnectorPanelReader),
             config_rx,
             ctl_tx,
             executors_rx,
@@ -1464,6 +1670,7 @@ mod tests {
         let mut last_state_read = HashMap::new();
         let mut reprobe_state = HashMap::new();
         let mut pending_observed_gain = HashSet::new();
+        let mut panel_mismatches = HashSet::new();
         for _ in 0..ticks {
             tokio::time::advance(poll_interval).await;
             poll_once(
@@ -1472,6 +1679,7 @@ mod tests {
                 &mut last_state_read,
                 &mut reprobe_state,
                 &mut pending_observed_gain,
+                &mut panel_mismatches,
             )
             .await;
         }

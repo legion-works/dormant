@@ -184,6 +184,9 @@ fn active_sampler_display_context(
         .as_ref()
         .and_then(|sampling| sampling.stream_mode);
     DisplaySamplingContext {
+        panel_expectation: crate::active_sampler::source_gate::PanelExpectation::from_display(
+            display_config,
+        ),
         display: display_exists.then(|| DisplayExpectation {
             display: display.0.clone(),
             compositor_output,
@@ -488,6 +491,7 @@ async fn spawn_active_sampler_runtime(
     let (updates, update_rx) = mpsc::channel::<SamplerUpdate>(16);
     let cancel = sampler_cancellation_token(root);
     let (handle, join) = active_sampler::spawn_with_handle(ActiveSamplerDeps {
+        panel_reader: Arc::new(dormant_displays::connector_panel::SystemConnectorPanelReader),
         initial_config: cfg.clone(),
         display_id: display_id.clone(),
         update_rx,
@@ -673,6 +677,7 @@ mod active_sampler_reload_tests {
     /// context helper.
     fn sample_display_config() -> DisplayConfig {
         DisplayConfig {
+            output_panel: None,
             controllers: Vec::new(),
             scope: DisplayScope::default(),
             shared_input_code: None,
@@ -6697,6 +6702,7 @@ fn spawn_generation(
         && let Some(state) = coordination
     {
         producer_handles.push(coordination_poll::spawn(CoordinationPollDeps {
+            panel_reader: Arc::new(dormant_displays::connector_panel::SystemConnectorPanelReader),
             config_rx,
             ctl_tx: ctl_tx.clone(),
             executors_rx,
@@ -7530,6 +7536,7 @@ mod render_tests {
     /// helper to avoid coupling across crates.
     fn base_display_cfg_for_test() -> dormant_core::config::schema::DisplayConfig {
         dormant_core::config::schema::DisplayConfig {
+            output_panel: None,
             scope: dormant_core::config::DisplayScope::default(),
             shared_input_code: None,
             shared_input_write_code: None,
@@ -8116,6 +8123,7 @@ mod render_tests {
                 m.insert(
                     "mon".into(),
                     dormant_core::config::schema::DisplayConfig {
+                        output_panel: None,
                         scope: dormant_core::config::DisplayScope::default(),
                         shared_input_code: None,
                         shared_input_write_code: None,
@@ -9363,6 +9371,7 @@ mod macos_gamma_black_assembly_tests {
     #[tokio::test]
     async fn chain_with_no_effective_mode_fails_assembly_as_mode_unsupported() {
         let display = DisplayConfig {
+            output_panel: None,
             scope: dormant_core::config::DisplayScope::default(),
             shared_input_code: None,
             shared_input_write_code: None,
@@ -9446,6 +9455,7 @@ mod macos_gamma_black_assembly_tests {
         use dormant_core::types::{LadderStage, StageKind};
 
         let display = DisplayConfig {
+            output_panel: None,
             scope: dormant_core::config::DisplayScope::default(),
             shared_input_code: None,
             shared_input_write_code: None,
@@ -9726,6 +9736,7 @@ mod gamma_reload_tests {
 
     fn gamma_display_cfg(controller: &str, selector: &str) -> DisplayConfig {
         DisplayConfig {
+            output_panel: None,
             scope: dormant_core::config::DisplayScope::default(),
             shared_input_code: None,
             shared_input_write_code: None,

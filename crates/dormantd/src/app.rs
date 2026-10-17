@@ -8375,7 +8375,7 @@ mod render_tests {
             });
 
         let (sinks, _rx) = build_render_sinks(&cfg, Some(&factory));
-        assert_ne!(sinks, HashMap::<DisplayId, Arc<dyn RenderSink>>::new());
+        assert_ne!(sinks.len(), 0);
         assert!(
             captured_shift.lock().expect("capture").take().is_none(),
             "no [displays.<id>.screensaver] table => shift must be None (fully disabled)"
@@ -8580,7 +8580,7 @@ mod render_tests {
             });
 
         let (sinks, _rx) = build_render_sinks(&cfg, Some(&factory));
-        assert_ne!(sinks, HashMap::<DisplayId, Arc<dyn RenderSink>>::new());
+        assert_ne!(sinks.len(), 0);
 
         let observed = captured
             .lock()
@@ -8786,7 +8786,7 @@ mod render_tests {
             });
 
         let (sinks, _rx) = build_render_sinks(&cfg, Some(&factory));
-        assert_ne!(sinks, HashMap::<DisplayId, Arc<dyn RenderSink>>::new());
+        assert_ne!(sinks.len(), 0);
 
         let observed = captured
             .lock()

@@ -384,7 +384,7 @@ async fn run(deps: StatePublisherDeps, transport_box: Option<Box<dyn PublisherTr
                     return;
                 }
             },
-            res = &mut *transport_fut => {
+            res = &mut **transport_fut => {
                 let _ = res;
                 tracing::error!(event = "publish_transport_exited", "publisher transport ended; reload required to retry");
                 return;
@@ -1872,7 +1872,10 @@ mod tests {
     fn discovery_records_empty_when_disabled() {
         let cfg = disabled_cfg();
         let inv = EntityInventory::from_config(&cfg);
-        assert!(discovery_records(&cfg, &inv, "office-pc").is_empty());
+        assert_eq!(
+            discovery_records(&cfg, &inv, "office-pc"),
+            Vec::<PublishRecord>::new()
+        );
     }
 
     // ── Global online availability (issue #174) ───────────────────
@@ -1926,7 +1929,10 @@ mod tests {
     fn snapshot_records_empty_when_disabled() {
         let cfg = disabled_cfg();
         let snap = snapshot_one_of_each();
-        assert!(snapshot_records(&cfg, &snap, "office-pc").is_empty());
+        assert_eq!(
+            snapshot_records(&cfg, &snap, "office-pc"),
+            Vec::<PublishRecord>::new()
+        );
     }
 
     #[test]
@@ -1936,7 +1942,10 @@ mod tests {
             sensor: SensorId("desk".into()),
             state: SensorState::Present,
         };
-        assert!(event_records(&cfg, &ev, "office-pc").is_empty());
+        assert_eq!(
+            event_records(&cfg, &ev, "office-pc"),
+            Vec::<PublishRecord>::new()
+        );
     }
 
     // ── Discovery records: EXACT topic + payload literals ──────────────

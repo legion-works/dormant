@@ -4039,7 +4039,7 @@ mod tests {
         let mut fake = FakeShiftView::new(2);
         let result = fake.apply_shift_destination_and_initial_source((1920, 1080));
         assert!(result.is_none());
-        assert!(fake.take_call_log().is_empty());
+        assert_eq!(fake.take_call_log(), Vec::<String>::new());
     }
 
     #[test]
@@ -4064,7 +4064,7 @@ mod tests {
         let mut fake = FakeShiftView::new(2);
         let dims = fake.reaim_shift_viewport(6, 10, (1920, 1080), 4);
         assert_eq!(dims, None);
-        assert!(fake.take_call_log().is_empty());
+        assert_eq!(fake.take_call_log(), Vec::<String>::new());
     }
 
     #[test]

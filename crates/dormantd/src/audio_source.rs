@@ -872,8 +872,8 @@ mod poller_tests {
 
         assert!(matches!(outcome, TickOutcome::Success(_)));
         assert_eq!(
-            reap_list,
-            Vec::<tokio::process::Child>::new(),
+            reap_list.len(),
+            0,
             "an exited child must not enter the reap list"
         );
     }
@@ -901,11 +901,7 @@ mod poller_tests {
             outcome,
             TickOutcome::Failure(FailureKind::TimedOut)
         ));
-        assert_eq!(
-            reap_list,
-            Vec::<tokio::process::Child>::new(),
-            "the killed child must be reaped"
-        );
+        assert_eq!(reap_list.len(), 0, "the killed child must be reaped");
     }
 
     #[tokio::test]

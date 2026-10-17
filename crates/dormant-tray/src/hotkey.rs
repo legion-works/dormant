@@ -818,7 +818,7 @@ mod tests {
         );
         let notifications = notif_rec.lock().unwrap();
         assert_ne!(
-            notifications,
+            *notifications,
             Vec::<(String, String)>::new(),
             "ambiguous target must notify"
         );

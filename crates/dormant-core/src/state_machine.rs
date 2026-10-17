@@ -2107,7 +2107,7 @@ mod tests {
         drive_blank(&mut sm, t(0), true);
         let effects = sm.step(Input::ZonePresent(true), t(100));
         assert_issue_wake(&effects, 2);
-        assert!(sm.step(Input::SoftBlank, t(110)).is_empty());
+        assert_eq!(sm.step(Input::SoftBlank, t(110)), Vec::<Effect>::new());
         let effects = sm.step(
             Input::WakeResult {
                 r#gen: 2,

@@ -295,8 +295,8 @@ mod tests {
 
     #[test]
     fn raster_offsets_step_zero_is_empty() {
-        assert!(raster_offsets(0, 8).is_empty());
-        assert!(raster_offsets(0, 0).is_empty());
+        assert_eq!(raster_offsets(0, 8), Vec::<(i32, i32)>::new());
+        assert_eq!(raster_offsets(0, 0), Vec::<(i32, i32)>::new());
     }
 
     #[test]

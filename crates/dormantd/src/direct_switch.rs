@@ -3146,11 +3146,7 @@ mod tests {
         assert_eq!(outcome, SwitchOutcome::Switched);
 
         let events = drain_events(&mut front_ctl_rx);
-        assert_ne!(
-            events,
-            Vec::<DaemonEvent>::new(),
-            "push must emit Ownership event"
-        );
+        assert_ne!(events.len(), 0, "push must emit Ownership event");
 
         match &events[0] {
             DaemonEvent::Ownership {

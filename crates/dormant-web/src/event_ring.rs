@@ -243,7 +243,7 @@ mod tests {
         let ring = EventRing::new();
         ring.push(sensor_event("s1"));
         let snap = ring.snapshot(0);
-        assert_eq!(snap, Vec::<RecentEvent>::new());
+        assert_eq!(snap.len(), 0);
     }
 
     #[test]

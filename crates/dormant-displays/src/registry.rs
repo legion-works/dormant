@@ -1083,7 +1083,7 @@ mod tests {
         cfg.controllers = vec![];
         let creds = Credentials::default();
         let chain = build_controllers("no-display", &cfg, &creds, &test_ctx()).unwrap();
-        assert_eq!(chain, Vec::<Box<dyn DisplayController>>::new());
+        assert_eq!(chain.len(), 0);
     }
 
     #[test]

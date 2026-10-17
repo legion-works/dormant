@@ -3878,7 +3878,7 @@ mod tests {
         // The restore step is also Unconfirmable (no observation).
         assert_eq!(report.steps[3].verdict, ExerciseVerdict::Unconfirmable);
         // But every command still ran (the sink log shows them).
-        assert!(!sink.log().is_empty());
+        assert_ne!(sink.log().len(), 0);
     }
 
     /// Fail-safe / wake-path-sacred: an error MID-exercise still ends with

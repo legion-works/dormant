@@ -802,10 +802,7 @@ topic = "test""#;
         assert_eq!(resp.config_version, 1);
         assert_ne!(resp.raw_toml, "");
         assert!(resp.validation.ok);
-        assert_eq!(
-            resp.validation.errors,
-            Vec::<SerializableValidationError>::new()
-        );
+        assert_eq!(resp.validation.errors.len(), 0);
         assert!(resp.validation.load_error.is_none());
     }
 
@@ -1027,10 +1024,7 @@ entity = "binary_sensor.motion"
             "inventory leaked secret on error path: {inventory_json}"
         );
         // display_rules must be coherent (from last-applied inventory, not disk).
-        assert_eq!(
-            resp.display_rules,
-            HashMap::<String, DisplayRuleInfo>::new()
-        );
+        assert_eq!(resp.display_rules.len(), 0);
     }
 
     #[tokio::test]
@@ -1079,10 +1073,7 @@ field = "/val"
             resp.raw_toml
         );
         // display_rules must be from last-applied (coherent with inventory).
-        assert_eq!(
-            resp.display_rules,
-            HashMap::<String, DisplayRuleInfo>::new()
-        );
+        assert_eq!(resp.display_rules.len(), 0);
     }
 
     // ── Absent-optional serialization (#40) ────────────────────────────────

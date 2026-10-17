@@ -223,6 +223,8 @@ async fn poll_once(
         // reads may wait on controller locks; mutate the verdict cache only
         // after the input read (and, on a due tick, the state read) completes.
         // The mismatch arm carries no readback: `expected` only keeps the shared
+        // dispatcher below reachable, so `observed` is a placeholder there and
+        // every use of it must check `panel_mismatch` first.
         // transition dispatcher below reachable; the core receives panel evidence.
         let input = if panel_mismatch {
             Ok(Some(expected))
@@ -333,12 +335,23 @@ async fn poll_once(
             // (issue #134). Surfacing the deferred count lets operators see the
             // debounce in flight rather than mistaking the silence for a stall.
             if let Some(pending_count) = outcome.deferred_loss_count {
-                tracing::info!(
-                    event = "coord_ownership_loss_deferred",
-                    display = %display_id,
-                    pending_count,
-                    observed,
-                );
+                if panel_mismatch {
+                    // `observed` holds the placeholder local code on a mismatch
+                    // tick; logging it would read as a local readback.
+                    tracing::info!(
+                        event = "coord_ownership_loss_deferred",
+                        display = %display_id,
+                        pending_count,
+                        cause = "output_panel_mismatch",
+                    );
+                } else {
+                    tracing::info!(
+                        event = "coord_ownership_loss_deferred",
+                        display = %display_id,
+                        pending_count,
+                        observed,
+                    );
+                }
             }
             // A potential ownership gain is held pending further confirmations
             // (symmetric debounce). Surfacing the deferred count mirrors the

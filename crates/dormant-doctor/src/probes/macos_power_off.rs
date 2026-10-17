@@ -209,7 +209,11 @@ mod tests {
             ),
         )]);
         let hits: Vec<_> = hazardous_displays(&cfg).map(|(id, _)| id).collect();
-        assert!(hits.is_empty(), "private panel must not be hazardous");
+        assert_eq!(
+            hits,
+            Vec::<&str>::new(),
+            "private panel must not be hazardous"
+        );
     }
 
     #[test]
@@ -325,7 +329,7 @@ mod tests {
                 ),
             )]);
             let results = probe_macos_power_off_hazard(&cfg);
-            assert!(results.is_empty());
+            assert_eq!(results, Vec::<ProbeResult>::new());
         }
     }
 }

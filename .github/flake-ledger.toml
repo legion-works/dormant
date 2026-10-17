@@ -31,9 +31,7 @@ first_run_url = ""
 last_run_url = ""
 mechanism = "cross-generation-lost-command-window-during-reload-teardown; canonical lifecycle anchor, while FLAKE-0094 uses its distinct phase-race symptom test"
 reproduction = "cargo nextest run -p dormantd --test daemon_smoke --stress-count 100 --retries 0 --flaky-result fail -E 'test(manual_only_display_full_lifecycle_across_reload)'"
-root_cause = ""
-triage_deferred_until = "2026-09-30"
-triage_deferred_reason = "Needs a reload-teardown instrumentation pass, not a test tweak: the symptom is a command issued against generation N landing after N has been torn down, so diagnosing it requires per-generation command tracing through App::reload that does not exist yet. Shares a mechanism with FLAKE-0094 and should be investigated with it -- fixing either in isolation risks moving the race rather than closing it."
+root_cause = "Reload takes its restore snapshot while the old generation still accepts controls: Runner::reload snapshots, pauses the control router, drains, tears the engine down and restores that same snapshot. A manual command that completes between the snapshot and the pause is lost, because the next generation restores the earlier phase. Holding controls during the swap (#104) and keeping queued controls after a failed install (#322) do not cover a command already processed after the snapshot. Fix tracked in https://github.com/legion-works/dormant/issues/401."
 fix_pr = ""
 proving_test = ""
 soak_evidence = []
@@ -48,12 +46,13 @@ first_run_url = ""
 last_run_url = ""
 mechanism = "shared-global-subscriber-buffer-contention-across-boot-tests"
 reproduction = "cargo nextest run -p dormantd --test boot_rollback --stress-count 100 --retries 0 --flaky-result fail -E 'test(bad_config_with_lkg_immediate_rollback)'"
-root_cause = ""
-triage_deferred_until = "2026-09-30"
-triage_deferred_reason = "Root cause is suspected to be the process-global tracing subscriber buffer shared across boot_rollback tests, which means the fix is a test-harness change (per-test subscriber isolation) affecting every test that asserts on captured logs. That is a wide blast radius for a 1-in-N flake and wants its own change, not a rushed one alongside a release."
-fix_pr = ""
-proving_test = ""
-soak_evidence = []
+root_cause = "The test observed the rollback by draining a process-global tracing buffer instead of diagnostics owned by its own boot instance, so sibling tests running in the same process could mix into or consume the captured output. #107 removed the global capture: each harness owns an ObservationHub and asserts a typed BootRollback observation."
+fix_pr = "https://github.com/legion-works/dormant/pull/107"
+proving_test = "boot_rollback::bad_config_with_lkg_immediate_rollback"
+soak_evidence = [
+  "https://github.com/legion-works/dormant/actions/runs/38872774488",
+  "https://github.com/legion-works/dormant/actions/runs/38705508855",
+]
 status = "open"
 
 [[incident]]
@@ -80,12 +79,13 @@ first_run_url = ""
 last_run_url = ""
 mechanism = "persist-read-race-left-trailing-characters-in-the-wear-ledger"
 reproduction = "cargo nextest run -p dormantd --test daemon_smoke --stress-count 100 --retries 0 --flaky-result fail -E 'test(wear_shutdown_persists_final_ledger)'"
-root_cause = ""
-triage_deferred_until = "2026-09-30"
-triage_deferred_reason = "Trailing characters in the wear ledger point at a read racing a non-atomic persist. The persist path already writes atomically via rename, so either the test reads outside that guarantee or a second writer exists -- distinguishing those requires instrumenting wear_tracker's persist path with write-generation markers. Until that distinction is made, any fix would be a guess about which of two mechanisms is real."
-fix_pr = ""
-proving_test = ""
-soak_evidence = []
+root_cause = "Concurrent ledger writers for the same key shared one temporary path (wear-<key>.json.tmp), so their writes could interleave before the atomic rename and leave a blended JSON file. #95 gives every write its own PID-plus-sequence temporary file; #107 gives the test its own state directory, and the test awaits the final tracker join before reading."
+fix_pr = "https://github.com/legion-works/dormant/pull/95"
+proving_test = "daemon_smoke::wear_shutdown_persists_final_ledger"
+soak_evidence = [
+  "https://github.com/legion-works/dormant/actions/runs/38872774488",
+  "https://github.com/legion-works/dormant/actions/runs/38705508855",
+]
 status = "open"
 
 [[incident]]
@@ -112,12 +112,13 @@ first_run_url = ""
 last_run_url = ""
 mechanism = "watcher-trigger-and-explicit-trigger-reloaded-the-same-content-twice"
 reproduction = "cargo nextest run -p dormantd --test daemon_smoke --stress-count 100 --retries 0 --flaky-result fail -E 'test(config_watch_updates_on_successful_reload_only)'"
-root_cause = ""
-triage_deferred_until = "2026-09-30"
-triage_deferred_reason = "The watcher and the explicit trigger reload identical content, so the assertion cannot currently tell 'reloaded twice' from 'reloaded once and observed twice'. Fixing it means giving reload observations a causal identity (revision + origin) rather than tightening a count -- a dormant-core change, not a test change."
-fix_pr = ""
-proving_test = ""
-soak_evidence = []
+root_cause = "The watcher and the explicit control trigger could each produce a reload notification, while the test awaited an uncorrelated notification and inferred that its own request had completed; the initial watch borrow also left the value unseen, so a stale change could fire. #104 completes reloads with request-ID receipts and marks the initial watch value seen."
+fix_pr = "https://github.com/legion-works/dormant/pull/104"
+proving_test = "daemon_smoke::config_watch_updates_on_successful_reload_only"
+soak_evidence = [
+  "https://github.com/legion-works/dormant/actions/runs/38872774488",
+  "https://github.com/legion-works/dormant/actions/runs/38705508855",
+]
 status = "open"
 
 [[incident]]
@@ -129,12 +130,13 @@ first_run_url = ""
 last_run_url = ""
 mechanism = "marker-write-precedes-phase-landing-and-can-preserve-blanking; distinct symptom anchor resolves the historical FLAKE-0009 same-test collision"
 reproduction = "cargo nextest run -p dormantd --test daemon_smoke --stress-count 100 --retries 0 --flaky-result fail -E 'test(manual_only_display_no_defensive_wake_on_reload)'"
-root_cause = ""
-triage_deferred_until = "2026-09-30"
-triage_deferred_reason = "The marker write can precede the phase landing, so the test observes an intermediate state that is legal but not the one asserted. Needs the same per-generation reload tracing as FLAKE-0009 and should be taken with it; the two were split precisely because they are distinct symptoms of one underlying window."
-fix_pr = ""
-proving_test = ""
-soak_evidence = []
+root_cause = "The command marker is written before the engine consumes the controller result and moves Blanking to Blanked. The test treated the marker as completion, reloaded during the intermediate phase and asserted preservation of a state it had not reached. #95 makes the test wait for Blanked before reloading."
+fix_pr = "https://github.com/legion-works/dormant/pull/95"
+proving_test = "daemon_smoke::manual_only_display_no_defensive_wake_on_reload"
+soak_evidence = [
+  "https://github.com/legion-works/dormant/actions/runs/38872774488",
+  "https://github.com/legion-works/dormant/actions/runs/38705508855",
+]
 status = "open"
 
 [[incident]]
@@ -146,11 +148,9 @@ first_run_url = ""
 last_run_url = ""
 mechanism = "capture-plane-global-state-dependent-observation"
 reproduction = "cargo nextest run -p dormantd --lib --stress-count 100 --retries 0 --flaky-result fail -E 'test(corrupt_rename_failure_logs_wear_ledger_corrupt_not_persist_failed)'"
-root_cause = ""
-triage_deferred_until = "2026-09-30"
-triage_deferred_reason = "Observation depends on process-global capture-plane state, so the test can see another test's log lines under nextest parallelism. Same class as FLAKE-0047 (shared subscriber state) and likely closed by the same per-test isolation work; deferring to be fixed together rather than patched twice in different ways."
+root_cause = "the flaky assertion no longer exists. The test asserted on log text captured with a scoped tracing subscriber; #107 replaced that with a typed WearLedgerCorrupt observation, so the assertion that failed is gone. No failing run log survives, so the original mechanism is not determined. The rewritten test passed every soak iteration since."
 fix_pr = ""
-proving_test = ""
+proving_test = "wear_tracker::tests::corrupt_rename_failure_logs_wear_ledger_corrupt_not_persist_failed"
 soak_evidence = []
 status = "open"
 

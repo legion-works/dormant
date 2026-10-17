@@ -1281,7 +1281,7 @@ async fn reload_rejected_keeps_old() {
         .expect("reload outcome in time")
         .expect("reload bus open");
     match outcome {
-        ReloadOutcome::Rejected(detail) => assert!(!detail.is_empty()),
+        ReloadOutcome::Rejected(detail) => assert_ne!(detail, ""),
         ReloadOutcome::Reloaded => panic!("expected Rejected, got Reloaded"),
     }
 

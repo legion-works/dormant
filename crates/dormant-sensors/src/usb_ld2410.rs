@@ -437,7 +437,7 @@ mod tests {
         let (first, second) = frame.split_at(10);
 
         let frames1 = parser.push(first);
-        assert!(frames1.is_empty(), "no complete frame yet");
+        assert_eq!(frames1, Vec::<Ld2410Frame>::new(), "no complete frame yet");
 
         let frames2 = parser.push(second);
         assert_eq!(frames2.len(), 1);

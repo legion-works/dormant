@@ -611,6 +611,7 @@ impl OwnershipGate for CoordinationGate {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -1773,7 +1774,7 @@ mod tests {
 
         let record = &handle.snapshot()[&aoc];
         assert!(!record.contested);
-        assert!(record.transition_times.is_empty());
+        assert_eq!(record.transition_times, VecDeque::<Instant>::new());
         assert!(record.owned);
     }
 

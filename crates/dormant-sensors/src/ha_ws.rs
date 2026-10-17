@@ -766,14 +766,19 @@ mod tests {
         let actions = proto.handle_message(
             r#"{"id":1,"type":"event","event":{"a":{"binary_sensor.unknown":{"s":"on"}}}}"#,
         );
-        assert!(actions.is_empty(), "expected no actions for unknown entity");
+        assert_eq!(
+            actions,
+            Vec::<Action>::new(),
+            "expected no actions for unknown entity"
+        );
 
         // Second occurrence of same unknown entity should also be ignored.
         let actions = proto.handle_message(
             r#"{"id":2,"type":"event","event":{"a":{"binary_sensor.unknown":{"s":"off"}}}}"#,
         );
-        assert!(
-            actions.is_empty(),
+        assert_eq!(
+            actions,
+            Vec::<Action>::new(),
             "expected no actions for unknown entity (2nd)"
         );
     }
@@ -806,7 +811,11 @@ mod tests {
         let actions = proto.handle_message(
             r#"{"id":1,"type":"event","event":{"a":{"binary_sensor.test_motion":{"s":"bogus"}}}}"#,
         );
-        assert!(actions.is_empty(), "expected no actions for unknown state");
+        assert_eq!(
+            actions,
+            Vec::<Action>::new(),
+            "expected no actions for unknown state"
+        );
     }
 
     #[test]
@@ -949,7 +958,11 @@ mod tests {
             r#"{"type":"event","event":{"r":[42]}}"#,
         ] {
             let actions = proto.handle_message(raw);
-            assert!(actions.is_empty(), "malformed removal should be ignored");
+            assert_eq!(
+                actions,
+                Vec::<Action>::new(),
+                "malformed removal should be ignored"
+            );
         }
 
         // Control: a WELL-FORMED removal on the same protocol instance must
@@ -1004,7 +1017,11 @@ mod tests {
         let actions = proto.handle_message(
             r#"{"id":1,"type":"event","event":{"a":{"binary_sensor.test_motion":{"s":"bogus"}}}}"#,
         );
-        assert!(actions.is_empty(), "expected no actions for unknown state");
+        assert_eq!(
+            actions,
+            Vec::<Action>::new(),
+            "expected no actions for unknown state"
+        );
 
         // Second occurrence of same "bogus" state → also no actions (dedup).
         let actions = proto.handle_message(

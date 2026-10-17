@@ -2718,7 +2718,7 @@ mod tests {
             "{errors:?}"
         );
         let value: toml::Value = toml::from_str("[displays.panel.hooks]\nbefore_acquire = [{ command = ['caffeinate'], skip_if_display_awake = true }]").unwrap();
-        assert!(collect_unknown_keys(&value).is_empty());
+        assert_eq!(collect_unknown_keys(&value), Vec::<UnknownKey>::new());
     }
     use crate::config::DaemonConfig;
     use crate::config::MqttCredential;
@@ -2743,7 +2743,7 @@ gracee_period = "60s"
 "#;
         let value: toml::Value = toml::from_str(toml_str).unwrap();
         let unknown = collect_unknown_keys(&value);
-        assert!(!unknown.is_empty());
+        assert_ne!(unknown, Vec::<UnknownKey>::new());
         assert!(
             unknown.iter().any(|u| u.key_path.contains("gracee_period")),
             "expected gracee_period to be flagged, got {:?}",
@@ -2888,7 +2888,7 @@ gracee_period = "60s"
         let path = Path::new("/tmp/dormant-nonexistent-creds.toml");
         let creds = crate::config::load_credentials(path).unwrap();
         assert!(creds.ha_token.is_none());
-        assert!(creds.samsung.is_empty());
+        assert_eq!(creds.samsung, IndexMap::<String, String>::new());
     }
 
     #[cfg(unix)]
@@ -3429,7 +3429,7 @@ gracee_period = "60s"
     fn kvm_known_keys_accept_every_new_config_key() {
         let config = "config_version = 1\n[keymap]\nclaim_hotkey = \"Meta+F12\"\n[input_filter]\nignore_devices = [\"*jiggler*\"]\n[coordination]\npoll_interval = \"2s\"\nflap_threshold = 8\nflap_window = \"2m\"\nflap_settle = \"1m\"\nactivity_follow = false\narm_after = \"7s\"\ncooldown = \"3s\"\n[displays.main]\ncontrollers = [\"ddcci\"]\nscope = \"shared\"\nshared_input_code = 1\nblank_mode = \"power_off\"\n[displays.main.hooks]\nbefore_release = [{ command = [\"true\"], timeout = \"100ms\", blocking = true, abort_on_failure = false }]\nafter_release = [{ mqtt = { topic = \"x\", payload = \"y\" } }]\nbefore_acquire = []\nafter_acquire = []\n";
         let value: toml::Value = toml::from_str(config).unwrap();
-        assert!(collect_unknown_keys(&value).is_empty());
+        assert_eq!(collect_unknown_keys(&value), Vec::<UnknownKey>::new());
     }
 
     #[test]
@@ -3439,7 +3439,7 @@ gracee_period = "60s"
         // defaults to the read code when absent.
         let config = "config_version = 1\n[displays.main]\ncontrollers = [\"ddcci\"]\nscope = \"shared\"\nshared_input_code = 15\nblank_mode = \"power_off\"\n";
         let value: toml::Value = toml::from_str(config).unwrap();
-        assert!(collect_unknown_keys(&value).is_empty());
+        assert_eq!(collect_unknown_keys(&value), Vec::<UnknownKey>::new());
         let cfg: crate::config::Config = toml::from_str(config).unwrap();
         let dc = &cfg.displays["main"];
         assert_eq!(dc.shared_input_code, Some(15));
@@ -4972,7 +4972,7 @@ typo_top = true
 ";
         let value: toml::Value = toml::from_str(toml_str).unwrap();
         let unknown = collect_unknown_keys(&value);
-        assert!(!unknown.is_empty());
+        assert_ne!(unknown, Vec::<UnknownKey>::new());
         assert!(
             unknown.iter().any(|u| u.key_path == "typo_top"),
             "expected typo_top to be flagged, got {:?}",
@@ -5392,7 +5392,7 @@ password = "test-pass"
             &std::collections::HashMap::new(),
             &Credentials::default(),
         );
-        assert!(errors.is_empty());
+        assert_eq!(errors, Vec::<ValidationError>::new());
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────
@@ -7408,7 +7408,7 @@ stream_mode = "warm"
     #[test]
     fn watchdog_defaults_when_section_absent() {
         let (cfg, warnings) = load_str("config_version = 1\n").unwrap();
-        assert!(warnings.is_empty());
+        assert_eq!(warnings, Vec::<super::super::schema::Warning>::new());
         // Literal values, NOT the defaults:: consts — comparing against the
         // same symbol that produced the value would be tautological and
         // couldn't catch a drifted const (spec §7 pins true / true / 5m).
@@ -7423,7 +7423,7 @@ stream_mode = "warm"
     #[test]
     fn watchdog_defaults_when_section_empty() {
         let (cfg, warnings) = load_str("config_version = 1\n[watchdog]\n").unwrap();
-        assert!(warnings.is_empty());
+        assert_eq!(warnings, Vec::<super::super::schema::Warning>::new());
         // Literal values — see watchdog_defaults_when_section_absent.
         assert!(cfg.watchdog.lkg_enabled);
         assert!(cfg.watchdog.lkg_rollback_enabled);
@@ -8330,7 +8330,11 @@ availability_payload_offline = "down"
         let errors = validate_str(
             "config_version = 1\n[displays.desk]\ncontrollers = [\"command\", \"ddcci\"]\nblank_mode = \"power_off\"\nmodes = [\"power_off\"]\nblank_command = \"true\"\nwake_command = \"true\"\nscope = \"shared\"\nshared_input_code = 15\n",
         );
-        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert_eq!(
+            errors,
+            Vec::<ValidationError>::new(),
+            "unexpected errors: {errors:?}"
+        );
     }
 
     // ── KVM direct-write config tests ───────────────────────────────────────

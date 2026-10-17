@@ -639,7 +639,7 @@ mod tests {
     async fn get_wear_empty_handle_returns_empty_list() {
         let state = test_state_with(HashMap::new(), WearConfig::default(), BIND);
         let Json(resp) = get_wear(State(state)).await;
-        assert!(resp.displays.is_empty());
+        assert_eq!(resp.displays, Vec::<WearSummary>::new());
     }
 
     // ── GET /api/wear/{display} — detail + 404 ──────────────────────────────

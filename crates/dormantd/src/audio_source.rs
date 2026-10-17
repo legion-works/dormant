@@ -871,8 +871,9 @@ mod poller_tests {
         .expect("successful probe must exit");
 
         assert!(matches!(outcome, TickOutcome::Success(_)));
-        assert!(
-            reap_list.is_empty(),
+        assert_eq!(
+            reap_list.len(),
+            0,
             "an exited child must not enter the reap list"
         );
     }
@@ -900,7 +901,7 @@ mod poller_tests {
             outcome,
             TickOutcome::Failure(FailureKind::TimedOut)
         ));
-        assert!(reap_list.is_empty(), "the killed child must be reaped");
+        assert_eq!(reap_list.len(), 0, "the killed child must be reaped");
     }
 
     #[tokio::test]

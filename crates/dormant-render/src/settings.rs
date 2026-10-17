@@ -335,7 +335,7 @@ mod tests {
         let s = ScreensaverSettings::default();
         assert!(!s.audio);
         assert_eq!(s.image_duration, Duration::from_secs(10));
-        assert!(s.items.is_empty());
+        assert_eq!(s.items, Vec::<PlaylistItem>::new());
         // scale_mode defaults to Fill — the OS-screensaver norm.
         assert_eq!(s.scale_mode, ScaleMode::Fill);
         // transition defaults to Crossfade — the production default.

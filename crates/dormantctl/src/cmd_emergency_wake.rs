@@ -1375,7 +1375,7 @@ mod tests {
     async fn probe_and_wake_all_paused_is_false() {
         let report = probe_and_wake_all(Vec::new(), HashMap::new()).await;
         assert!(!report.paused, "fallback path sets paused=false");
-        assert!(report.displays.is_empty());
+        assert_eq!(report.displays, Vec::<EmergencyWakeResult>::new());
     }
 
     #[tokio::test(start_paused = true)]

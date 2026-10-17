@@ -572,7 +572,7 @@ mod tests {
                     (*size as usize) * (*size as usize) * 4,
                     "wrong blob length for size {size}"
                 );
-                assert!(!bytes.is_empty(), "blob for size {size} is empty");
+                assert_ne!(bytes.len(), 0, "blob for size {size} is empty");
             }
         }
     }

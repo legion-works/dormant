@@ -193,7 +193,7 @@ mod tests {
             unreachable: true,
         });
         assert_eq!(t.title, "dormant: daemon unreachable");
-        assert!(t.body.is_empty());
+        assert_eq!(t.body, "");
     }
 
     #[test]
@@ -203,7 +203,7 @@ mod tests {
             unreachable: false,
         });
         assert_eq!(t.title, "dormant: starting…");
-        assert!(t.body.is_empty());
+        assert_eq!(t.body, "");
     }
 
     #[test]

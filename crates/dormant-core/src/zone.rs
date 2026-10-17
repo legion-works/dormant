@@ -593,7 +593,7 @@ mod tests {
         // Sensor a goes absent.
         let changes = engine.apply(&event("a", SensorState::Absent));
         // b is still unavailable → present, so zone stays present.
-        assert!(changes.is_empty());
+        assert_eq!(changes, Vec::<ZoneChange>::new());
         assert!(engine.is_present(&zid("z")).unwrap());
 
         // Both absent.
@@ -823,7 +823,7 @@ mod tests {
 
         // Same event again — no flip.
         let changes = engine.apply(&event("a", SensorState::Present));
-        assert!(changes.is_empty());
+        assert_eq!(changes, Vec::<ZoneChange>::new());
     }
 
     #[test]
@@ -884,7 +884,7 @@ mod tests {
 
         // Event for sensor not in inventory.
         let changes = engine.apply(&event("unknown", SensorState::Present));
-        assert!(changes.is_empty());
+        assert_eq!(changes, Vec::<ZoneChange>::new());
 
         // Known sensor still works — first make it absent so we get a flip.
         engine.apply(&event("a", SensorState::Absent));

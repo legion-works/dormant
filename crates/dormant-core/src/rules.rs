@@ -3878,7 +3878,7 @@ mod tests {
         // The restore step is also Unconfirmable (no observation).
         assert_eq!(report.steps[3].verdict, ExerciseVerdict::Unconfirmable);
         // But every command still ran (the sink log shows them).
-        assert!(!sink.log().is_empty());
+        assert_ne!(sink.log().len(), 0);
     }
 
     /// Fail-safe / wake-path-sacred: an error MID-exercise still ends with
@@ -4011,7 +4011,7 @@ mod tests {
         // default it to empty (serde back-compat).
         let legacy = r#"{"phase":"active","inhibited":false,"paused":false,"cmd_gen":0}"#;
         let snap: DisplaySnapshot = serde_json::from_str(legacy).unwrap();
-        assert!(snap.controllers.is_empty());
+        assert_eq!(snap.controllers, Vec::<ControllerHealth>::new());
     }
 
     #[test]
@@ -4082,7 +4082,7 @@ mod tests {
         let legacy =
             r#"{"phase":"active","inhibited":false,"paused":false,"cmd_gen":0,"controllers":[]}"#;
         let snap: DisplaySnapshot = serde_json::from_str(legacy).unwrap();
-        assert!(snap.rules.is_empty());
+        assert_eq!(snap.rules, Vec::<String>::new());
     }
 
     #[test]
@@ -5199,7 +5199,7 @@ mod tests {
             1,
             Tick::now(),
         );
-        assert!(effects.is_empty());
+        assert_eq!(effects, Vec::<Effect>::new());
         engine.machines.insert(display.clone(), restored);
 
         let (subscribe, mut events) = oneshot::channel();
@@ -6053,7 +6053,7 @@ fn install_restored_machine_replaces_phase_and_queues_effects() {
     // from before a reload.
     let (restored, effects) = DisplayStateMachine::restore(timings, ladder, Phase::Blanked, 1, now);
     // Phase::Blanked restore emits no scheduling effects.
-    assert!(effects.is_empty());
+    assert_eq!(effects, Vec::<Effect>::new());
 
     // Act — install the restored machine.
     engine.install_restored_machine(&display_id, restored, effects, now);
@@ -6161,7 +6161,7 @@ fn install_restored_never_owned_refeed_not_dropped() {
     // from before a reload.
     let (restored, restore_effects) =
         DisplayStateMachine::restore(timings, ladder, Phase::Blanked, 1, now);
-    assert!(restore_effects.is_empty());
+    assert_eq!(restore_effects, Vec::<Effect>::new());
 
     // Act — install the restored machine.
     engine.install_restored_machine(&display_id, restored, restore_effects, now);

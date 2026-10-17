@@ -197,7 +197,7 @@ mod tests {
     fn build_empty_map_returns_empty_vec() {
         let sensors: IndexMap<String, SensorConfig> = IndexMap::new();
         let sources = build(&sensors, &creds_with_token()).unwrap();
-        assert!(sources.is_empty());
+        assert_eq!(sources.len(), 0);
     }
 
     #[test]

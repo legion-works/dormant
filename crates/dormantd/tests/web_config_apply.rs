@@ -204,7 +204,7 @@ async fn config_apply_full_loop() {
     let fingerprint1 = cfg_resp["fingerprint"]
         .as_str()
         .expect("fingerprint present");
-    assert!(!fingerprint1.is_empty(), "fingerprint must be non-empty");
+    assert_ne!(fingerprint1, "", "fingerprint must be non-empty");
     let grace1 = cfg_resp["inventory"]["rules"]["r"]["grace_period"]
         .as_str()
         .expect("grace_period is a string");

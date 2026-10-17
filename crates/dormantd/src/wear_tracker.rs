@@ -4241,7 +4241,7 @@ mod tests {
             None,
             &HashMap::new(),
         );
-        assert!(actions.is_empty());
+        assert_eq!(actions, Vec::<TrackerAction>::new());
     }
 
     #[test]

@@ -877,7 +877,7 @@ wake_retry_interval = "5s"
                     .is_some_and(|n| n.starts_with("config.toml.tmp."))
             })
             .collect();
-        assert!(temps.is_empty(), "no temp files left");
+        assert_eq!(temps.len(), 0, "no temp files left");
     }
 
     // ── Redacted path → 422 ─────────────────────────────────────────────────

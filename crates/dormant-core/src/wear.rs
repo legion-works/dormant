@@ -881,7 +881,7 @@ mod tests {
         let mut l = WearLedger::new(ident(), PanelType::Unknown, 2, 2, 0);
         l.attribute_uniform(Duration::from_secs(7200), 1.0); // 2.0 total
         l.resize_grid(0, 0);
-        assert!(l.cells.is_empty());
+        assert_eq!(l.cells, Vec::<WearCell>::new());
         assert_eq!(l.total_on_hours, 0.0);
     }
 

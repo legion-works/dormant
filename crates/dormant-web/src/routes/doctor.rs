@@ -550,10 +550,10 @@ mod tests {
         };
         let ctl_tx = spawn_fake_engine(snapshot);
         let state = test_web_state(ctl_tx);
-        let result = post_doctor(State(state)).await;
-        // Should return a DoctorReport (non-empty checks not required — empty
-        // snapshot means no checks, and that's fine).
-        assert!(!result.checks.is_empty() || result.checks.is_empty());
+        // The handler must answer with a report. Its checks depend on probes
+        // this empty snapshot does not configure, so their content is not
+        // asserted here.
+        let Json(_report): Json<DoctorReport> = post_doctor(State(state)).await;
     }
 
     // ── #184 OperationsChanged publish tests ──────────────────────────────

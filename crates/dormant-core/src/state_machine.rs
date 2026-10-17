@@ -2000,7 +2000,7 @@ mod tests {
         // Tick past grace — ignored (frozen).
         let effects = sm.step(Input::Tick, t(600));
         assert!(matches!(sm.phase(), Phase::Grace { .. }));
-        assert!(effects.is_empty());
+        assert_eq!(effects, Vec::<Effect>::new());
 
         // But wake path is unaffected: ForceWake in Grace goes to Active,
         // then chains into Grace because zone is still absent (Should).
@@ -2107,7 +2107,7 @@ mod tests {
         drive_blank(&mut sm, t(0), true);
         let effects = sm.step(Input::ZonePresent(true), t(100));
         assert_issue_wake(&effects, 2);
-        assert!(sm.step(Input::SoftBlank, t(110)).is_empty());
+        assert_eq!(sm.step(Input::SoftBlank, t(110)), Vec::<Effect>::new());
         let effects = sm.step(
             Input::WakeResult {
                 r#gen: 2,
@@ -2147,7 +2147,11 @@ mod tests {
             matches!(sm.phase(), Phase::Waking),
             "stale gen should not change phase"
         );
-        assert!(effects.is_empty(), "stale gen should produce no effects");
+        assert_eq!(
+            effects,
+            Vec::<Effect>::new(),
+            "stale gen should produce no effects"
+        );
     }
 
     #[test]
@@ -2246,7 +2250,7 @@ mod tests {
         // Tick past original expiry — ignored.
         let effects = sm.step(Input::Tick, t(600));
         assert!(matches!(sm.phase(), Phase::Grace { .. }));
-        assert!(effects.is_empty());
+        assert_eq!(effects, Vec::<Effect>::new());
 
         // Inhibitor deactivates — unfreezes with remaining time, schedules tick.
         let effects = sm.step(Input::InhibitorChanged(false), t(800));
@@ -2608,7 +2612,7 @@ mod tests {
         // Tick past grace — ignored (frozen).
         let effects = sm.step(Input::Tick, t(700));
         assert!(matches!(sm.phase(), Phase::Grace { .. }));
-        assert!(effects.is_empty());
+        assert_eq!(effects, Vec::<Effect>::new());
 
         // Inhibitor deactivates — unfreezes with full grace period.
         let effects = sm.step(Input::InhibitorChanged(false), t(800));
@@ -2840,7 +2844,7 @@ mod tests {
         sm.step(Input::OwnershipChanged(false), t(10));
 
         let expired_unowned = sm.step(Input::Tick, t(500));
-        assert!(expired_unowned.is_empty());
+        assert_eq!(expired_unowned, Vec::<Effect>::new());
         assert_eq!(sm.phase_name(), "grace");
 
         let rearmed = sm.step(Input::OwnershipChanged(true), t(510));

@@ -591,7 +591,11 @@ mod tests {
         let cmd = caps
             .get("command")
             .expect("'command' must be in capabilities");
-        assert!(cmd.is_empty(), "command controller has no static modes");
+        assert_eq!(
+            cmd,
+            &Vec::<BlankMode>::new(),
+            "command controller has no static modes"
+        );
     }
 
     #[test]
@@ -1079,7 +1083,7 @@ mod tests {
         cfg.controllers = vec![];
         let creds = Credentials::default();
         let chain = build_controllers("no-display", &cfg, &creds, &test_ctx()).unwrap();
-        assert!(chain.is_empty());
+        assert_eq!(chain.len(), 0);
     }
 
     #[test]

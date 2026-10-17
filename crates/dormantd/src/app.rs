@@ -8375,7 +8375,7 @@ mod render_tests {
             });
 
         let (sinks, _rx) = build_render_sinks(&cfg, Some(&factory));
-        assert!(!sinks.is_empty());
+        assert_ne!(sinks.len(), 0);
         assert!(
             captured_shift.lock().expect("capture").take().is_none(),
             "no [displays.<id>.screensaver] table => shift must be None (fully disabled)"
@@ -8580,7 +8580,7 @@ mod render_tests {
             });
 
         let (sinks, _rx) = build_render_sinks(&cfg, Some(&factory));
-        assert!(!sinks.is_empty());
+        assert_ne!(sinks.len(), 0);
 
         let observed = captured
             .lock()
@@ -8786,7 +8786,7 @@ mod render_tests {
             });
 
         let (sinks, _rx) = build_render_sinks(&cfg, Some(&factory));
-        assert!(!sinks.is_empty());
+        assert_ne!(sinks.len(), 0);
 
         let observed = captured
             .lock()
@@ -10186,7 +10186,7 @@ mod gamma_reload_tests {
         let changed_identity =
             changed_dispatch_dark_displays(Some(&snapshot), &old_cfg, &new_cfg, &ruled);
 
-        assert!(removed.is_empty());
+        assert_eq!(removed, Vec::<DisplayId>::new());
         assert_eq!(
             changed_identity,
             vec![DisplayId("mon".into())],

@@ -1501,7 +1501,7 @@ mod tests {
 
         let plan = prepare(&config, &creds, &state_dir, Strictness::Warn, true);
         assert_eq!(plan.chosen_config, config);
-        assert!(plan.deferred_events.is_empty());
+        assert_eq!(plan.deferred_events, Vec::<DeferredEvent>::new());
         assert!(plan.pending_message.is_none());
 
         let raw = std::fs::read_to_string(state_dir.join(CRASH_LOOP_FILE)).unwrap();

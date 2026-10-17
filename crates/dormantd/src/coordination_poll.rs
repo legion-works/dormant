@@ -199,11 +199,11 @@ async fn poll_once(
                 None
             };
             let panel = dormant_core::output_panel::classify(expected_panel, found.as_deref());
-            if let dormant_core::output_panel::OutputPanel::Mismatch { found } = &panel {
-                if panel_mismatches.insert(display_id.clone()) {
-                    tracing::warn!(event = "output_panel_mismatch", display = %display_id,
-                        connector = connector.map_or("", String::as_str), expected = %expected_panel, found = %found);
-                }
+            if let dormant_core::output_panel::OutputPanel::Mismatch { found } = &panel
+                && panel_mismatches.insert(display_id.clone())
+            {
+                tracing::warn!(event = "output_panel_mismatch", display = %display_id,
+                    connector = connector.map_or("", String::as_str), expected = %expected_panel, found = %found);
             }
             panel
         } else {
@@ -1003,12 +1003,16 @@ mod tests {
         calls: Mutex<u32>,
     }
 
-    #[async_trait::async_trait]
     impl dormant_displays::connector_panel::ConnectorPanelReader for ScriptedPanel {
-        async fn identity(&self, connector: &str) -> Option<String> {
-            assert_eq!(connector, "HDMI-A-1");
-            *self.calls.lock().unwrap() += 1;
-            self.found.lock().unwrap().clone()
+        fn identity<'a>(
+            &'a self,
+            connector: &'a str,
+        ) -> dormant_displays::connector_panel::IdentityRead<'a> {
+            Box::pin(async move {
+                assert_eq!(connector, "HDMI-A-1");
+                *self.calls.lock().unwrap() += 1;
+                self.found.lock().unwrap().clone()
+            })
         }
     }
 
@@ -1022,7 +1026,12 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn panel_mismatch_loses_without_ddc_reads_and_restores() {
-        let cfg = panel_config();
+        let mut cfg = panel_config();
+        cfg.coordination.flap_threshold = 2;
+        cfg.displays
+            .get_mut("shared")
+            .unwrap()
+            .shared_peer_input_code = None;
         let confirmations = cfg.coordination.loss_confirmations;
         let panel = Arc::new(ScriptedPanel {
             found: Mutex::new(Some("SAM:TV".into())),
@@ -1057,6 +1066,10 @@ mod tests {
             "matching panel reuses local gain path"
         );
         assert_eq!(sink.reads(), confirmations);
+        assert!(
+            !state.snapshot()[&id].contested,
+            "panel replacement is not an input flap"
+        );
         cancel.cancel();
     }
 
@@ -1070,7 +1083,7 @@ mod tests {
         });
         let sink = Arc::new(ScriptedSink::with_inputs(std::iter::repeat_n(
             Ok(Some(0x12)),
-            confirmations as usize,
+            usize::try_from(confirmations).unwrap(),
         )));
         let (_cfg, _exec, _ctl, state, cancel) = setup_with_panel_reader(cfg, sink.clone(), panel);
         let id = DisplayId("shared".into());

@@ -58,24 +58,28 @@ pub fn read_at(root: &std::path::Path, connector: &str) -> Option<String> {
     .claim_identity()
 }
 
+/// Object-safe identity read without blocking the caller's async executor.
+pub type IdentityRead<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>>;
+
 /// Injectable async boundary shared by ownership and capture gates.
-#[async_trait::async_trait]
 pub trait ConnectorPanelReader: Send + Sync {
     /// Return the connector's claim identity, or inconclusive evidence.
-    async fn identity(&self, connector: &str) -> Option<String>;
+    fn identity<'a>(&'a self, connector: &'a str) -> IdentityRead<'a>;
 }
 
 /// Production DRM reader; filesystem reads do not block the async executor.
 pub struct SystemConnectorPanelReader;
 
-#[async_trait::async_trait]
 impl ConnectorPanelReader for SystemConnectorPanelReader {
-    async fn identity(&self, connector: &str) -> Option<String> {
-        let connector = connector.to_owned();
-        tokio::task::spawn_blocking(move || read(&connector))
-            .await
-            .ok()
-            .flatten()
+    fn identity<'a>(&'a self, connector: &'a str) -> IdentityRead<'a> {
+        Box::pin(async move {
+            let connector = connector.to_owned();
+            tokio::task::spawn_blocking(move || read(&connector))
+                .await
+                .ok()
+                .flatten()
+        })
     }
 }
 

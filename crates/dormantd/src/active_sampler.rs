@@ -3091,11 +3091,15 @@ mod tests {
 
     struct PanelReader(Mutex<Option<String>>);
 
-    #[async_trait]
     impl dormant_displays::connector_panel::ConnectorPanelReader for PanelReader {
-        async fn identity(&self, connector: &str) -> Option<String> {
-            assert_eq!(connector, "HDMI-A-1");
-            self.0.lock().unwrap().clone()
+        fn identity<'a>(
+            &'a self,
+            connector: &'a str,
+        ) -> dormant_displays::connector_panel::IdentityRead<'a> {
+            Box::pin(async move {
+                assert_eq!(connector, "HDMI-A-1");
+                self.0.lock().unwrap().clone()
+            })
         }
     }
 

@@ -200,7 +200,7 @@ jobs:
           DORMANT_GATE_FEATURES: --features web-ui
 
   macos-test:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
@@ -220,7 +220,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: nextest-junit-macos-14
+          name: nextest-junit-macos-15
           path: target/nextest/ci/junit.xml
           if-no-files-found: warn
 
@@ -258,7 +258,7 @@ jobs:
           if-no-files-found: warn
 
   changed-test-stress-macos:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
     env:
       BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
@@ -283,7 +283,7 @@ jobs:
           if-no-files-found: warn
 
   macos-msrv:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6

@@ -394,6 +394,14 @@ Here `render_black` buys 30 seconds of audio-safe, cursorless black before
 the panel actually powers off. If the sensor reports presence during those
 30 seconds, the overlay vanishes — no wake latency, no re-handshake.
 
+If a render failure occurs, the daemon waits for the stage's full `dwell` before
+the next stage. A render failure does not decrease the time before hardware
+power-off. If the sensor reports presence during this dwell, the display stays on.
+
+After a render failure in a stage without a `dwell`, the next controller stage starts.
+If there is no next controller stage, the daemon removes the render surface and
+goes to Active.
+
 ### When to use it
 
 - **OLED + audio over monitor:** the panel powers off via DDC/CI or Tizen,

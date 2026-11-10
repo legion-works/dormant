@@ -32,6 +32,8 @@ pub mod macos_input_filter;
 pub mod macos_idle;
 pub mod notifier;
 pub mod reload;
+#[cfg(feature = "render")]
+mod retry_render_sink;
 pub mod sd_notify;
 pub mod single_instance;
 pub mod state_publisher;

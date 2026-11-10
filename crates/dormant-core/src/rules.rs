@@ -2477,6 +2477,27 @@ impl RulesEngine {
         self.step_machine(display, Input::OwnershipChanged(owns), now);
     }
 
+    fn display_health(&self, dcfg: &DisplayRuntimeCfg) -> Vec<ControllerHealth> {
+        let mut controllers = self
+            .executors
+            .get(&dcfg.display)
+            .map(|exec| exec.controller_health())
+            .unwrap_or_default();
+        if dcfg.ladder.iter().any(|stage| stage.kind.is_render()) {
+            let detail = self.render_sinks.get(&dcfg.display).map_or_else(
+                || Some("render sink unavailable".to_string()),
+                |sink| sink.health_error(),
+            );
+            controllers.push(ControllerHealth {
+                name: "render".into(),
+                role: ControllerRole::Fallback,
+                healthy: detail.is_none(),
+                detail,
+            });
+        }
+        controllers
+    }
+
     fn send_snapshot(&self, tx: oneshot::Sender<StateSnapshot>) {
         let now_sys = std::time::SystemTime::now();
         let sensors = self
@@ -2513,11 +2534,7 @@ impl RulesEngine {
         let mut displays: Vec<(String, DisplaySnapshot)> = Vec::new();
         for dcfg in &self.cfg.displays {
             if let Some(m) = self.machines.get(&dcfg.display) {
-                let controllers = self
-                    .executors
-                    .get(&dcfg.display)
-                    .map(|exec| exec.controller_health())
-                    .unwrap_or_default();
+                let controllers = self.display_health(dcfg);
                 let coordination = self
                     .coordination
                     .as_ref()
@@ -5073,6 +5090,30 @@ mod tests {
         fn owns(&self, _display: &DisplayId) -> bool {
             self.0.load(std::sync::atomic::Ordering::Relaxed)
         }
+    }
+
+    #[tokio::test]
+    async fn render_health_reports_missing_sink() {
+        let display = DisplayId("mon".into());
+        let mut engine = manual_engine_with_ladder(
+            display,
+            HashMap::new(),
+            HashMap::new(),
+            vec![LadderStage {
+                kind: StageKind::RenderBlack,
+                dwell: None,
+            }],
+            Arc::new(crate::ownership::AlwaysOwned),
+        );
+        let snapshot = snapshot_of(&mut engine);
+        let row = snapshot.displays[0]
+            .1
+            .controllers
+            .iter()
+            .find(|c| c.name == "render")
+            .expect("render health must be included");
+        assert!(!row.healthy, "missing render sink must degrade health");
+        assert!(row.detail.as_deref().unwrap().contains("unavailable"));
     }
 
     fn manual_display_engine(

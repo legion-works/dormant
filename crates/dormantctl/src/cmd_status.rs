@@ -555,6 +555,26 @@ mod tests {
     }
 
     #[test]
+    fn health_column_shows_render_failure_reason() {
+        let mut snap = canned_snapshot();
+        snap.displays[0]
+            .1
+            .controllers
+            .push(dormant_core::rules::ControllerHealth {
+                name: "render".into(),
+                role: dormant_core::rules::ControllerRole::Fallback,
+                healthy: false,
+                detail: Some("output 'HDMI-A-1' not found".into()),
+            });
+        assert!(render_table(&snap).contains("render: output 'HDMI-A-1' not found"));
+        assert!(
+            serde_json::to_string(&snap)
+                .unwrap()
+                .contains("output 'HDMI-A-1' not found")
+        );
+    }
+
+    #[test]
     fn health_column_shows_unhealthy_controller_detail() {
         use dormant_core::rules::ControllerHealth;
         use dormant_core::rules::ControllerRole;

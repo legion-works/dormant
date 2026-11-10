@@ -424,6 +424,11 @@ pub trait CommandSink: Send + Sync {
 /// the implementation crate.
 #[async_trait::async_trait]
 pub trait RenderSink: Send + Sync {
+    /// Return the construction failure while the render sink is unavailable.
+    fn health_error(&self) -> Option<String> {
+        None
+    }
+
     /// Show a render surface for the given ladder stage.
     ///
     /// `r#gen` is a monotonically increasing generation counter for stale-

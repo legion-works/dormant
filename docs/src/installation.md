@@ -145,6 +145,15 @@ systemctl --user daemon-reload
 systemctl --user enable --now app-dormant.service
 ```
 
+The unit starts only when the systemd user manager has `WAYLAND_DISPLAY` or
+`DISPLAY` in its environment. The desktop session sets these variables when it
+starts. If you run `systemctl --user enable --now` from SSH or from a text
+console before you log in to the desktop, systemd enables the unit but does not
+start it. The daemon then starts with the desktop session. Without this
+condition, a daemon started before the desktop cannot draw its render stages,
+cannot read keyboard and mouse idle time, and cannot run hooks that need the
+compositor, until it restarts.
+
 Check status:
 
 ```bash

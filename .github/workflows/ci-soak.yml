@@ -152,7 +152,7 @@ jobs:
 
   soak-macos-fixed:
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-soak-probe')
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
@@ -207,7 +207,7 @@ jobs:
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/ci/update_flake_issue.py --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" --os-image macos-14 --commit-sha "${{ github.sha }}" < target/soak-macos-fixed/classifications.jsonl
+        run: python3 scripts/ci/update_flake_issue.py --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" --os-image macos-15 --commit-sha "${{ github.sha }}" < target/soak-macos-fixed/classifications.jsonl
       - name: Upload soak JUnit
         if: always()
         uses: actions/upload-artifact@v7
@@ -328,7 +328,7 @@ jobs:
 
   soak-hermeticity-macos:
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-soak-probe')
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6

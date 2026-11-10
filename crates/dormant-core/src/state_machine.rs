@@ -46,11 +46,11 @@ pub enum Phase {
         /// Generation counter matching the `ShowRender` that was issued.
         r#gen: u64,
     },
-    /// A render surface is currently shown on the display.
+    /// A render stage waits for its dwell or an external event, with or without a surface.
     Staged {
         /// Index into the display's ladder.
         idx: usize,
-        /// Generation counter matching the active render surface.
+        /// Generation counter for the completed render attempt.
         r#gen: u64,
     },
 }
@@ -1075,7 +1075,7 @@ impl DisplayStateMachine {
             }
 
             // ── Staged ───────────────────────────────────────────────────────
-            // Render surface is up.  Zone presence tears down + Active.
+            // Presence goes to Active with or without a render surface.
             (Phase::Staged { .. }, Input::ZonePresent(present)) => {
                 self.zone_present = Some(present);
                 if present {

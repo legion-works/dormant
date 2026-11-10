@@ -2913,9 +2913,7 @@ impl RulesEngine {
                         });
                     });
                 } else {
-                    // No render backend — render stage fails fall-through
-                    // so the machine never wedges in RenderPending.
-                    //
+                    // Report the failure so the machine can keep the stage dwell.
                     let display = display_id.clone();
                     let tx = self.results_tx.clone();
                     tokio::spawn(async move {

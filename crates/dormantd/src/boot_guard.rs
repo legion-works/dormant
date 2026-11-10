@@ -783,7 +783,7 @@ pub enum PromoteVerdict {
 ///    checks yet — an unbroken healthy window is a wall-clock precondition,
 ///    not something the display-health gate can shortcut).
 /// 2. Display-health gate (spec F4): a display counts as "all-unhealthy"
-///    only when its `controllers` vector is NON-EMPTY and every row is
+///    only when its controller-chain health is NON-EMPTY and every chain row is
 ///    unhealthy — a display never commanded during the window (empty
 ///    health) is unproven, not failing, and NEVER defers (spec's honest
 ///    limit, documented, not a bug). If any display is all-unhealthy:
@@ -813,10 +813,14 @@ pub fn should_promote(
         return PromoteVerdict::Wait;
     }
 
-    let any_all_unhealthy = snapshot
-        .displays
-        .iter()
-        .any(|(_, d)| !d.controllers.is_empty() && d.controllers.iter().all(|c| !c.healthy));
+    let any_all_unhealthy = snapshot.displays.iter().any(|(_, d)| {
+        let mut chain = d
+            .controllers
+            .iter()
+            .filter(|row| row.name != dormant_core::rules::RENDER_HEALTH_ROW)
+            .peekable();
+        chain.peek().is_some() && chain.all(|row| !row.healthy)
+    });
 
     if any_all_unhealthy && defer_count < LKG_HEALTH_DEFER_CAP {
         return PromoteVerdict::DeferHealth;
@@ -1828,7 +1832,9 @@ mod tests {
 #[cfg(test)]
 mod promote_tests {
     use super::*;
-    use dormant_core::rules::{ControllerHealth, ControllerRole, DisplaySnapshot};
+    use dormant_core::rules::{
+        ControllerHealth, ControllerRole, DisplaySnapshot, RENDER_HEALTH_ROW,
+    };
 
     fn healthy_ctl(name: &str) -> ControllerHealth {
         ControllerHealth {
@@ -1889,6 +1895,56 @@ mod promote_tests {
     }
 
     const WINDOW: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn lkg_gate_ignores_healthy_render_row() {
+        let since = Instant::now();
+        let snapshot = snap(vec![(
+            "mon",
+            display(
+                "active",
+                vec![unhealthy_ctl("ddcci"), healthy_ctl(RENDER_HEALTH_ROW)],
+            ),
+        )]);
+        assert_eq!(
+            should_promote(since, since + WINDOW, WINDOW, &snapshot, 0, true),
+            PromoteVerdict::DeferHealth,
+            "healthy render row must not hide a dead controller chain"
+        );
+    }
+
+    #[test]
+    fn lkg_gate_ignores_unhealthy_render_row() {
+        let since = Instant::now();
+        let snapshot = snap(vec![(
+            "mon",
+            display(
+                "active",
+                vec![healthy_ctl("ddcci"), unhealthy_ctl(RENDER_HEALTH_ROW)],
+            ),
+        )]);
+        assert_eq!(
+            should_promote(since, since + WINDOW, WINDOW, &snapshot, 0, true),
+            PromoteVerdict::Promote,
+            "unhealthy render row must not defer a healthy controller chain"
+        );
+    }
+
+    #[test]
+    fn lkg_gate_render_only_health_is_unproven() {
+        let since = Instant::now();
+        for row in [
+            healthy_ctl(RENDER_HEALTH_ROW),
+            unhealthy_ctl(RENDER_HEALTH_ROW),
+        ] {
+            let snapshot = snap(vec![("mon", display("active", vec![row]))]);
+            assert_eq!(
+                should_promote(since, since + WINDOW, WINDOW, &snapshot, 0, true),
+                PromoteVerdict::Promote,
+                "render-only health must not prove a controller-chain failure"
+            );
+        }
+    }
 
     #[test]
     fn window_not_elapsed_waits() {

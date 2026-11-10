@@ -93,7 +93,7 @@ pub(super) fn spawn_wayland_thread(
     let iwt = input_wake_tx.cloned();
     let irt = item_report_tx.cloned();
 
-    std::thread::Builder::new()
+    let thread = std::thread::Builder::new()
         .name(format!("dormant-render-{display_id}"))
         .spawn(move || {
             let result = init(&did, &oname, iwt.as_ref(), irt.as_ref());
@@ -119,10 +119,18 @@ pub(super) fn spawn_wayland_thread(
             error: format!("{E_RENDER_UNAVAILABLE}: spawn wayland thread: {e}"),
         })?;
 
-    init_rx.recv().map_err(|e| CmdFailure {
-        controller: "render-black".into(),
-        error: format!("{E_RENDER_UNAVAILABLE}: init channel closed: {e}"),
-    })?
+    let result = init_rx
+        .recv()
+        .map_err(|e| CmdFailure {
+            controller: "render-black".into(),
+            error: format!("{E_RENDER_UNAVAILABLE}: init channel closed: {e}"),
+        })
+        .and_then(std::convert::identity);
+    if result.is_err() {
+        // A retry must not overlap a failed thread or its Wayland connection.
+        let _ = thread.join();
+    }
+    result
 }
 
 /// Initialise the connection, bind the globals, locate the target

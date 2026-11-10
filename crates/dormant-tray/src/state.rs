@@ -14,7 +14,8 @@
 //!   human deliberately disabled blanking; the overlay badge communicates
 //!   that intent.
 //! - [`IconState::Failure`] — any display has accumulated wake attempts
-//!   (`wake_attempts > 0`) or failed its last blank (`last_blank_failed`).
+//!   (`wake_attempts > 0`), failed its last blank (`last_blank_failed`),
+//!   or reports an unhealthy controller.
 //!   Failure outranks Paused: a failing display needs the operator's
 //!   attention even if the display happens to also be paused.
 //! - [`IconState::Unreachable`] — the IPC socket could not be reached
@@ -33,8 +34,7 @@ pub enum IconState {
     Attention,
     /// At least one display paused (operator override).
     Paused,
-    /// At least one display is failing to wake or failed its last blank
-    /// attempt (`wake_attempts > 0 || last_blank_failed`).
+    /// At least one display cannot wake, cannot blank, or has an unhealthy controller.
     Failure,
     /// Daemon unreachable (IPC socket down).
     Unreachable,
@@ -93,10 +93,9 @@ pub fn derive_icon_state(snap: &StateSnapshot) -> IconState {
         return IconState::Normal;
     }
 
-    let any_failing = snap
-        .displays
-        .iter()
-        .any(|(_id, d)| d.wake_attempts > 0 || d.last_blank_failed);
+    let any_failing = snap.displays.iter().any(|(_id, d)| {
+        d.wake_attempts > 0 || d.last_blank_failed || d.controllers.iter().any(|row| !row.healthy)
+    });
     if any_failing {
         return IconState::Failure;
     }
@@ -118,6 +117,28 @@ pub fn derive_icon_state(snap: &StateSnapshot) -> IconState {
 mod tests {
     use super::*;
     use dormant_core::rules::{DisplaySnapshot, StateSnapshot};
+
+    #[test]
+    fn render_health_failure_sets_failure_icon_and_recovers() {
+        let mut snap = snap_with("active", false);
+        snap.displays[0]
+            .1
+            .controllers
+            .push(dormant_core::rules::ControllerHealth {
+                name: "render".into(),
+                role: dormant_core::rules::ControllerRole::Fallback,
+                healthy: false,
+                detail: Some("output 'HDMI-A-1' not found".into()),
+            });
+        assert_eq!(
+            derive_icon_state(&snap),
+            IconState::Failure,
+            "unavailable render sink must set failure icon"
+        );
+        snap.displays[0].1.controllers[0].healthy = true;
+        snap.displays[0].1.controllers[0].detail = None;
+        assert_eq!(derive_icon_state(&snap), IconState::Normal);
+    }
 
     fn snap_with(phase: &str, paused: bool) -> StateSnapshot {
         StateSnapshot {

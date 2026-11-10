@@ -255,10 +255,12 @@ async fn run_inner(
 
     // ── Owned displays — per-controller health from snapshot ──
     for (display_id, display) in &snapshot.displays {
-        if display.controllers.is_empty() {
-            // No attempts yet (e.g. cold start, or display never blanked).
-            // Report a single Skip so the operator sees the display exists
-            // but has no health record.
+        if display
+            .controllers
+            .iter()
+            .all(|row| row.name == dormant_core::rules::RENDER_HEALTH_ROW)
+        {
+            // Render construction does not prove a controller-chain attempt.
             checks.push(Check {
                 name: format!("display {display_id}"),
                 status: CheckStatus::Skip,
@@ -266,7 +268,6 @@ async fn run_inner(
                 category: Some("display".into()),
                 subject: Some(display_id.clone()),
             });
-            continue;
         }
         for h in &display.controllers {
             let name = format!("{} ({display_id})", h.name);
@@ -276,7 +277,16 @@ async fn run_inner(
                 CheckStatus::Fail
             };
             let detail = h.detail.clone().or_else(|| {
-                if h.healthy {
+                if h.name == dormant_core::rules::RENDER_HEALTH_ROW {
+                    Some(
+                        if h.healthy {
+                            "render sink available"
+                        } else {
+                            "render sink unavailable"
+                        }
+                        .into(),
+                    )
+                } else if h.healthy {
                     Some("last attempt succeeded".into())
                 } else {
                     Some("last attempt failed (no detail recorded)".into())
@@ -735,6 +745,55 @@ mod tests {
         assert!(report.checks.iter().all(|c| !c.name.starts_with("usb ")
             && !c.name.starts_with("mqtt ")
             && !c.name.starts_with("ha ")));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn render_health_does_not_imply_controller_attempts() {
+        use dormant_core::rules::{ControllerHealth, ControllerRole, RENDER_HEALTH_ROW};
+        for healthy in [true, false] {
+            let mut cfg = (*test_config()).clone();
+            cfg.sensors.clear();
+            let mut snapshot = owned_usb_snapshot();
+            snapshot.sensors.clear();
+            snapshot.displays[0].1.controllers.push(ControllerHealth {
+                name: RENDER_HEALTH_ROW.into(),
+                role: ControllerRole::Fallback,
+                healthy,
+                detail: (!healthy).then(|| "output absent".into()),
+            });
+            let ctl_tx = spawn_fake_engine(snapshot, None, Arc::new(AtomicUsize::new(0)));
+            let (_config_tx, config_rx) = watch::channel(Arc::new(cfg));
+            let (_creds_tx, creds_rx) = watch::channel(test_creds());
+            let report = DoctorService::new(ctl_tx, config_rx, creds_rx).run().await;
+            assert!(
+                report
+                    .checks
+                    .iter()
+                    .any(|check| check.name == "display main" && check.status == CheckStatus::Skip),
+                "render health must not suppress the unproven controller-chain check"
+            );
+            let render = report
+                .checks
+                .iter()
+                .find(|check| check.name == "render (main)")
+                .expect("render availability check required");
+            assert_eq!(
+                render.status,
+                if healthy {
+                    CheckStatus::Ok
+                } else {
+                    CheckStatus::Fail
+                }
+            );
+            assert_eq!(
+                render.detail.as_deref(),
+                Some(if healthy {
+                    "render sink available"
+                } else {
+                    "output absent"
+                })
+            );
+        }
     }
 
     /// Snapshot fetch timeout falls back to an empty snapshot, the report

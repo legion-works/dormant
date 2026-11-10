@@ -311,12 +311,11 @@ export default function DisplayDetail({ id, snapshot, config, rule, wear, wearEr
                   <span className={`display-detail__controller-dot${c.healthy ? " display-detail__controller-dot--healthy" : " display-detail__controller-dot--failing"}`} />
                   <div className="display-detail__controller-info">
                     <span className="display-detail__controller-name">{c.name}</span>
-                    {!c.healthy && c.detail && (
-                      <span className="display-detail__controller-detail">{c.detail}</span>
-                    )}
-                    {c.healthy && (
-                      <span className="display-detail__controller-detail">primary · last attempt succeeded</span>
-                    )}
+                    <span className="display-detail__controller-detail">
+                      {c.name === "render"
+                        ? c.healthy ? "render · ready" : (c.detail ?? "render unavailable")
+                        : `${c.role} · ${c.healthy ? "last attempt succeeded" : (c.detail ?? "last attempt failed")}`}
+                    </span>
                   </div>
                   <span className={`display-detail__controller-status${c.healthy ? " display-detail__controller-status--ok" : " display-detail__controller-status--fail"}`}>
                     {c.healthy ? "healthy" : "failing"}

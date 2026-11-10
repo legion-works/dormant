@@ -6551,51 +6551,59 @@ fn build_render_sinks_with_context(
         };
 
         if let Some(output_name) = &dc.output {
-            let ss_ref = screensaver_settings.as_ref();
-            let shift_ref = shift_settings.as_ref();
-            let sink: Option<Arc<dyn RenderSink>> = if let Some(builder) = render_sink_builder {
-                (builder)(
-                    did.clone(),
-                    output_name.clone(),
-                    Some(&input_wake_tx),
-                    Some(&item_report_tx),
-                    ss_ref,
-                    shift_ref,
-                )
-            } else {
-                match LayerShellRenderSink::new(
-                    did.clone(),
-                    output_name.clone(),
-                    Some(&input_wake_tx),
-                    Some(&item_report_tx),
-                ) {
-                    Ok(sink) => {
-                        if let Some(ref settings) = screensaver_settings {
-                            sink.set_screensaver(settings.clone());
-                        }
-                        if let Some(shift) = shift_settings {
-                            sink.set_shift(shift);
-                        }
-                        Some(Arc::new(sink))
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            event = "render_sink_build_failed",
-                            display = %did,
-                            error = %e,
-                        );
-                        None
-                    }
+            let display = did.clone();
+            let output = output_name.clone();
+            let wake_tx = input_wake_tx.clone();
+            let report_tx = item_report_tx.clone();
+            let factory = render_sink_builder.cloned();
+            let builder = Box::new(move || {
+                if let Some(factory) = &factory {
+                    return factory(
+                        display.clone(),
+                        output.clone(),
+                        Some(&wake_tx),
+                        Some(&report_tx),
+                        screensaver_settings.as_ref(),
+                        shift_settings.as_ref(),
+                    )
+                    .ok_or_else(|| dormant_core::types::CmdFailure {
+                        controller: "render".into(),
+                        error: "E_RENDER_UNAVAILABLE: render sink builder failed".into(),
+                    });
                 }
-            };
-            if let Some(sink) = sink {
-                sinks.insert(did, sink);
-            }
+                let sink = LayerShellRenderSink::new(
+                    display.clone(),
+                    output.clone(),
+                    Some(&wake_tx),
+                    Some(&report_tx),
+                )?;
+                if let Some(settings) = &screensaver_settings {
+                    sink.set_screensaver(settings.clone());
+                }
+                if let Some(shift) = &shift_settings {
+                    sink.set_shift(*shift);
+                }
+                Ok(Arc::new(sink) as Arc<dyn RenderSink>)
+            });
+            sinks.insert(
+                did.clone(),
+                Arc::new(crate::retry_render_sink::RetryRenderSink::new(did, builder)),
+            );
         } else {
             tracing::warn!(
                 event = "render_sink_missing_output",
                 display = %did,
-                "render stage configured but no output connector; skipping render sink"
+                "render stage configured but no output connector"
+            );
+            sinks.insert(
+                did.clone(),
+                Arc::new(crate::retry_render_sink::RetryRenderSink::unavailable(
+                    did,
+                    dormant_core::types::CmdFailure {
+                        controller: "render".into(),
+                        error: "E_RENDER_UNAVAILABLE: no output connector configured".into(),
+                    },
+                )),
             );
         }
     }
@@ -7624,6 +7632,213 @@ mod render_tests {
             input_filter: dormant_core::config::InputFilterConfig::default(),
             publish: dormant_core::config::PublishConfig::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn failed_render_build_retries_and_delegates_teardown() {
+        use dormant_core::fakes::{RecordingRenderSink, RenderCmd};
+        use dormant_core::types::StageKind;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cfg = screensaver_config_for_test(std::path::Path::new("/nonexistent"), 0.05, 0.25);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let attempts = calls.clone();
+        let recording = RecordingRenderSink::new();
+        let built = recording.clone();
+        let factory: RenderSinkBuilder = Arc::new(move |_, _, _, _, _, _| {
+            if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+                None
+            } else {
+                Some(Arc::new(built.clone()))
+            }
+        });
+        let (sinks, _rx) = build_render_sinks(&cfg, Some(&factory));
+        let sink = sinks
+            .get(&DisplayId("mon".into()))
+            .expect("failed construction must retain a retry sink");
+        assert!(
+            sink.health_error()
+                .unwrap()
+                .contains("render sink builder failed")
+        );
+        assert!(sink.show(1, 0, StageKind::RenderBlack).await.is_err());
+        assert!(
+            sink.health_error().is_some(),
+            "failed builder must degrade health"
+        );
+        assert!(
+            sink.show(2, 0, StageKind::RenderScreensaver).await.is_ok(),
+            "second show must retry construction"
+        );
+        assert!(
+            sink.health_error().is_none(),
+            "late build must restore health"
+        );
+        sink.show_current_overlay().await.unwrap();
+        sink.teardown(3).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(
+            recording
+                .log()
+                .iter()
+                .any(|(_, cmd)| matches!(cmd, RenderCmd::Teardown { r#gen: 3 }))
+        );
+        assert!(
+            recording
+                .log()
+                .iter()
+                .any(|(_, cmd)| matches!(cmd, RenderCmd::OverlayReassert))
+        );
+    }
+
+    async fn render_health_snapshot_for_test(
+        sink: Arc<dyn RenderSink>,
+    ) -> dormant_core::rules::DisplaySnapshot {
+        use dormant_core::rules::{DisplayRuntimeCfg, RulesEngine, RulesEngineConfig};
+        use dormant_core::types::{LadderStage, StageKind};
+        let display = DisplayId("mon".into());
+        let engine = RulesEngine::new(
+            RulesEngineConfig {
+                rules: vec![],
+                displays: vec![DisplayRuntimeCfg {
+                    display: display.clone(),
+                    blank_mode: dormant_core::types::BlankMode::PowerOff,
+                    ladder: vec![LadderStage {
+                        kind: StageKind::RenderBlack,
+                        dwell: None,
+                    }],
+                    timings: DisplayRuntimeCfg::manual_defaults(Duration::ZERO),
+                }],
+                sensors: vec![],
+                doctor_wake_settle: Duration::from_secs(3),
+            },
+            dormant_core::zone::ZoneEngine::new(vec![], &[]).unwrap(),
+            HashMap::new(),
+            HashMap::from([(display, sink)]),
+            Arc::new(dormant_core::ownership::AlwaysOwned),
+        )
+        .unwrap();
+        let (_events_tx, events_rx) = mpsc::channel(1);
+        let (ctl_tx, ctl_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(engine.run(events_rx, ctl_rx, cancel.clone()));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        ctl_tx.send(ControlMsg::Snapshot(tx)).await.unwrap();
+        let mut snapshot = rx.await.unwrap();
+        cancel.cancel();
+        task.await.unwrap();
+        snapshot.displays.remove(0).1
+    }
+
+    #[tokio::test]
+    async fn render_health_clears_after_late_build() {
+        use dormant_core::fakes::RecordingRenderSink;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let sink: Arc<dyn RenderSink> = Arc::new(crate::retry_render_sink::RetryRenderSink::new(
+            DisplayId("mon".into()),
+            Box::new(move || {
+                if calls.fetch_add(1, Ordering::SeqCst) < 2 {
+                    Err(dormant_core::types::CmdFailure {
+                        controller: "render-black".into(),
+                        error: "output 'HDMI-A-1' not found".into(),
+                    })
+                } else {
+                    Ok(Arc::new(RecordingRenderSink::new()))
+                }
+            }),
+        ));
+        assert!(
+            sink.show(1, 0, dormant_core::types::StageKind::RenderBlack)
+                .await
+                .is_err()
+        );
+        let failed = render_health_snapshot_for_test(sink.clone()).await;
+        let row = failed
+            .controllers
+            .iter()
+            .find(|row| row.name == "render")
+            .expect("render health row required");
+        assert!(!row.healthy, "failed builder must degrade snapshot health");
+        assert_eq!(row.detail.as_deref(), Some("output 'HDMI-A-1' not found"));
+        sink.show(2, 0, dormant_core::types::StageKind::RenderBlack)
+            .await
+            .unwrap();
+        let recovered = render_health_snapshot_for_test(sink).await;
+        assert!(
+            recovered.controllers.iter().all(|row| row.healthy),
+            "late build must restore snapshot health"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_render_build_retains_settings_and_report_channels() {
+        use dormant_core::fakes::RecordingRenderSink;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cfg = screensaver_config_for_test(std::path::Path::new("/nonexistent"), 0.05, 0.25);
+        let context = RenderContext {
+            luma_cache: Arc::new(LumaCache::new()),
+            luma_catalog: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            heat_snapshots: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            seed: 7,
+            item_journal: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let calls = AtomicUsize::new(0);
+        let factory: RenderSinkBuilder =
+            Arc::new(move |did, output, wake, reports, settings, shift| {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return None;
+                }
+                assert_eq!(output, "DP-1");
+                assert_eq!(settings.unwrap().wear_temperature, 0.05);
+                assert!(shift.is_some());
+                wake.unwrap().send(did.clone()).unwrap();
+                reports
+                    .unwrap()
+                    .send(ScreensaverItemReport {
+                        display_id: did,
+                        uri: Some("late-item".into()),
+                        luma: None,
+                        observed_at: std::time::Instant::now(),
+                    })
+                    .unwrap();
+                Some(Arc::new(RecordingRenderSink::new()))
+            });
+        let (sinks, mut wake_rx, _, mut reports_rx) =
+            build_render_sinks_with_context(&cfg, Some(&factory), &context);
+        sinks[&DisplayId("mon".into())]
+            .show(1, 0, dormant_core::types::StageKind::RenderScreensaver)
+            .await
+            .unwrap();
+        assert_eq!(wake_rx.try_recv().unwrap(), DisplayId("mon".into()));
+        let report = reports_rx.try_recv().unwrap();
+        assert_eq!(report.display_id, DisplayId("mon".into()));
+        assert_eq!(report.uri.as_deref(), Some("late-item"));
+    }
+
+    #[tokio::test]
+    async fn missing_output_has_fixed_degraded_health() {
+        let mut cfg = screensaver_config_for_test(std::path::Path::new("/nonexistent"), 0.05, 0.25);
+        cfg.displays.get_mut("mon").unwrap().output = None;
+        let factory: RenderSinkBuilder =
+            Arc::new(|_, _, _, _, _, _| panic!("missing output must not retry"));
+        let (sinks, _rx) = build_render_sinks(&cfg, Some(&factory));
+        let sink = &sinks[&DisplayId("mon".into())];
+        assert!(
+            sink.health_error()
+                .unwrap()
+                .contains("no output connector configured")
+        );
+        assert!(
+            sink.show(1, 0, dormant_core::types::StageKind::RenderBlack)
+                .await
+                .is_err()
+        );
+        assert!(
+            sink.show(2, 0, dormant_core::types::StageKind::RenderBlack)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

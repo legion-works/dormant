@@ -813,14 +813,17 @@ pub enum ControllerRole {
     Fallback,
 }
 
-/// Per-controller health, recorded from the LAST blank/wake attempt.
+/// Name of the render health row, which is not part of the controller chain.
+pub const RENDER_HEALTH_ROW: &str = "render";
+
+/// Health of a controller or the render sink.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControllerHealth {
-    /// Controller name literal (matches the config `type` key).
+    /// Controller name from the config, or [`RENDER_HEALTH_ROW`].
     pub name: String,
     /// Position in the chain.
     pub role: ControllerRole,
-    /// Whether the last attempt succeeded.
+    /// Whether the last controller attempt or render construction succeeded.
     pub healthy: bool,
     /// Failure detail when `healthy` is false (`None` on success or before
     /// first attempt).
@@ -866,9 +869,9 @@ pub struct DisplaySnapshot {
     /// Panel state observed with the shared-display input source. `None` is unknown or stale.
     #[serde(default)]
     pub panel_state: Option<PanelState>,
-    /// Per-controller health from the last blank/wake attempt.  Empty until
-    /// the first attempt or when deserializing legacy snapshots without this
-    /// field (serde back-compat).
+    /// Controller-chain health plus a [`RENDER_HEALTH_ROW`] when render is configured.
+    /// Legacy snapshots can omit this list. The render row reports construction
+    /// health, not a controller-chain attempt.
     #[serde(default)]
     pub controllers: Vec<ControllerHealth>,
     /// Current wake-retry attempt counter for this display (0 once healthy
@@ -2477,6 +2480,27 @@ impl RulesEngine {
         self.step_machine(display, Input::OwnershipChanged(owns), now);
     }
 
+    fn display_health(&self, dcfg: &DisplayRuntimeCfg) -> Vec<ControllerHealth> {
+        let mut controllers = self
+            .executors
+            .get(&dcfg.display)
+            .map(|exec| exec.controller_health())
+            .unwrap_or_default();
+        if dcfg.ladder.iter().any(|stage| stage.kind.is_render()) {
+            let detail = self.render_sinks.get(&dcfg.display).map_or_else(
+                || Some("render sink unavailable".to_string()),
+                |sink| sink.health_error(),
+            );
+            controllers.push(ControllerHealth {
+                name: RENDER_HEALTH_ROW.into(),
+                role: ControllerRole::Fallback,
+                healthy: detail.is_none(),
+                detail,
+            });
+        }
+        controllers
+    }
+
     fn send_snapshot(&self, tx: oneshot::Sender<StateSnapshot>) {
         let now_sys = std::time::SystemTime::now();
         let sensors = self
@@ -2513,11 +2537,7 @@ impl RulesEngine {
         let mut displays: Vec<(String, DisplaySnapshot)> = Vec::new();
         for dcfg in &self.cfg.displays {
             if let Some(m) = self.machines.get(&dcfg.display) {
-                let controllers = self
-                    .executors
-                    .get(&dcfg.display)
-                    .map(|exec| exec.controller_health())
-                    .unwrap_or_default();
+                let controllers = self.display_health(dcfg);
                 let coordination = self
                     .coordination
                     .as_ref()
@@ -5073,6 +5093,30 @@ mod tests {
         fn owns(&self, _display: &DisplayId) -> bool {
             self.0.load(std::sync::atomic::Ordering::Relaxed)
         }
+    }
+
+    #[tokio::test]
+    async fn render_health_reports_missing_sink() {
+        let display = DisplayId("mon".into());
+        let mut engine = manual_engine_with_ladder(
+            display,
+            HashMap::new(),
+            HashMap::new(),
+            vec![LadderStage {
+                kind: StageKind::RenderBlack,
+                dwell: None,
+            }],
+            Arc::new(crate::ownership::AlwaysOwned),
+        );
+        let snapshot = snapshot_of(&mut engine);
+        let row = snapshot.displays[0]
+            .1
+            .controllers
+            .iter()
+            .find(|c| c.name == "render")
+            .expect("render health must be included");
+        assert!(!row.healthy, "missing render sink must degrade health");
+        assert!(row.detail.as_deref().unwrap().contains("unavailable"));
     }
 
     fn manual_display_engine(

@@ -9,7 +9,7 @@ import Displays from "../app/views/Displays";
 import { LiveStateProvider } from "../app/state";
 import { LiveStateContext } from "../app/hooks/useLiveState";
 import { liveStateFixture } from "./fixtures/live-state";
-import type { DisplayConfig, DisplaySnapshot } from "../api/types";
+import type { ControllerHealth, DisplayConfig, DisplaySnapshot } from "../api/types";
 
 
 const { SAMPLE_STATE, SAMPLE_CONFIG, mocks } = vi.hoisted(() => {
@@ -577,7 +577,7 @@ describe("Displays", () => {
     expect(stageLabels).toHaveLength(1);
   });
 
-function DisplaysDetailHarness() {
+function DisplaysDetailHarness({ controllers = [{ name: "ddcci", role: "primary", healthy: true }] }: { controllers?: ControllerHealth[] } = {}) {
   const [selectedDisplay, selectDisplay] = useState<string | null>(null);
   const state = liveStateFixture({
     snapshot: {
@@ -588,7 +588,7 @@ function DisplaysDetailHarness() {
         inhibited: false,
         paused: false,
         cmd_gen: 1,
-        controllers: [{ name: "ddcci", role: "primary", healthy: true }],
+        controllers,
       }]],
       pending_reload: null,
     },
@@ -624,4 +624,26 @@ it("switches between the display list and selected detail in one view", () => {
   expect(screen.getByRole("grid", { name: "main panel wear heat map" })).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "← Displays" }));
   expect(screen.getByRole("button", { name: "Detail →" })).toBeInTheDocument();
+});
+
+it("shows the actual fallback role in display health detail", () => {
+  render(<DisplaysDetailHarness controllers={[{ name: "kwin-dpms", role: "fallback", healthy: true }]} />);
+  fireEvent.click(screen.getByRole("button", { name: "Detail →" }));
+  expect(screen.getByText("fallback · last attempt succeeded")).toBeInTheDocument();
+  expect(screen.queryByText("primary · last attempt succeeded")).not.toBeInTheDocument();
+});
+
+it("shows healthy render readiness without a controller attempt claim", () => {
+  render(<DisplaysDetailHarness controllers={[{ name: "render", role: "fallback", healthy: true }]} />);
+  fireEvent.click(screen.getByRole("button", { name: "Detail →" }));
+  expect(screen.getByText("render · ready")).toBeInTheDocument();
+  expect(screen.queryByText(/last attempt succeeded/)).not.toBeInTheDocument();
+});
+
+it("shows the unhealthy render reason without a controller attempt claim", () => {
+  render(<DisplaysDetailHarness controllers={[{ name: "render", role: "fallback", healthy: false, detail: "output 'HDMI-A-1' not found" }]} />);
+  fireEvent.click(screen.getByRole("button", { name: "Detail →" }));
+  expect(screen.getByText("output 'HDMI-A-1' not found")).toBeInTheDocument();
+  expect(screen.queryByText("render · ready")).not.toBeInTheDocument();
+  expect(screen.queryByText(/last attempt succeeded/)).not.toBeInTheDocument();
 });

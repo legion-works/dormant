@@ -112,7 +112,8 @@ describe("DisplayDetail", () => {
     expect(screen.getByText("Since long dwell")).toBeInTheDocument();
 
     expect(screen.getByText("kwin-dpms")).toBeInTheDocument();
-    expect(screen.getByText("timeout")).toBeInTheDocument();
+    expect(screen.getByText("fallback · timeout")).toBeInTheDocument();
+    expect(screen.getByText("primary · last attempt succeeded")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /emergency wake/i })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Run control-path exercise" })).toBeInTheDocument();
 

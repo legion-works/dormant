@@ -813,14 +813,17 @@ pub enum ControllerRole {
     Fallback,
 }
 
-/// Per-controller health, recorded from the LAST blank/wake attempt.
+/// Name of the render health row, which is not part of the controller chain.
+pub const RENDER_HEALTH_ROW: &str = "render";
+
+/// Health of a controller or the render sink.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControllerHealth {
-    /// Controller name literal (matches the config `type` key).
+    /// Controller name from the config, or [`RENDER_HEALTH_ROW`].
     pub name: String,
     /// Position in the chain.
     pub role: ControllerRole,
-    /// Whether the last attempt succeeded.
+    /// Whether the last controller attempt or render construction succeeded.
     pub healthy: bool,
     /// Failure detail when `healthy` is false (`None` on success or before
     /// first attempt).
@@ -866,9 +869,9 @@ pub struct DisplaySnapshot {
     /// Panel state observed with the shared-display input source. `None` is unknown or stale.
     #[serde(default)]
     pub panel_state: Option<PanelState>,
-    /// Per-controller health from the last blank/wake attempt.  Empty until
-    /// the first attempt or when deserializing legacy snapshots without this
-    /// field (serde back-compat).
+    /// Controller-chain health plus a [`RENDER_HEALTH_ROW`] when render is configured.
+    /// Legacy snapshots can omit this list. The render row reports construction
+    /// health, not a controller-chain attempt.
     #[serde(default)]
     pub controllers: Vec<ControllerHealth>,
     /// Current wake-retry attempt counter for this display (0 once healthy
@@ -2489,7 +2492,7 @@ impl RulesEngine {
                 |sink| sink.health_error(),
             );
             controllers.push(ControllerHealth {
-                name: "render".into(),
+                name: RENDER_HEALTH_ROW.into(),
                 role: ControllerRole::Fallback,
                 healthy: detail.is_none(),
                 detail,

@@ -19,6 +19,7 @@ pub(crate) struct RetryRenderSink {
     display: DisplayId,
     builder: Option<Arc<SinkBuilder>>,
     state: Arc<Mutex<State>>,
+    build_lock: Arc<Mutex<()>>,
 }
 
 impl RetryRenderSink {
@@ -34,6 +35,7 @@ impl RetryRenderSink {
         Self {
             display: did,
             builder: Some(Arc::new(builder)),
+            build_lock: Arc::new(Mutex::new(())),
             state: Arc::new(Mutex::new(State {
                 sink,
                 error,
@@ -46,6 +48,7 @@ impl RetryRenderSink {
         Self {
             display,
             builder: None,
+            build_lock: Arc::new(Mutex::new(())),
             state: Arc::new(Mutex::new(State {
                 sink: None,
                 error: Some(error),
@@ -55,14 +58,22 @@ impl RetryRenderSink {
     }
 
     fn get_or_build(&self) -> Result<Arc<dyn RenderSink>, CmdFailure> {
-        let mut state = self.state.lock().expect("render retry state poisoned");
-        if let Some(sink) = &state.sink {
-            return Ok(sink.clone());
+        let _build = self.build_lock.lock().expect("render build lock poisoned");
+        if let Some(sink) = self.built() {
+            return Ok(sink);
         }
         let Some(builder) = &self.builder else {
-            return Err(state.error.clone().expect("unavailable sink has a reason"));
+            return Err(self
+                .state
+                .lock()
+                .expect("render retry state poisoned")
+                .error
+                .clone()
+                .expect("unavailable sink has a reason"));
         };
-        match builder() {
+        let result = builder();
+        let mut state = self.state.lock().expect("render retry state poisoned");
+        match result {
             Ok(sink) => {
                 tracing::info!(event = "render_sink_built_late", display = %self.display);
                 state.error = None;

@@ -7772,6 +7772,51 @@ mod render_tests {
     }
 
     #[tokio::test]
+    async fn late_render_build_retains_settings_and_report_channels() {
+        use dormant_core::fakes::RecordingRenderSink;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cfg = screensaver_config_for_test(std::path::Path::new("/nonexistent"), 0.05, 0.25);
+        let context = RenderContext {
+            luma_cache: Arc::new(LumaCache::new()),
+            luma_catalog: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            heat_snapshots: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            seed: 7,
+            item_journal: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let calls = AtomicUsize::new(0);
+        let factory: RenderSinkBuilder =
+            Arc::new(move |did, output, wake, reports, settings, shift| {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return None;
+                }
+                assert_eq!(output, "DP-1");
+                assert_eq!(settings.unwrap().wear_temperature, 0.05);
+                assert!(shift.is_some());
+                wake.unwrap().send(did.clone()).unwrap();
+                reports
+                    .unwrap()
+                    .send(ScreensaverItemReport {
+                        display_id: did,
+                        uri: Some("late-item".into()),
+                        luma: None,
+                        observed_at: std::time::Instant::now(),
+                    })
+                    .unwrap();
+                Some(Arc::new(RecordingRenderSink::new()))
+            });
+        let (sinks, mut wake_rx, _, mut reports_rx) =
+            build_render_sinks_with_context(&cfg, Some(&factory), &context);
+        sinks[&DisplayId("mon".into())]
+            .show(1, 0, dormant_core::types::StageKind::RenderScreensaver)
+            .await
+            .unwrap();
+        assert_eq!(wake_rx.try_recv().unwrap(), DisplayId("mon".into()));
+        let report = reports_rx.try_recv().unwrap();
+        assert_eq!(report.display_id, DisplayId("mon".into()));
+        assert_eq!(report.uri.as_deref(), Some("late-item"));
+    }
+
+    #[tokio::test]
     async fn missing_output_has_fixed_degraded_health() {
         let mut cfg = screensaver_config_for_test(std::path::Path::new("/nonexistent"), 0.05, 0.25);
         cfg.displays.get_mut("mon").unwrap().output = None;

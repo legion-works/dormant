@@ -46,11 +46,11 @@ pub enum Phase {
         /// Generation counter matching the `ShowRender` that was issued.
         r#gen: u64,
     },
-    /// A render surface is currently shown on the display.
+    /// A render stage waits for its dwell or an external event, with or without a surface.
     Staged {
         /// Index into the display's ladder.
         idx: usize,
-        /// Generation counter matching the active render surface.
+        /// Generation counter for the completed render attempt.
         r#gen: u64,
     },
 }
@@ -1003,8 +1003,20 @@ impl DisplayStateMachine {
                     // Schedule stage-tick if non-terminal.
                     effects.append(&mut self.schedule_stage_tick(now));
                     effects
+                } else if self.ladder[*idx].dwell.is_some() {
+                    // A render failure must not decrease the configured time before hardware power-off.
+                    let mut effects = vec![Effect::LogTransition {
+                        from: "render_pending",
+                        to: "staged",
+                        cause: "render_failed",
+                    }];
+                    self.phase = Phase::Staged {
+                        idx: *idx,
+                        r#gen: *pending_gen,
+                    };
+                    effects.append(&mut self.schedule_stage_tick(now));
+                    effects
                 } else {
-                    // Render failed — fall through to next controller stage.
                     self.advance_to_next_controller(now, "render_failed")
                 }
             }
@@ -1063,7 +1075,7 @@ impl DisplayStateMachine {
             }
 
             // ── Staged ───────────────────────────────────────────────────────
-            // Render surface is up.  Zone presence tears down + Active.
+            // Presence goes to Active with or without a render surface.
             (Phase::Staged { .. }, Input::ZonePresent(present)) => {
                 self.zone_present = Some(present);
                 if present {
@@ -1544,7 +1556,7 @@ impl DisplayStateMachine {
     }
 
     /// Advance to the next NON-render stage, skipping all intervening render
-    /// stages.  Used when a render stage fails — the fall-through rule.
+    /// stages. Used after a terminal render failure.
     fn advance_to_next_controller(&mut self, now: Tick, cause: &'static str) -> Vec<Effect> {
         let start = self.current_stage.map_or(0, |i| i + 1);
         for idx in start..self.ladder.len() {
@@ -3648,7 +3660,7 @@ mod ladder_tests {
     }
 
     #[test]
-    fn render_fail_falls_through_to_next_controller_stage() {
+    fn render_fail_waits_before_next_render_stage() {
         let mut sm = sm_with(vec![
             LadderStage {
                 kind: StageKind::RenderScreensaver,
@@ -3680,29 +3692,27 @@ mod ladder_tests {
             },
             t(700),
         );
-        assert!(
-            fx.iter().any(|e| matches!(
-                e,
-                Effect::IssueBlank {
-                    mode: BlankMode::PowerOff,
-                    ..
-                }
-            )),
-            "expected IssueBlank(PowerOff) at idx:2, got {fx:?}"
-        );
+        assert!(!fx.iter().any(|e| matches!(e, Effect::IssueBlank { .. })));
         assert!(
             !fx.iter().any(|e| matches!(e, Effect::ShowRender { .. })),
             "must not emit ShowRender for idx:1"
         );
-        assert_eq!(sm.phase_name(), "blanking");
+        assert!(matches!(sm.phase(), Phase::Staged { idx: 0, .. }));
+        let at = get_schedule_stage_tick(&fx).expect("failed render must schedule its dwell");
+        let fx = sm.step(
+            Input::StageTick {
+                r#gen: sm.stage_gen,
+            },
+            at,
+        );
+        assert!(
+            fx.iter()
+                .any(|e| matches!(e, Effect::ShowRender { idx: 1, .. }))
+        );
     }
 
     #[test]
-    fn render_only_total_cascade_returns_active() {
-        // Per R7: render failure skips intervening render stages to the next
-        // controller stage.  In a render-only ladder there is no controller
-        // stage, so the first failure cascades straight to Active with a
-        // TeardownRender.
+    fn render_only_failure_keeps_nonterminal_dwell() {
         let mut sm = sm_with(vec![
             LadderStage {
                 kind: StageKind::RenderScreensaver,
@@ -3734,18 +3744,177 @@ mod ladder_tests {
             t(700),
         );
         assert!(
-            fx.iter()
-                .any(|e| matches!(e, Effect::TeardownRender { .. })),
-            "render-only ladder failure must emit TeardownRender, got {fx:?}"
+            !fx.iter()
+                .any(|e| matches!(e, Effect::TeardownRender { .. }))
         );
         assert!(
             !fx.iter().any(|e| matches!(e, Effect::ShowRender { .. })),
-            "render failure must skip intervening render stages"
+            "render failure must wait before the next render stage"
         );
-        assert!(!matches!(
-            sm.phase(),
-            Phase::RenderPending { .. } | Phase::Staged { .. }
-        ));
+        assert!(matches!(sm.phase(), Phase::Staged { idx: 0, .. }));
+        assert!(get_schedule_stage_tick(&fx).is_some());
+    }
+
+    #[test]
+    fn render_failure_keeps_ladder_timing_before_power_off() {
+        let mut sm = sm_with(vec![
+            LadderStage {
+                kind: StageKind::RenderScreensaver,
+                dwell: Some(Duration::from_secs(300)),
+            },
+            render_black_stage(600),
+            off_stage(),
+        ]);
+        let entry = drive_to_entry(&mut sm);
+        assert!(
+            entry
+                .iter()
+                .any(|e| matches!(e, Effect::ShowRender { idx: 0, .. }))
+        );
+        assert!(!entry.iter().any(|e| matches!(e, Effect::IssueBlank { .. })));
+        let start = t(600);
+        let fx = sm.step(
+            Input::RenderResult {
+                r#gen: sm.stage_gen,
+                result: Err(cmd_failure("render-screensaver")),
+            },
+            start,
+        );
+        assert!(
+            !fx.iter().any(|e| matches!(e, Effect::IssueBlank { .. })),
+            "render failure must not blank before the dwell"
+        );
+        assert!(matches!(sm.phase(), Phase::Staged { idx: 0, .. }));
+        assert!(fx.iter().any(|e| matches!(
+            e,
+            Effect::LogTransition {
+                from: "render_pending",
+                to: "staged",
+                cause: "render_failed"
+            }
+        )));
+        let black_at = Tick(start.0 + Duration::from_secs(300));
+        assert_eq!(
+            get_schedule_stage_tick(&fx),
+            Some(black_at),
+            "failed render must schedule the five-minute dwell"
+        );
+        let fx = sm.step(
+            Input::StageTick {
+                r#gen: sm.stage_gen,
+            },
+            black_at,
+        );
+        assert!(fx.iter().any(|e| matches!(
+            e,
+            Effect::ShowRender {
+                idx: 1,
+                kind: StageKind::RenderBlack,
+                ..
+            }
+        )));
+        assert!(!fx.iter().any(|e| matches!(e, Effect::IssueBlank { .. })));
+        let fx = sm.step(
+            Input::RenderResult {
+                r#gen: sm.stage_gen,
+                result: Err(cmd_failure("render-black")),
+            },
+            black_at,
+        );
+        assert!(matches!(sm.phase(), Phase::Staged { idx: 1, .. }));
+        assert!(!fx.iter().any(|e| matches!(e, Effect::IssueBlank { .. })));
+        let off_at = Tick(start.0 + Duration::from_secs(900));
+        assert_eq!(get_schedule_stage_tick(&fx), Some(off_at));
+        let fx = sm.step(
+            Input::StageTick {
+                r#gen: sm.stage_gen,
+            },
+            off_at,
+        );
+        assert!(fx.iter().any(|e| matches!(
+            e,
+            Effect::IssueBlank {
+                mode: BlankMode::PowerOff,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn presence_after_render_failure_wakes_without_blank() {
+        let mut sm = sm_with(vec![render_black_stage(300), off_stage()]);
+        let entry = drive_to_entry(&mut sm);
+        let failed = sm.step(
+            Input::RenderResult {
+                r#gen: sm.stage_gen,
+                result: Err(cmd_failure("render-black")),
+            },
+            t(600),
+        );
+        let present = sm.step(Input::ZonePresent(true), t(700));
+        assert!(
+            entry
+                .iter()
+                .chain(&failed)
+                .chain(&present)
+                .all(|e| !matches!(e, Effect::IssueBlank { .. })),
+            "presence after render failure must never issue a blank"
+        );
+        assert!(matches!(sm.phase(), Phase::Active));
+        assert!(
+            present
+                .iter()
+                .any(|e| matches!(e, Effect::TeardownRender { .. }))
+        );
+    }
+
+    #[test]
+    fn render_failure_on_terminal_render_stage_returns_active() {
+        let mut sm = sm_with(vec![
+            LadderStage {
+                kind: StageKind::RenderScreensaver,
+                dwell: Some(Duration::from_secs(300)),
+            },
+            LadderStage {
+                kind: StageKind::RenderBlack,
+                dwell: None,
+            },
+        ]);
+        sm.step(Input::SoftBlank, t(0));
+        let fx = sm.step(
+            Input::RenderResult {
+                r#gen: sm.stage_gen,
+                result: Ok(()),
+            },
+            t(10),
+        );
+        let at = get_schedule_stage_tick(&fx).expect("screensaver dwell");
+        let fx = sm.step(
+            Input::StageTick {
+                r#gen: sm.stage_gen,
+            },
+            at,
+        );
+        assert!(
+            fx.iter()
+                .any(|e| matches!(e, Effect::ShowRender { idx: 1, .. }))
+        );
+        let fx = sm.step(
+            Input::RenderResult {
+                r#gen: sm.stage_gen,
+                result: Err(cmd_failure("render-black")),
+            },
+            at,
+        );
+        assert!(
+            fx.iter()
+                .any(|e| matches!(e, Effect::TeardownRender { .. }))
+        );
+        assert!(matches!(sm.phase(), Phase::Active));
+        assert!(!fx.iter().any(|e| matches!(
+            e,
+            Effect::IssueBlank { .. } | Effect::ScheduleStageTickAt { .. }
+        )));
     }
 
     #[test]

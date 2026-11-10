@@ -246,12 +246,19 @@ TV's HDMI input from another source.
 
 ### Escalation ladder
 
-Instead of `blank_mode` and `degraded_mode`, a display can define an ordered
-**ladder** of stages. Each stage is tried in order; if one fails, the next one
-runs. A stage with a `dwell` duration ("dwell stage") is held for that long
-before the ladder advances. The last stage (the terminal stage) has no time
-limit — the ladder stays there until an external event (sensor, user wake)
-moves it.
+As an alternative to `blank_mode` and `degraded_mode`, a display can use an ordered
+**ladder** of stages. The daemon tries each stage in order. A stage with a
+`dwell` time stays in position for that time before the next stage starts.
+The last stage (the terminal stage) has no time limit. After a satisfactory result,
+the terminal stage stays in position until an external event (sensor, user wake) moves it.
+
+If a render failure occurs, the daemon logs `render_failed` and keeps the stage's `dwell`
+without a render surface. The next stage starts only after this dwell.
+The next render stage tries to render again. Presence sends the display to
+Active without a hardware blank. Inhibitors and pause freeze the dwell as usual.
+
+A terminal render stage has no dwell. After a render failure, the next controller
+stage starts. If there is no next controller stage, the display goes to Active.
 
 `blank_mode` and `ladder` are mutually exclusive — a config containing both
 is rejected at startup.

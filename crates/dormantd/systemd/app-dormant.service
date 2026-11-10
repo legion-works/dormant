@@ -3,6 +3,13 @@ Description=dormant — proximity-driven display blanking daemon
 Documentation=https://github.com/legion-works/dormant
 After=graphical-session.target
 PartOf=graphical-session.target
+# Start only inside a graphical session. A start from SSH or a text console
+# before login has no WAYLAND_DISPLAY and no DISPLAY. Without them, the render
+# stages, the user-activity inhibitor and the command hooks that need the
+# compositor fail for the life of the process. systemd skips such a start,
+# and graphical-session.target starts the unit when the session starts.
+ConditionEnvironment=|WAYLAND_DISPLAY
+ConditionEnvironment=|DISPLAY
 
 [Service]
 Type=notify

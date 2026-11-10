@@ -105,6 +105,14 @@ pub fn build_tooltip(inputs: &TooltipInputs<'_>) -> Tooltip {
         } else if d.last_blank_failed {
             phase.push_str(" (last blank failed)");
         }
+        for controller in d.controllers.iter().filter(|row| !row.healthy) {
+            let _ = write!(
+                phase,
+                " ({}: {})",
+                controller.name,
+                controller.detail.as_deref().unwrap_or("unavailable")
+            );
+        }
         // Coverage marker — a display that no rule drives is never blanked
         // on its own, so the operator gets a plain "no automatic rule"
         // suffix on its line. Displays with at least one driving rule keep
@@ -184,6 +192,36 @@ mod tests {
             kvm: None,
             wear_sampling_status: None,
         }
+    }
+
+    #[test]
+    fn render_health_failure_reason_is_visible_and_clears() {
+        let mut snap = snap_two_displays();
+        snap.displays[0]
+            .1
+            .controllers
+            .push(dormant_core::rules::ControllerHealth {
+                name: "render".into(),
+                role: dormant_core::rules::ControllerRole::Fallback,
+                healthy: false,
+                detail: Some("output 'HDMI-A-1' not found".into()),
+            });
+        let tooltip = build_tooltip(&TooltipInputs {
+            snapshot: Some(&snap),
+            unreachable: false,
+        });
+        assert!(
+            tooltip.body.contains("render: output 'HDMI-A-1' not found"),
+            "render failure reason must be visible: {}",
+            tooltip.body
+        );
+        snap.displays[0].1.controllers[0].healthy = true;
+        snap.displays[0].1.controllers[0].detail = None;
+        let tooltip = build_tooltip(&TooltipInputs {
+            snapshot: Some(&snap),
+            unreachable: false,
+        });
+        assert!(!tooltip.body.contains("render:"));
     }
 
     #[test]

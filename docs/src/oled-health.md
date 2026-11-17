@@ -80,11 +80,15 @@ controllers use their panel identity (for example, `samsung:<host>`) or the
 config display id.
 
 At startup, dormant adds history from the panel's current bus and config id
-to its EDID ledger, with support for legacy filenames. It saves the history
+to its EDID ledger. It also reads legacy filenames. It saves the history
 before it renames source files to `.json.migrated`. Stored source keys and
 snapshot digests prevent duplicate history if a rename does not finish.
 Ledgers for other buses or config ids stay unchanged. A schema or grid mismatch
-prevents adoption and logs a warning. Writes are atomic and mode `0644`.
+prevents adoption and logs a warning.
+
+If a source with a saved baseline changes after a rename failure, dormant keeps
+the two files. It logs the source path for a manual merge. Writes are atomic
+and mode `0644`.
 
 dormant persists every `wear.persist_interval` (default `5m`), on shutdown, and
 when tracking is disabled at runtime. A crash can lose at most one persistence

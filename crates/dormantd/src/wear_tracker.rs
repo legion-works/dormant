@@ -1475,15 +1475,27 @@ fn adopt_panel_ledgers(dir: &Path, key: &str, sources: &[String], result: &mut L
                 continue;
             }
         };
-        let marker = ledger_adoption_key(&source_key, &contents);
+        let source_ledger = match serde_json::from_slice::<WearLedger>(&contents) {
+            Ok(ledger) => ledger,
+            Err(error) => {
+                tracing::warn!(event = "wear_ledger_adoption_failed", source_key, error = %error);
+                continue;
+            }
+        };
+        let generation = format!("{source_key}:{}", source_ledger.advisory_baseline_epoch_s);
+        let marker = ledger_adoption_key(&generation, &contents);
         if !result.ledger.adopted_sources.contains(&marker) {
-            let source_ledger = match serde_json::from_slice::<WearLedger>(&contents) {
-                Ok(ledger) => ledger,
-                Err(error) => {
-                    tracing::warn!(event = "wear_ledger_adoption_failed", source_key, error = %error);
-                    continue;
-                }
-            };
+            let prefix = format!("{generation}:");
+            if result
+                .ledger
+                .adopted_sources
+                .iter()
+                .any(|prior| prior.starts_with(&prefix))
+            {
+                tracing::warn!(event = "wear_ledger_adoption_failed", source_key,
+                    path = %path.display(), error = "source history changed after adoption; manual merge required");
+                continue;
+            }
             let mut merged = result.ledger.clone();
             if let Err(error) = merged.merge(&source_ledger) {
                 tracing::warn!(event = "wear_ledger_adoption_failed", source_key, error = %error);
@@ -1495,8 +1507,11 @@ fn adopt_panel_ledgers(dir: &Path, key: &str, sources: &[String], result: &mut L
             if path == canonical
                 && legacy != canonical
                 && let Ok(alias) = std::fs::read(&legacy)
+                && let Ok(alias_ledger) = serde_json::from_slice::<WearLedger>(&alias)
             {
-                let alias_marker = ledger_adoption_key(&source_key, &alias);
+                let alias_generation =
+                    format!("{source_key}:{}", alias_ledger.advisory_baseline_epoch_s);
+                let alias_marker = ledger_adoption_key(&alias_generation, &alias);
                 if !merged.adopted_sources.contains(&alias_marker) {
                     merged.adopted_sources.push(alias_marker);
                 }
@@ -3649,6 +3664,14 @@ mod tests {
             result.ledger.total_on_hours, 136.5,
             "committed source must not be added twice"
         );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        std::fs::remove_file(source_path.with_extension("json.migrated")).unwrap();
+        adopt_panel_ledgers(dir.path(), &key, &["mon".into()], &mut result);
+        assert!(
+            !source_path.exists(),
+            "a committed source rename must be retried when possible"
+        );
+        assert!(source_path.with_extension("json.migrated").exists());
         assert_eq!(std::fs::read(path).unwrap(), bytes);
     }
 
@@ -3674,6 +3697,10 @@ mod tests {
         let bytes = std::fs::read(&source_path).unwrap();
         std::fs::create_dir(dir.path().join(format!("wear-{key}.json"))).unwrap();
         adopt_panel_ledgers(dir.path(), &key, &["mon".into()], &mut result);
+        assert!(
+            source_path.exists(),
+            "a failed merged write must not rename the source"
+        );
         assert_eq!(std::fs::read(&source_path).unwrap(), bytes);
         assert!(!source_path.with_extension("json.migrated").exists());
         assert_eq!(result.ledger, before);
@@ -3688,19 +3715,58 @@ mod tests {
             needs_seed: false,
             persist_readonly: false,
         };
-        for hours in [9.0, 12.0] {
-            persist_ledger(
-                dir.path(),
-                &ledger_identity_key("mon"),
-                &adoption_fixture("mon", hours, 15_121),
-            )
-            .unwrap();
+        for (hours, baseline) in [(9.0, 100), (12.0, 200)] {
+            let mut source = adoption_fixture("mon", hours, 15_121);
+            source.advisory_baseline_epoch_s = baseline;
+            persist_ledger(dir.path(), &ledger_identity_key("mon"), &source).unwrap();
             adopt_panel_ledgers(dir.path(), &key, &["mon".into()], &mut result);
         }
         assert_eq!(
             result.ledger.total_on_hours, 148.5,
             "a new source snapshot must not be mistaken for the old adopted snapshot"
         );
+    }
+
+    #[test]
+    fn adoption_refuses_changed_history_from_an_already_adopted_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = ledger_identity_key("AOC:AG326UZD:serial");
+        let mut result = LoadResult {
+            ledger: adoption_fixture(&key, 127.5, 179_447),
+            needs_seed: false,
+            persist_readonly: false,
+        };
+        let source_key = ledger_identity_key("mon");
+        let source_path = dir.path().join(format!("wear-{source_key}.json"));
+        std::fs::write(source_path.with_extension("json.migrated"), b"older backup").unwrap();
+        persist_ledger(
+            dir.path(),
+            &source_key,
+            &adoption_fixture("mon", 9.0, 15_121),
+        )
+        .unwrap();
+        adopt_panel_ledgers(dir.path(), &key, &["mon".into()], &mut result);
+        let path = dir.path().join(format!("wear-{key}.json"));
+        let dest_bytes = std::fs::read(&path).unwrap();
+        result.ledger = serde_json::from_slice(&dest_bytes).unwrap();
+        persist_ledger(
+            dir.path(),
+            &source_key,
+            &adoption_fixture("mon", 12.0, 20_000),
+        )
+        .unwrap();
+        let source_bytes = std::fs::read(&source_path).unwrap();
+        let logs =
+            capture_tracing(|| adopt_panel_ledgers(dir.path(), &key, &["mon".into()], &mut result));
+        assert_eq!(
+            result.ledger.total_on_hours, 136.5,
+            "changed history with an adopted baseline must not duplicate its old prefix"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), dest_bytes);
+        assert_eq!(std::fs::read(&source_path).unwrap(), source_bytes);
+        assert!(logs.contains("WARN"));
+        assert!(logs.contains("manual merge required"));
+        assert!(logs.contains(source_path.to_str().unwrap()));
     }
 
     #[test]

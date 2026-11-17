@@ -171,7 +171,7 @@ pub struct WearLedger {
     /// Epoch seconds this ledger was created — the "assume-healthy" baseline
     /// advisories are measured relative to.
     pub advisory_baseline_epoch_s: u64,
-    /// Source identity keys and snapshot digests already included in this ledger.
+    /// Source identity keys, baselines, and snapshot digests included in this ledger.
     /// These markers prevent a second merge if a source rename does not finish.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub adopted_sources: Vec<String>,

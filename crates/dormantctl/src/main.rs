@@ -91,8 +91,9 @@ enum Command {
     },
     /// Pause blanking (optional rule, optional duration).
     Pause {
-        /// Duration like "2h", "90m", "30s" (humantime format).
-        duration: Option<humantime::Duration>,
+        /// Duration like "2h", "90m", "30s".
+        #[arg(value_parser = dormant_core::duration::parse_duration)]
+        duration: Option<std::time::Duration>,
 
         /// Only pause this rule.
         #[arg(long)]
@@ -260,10 +261,7 @@ fn main() -> ExitCode {
 
     let result = match cli.command {
         Command::Status { json } => cmd_status::run(&socket_path, json),
-        Command::Pause { duration, rule } => {
-            let dur = duration.map(std::convert::Into::into);
-            cmd_pause::run_pause(&socket_path, dur, rule)
-        }
+        Command::Pause { duration, rule } => cmd_pause::run_pause(&socket_path, duration, rule),
         Command::Resume { rule } => cmd_pause::run_resume(&socket_path, rule),
         Command::Blank { display, hard, yes } => {
             cmd_blank::run_blank(&socket_path, &display, hard, yes)
@@ -488,6 +486,36 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn pause_duration_golden_table() {
+        let table: serde_json::Value = serde_json::from_str(include_str!(
+            "../../dormant-core/tests/fixtures/duration_golden.json"
+        ))
+        .unwrap();
+        for row in table["parse"].as_array().unwrap() {
+            let input = row["input"].as_str().unwrap();
+            let result = Cli::try_parse_from(["dormantctl", "pause", input]);
+            if let Some(secs) = row["result"]["secs"].as_u64() {
+                let cli = result.unwrap_or_else(|e| panic!("{input:?}: {e}"));
+                let Command::Pause {
+                    duration: Some(duration),
+                    ..
+                } = cli.command
+                else {
+                    panic!("missing pause duration: {input:?}");
+                };
+                assert_eq!(duration.as_secs(), secs, "{input:?}");
+                assert_eq!(
+                    u64::from(duration.subsec_nanos()),
+                    row["result"]["nanos"].as_u64().unwrap(),
+                    "{input:?}"
+                );
+            } else {
+                assert!(result.is_err(), "invalid CLI duration accepted: {input:?}");
+            }
+        }
+    }
 
     #[test]
     fn parse_pair_samsung() {

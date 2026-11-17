@@ -71,11 +71,21 @@ const MAX_BACKUPS: usize = 5;
 
 /// Build a backup filename: `config.toml.<rfc3339-nanos>.<rand4>`.
 ///
-/// Uses [`humantime::format_rfc3339_nanos`] for a standard timestamp;
-/// colons are replaced with dashes for filesystem safety.
+/// The UTC timestamp has nine fractional digits. Colons are replaced with
+/// dashes for filesystem safety.
 /// This is a pure function so it can be unit-tested.
 fn backup_filename(now: std::time::SystemTime, rand: &str) -> String {
-    let ts = humantime::format_rfc3339_nanos(now).to_string();
+    let now = time::OffsetDateTime::from(now);
+    let ts = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:09}Z",
+        now.year(),
+        u8::from(now.month()),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second(),
+        now.nanosecond(),
+    );
     // Replace colons with dashes for filesystem-safe filenames.
     let safe_ts = ts.replace(':', "-");
     format!("config.toml.{safe_ts}.{rand}")
@@ -688,6 +698,26 @@ mod tests {
     }
 
     // ── backup_filename tests ───────────────────────────────────────────────
+
+    #[test]
+    fn backup_filename_keeps_nine_fractional_digits() {
+        for (nanos, suffix) in [
+            (0, "000000000"),
+            (1, "000000001"),
+            (123_456_789, "123456789"),
+        ] {
+            let now = std::time::UNIX_EPOCH + std::time::Duration::new(42, nanos);
+            assert_eq!(
+                backup_filename(now, "abcd"),
+                format!("config.toml.1970-01-01T00-00-42.{suffix}Z.abcd")
+            );
+        }
+        let leap_day = std::time::UNIX_EPOCH + std::time::Duration::new(951_827_696, 123_456_789);
+        assert_eq!(
+            backup_filename(leap_day, "abcd"),
+            "config.toml.2000-02-29T12-34-56.123456789Z.abcd"
+        );
+    }
 
     #[test]
     #[allow(clippy::case_sensitive_file_extension_comparisons)]

@@ -1,0 +1,191 @@
+//! Baseline measurement source for humantime 2.4.0, retained for audit only.
+
+use std::collections::BTreeSet;
+use std::path::Path;
+use std::time::Duration;
+
+use humantime::{format_duration, parse_duration};
+use serde_json::{Value, json};
+
+#[test]
+#[ignore = "records the dependency baseline before replacement"]
+fn measure_duration_baseline() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut literals = BTreeSet::new();
+    for path in ["examples", "docs/src", "crates"] {
+        collect_literals(&root.join(path), &mut literals);
+    }
+    let mut inputs = literals.clone();
+    for unit in [
+        "nanos", "nsec", "ns", "usec", "us", "µs", "millis", "msec", "ms", "seconds", "second",
+        "secs", "sec", "s", "minutes", "minute", "min", "mins", "m", "hours", "hour", "hr", "hrs",
+        "h", "days", "day", "d", "weeks", "week", "wk", "wks", "w", "months", "month", "M",
+        "years", "year", "yr", "yrs", "y",
+    ] {
+        for n in [
+            "0",
+            "1",
+            "2",
+            "17",
+            "1.5",
+            "0.0",
+            "0.000000001",
+            "18446744073709551615",
+            "18446744073709551616",
+        ] {
+            for separator in ["", " ", "\t", "\u{2003}"] {
+                inputs.insert(format!("{n}{separator}{unit}"));
+            }
+        }
+        inputs.insert(format!("1{unit}2s"));
+        inputs.insert(format!("1 {unit} 2s"));
+    }
+    for input in [
+        "",
+        " ",
+        "\t\n",
+        "0",
+        "00",
+        " 0",
+        "0 ",
+        "1",
+        "-1s",
+        "+1s",
+        "s",
+        "1fortnight",
+        "1S",
+        "1μs",
+        "1µ",
+        "1 sec min",
+        "1m sec",
+        "1.s",
+        ".1s",
+        "1..2s",
+        "1,5s",
+        "1.0000000001s",
+        "0.000123456789s",
+        "1.00000000000000000000s",
+        "1.1ns",
+        "0.5ns",
+        "0.5us",
+        "0.0001h",
+        "0.5h",
+        "1 2s",
+        "1.2 3s",
+        "1\n2s",
+        "1s!",
+        "1s  !",
+        "1. s",
+        "1. s2s",
+        "1. 2 s",
+        "1.2",
+        "1s2",
+        "1s 2",
+        "1s\u{2003}2µs",
+        "18446744073709551615s 1ns",
+        "18446744073709551615s 999999999ns",
+        "18446744073709551614s 1000000000ns",
+        "18446744073709551615s 1s",
+        "18446744073709551615ns 1ns",
+        "18446744073709551us",
+        "18446744073709552us",
+        "18446744073709ms",
+        "18446744073710ms",
+        "307445734561825860m",
+        "307445734561825861m",
+    ] {
+        inputs.insert(input.to_owned());
+    }
+    let parse: Vec<Value> = inputs
+        .iter()
+        .map(|input| {
+            let result = match parse_duration(input) {
+                Ok(d) => json!({"secs": d.as_secs(), "nanos": d.subsec_nanos()}),
+                Err(e) => json!({"error": format!("{e:?}"), "message": e.to_string()}),
+            };
+            json!({"input": input, "result": result})
+        })
+        .collect();
+    let mut durations = BTreeSet::new();
+    for boundary in [
+        0,
+        1,
+        60,
+        3600,
+        86400,
+        604800,
+        2630016,
+        31557600,
+        63115200,
+        u64::MAX,
+    ] {
+        for secs in [
+            boundary.saturating_sub(1),
+            boundary,
+            boundary.saturating_add(1),
+        ] {
+            for nanos in [
+                0, 1, 999, 1000, 1001, 999999, 1000000, 1000001, 123456789, 999999999,
+            ] {
+                durations.insert((secs, nanos));
+            }
+        }
+    }
+    let format: Vec<Value> = durations.into_iter().map(|(secs, nanos)| {
+        json!({"secs": secs, "nanos": nanos, "output": format_duration(Duration::new(secs, nanos)).to_string()})
+    }).collect();
+    let table = json!({"baseline": "humantime 2.4.0", "literals": literals, "parse": parse, "format": format});
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/duration_golden.json");
+    std::fs::write(path, serde_json::to_string_pretty(&table).unwrap() + "\n").unwrap();
+    println!(
+        "MEASURE literals={} parse={} format={}",
+        table["literals"].as_array().unwrap().len(),
+        table["parse"].as_array().unwrap().len(),
+        table["format"].as_array().unwrap().len()
+    );
+}
+
+fn collect_literals(path: &Path, literals: &mut BTreeSet<String>) {
+    if path.is_dir() {
+        for entry in std::fs::read_dir(path).unwrap() {
+            collect_literals(&entry.unwrap().path(), literals);
+        }
+    } else if matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("rs" | "md" | "toml" | "yaml" | "json")
+    ) {
+        let text = std::fs::read_to_string(path).unwrap();
+        for part in text.split(['"', '`', '\n']) {
+            if part.chars().next().is_some_and(|c| c.is_ascii_digit())
+                && parse_duration(part).is_ok()
+            {
+                literals.insert(part.to_owned());
+            }
+        }
+    }
+}
+
+#[test]
+fn duration_golden_table() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/duration_golden.json");
+    let table: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    for row in table["parse"].as_array().unwrap() {
+        let input = row["input"].as_str().unwrap();
+        let actual = match parse_duration(input) {
+            Ok(d) => json!({"secs": d.as_secs(), "nanos": d.subsec_nanos()}),
+            Err(e) => json!({"error": format!("{e:?}"), "message": e.to_string()}),
+        };
+        assert_eq!(actual, row["result"], "parse {input:?}");
+    }
+    for row in table["format"].as_array().unwrap() {
+        let duration = Duration::new(
+            row["secs"].as_u64().unwrap(),
+            row["nanos"].as_u64().unwrap().try_into().unwrap(),
+        );
+        assert_eq!(
+            format_duration(duration).to_string(),
+            row["output"].as_str().unwrap(),
+            "format {duration:?}"
+        );
+    }
+}

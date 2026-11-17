@@ -287,8 +287,8 @@ ladder = [
 
 #### `dwell`
 
-An optional [humantime](https://docs.rs/humantime/latest/humantime/) duration
-(e.g., `"30s"`, `"5m"`) the ladder stays at this stage before advancing.
+An optional duration string (for example, `"30s"` or `"5m"`) sets how long
+the ladder stays at this stage before it advances.
 Omitting `dwell` (or setting it to `None`) makes the stage terminal — the
 ladder stops here and waits for an external event.
 

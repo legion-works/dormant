@@ -23,7 +23,6 @@ tokio = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 libc = { workspace = true }
-humantime = "2"
 comfy-table = "7"
 rumqttc = { workspace = true }
 tokio-util = { workspace = true }

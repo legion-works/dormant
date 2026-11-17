@@ -246,19 +246,18 @@ pub trait DisplayController: Any + Send + Sync {
         None
     }
 
-    /// Stable, panel-derived identity for this controller's physical panel,
-    /// if one is available (spec §3 `WearIdentity`).
-    ///
-    /// Default returns `None` — the honest answer for every controller with
-    /// no panel-derived identity (`command`, `kwin-dpms`, `ha-passthrough`).
-    /// `DdcciController` overrides with its canonical panel-lock key
-    /// (resolved during `probe`, before any VCP transaction);
-    /// `SamsungTizenController` overrides with `"samsung:<host>"`. Used
-    /// once, at ledger-creation time, so a wear ledger's identity survives a
-    /// `[displays.*]` config rename instead of following the config key —
-    /// the entire reason `WearIdentity` exists (T7 review finding M1).
+    /// Panel-derived local identity, if available.
+    /// DDC/CI returns its bus-derived panel I/O lock key. Samsung returns
+    /// `"samsung:<host>"`. Controllers without a panel identity return `None`.
+    /// Use [`Self::wear_identity`] for wear history instead of the local key.
     fn panel_identity(&self) -> Option<String> {
         None
+    }
+
+    /// Identity for wear history, independent of the panel I/O lock key.
+    /// Controllers without a serial-based identity retain their panel identity.
+    fn wear_identity(&self) -> Option<String> {
+        self.panel_identity()
     }
 
     /// Cross-machine claim identity for the shared-panel KVM-switch protocol
@@ -411,6 +410,12 @@ pub trait CommandSink: Send + Sync {
     /// this with a chain-walk identical in shape to `read_usage_hours`.
     fn panel_identity(&self) -> Option<String> {
         None
+    }
+
+    /// Read the wear identity through the controller chain.
+    /// The default retains the existing panel identity.
+    fn wear_identity(&self) -> Option<String> {
+        self.panel_identity()
     }
 
     /// Read the cross-machine claim identity through whichever controller in

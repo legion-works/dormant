@@ -12,6 +12,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::traits::PanelState;
@@ -170,6 +171,24 @@ pub struct WearLedger {
     /// Epoch seconds this ledger was created — the "assume-healthy" baseline
     /// advisories are measured relative to.
     pub advisory_baseline_epoch_s: u64,
+    /// Source identity keys and snapshot digests already included in this ledger.
+    /// These markers prevent a second merge if a source rename does not finish.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub adopted_sources: Vec<String>,
+}
+
+/// Failure to combine ledgers without a schema or grid conversion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum WearMergeError {
+    /// The ledger schemas differ.
+    #[error("wear ledger schema mismatch")]
+    SchemaMismatch,
+    /// The grid dimensions or cell counts differ or are invalid.
+    #[error("wear ledger grid mismatch")]
+    GridMismatch,
+    /// The combined sample count exceeds its storage range.
+    #[error("wear ledger sample count overflow")]
+    SampleCountOverflow,
 }
 
 /// Failure returned when spatial luma does not match the ledger grid.
@@ -401,7 +420,58 @@ impl WearLedger {
             last_sample_at_epoch_s: None,
             last_long_dwell_epoch_s: None,
             advisory_baseline_epoch_s: now_epoch_s,
+            adopted_sources: Vec::new(),
         }
+    }
+
+    /// Add disjoint recorded history and retain the destination identity.
+    /// Prior usage is a panel counter snapshot: retain the largest known value.
+    /// Retain the earliest advisory baseline and the latest observed timestamps.
+    ///
+    /// # Errors
+    /// Returns an error without changes if schemas or grids differ, a grid has
+    /// an invalid cell count, or the combined sample count overflows.
+    pub fn merge(&mut self, source: &Self) -> Result<(), WearMergeError> {
+        if self.schema_version != source.schema_version {
+            return Err(WearMergeError::SchemaMismatch);
+        }
+        let count = usize::from(self.grid_rows) * usize::from(self.grid_cols);
+        if self.grid_rows != source.grid_rows
+            || self.grid_cols != source.grid_cols
+            || count == 0
+            || self.cells.len() != count
+            || source.cells.len() != count
+        {
+            return Err(WearMergeError::GridMismatch);
+        }
+        let samples = self
+            .sample_count
+            .checked_add(source.sample_count)
+            .ok_or(WearMergeError::SampleCountOverflow)?;
+        for (cell, added) in self.cells.iter_mut().zip(&source.cells) {
+            cell.wear_hours += added.wear_hours;
+        }
+        self.total_on_hours += source.total_on_hours;
+        self.sample_count = samples;
+        self.seeded_usage_hours = self.seeded_usage_hours.max(source.seeded_usage_hours);
+        self.last_sample_at_epoch_s = self
+            .last_sample_at_epoch_s
+            .max(source.last_sample_at_epoch_s);
+        self.last_long_dwell_epoch_s = self
+            .last_long_dwell_epoch_s
+            .max(source.last_long_dwell_epoch_s);
+        self.advisory_baseline_epoch_s = self
+            .advisory_baseline_epoch_s
+            .min(source.advisory_baseline_epoch_s);
+        if self.panel_type == PanelType::Unknown {
+            self.panel_type = source.panel_type;
+        }
+        for key in &source.adopted_sources {
+            if !self.adopted_sources.contains(key) {
+                self.adopted_sources.push(key.clone());
+            }
+        }
+        Ok(())
     }
 
     /// Attribute `span` of uniform on-time, weighted by `brightness_norm`
@@ -676,6 +746,13 @@ pub fn ledger_identity_key(identity: &str) -> String {
     encoded
 }
 
+/// Identify one source snapshot, not all future history at the same path.
+/// SHA-256 keeps the marker bounded without changes to source files.
+#[must_use]
+pub fn ledger_adoption_key(source_key: &str, contents: &[u8]) -> String {
+    format!("{source_key}:{:x}", Sha256::digest(contents))
+}
+
 #[cfg(test)]
 #[allow(
     clippy::float_cmp,
@@ -703,6 +780,45 @@ mod tests {
         assert_eq!(l.total_on_hours, 0.0);
         assert_eq!(l.last_long_dwell_epoch_s, None); // observed-only, starts None
         assert_eq!(l.advisory_baseline_epoch_s, 1_000); // assume-healthy baseline
+    }
+
+    #[test]
+    fn merge_combines_history_not_panel_counter_snapshots() {
+        let mut dest = WearLedger::new(ident(), PanelType::Unknown, 9, 16, 300);
+        for (hours, samples, seed, baseline, last) in [
+            (127.5, 179_447, Some(1249), 100, Some(400)),
+            (9.0, 15_121, Some(2411), 200, Some(600)),
+            (61.7, 14_545, None, 150, None),
+        ] {
+            let mut source = WearLedger::new(ident(), PanelType::QdOled, 9, 16, baseline);
+            source.cells.fill(WearCell { wear_hours: hours });
+            source.total_on_hours = hours;
+            source.sample_count = samples;
+            source.seeded_usage_hours = seed;
+            source.last_sample_at_epoch_s = last;
+            source.last_long_dwell_epoch_s = last;
+            dest.merge(&source).unwrap();
+        }
+        assert_eq!(dest.total_on_hours, 198.2);
+        assert!(dest.cells.iter().all(|c| c.wear_hours == 198.2));
+        assert_eq!(dest.sample_count, 209_113);
+        assert_eq!(dest.seeded_usage_hours, Some(2411));
+        assert_eq!(dest.last_sample_at_epoch_s, Some(600));
+        assert_eq!(dest.last_long_dwell_epoch_s, Some(600));
+        assert_eq!(dest.advisory_baseline_epoch_s, 100);
+        assert_eq!(dest.panel_type, PanelType::QdOled);
+    }
+
+    #[test]
+    fn merge_refuses_schema_and_grid_mismatches_without_changes() {
+        let original = WearLedger::new(ident(), PanelType::Unknown, 9, 16, 100);
+        for (schema, rows, cols) in [(2, 9, 16), (1, 16, 9), (1, 1, 1)] {
+            let mut source = WearLedger::new(ident(), PanelType::QdOled, rows, cols, 200);
+            source.schema_version = schema;
+            let mut dest = original.clone();
+            assert!(dest.merge(&source).is_err());
+            assert_eq!(dest, original);
+        }
     }
 
     #[test]

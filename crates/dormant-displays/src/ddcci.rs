@@ -874,19 +874,19 @@ impl DisplayController for DdcciController {
         Some(decode_usage_hours(raw))
     }
 
-    /// Stable panel identity (spec §3 / T7 review M1): the canonical
-    /// panel-lock key resolved during `probe` — ddc-hi's `Display::info`
-    /// ident string (`backend:id manufacturer model_name`), the same value
-    /// `matched_ident` holds. This is bus-path-derived, NOT the EDID
-    /// mfg/model/serial format the spec's `WearIdentity` doc names as the
-    /// ideal (that would require deeper `ddc-hi` field access this
-    /// controller does not yet parse — out of scope for this fix per the
-    /// T7 review's priority adjudication A); it is nonetheless
-    /// panel-derived rather than config-derived, which is the property
-    /// that matters: a `[displays.*]` rename does not orphan the ledger.
-    /// `None` before `probe()` has run.
+    /// The bus-derived panel I/O lock key. `None` before probe.
     fn panel_identity(&self) -> Option<String> {
         self.state.lock().unwrap().matched_ident.clone()
+    }
+
+    fn wear_identity(&self) -> Option<String> {
+        let state = self.state.lock().unwrap();
+        state
+            .claim_identity
+            .as_ref()
+            .filter(|identity| identity.split(':').count() == 3)
+            .cloned()
+            .or_else(|| state.matched_ident.clone())
     }
 
     /// Cross-machine claim identity (spec F5): the EDID-derived
@@ -3119,6 +3119,36 @@ mod tests {
             &PanelLocks::new(),
         );
         assert_eq!(ctrl.panel_identity(), None);
+    }
+
+    #[tokio::test]
+    async fn wear_identity_uses_serial_without_changing_bus_lock() {
+        let fake = Arc::new(single_display_vcp());
+        let ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &PanelLocks::new(),
+        );
+        assert_eq!(ctrl.wear_identity(), None);
+        for claim in ["AOC:AG326UZD:XK2R9JA000013", "AOC:AG326UZD"] {
+            {
+                let mut state = ctrl.state.lock().unwrap();
+                state.matched_ident = Some("i2c-dev:22800 AOC AG326UZD".into());
+                state.claim_identity = Some(claim.into());
+            }
+            assert_eq!(
+                ctrl.panel_identity().as_deref(),
+                Some("i2c-dev:22800 AOC AG326UZD")
+            );
+            let expected = if claim.ends_with("XK2R9JA000013") {
+                claim
+            } else {
+                "i2c-dev:22800 AOC AG326UZD"
+            };
+            assert_eq!(ctrl.wear_identity().as_deref(), Some(expected));
+        }
     }
 
     /// After probe, `panel_identity()` returns the same canonical

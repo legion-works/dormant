@@ -950,6 +950,12 @@ impl CommandSink for DisplayExecutor {
         None
     }
 
+    fn wear_identity(&self) -> Option<String> {
+        self.chain
+            .iter()
+            .find_map(|controller| controller.wear_identity())
+    }
+
     /// Walk the configured chain and return the first non-`None`
     /// cross-machine claim identity — mirrors [`Self::panel_identity`]'s
     /// chain-walk shape exactly (spec F5). Used by the claim broadcast to
@@ -1013,6 +1019,7 @@ mod tests {
         /// Scripted [`DisplayController::panel_identity`] response — used
         /// by the T7 chain-walk test.
         panel_identity: Option<String>,
+        wear_identity: Option<String>,
         /// Scripted [`DisplayController::claim_identity`] response — used
         /// by the F5 chain-walk test.
         claim_identity: Option<String>,
@@ -1257,6 +1264,10 @@ mod tests {
 
         fn panel_identity(&self) -> Option<String> {
             self.inner.lock().unwrap().panel_identity.clone()
+        }
+
+        fn wear_identity(&self) -> Option<String> {
+            self.inner.lock().unwrap().wear_identity.clone()
         }
 
         fn claim_identity(&self) -> Option<String> {
@@ -2084,6 +2095,20 @@ mod tests {
         let a = FakeController::new("A", vec![BlankMode::PowerOff]);
         let (exec, _) = executor_with(vec![a], default_retry());
         assert_eq!(exec.panel_identity(), None);
+    }
+
+    #[tokio::test]
+    async fn wear_identity_chain_is_distinct_from_bus_identity() {
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let b = FakeController::new("B", vec![BlankMode::PowerOff]);
+        b.set_panel_identity(Some("i2c-dev:22800 AOC AG326UZD".into()));
+        b.inner.lock().unwrap().wear_identity = Some("AOC:AG326UZD:serial".into());
+        let (exec, _) = executor_with(vec![a, b], default_retry());
+        assert_eq!(exec.wear_identity().as_deref(), Some("AOC:AG326UZD:serial"));
+        assert_eq!(
+            exec.panel_identity().as_deref(),
+            Some("i2c-dev:22800 AOC AG326UZD")
+        );
     }
 
     // ── F5: claim_identity chain-walk ───────────────────────────────────────

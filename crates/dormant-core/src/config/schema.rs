@@ -142,7 +142,7 @@ pub struct CoordinationConfig {
     /// Interval between shared-display ownership polls.
     #[serde(
         default = "default_coordination_poll_interval",
-        with = "humantime_serde"
+        with = "crate::duration::serde"
     )]
     pub poll_interval: Duration,
 
@@ -155,7 +155,7 @@ pub struct CoordinationConfig {
     /// for the slower cadence lives on [`defaults::COORDINATION_STATE_POLL_INTERVAL`].
     #[serde(
         default,
-        with = "humantime_serde::option",
+        with = "crate::duration::option",
         skip_serializing_if = "Option::is_none"
     )]
     pub state_poll_interval: Option<Duration>,
@@ -198,12 +198,18 @@ pub struct CoordinationConfig {
     pub flap_threshold: u32,
 
     /// Sliding interval for `flap_threshold`; must be at least `poll_interval`.
-    #[serde(default = "default_coordination_flap_window", with = "humantime_serde")]
+    #[serde(
+        default = "default_coordination_flap_window",
+        with = "crate::duration::serde"
+    )]
     pub flap_window: Duration,
 
     /// Quiet time — no change in the panel's reported input — before a
     /// contested panel resumes evaluation; must be at least `poll_interval`.
-    #[serde(default = "default_coordination_flap_settle", with = "humantime_serde")]
+    #[serde(
+        default = "default_coordination_flap_settle",
+        with = "crate::duration::serde"
+    )]
     pub flap_settle: Duration,
 
     /// Number of consecutive failed input-source reads before an on-demand
@@ -219,7 +225,7 @@ pub struct CoordinationConfig {
     /// last-attempt timestamp across flap boundaries.
     #[serde(
         default = "default_coordination_reprobe_interval",
-        with = "humantime_serde"
+        with = "crate::duration::serde"
     )]
     pub reprobe_interval: Duration,
 
@@ -228,11 +234,11 @@ pub struct CoordinationConfig {
     pub activity_follow: bool,
 
     /// Grace window after a local-activity edge before the pull commits.
-    #[serde(default = "default_arm_after", with = "humantime_serde")]
+    #[serde(default = "default_arm_after", with = "crate::duration::serde")]
     pub arm_after: Duration,
 
     /// Minimum interval between successive activity-driven pulls.
-    #[serde(default = "default_cooldown", with = "humantime_serde")]
+    #[serde(default = "default_cooldown", with = "crate::duration::serde")]
     pub cooldown: Duration,
 }
 
@@ -274,11 +280,14 @@ impl CoordinationConfig {
 #[allow(clippy::struct_excessive_bools)]
 pub struct DaemonConfig {
     /// How long to wait after startup before acting.
-    #[serde(default = "default_startup_holdoff", with = "humantime_serde")]
+    #[serde(default = "default_startup_holdoff", with = "crate::duration::serde")]
     pub startup_holdoff: Duration,
 
     /// How long a sensor can go silent before considered stale.
-    #[serde(default = "default_stale_sensor_timeout", with = "humantime_serde")]
+    #[serde(
+        default = "default_stale_sensor_timeout",
+        with = "crate::duration::serde"
+    )]
     pub stale_sensor_timeout: Duration,
 
     /// Log level for the daemon.
@@ -300,14 +309,14 @@ pub struct DaemonConfig {
     pub idle_source: IdleSource,
 
     /// Debounce window coalescing rapid config-file changes into one reload.
-    #[serde(default = "default_reload_debounce", with = "humantime_serde")]
+    #[serde(default = "default_reload_debounce", with = "crate::duration::serde")]
     pub reload_debounce: Duration,
 
     /// Maximum time a generation swap waits for its old engine to acknowledge
     /// the drained-input barrier. Validated to `> 0`.
     #[serde(
         default = "default_generation_barrier_ack_timeout",
-        with = "humantime_serde"
+        with = "crate::duration::serde"
     )]
     pub generation_barrier_ack_timeout: Duration,
 
@@ -342,12 +351,15 @@ pub struct DaemonConfig {
 
     /// Timeout for a single pairing-wizard attempt. Validated to
     /// `30s..=300s`.
-    #[serde(default = "default_pair_timeout", with = "humantime_serde")]
+    #[serde(default = "default_pair_timeout", with = "crate::duration::serde")]
     pub pair_timeout: Duration,
 
     /// Post-wake settle window for the doctor exercise's bounded retry
     /// read (`dormantctl doctor --exercise`). Validated to `100ms..=30s`.
-    #[serde(default = "default_doctor_wake_settle", with = "humantime_serde")]
+    #[serde(
+        default = "default_doctor_wake_settle",
+        with = "crate::duration::serde"
+    )]
     pub doctor_wake_settle: Duration,
 
     /// macOS `CoreGraphics` idle source: number of consecutive
@@ -361,13 +373,19 @@ pub struct DaemonConfig {
     /// idle-time reading — readings above this are treated as bogus rather
     /// than genuine idle duration. Only consulted when
     /// `idle_source = "macos"`. Validated to `> 0`.
-    #[serde(default = "default_macos_idle_sanity_cap", with = "humantime_serde")]
+    #[serde(
+        default = "default_macos_idle_sanity_cap",
+        with = "crate::duration::serde"
+    )]
     pub macos_idle_sanity_cap: Duration,
 
     /// macOS `CoreGraphics` idle source: grace window after daemon startup
     /// before idle readings are trusted. Only consulted when
     /// `idle_source = "macos"`. Validated to `> 0`.
-    #[serde(default = "default_macos_idle_startup_grace", with = "humantime_serde")]
+    #[serde(
+        default = "default_macos_idle_startup_grace",
+        with = "crate::duration::serde"
+    )]
     pub macos_idle_startup_grace: Duration,
 }
 
@@ -472,15 +490,21 @@ pub struct WearConfig {
     pub enabled: bool,
 
     /// How often to sample panel state for wear attribution.
-    #[serde(default = "default_wear_sample_interval", with = "humantime_serde")]
+    #[serde(
+        default = "default_wear_sample_interval",
+        with = "crate::duration::serde"
+    )]
     pub sample_interval: Duration,
 
     /// How often to persist the wear ledger to disk.
-    #[serde(default = "default_wear_persist_interval", with = "humantime_serde")]
+    #[serde(
+        default = "default_wear_persist_interval",
+        with = "crate::duration::serde"
+    )]
     pub persist_interval: Duration,
 
     /// Timeout for a single panel-state read during sampling.
-    #[serde(default = "default_wear_read_timeout", with = "humantime_serde")]
+    #[serde(default = "default_wear_read_timeout", with = "crate::duration::serde")]
     pub read_timeout: Duration,
 
     /// Number of rows in the wear-attribution grid.
@@ -503,12 +527,18 @@ pub struct WearConfig {
 
     /// Minimum dwell before a blank/wake cycle counts as a "full" cycle
     /// rather than a short cycle for wear-cycle-count heuristics.
-    #[serde(default = "default_wear_short_cycle_dwell", with = "humantime_serde")]
+    #[serde(
+        default = "default_wear_short_cycle_dwell",
+        with = "crate::duration::serde"
+    )]
     pub short_cycle_dwell: Duration,
 
     /// Panel age (accumulated on-hours) after which wear advisories start
     /// surfacing to the operator.
-    #[serde(default = "default_wear_advisory_after", with = "humantime_serde")]
+    #[serde(
+        default = "default_wear_advisory_after",
+        with = "crate::duration::serde"
+    )]
     pub advisory_after: Duration,
 
     /// Active-time spatial sampling configuration.
@@ -559,7 +589,7 @@ pub struct ActiveSamplingConfig {
     /// Maximum time spent capturing one sample.
     #[serde(
         default = "default_active_sampling_capture_timeout",
-        with = "humantime_serde"
+        with = "crate::duration::serde"
     )]
     pub capture_timeout: Duration,
 
@@ -570,7 +600,7 @@ pub struct ActiveSamplingConfig {
     /// Delay before retrying an open circuit.
     #[serde(
         default = "default_active_sampling_circuit_reset_after",
-        with = "humantime_serde"
+        with = "crate::duration::serde"
     )]
     pub circuit_reset_after: Duration,
 }
@@ -718,13 +748,12 @@ impl<'de> Deserialize<'de> for ActiveSamplingConfig {
                             if capture_timeout.is_some() {
                                 return Err(V::Error::duplicate_field("capture_timeout"));
                             }
-                            // humantime string → Duration; delegates to the
-                            // humantime_serde adapter used by the previous
-                            // serde-generated code so existing configs
-                            // (`capture_timeout = "3s"`) keep parsing.
+                            // Keep duration strings compatible with the previous
+                            // representation (`capture_timeout = "3s"`).
                             let raw: String = map.next_value()?;
-                            capture_timeout =
-                                Some(humantime::parse_duration(&raw).map_err(V::Error::custom)?);
+                            capture_timeout = Some(
+                                crate::duration::parse_duration(&raw).map_err(V::Error::custom)?,
+                            );
                         }
                         Field::FailureThreshold => {
                             if failure_threshold.is_some() {
@@ -737,8 +766,9 @@ impl<'de> Deserialize<'de> for ActiveSamplingConfig {
                                 return Err(V::Error::duplicate_field("circuit_reset_after"));
                             }
                             let raw: String = map.next_value()?;
-                            circuit_reset_after =
-                                Some(humantime::parse_duration(&raw).map_err(V::Error::custom)?);
+                            circuit_reset_after = Some(
+                                crate::duration::parse_duration(&raw).map_err(V::Error::custom)?,
+                            );
                         }
                         Field::Other => {
                             // Unknown keys are surfaced by the unknown-key
@@ -830,7 +860,7 @@ pub struct DisplaySamplingConfig {
     /// pipeline clamps it elsewhere.
     #[serde(
         default = "default_wear_source_poll_interval",
-        with = "humantime_serde"
+        with = "crate::duration::serde"
     )]
     pub source_poll_interval: Duration,
 
@@ -913,7 +943,7 @@ pub struct NotificationsConfig {
 
     /// Minimum time between successive wake-failure notifications for the
     /// same display.
-    #[serde(default = "default_notify_cooldown", with = "humantime_serde")]
+    #[serde(default = "default_notify_cooldown", with = "crate::duration::serde")]
     pub cooldown: Duration,
 
     /// Emit a recovery notification when a previously-failing display wakes
@@ -952,7 +982,10 @@ pub struct WatchdogConfig {
     pub lkg_rollback_enabled: bool,
     /// How long a boot must stay up before it counts as stable for LKG
     /// purposes.
-    #[serde(default = "default_lkg_stability_window", with = "humantime_serde")]
+    #[serde(
+        default = "default_lkg_stability_window",
+        with = "crate::duration::serde"
+    )]
     pub stability_window: Duration,
 }
 impl Default for WatchdogConfig {
@@ -977,13 +1010,16 @@ impl Default for WatchdogConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AudioConfig {
     /// How often to poll `pw_dump_command` for the current `PipeWire` graph.
-    #[serde(default = "default_audio_poll_interval", with = "humantime_serde")]
+    #[serde(
+        default = "default_audio_poll_interval",
+        with = "crate::duration::serde"
+    )]
     pub poll_interval: Duration,
     /// Minimum continuous stream activity before the audio inhibitor
     /// asserts (debounces transient blips such as a notification chime).
     /// Deassertion is immediate — the debounce is asymmetric on purpose,
     /// fail-toward-blanking.
-    #[serde(default = "default_audio_min_active", with = "humantime_serde")]
+    #[serde(default = "default_audio_min_active", with = "crate::duration::serde")]
     pub min_active: Duration,
     /// `media.role` values that mean "this running stream is a call".
     #[serde(default = "default_audio_call_roles")]
@@ -1201,11 +1237,11 @@ pub struct MqttSensorCfg {
     pub kind: SensorKind,
 
     /// Per-sensor hold-time override; defers an off event until the hold expires.
-    #[serde(default, with = "humantime_serde::option")]
+    #[serde(default, with = "crate::duration::option")]
     pub hold_time: Option<Duration>,
 
     /// Per-sensor stale-timeout override.
-    #[serde(default, with = "humantime_serde::option")]
+    #[serde(default, with = "crate::duration::option")]
     pub stale_timeout: Option<Duration>,
 }
 
@@ -1224,11 +1260,11 @@ pub struct HaSensorCfg {
     pub kind: SensorKind,
 
     /// Per-sensor hold-time override; defers an off event until the hold expires.
-    #[serde(default, with = "humantime_serde::option")]
+    #[serde(default, with = "crate::duration::option")]
     pub hold_time: Option<Duration>,
 
     /// Per-sensor stale-timeout override.
-    #[serde(default, with = "humantime_serde::option")]
+    #[serde(default, with = "crate::duration::option")]
     pub stale_timeout: Option<Duration>,
 }
 
@@ -1248,11 +1284,11 @@ pub struct UsbLd2410Cfg {
     pub kind: SensorKind,
 
     /// Per-sensor hold-time override; defers an off event until the hold expires.
-    #[serde(default, with = "humantime_serde::option")]
+    #[serde(default, with = "crate::duration::option")]
     pub hold_time: Option<Duration>,
 
     /// Per-sensor stale-timeout override.
-    #[serde(default, with = "humantime_serde::option")]
+    #[serde(default, with = "crate::duration::option")]
     pub stale_timeout: Option<Duration>,
 }
 
@@ -1409,7 +1445,7 @@ pub struct ScreensaverSource {
     /// How long each image is displayed before advancing.
     #[serde(
         default,
-        with = "humantime_serde::option",
+        with = "crate::duration::option",
         skip_serializing_if = "Option::is_none"
     )]
     pub image_duration: Option<Duration>,
@@ -1478,9 +1514,9 @@ pub struct ScreensaverConfig {
     /// the playlist is moving; very short blurs visibly skip.
     ///
     /// `None` (the field absent from the TOML) is treated as `"1s"` at
-    /// the daemon's `build_render_sinks` hop.  Read with humantime
+    /// the daemon's `build_render_sinks` hop. Read with duration text
     /// (`"500ms"`, `"1s"`).
-    #[serde(default, with = "humantime_serde::option")]
+    #[serde(default, with = "crate::duration::option")]
     pub transition_duration: Option<Duration>,
 
     /// Pixel-shift distance, in pixels, applied periodically while the
@@ -1489,7 +1525,7 @@ pub struct ScreensaverConfig {
     pub shift_px: u8,
 
     /// Interval between successive pixel shifts.
-    #[serde(default = "default_shift_interval", with = "humantime_serde")]
+    #[serde(default = "default_shift_interval", with = "crate::duration::serde")]
     pub shift_interval: Duration,
 
     /// Temperature used by deterministic wear-even ordering.
@@ -1654,7 +1690,7 @@ pub struct DisplayConfig {
     pub wake_data: Option<toml::Value>,
 
     /// Timeout for a single blank/wake command.
-    #[serde(default = "default_command_timeout", with = "humantime_serde")]
+    #[serde(default = "default_command_timeout", with = "crate::duration::serde")]
     pub command_timeout: Duration,
 
     /// Brightness level to restore on wake (1–100; 0 is rejected by config
@@ -1705,7 +1741,10 @@ pub struct DisplayConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HookSlots {
     /// Maximum total time hooks may consume during one display-switch operation.
-    #[serde(default = "default_hook_total_timeout", with = "humantime_serde")]
+    #[serde(
+        default = "default_hook_total_timeout",
+        with = "crate::duration::serde"
+    )]
     pub timeout: Duration,
     /// Actions run before releasing a display to another machine.
     #[serde(default)]
@@ -1781,7 +1820,7 @@ pub struct HookAction {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mqtt: Option<HookMqtt>,
     /// Maximum time an action may run.
-    #[serde(default = "default_hook_timeout", with = "humantime_serde")]
+    #[serde(default = "default_hook_timeout", with = "crate::duration::serde")]
     pub timeout: Duration,
     /// Explicit scheduling override; absent resolves from the containing slot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1874,15 +1913,15 @@ pub struct RuleConfig {
     pub displays: Vec<String>,
 
     /// Debounce period — zone must be stable for this long before acting.
-    #[serde(default = "default_grace_period", with = "humantime_serde")]
+    #[serde(default = "default_grace_period", with = "crate::duration::serde")]
     pub grace_period: Duration,
 
     /// Minimum time a display must stay blanked.
-    #[serde(default = "default_min_blank_time", with = "humantime_serde")]
+    #[serde(default = "default_min_blank_time", with = "crate::duration::serde")]
     pub min_blank_time: Duration,
 
     /// Minimum time a display must stay awake.
-    #[serde(default = "default_min_wake_time", with = "humantime_serde")]
+    #[serde(default = "default_min_wake_time", with = "crate::duration::serde")]
     pub min_wake_time: Duration,
 
     /// Named inhibitors that suppress this rule (M1: `"user-activity"`,
@@ -1892,11 +1931,17 @@ pub struct RuleConfig {
 
     /// How long without input before user-activity inhibitor considers the
     /// user idle.
-    #[serde(default = "default_activity_idle_threshold", with = "humantime_serde")]
+    #[serde(
+        default = "default_activity_idle_threshold",
+        with = "crate::duration::serde"
+    )]
     pub activity_idle_threshold: Duration,
 
     /// How often to poll activity state.
-    #[serde(default = "default_activity_poll_interval", with = "humantime_serde")]
+    #[serde(
+        default = "default_activity_poll_interval",
+        with = "crate::duration::serde"
+    )]
     pub activity_poll_interval: Duration,
 
     /// Number of retries for wake commands before escalating.
@@ -1904,16 +1949,22 @@ pub struct RuleConfig {
     pub wake_retries: u32,
 
     /// Backoff before the first wake retry.
-    #[serde(default = "default_wake_retry_backoff", with = "humantime_serde")]
+    #[serde(
+        default = "default_wake_retry_backoff",
+        with = "crate::duration::serde"
+    )]
     pub wake_retry_backoff: Duration,
 
     /// Interval between successive wake retries.
-    #[serde(default = "default_wake_retry_interval", with = "humantime_serde")]
+    #[serde(
+        default = "default_wake_retry_interval",
+        with = "crate::duration::serde"
+    )]
     pub wake_retry_interval: Duration,
 
     /// How long to hold a display awake after a render-surface `InputWake`
     /// when every driving zone is vacant.  Zero disables the hold.
-    #[serde(default = "default_input_wake_hold", with = "humantime_serde")]
+    #[serde(default = "default_input_wake_hold", with = "crate::duration::serde")]
     pub input_wake_hold: Duration,
 }
 

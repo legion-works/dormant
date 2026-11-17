@@ -139,6 +139,30 @@ describe("DisplayDetail", () => {
     expect(screen.getByText("2×2 grid · content-weighted on-hours")).toBeInTheDocument();
   });
 
+  // The tracker stores the panel's VCP 0xC0 lifetime counter beside the
+  // measured total and never adds it to `total_on_hours`, so a seed larger
+  // than the measured total must not hide the measured hours.
+  it("shows measured on-hours unchanged when the panel seed is larger", () => {
+    render(
+      <DisplayDetail
+        id="main"
+        snapshot={snapshot}
+        config={{ controllers: ["ddcci"], blank_mode: "power_off" } as DisplayConfig}
+        rule={undefined}
+        wear={{ ...wear, total_on_hours: 9.4, seeded_usage_hours: 2411 }}
+        wearError={null}
+        onBack={vi.fn()}
+      />,
+    );
+
+    const totalRow = screen.getByText("Total on-hours").closest(".display-detail__exposure-row");
+    expect(totalRow).toHaveTextContent(/^Total on-hours9$/);
+    const seedRow = screen.getByText("Seeded from panel").closest(".display-detail__exposure-row");
+    expect(seedRow).toHaveTextContent("2411");
+    const rows = Array.from(document.querySelectorAll(".display-detail__exposure-row"));
+    expect(rows.map((row) => row.textContent ?? "").filter((text) => /measured/i.test(text))).toEqual([]);
+  });
+
   // P1-F: Force wake is non-destructive — un-gated, no confirm dialog.
   // Mirrors Displays.test.tsx's "posts wake/resume immediately with no
   // confirm dialog" coverage at the detail-view level.

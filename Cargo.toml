@@ -34,8 +34,6 @@ async-trait = "0.1"
 evdev = { version = "0.13", features = ["tokio"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-humantime = "2"
-humantime-serde = "1"
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = [
   "json",

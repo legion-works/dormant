@@ -3068,13 +3068,32 @@ wake_retry_interval = "1s"
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_only_display_no_defensive_wake_on_reload() {
+    check_manual_only_display_no_defensive_wake_on_reload(|cfg, _| cfg).await;
+}
+
+/// The delayed command detects a fixed-sleep wait that checks before completion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_only_display_no_defensive_wake_on_reload_with_delayed_wake() {
+    check_manual_only_display_no_defensive_wake_on_reload(|cfg, mon| {
+        cfg.replace(
+            &format!("wake_command = \"printf W >> '{}'\"", mon.display()),
+            &format!(
+                "wake_command = \"sleep 1.2; printf W >> '{}'\"",
+                mon.display()
+            ),
+        )
+    })
+    .await;
+}
+
 #[allow(
     clippy::await_holding_lock,
-    reason = "capture_count_lock() serializes this test's reload() call against the exact- \
-              count step-boundary tests it would otherwise contaminate — test-local, always \
-              released promptly at test end"
+    reason = "capture_count_lock() serializes reload against the exact-count tests"
 )]
-async fn manual_only_display_no_defensive_wake_on_reload() {
+async fn check_manual_only_display_no_defensive_wake_on_reload(
+    rewrite: impl FnOnce(String, &Path) -> String,
+) {
     let _capture_guard = capture_count_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3083,7 +3102,6 @@ async fn manual_only_display_no_defensive_wake_on_reload() {
     let manual_marker = dir.path().join("manual");
     let cfg = manual_and_ruled_config(&mon_marker, &manual_marker, "300ms");
     let cfg_path = write_file(dir.path(), "config.toml", &cfg);
-    let creds_path = dir.path().join("credentials.toml");
 
     // Absent shortly after start → the rule-driven "mon" blanks.  The manual
     // display never blanks on its own (no rule drives it), but we can
@@ -3091,7 +3109,7 @@ async fn manual_only_display_no_defensive_wake_on_reload() {
     let script = vec![(Duration::from_millis(100), ev("desk", SensorState::Absent))];
     let app = App::build_with_sources(
         cfg_path.clone(),
-        creds_path,
+        dir.path().join("credentials.toml"),
         Strictness::Strict,
         fake_factory("desk", script),
     )
@@ -3132,6 +3150,12 @@ async fn manual_only_display_no_defensive_wake_on_reload() {
         "manual display's phase must settle to blanked before reload"
     );
 
+    // The command marker precedes the engine's terminal phase for both displays.
+    assert!(
+        wait_for_phase(&ctl, "mon", "blanked", Duration::from_secs(10)).await,
+        "rule-driven display's phase must settle to blanked before reload"
+    );
+
     // Clear any W that may have been written (defensive wake at initial
     // holdoff expiry, etc.) and track the exact counts before reload.
     let mon_wake_before = count(&mon_marker, 'W');
@@ -3140,11 +3164,8 @@ async fn manual_only_display_no_defensive_wake_on_reload() {
 
     // Reload: rewrite the same config with a different grace so the reload
     // actually takes effect (identical config is a no-op).
-    fs::write(
-        &cfg_path,
-        manual_and_ruled_config(&mon_marker, &manual_marker, "150ms"),
-    )
-    .unwrap();
+    let new_cfg = manual_and_ruled_config(&mon_marker, &manual_marker, "150ms");
+    fs::write(&cfg_path, rewrite(new_cfg, &mon_marker)).unwrap();
     assert!(handle.trigger_reload().await);
 
     let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
@@ -3153,8 +3174,16 @@ async fn manual_only_display_no_defensive_wake_on_reload() {
         .expect("reload bus open");
     assert_eq!(outcome, ReloadOutcome::Reloaded);
 
-    // Give the defensive wake a moment to fire.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Reload spawns the defensive wake without waiting for the command result.
+    assert!(
+        wait_for(
+            || count(&mon_marker, 'W') > mon_wake_before,
+            Duration::from_secs(10),
+        )
+        .await
+    );
+    // Observe late duplicate wakes before checking the manual display.
+    tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Check the manual display: NO additional wake (defensive wake must NOT
     // fire for the rule-less display).
@@ -3172,8 +3201,7 @@ async fn manual_only_display_no_defensive_wake_on_reload() {
     let manual_snap = snap
         .displays
         .iter()
-        .find(|(id, _)| id == "manual")
-        .map(|(_, ds)| ds);
+        .find_map(|(id, ds)| (id == "manual").then_some(ds));
     assert!(
         manual_snap.is_some(),
         "manual display must still be present in snapshot after reload"
@@ -3202,6 +3230,266 @@ async fn manual_only_display_no_defensive_wake_on_reload() {
         "manual-only blanked display must NOT re-blank after reload"
     );
 
+    shutdown(handle, join).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_blank_completed_during_reload_is_preserved() {
+    check_manual_control_during_reload_is_preserved(false, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_wake_completed_during_reload_is_preserved() {
+    check_manual_control_during_reload_is_preserved(true, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_blank_pending_during_reload_settles_before_restore() {
+    check_manual_control_during_reload_is_preserved(false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_wake_pending_during_reload_settles_before_restore() {
+    check_manual_control_during_reload_is_preserved(true, false).await;
+}
+
+async fn check_manual_control_during_reload_is_preserved(wake: bool, completed: bool) {
+    let dir = TempDir::new().unwrap();
+    let mon_marker = dir.path().join("mon");
+    let manual_marker = dir.path().join("manual");
+    let config = |grace| {
+        manual_and_ruled_config(&mon_marker, &manual_marker, grace)
+            .replace("command = \"printf", "command = \"sleep 0.6; printf")
+    };
+    let cfg_path = write_file(dir.path(), "config.toml", &config("300ms"));
+    let gate = GenerationBarrierGate::new();
+    let (handle, join) = App::build_with_sources(
+        cfg_path.clone(),
+        dir.path().join("credentials.toml"),
+        Strictness::Strict,
+        fake_factory("desk", Vec::new()),
+    )
+    .unwrap()
+    .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
+    .with_test_reload_ingress_gate(gate.clone())
+    .disable_config_watcher()
+    .disable_ipc()
+    .start()
+    .await
+    .unwrap();
+    let ctl = handle.control_sender();
+    if wake {
+        ctl.send(ControlMsg::ForceBlank(DisplayId("manual".into())))
+            .await
+            .unwrap();
+        assert!(wait_for_phase(&ctl, "manual", "blanked", Duration::from_secs(10)).await);
+    }
+
+    fs::write(&cfg_path, config("150ms")).unwrap();
+    let expected = if wake { "active" } else { "blanked" };
+    {
+        let reload = handle.request_reload_with_id(ReloadSource::Control);
+        tokio::pin!(reload);
+        tokio::select! {
+            _ = &mut reload => panic!("reload completed before the ingress boundary"),
+            result = tokio::time::timeout(Duration::from_secs(10), gate.wait_until_entered()) => {
+                result.expect("reload reaches ingress boundary");
+            }
+        }
+        ctl.send(if wake {
+            ControlMsg::ForceWake(DisplayId("manual".into()))
+        } else {
+            ControlMsg::ForceBlank(DisplayId("manual".into()))
+        })
+        .await
+        .unwrap();
+        let before_release = if completed {
+            expected
+        } else if wake {
+            "waking"
+        } else {
+            "blanking"
+        };
+        assert!(wait_for_phase(&ctl, "manual", before_release, Duration::from_secs(10)).await);
+        gate.release();
+        let (_, receipt) = tokio::time::timeout(Duration::from_secs(10), reload)
+            .await
+            .expect("reload completes after ingress gate release")
+            .expect("reload receipt");
+        assert_eq!(receipt.outcome, ReloadOutcome::Reloaded);
+    }
+    let snapshot = snapshot_with_retry(&ctl).await;
+    let (_, manual) = snapshot
+        .displays
+        .iter()
+        .find(|(id, _)| id == "manual")
+        .expect("manual display survives reload");
+    assert_eq!(
+        manual.phase, expected,
+        "reload must preserve the manual control completed before ingress freeze"
+    );
+    assert_eq!(
+        count(&manual_marker, 'B'),
+        1,
+        "manual blank is not replayed"
+    );
+    assert_eq!(
+        count(&manual_marker, 'W'),
+        usize::from(wake),
+        "manual wake is not replayed"
+    );
+    shutdown(handle, join).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_wake_at_reload_quiesce_deadline_restores_waking() {
+    let dir = TempDir::new().unwrap();
+    let mon = dir.path().join("mon");
+    let manual = dir.path().join("manual");
+    let release = dir.path().join("release-wake");
+    let config = |grace| {
+        manual_and_ruled_config(&mon, &manual, grace).replace(
+            &format!("wake_command = \"printf W >> '{}'\"", manual.display()),
+            &format!(
+                "wake_command = \"printf W >> '{}'; while ! test -f '{}'; do sleep 0.01; done; printf R >> '{}'\"\ncommand_timeout = \"30s\"",
+                manual.display(), release.display(), manual.display()
+            ),
+        )
+    };
+    let cfg_path = write_file(dir.path(), "config.toml", &config("300ms"));
+    let gate = GenerationBarrierGate::new();
+    let (handle, join) = App::build_with_sources(
+        cfg_path.clone(),
+        dir.path().join("credentials.toml"),
+        Strictness::Strict,
+        fake_factory("desk", Vec::new()),
+    )
+    .unwrap()
+    .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
+    .with_test_reload_ingress_gate(gate.clone())
+    .disable_config_watcher()
+    .disable_ipc()
+    .start()
+    .await
+    .unwrap();
+    let ctl = handle.control_sender();
+    ctl.send(ControlMsg::ForceBlank(DisplayId("manual".into())))
+        .await
+        .unwrap();
+    assert!(wait_for_phase(&ctl, "manual", "blanked", Duration::from_secs(10)).await);
+    fs::write(&cfg_path, config("150ms")).unwrap();
+    {
+        let reload = handle.request_reload_with_id(ReloadSource::Control);
+        tokio::pin!(reload);
+        tokio::select! {
+            _ = &mut reload => panic!("reload completed before the ingress boundary"),
+            result = tokio::time::timeout(Duration::from_secs(10), gate.wait_until_entered()) => {
+                result.expect("reload reaches ingress boundary");
+            }
+        }
+        ctl.send(ControlMsg::ForceWake(DisplayId("manual".into())))
+            .await
+            .unwrap();
+        assert!(wait_for(|| count(&manual, 'W') == 1, Duration::from_secs(10)).await);
+        assert!(wait_for_phase(&ctl, "manual", "waking", Duration::from_secs(10)).await);
+        let draining_started = tokio::time::Instant::now();
+        gate.release();
+        let (_, receipt) = tokio::time::timeout(Duration::from_secs(20), reload)
+            .await
+            .expect("reload must not wait indefinitely for the old wake")
+            .expect("reload receipt");
+        assert_eq!(receipt.outcome, ReloadOutcome::Reloaded);
+        assert!(
+            draining_started.elapsed() >= dormant_core::config::defaults::COMMAND_TIMEOUT,
+            "pending wake must use the same bounded quiesce deadline as blanking"
+        );
+    }
+    let snapshot = snapshot_with_retry(&ctl).await;
+    let (_, display) = snapshot
+        .displays
+        .iter()
+        .find(|(id, _)| id == "manual")
+        .unwrap();
+    assert_eq!(
+        display.phase, "waking",
+        "an unconfirmed wake must not restore active or blanked"
+    );
+    // Release and observe the old shell command before the test shuts down.
+    fs::write(&release, "release").unwrap();
+    assert!(wait_for(|| count(&manual, 'R') == 1, Duration::from_secs(10)).await);
+    shutdown(handle, join).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reload_drains_a_burst_of_queued_controls_into_the_new_generation() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("marker");
+    let cfg_path = write_file(
+        dir.path(),
+        "config.toml",
+        &one_display_config(&marker, "300ms"),
+    );
+    let gate = GenerationBarrierGate::new();
+    let (handle, join) = App::build_with_sources(
+        cfg_path.clone(),
+        dir.path().join("credentials.toml"),
+        Strictness::Strict,
+        fake_factory("desk", Vec::new()),
+    )
+    .unwrap()
+    .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
+    .with_test_generation_barrier_gate(gate.clone())
+    .disable_config_watcher()
+    .disable_ipc()
+    .start()
+    .await
+    .unwrap();
+    fs::write(
+        &cfg_path,
+        manual_and_ruled_config(&marker, &dir.path().join("manual"), "150ms"),
+    )
+    .unwrap();
+    let ctl = handle.control_sender();
+    let mut replies = Vec::new();
+    {
+        let reload = handle.request_reload_with_id(ReloadSource::Control);
+        tokio::pin!(reload);
+        tokio::select! {
+            _ = &mut reload => panic!("reload completed before the router pause"),
+            result = tokio::time::timeout(Duration::from_secs(10), gate.wait_until_entered()) => {
+                result.expect("reload pauses routing");
+            }
+        }
+        // Exceed the engine channel capacity while its old ingress is frozen.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for _ in 0..256 {
+                let (tx, rx) = oneshot::channel();
+                ctl.send(ControlMsg::Snapshot(tx)).await.unwrap();
+                replies.push(rx);
+            }
+        })
+        .await
+        .expect("paused router continues to accept controls");
+        gate.release();
+        let (_, receipt) = tokio::time::timeout(Duration::from_secs(10), reload)
+            .await
+            .expect("reload completes under control burst")
+            .expect("reload receipt");
+        assert_eq!(receipt.outcome, ReloadOutcome::Reloaded);
+    }
+    for reply in replies {
+        let snapshot = tokio::time::timeout(Duration::from_secs(10), reply)
+            .await
+            .expect("queued snapshot completes")
+            .expect("queued snapshot is not lost");
+        assert!(
+            snapshot.displays.iter().any(|(id, _)| id == "manual"),
+            "queued control must reach the new generation"
+        );
+    }
     shutdown(handle, join).await;
 }
 

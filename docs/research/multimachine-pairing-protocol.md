@@ -259,9 +259,9 @@ The complete `[coordination]` contract is:
 | Key | Type | Default | Bound / behavior |
 |---|---|---|---|
 | `enabled` | bool | `false` | Enables mDNS, pairing listener, pairing IPC, and pairing web routes. It never disables local `0x60` ownership polling. |
-| `poll_interval` | humantime duration | `"2s"` | Existing shared-display poll cadence; minimum `"1s"`, no upper ceiling. |
+| `poll_interval` | duration string | `"2s"` | Existing shared-display poll cadence; minimum `"1s"`, no upper ceiling. |
 | `pairing_port` | u16 | `0` | `0` asks the OS for an ephemeral port; otherwise `1..=65535`. The resolved port is published only in the pairing-window TXT record. |
-| `pairing_window` | humantime duration | `"5m"` | `"30s"..="15m"`; this is the only time that a LAN listener and mDNS service may exist. |
+| `pairing_window` | duration string | `"5m"` | `"30s"..="15m"`; this is the only time that a LAN listener and mDNS service may exist. |
 
 The routes compile with the existing `web-ui` feature; no new Cargo feature is
 introduced. When `enabled = false`, every instance-pairing route returns

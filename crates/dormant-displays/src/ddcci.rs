@@ -104,6 +104,7 @@ struct DdcState {
     /// `None` means no blank has happened yet (daemon just started /
     /// reloaded); wake falls through to [`DdcciController::configured_primary_mode`].
     last_blank_mode: Option<BlankMode>,
+    last_power_on: Option<tokio::time::Instant>,
     /// The EDID-derived cross-machine claim identity (spec F5), derived from
     /// the matched display's EDID text fields during `probe` — independent of
     /// `matched_ident` (which carries the machine-local bus prefix). `None`
@@ -572,6 +573,7 @@ impl DisplayController for DdcciController {
                             controller: Self::NAME.to_string(),
                             error: format!("{E_DISPLAY_IO}: failed to set power on: {e}"),
                         })?;
+                    self.state.lock().unwrap().last_power_on = Some(tokio::time::Instant::now());
                 }
                 Ok(())
             }
@@ -612,6 +614,7 @@ impl DisplayController for DdcciController {
                             controller: Self::NAME.to_string(),
                             error: format!("{E_DISPLAY_IO}: failed to set power on: {e}"),
                         })?;
+                    self.state.lock().unwrap().last_power_on = Some(tokio::time::Instant::now());
                 }
 
                 // Restore brightness.
@@ -716,6 +719,10 @@ impl DisplayController for DdcciController {
             .and_then(|raw| decode_input_source(raw).map(Some))
     }
 
+    fn last_power_on(&self) -> Option<tokio::time::Instant> {
+        self.state.lock().unwrap().last_power_on
+    }
+
     async fn ensure_powered_on(&self) -> Result<bool, String> {
         let (ident, lock) = {
             let state = self.state.lock().unwrap();
@@ -737,6 +744,7 @@ impl DisplayController for DdcciController {
         self.ops
             .set_vcp(&ident, VCP_POWER, D6_ON, &lock, VcpPriority::Command)
             .await?;
+        self.state.lock().unwrap().last_power_on = Some(tokio::time::Instant::now());
         Ok(true)
     }
 
@@ -866,19 +874,19 @@ impl DisplayController for DdcciController {
         Some(decode_usage_hours(raw))
     }
 
-    /// Stable panel identity (spec §3 / T7 review M1): the canonical
-    /// panel-lock key resolved during `probe` — ddc-hi's `Display::info`
-    /// ident string (`backend:id manufacturer model_name`), the same value
-    /// `matched_ident` holds. This is bus-path-derived, NOT the EDID
-    /// mfg/model/serial format the spec's `WearIdentity` doc names as the
-    /// ideal (that would require deeper `ddc-hi` field access this
-    /// controller does not yet parse — out of scope for this fix per the
-    /// T7 review's priority adjudication A); it is nonetheless
-    /// panel-derived rather than config-derived, which is the property
-    /// that matters: a `[displays.*]` rename does not orphan the ledger.
-    /// `None` before `probe()` has run.
+    /// The bus-derived panel I/O lock key. `None` before probe.
     fn panel_identity(&self) -> Option<String> {
         self.state.lock().unwrap().matched_ident.clone()
+    }
+
+    fn wear_identity(&self) -> Option<String> {
+        let state = self.state.lock().unwrap();
+        state
+            .claim_identity
+            .as_ref()
+            .filter(|identity| identity.split(':').count() == 3)
+            .cloned()
+            .or_else(|| state.matched_ident.clone())
     }
 
     /// Cross-machine claim identity (spec F5): the EDID-derived
@@ -2548,6 +2556,63 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn power_on_timestamp_tracks_only_successful_writes() {
+        let ident = "i2c-dev:56 DEL DELL U2723QE";
+        let fake = Arc::new(single_display_vcp());
+        fake.expect_get(ident, VCP_POWER, Ok(D6_ON));
+        let mut ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::PowerOff,
+            fake.clone(),
+            &PanelLocks::new(),
+        );
+        ctrl.probe().await.unwrap();
+        assert_eq!(ctrl.last_power_on(), None);
+        fake.expect_get(ident, VCP_POWER, Ok(D6_ON));
+        assert_eq!(ctrl.ensure_powered_on().await, Ok(false));
+        assert_eq!(ctrl.last_power_on(), None);
+        fake.expect_get(ident, VCP_POWER, Ok(D6_OFF));
+        fake.expect_set(ident, VCP_POWER, D6_ON, Err("write failed".into()));
+        assert!(ctrl.ensure_powered_on().await.is_err());
+        assert_eq!(ctrl.last_power_on(), None);
+        fake.expect_get(ident, VCP_POWER, Ok(D6_OFF));
+        fake.expect_set(ident, VCP_POWER, D6_ON, Ok(()));
+        assert_eq!(ctrl.ensure_powered_on().await, Ok(true));
+        let written = tokio::time::Instant::now();
+        assert_eq!(ctrl.last_power_on(), Some(written));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        fake.expect_get(ident, VCP_POWER, Ok(D6_ON));
+        assert_eq!(ctrl.ensure_powered_on().await, Ok(false));
+        assert_eq!(ctrl.last_power_on(), Some(written));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wake_records_power_on_in_both_modes() {
+        let ident = "i2c-dev:56 DEL DELL U2723QE";
+        for mode in [BlankMode::PowerOff, BlankMode::BrightnessZero] {
+            let fake = Arc::new(single_display_vcp());
+            fake.expect_get(ident, VCP_POWER, Ok(D6_ON));
+            let mut ctrl =
+                DdcciController::with_ops(None, 80, mode, fake.clone(), &PanelLocks::new());
+            ctrl.probe().await.unwrap();
+            fake.expect_set(ident, VCP_POWER, D6_ON, Err("write failed".into()));
+            assert!(ctrl.wake().await.is_err());
+            assert_eq!(ctrl.last_power_on(), None, "{mode:?}: failed write");
+            fake.expect_set(ident, VCP_POWER, D6_ON, Ok(()));
+            if mode == BlankMode::BrightnessZero {
+                fake.expect_set(ident, VCP_BRIGHTNESS, 80, Ok(()));
+            }
+            ctrl.wake().await.unwrap();
+            assert_eq!(
+                ctrl.last_power_on(),
+                Some(tokio::time::Instant::now()),
+                "{mode:?}: successful write"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn write_input_source_uses_0x60_at_command_priority() {
         let ident = "i2c-dev:56 DEL DELL U2723QE";
@@ -3054,6 +3119,36 @@ mod tests {
             &PanelLocks::new(),
         );
         assert_eq!(ctrl.panel_identity(), None);
+    }
+
+    #[tokio::test]
+    async fn wear_identity_uses_serial_without_changing_bus_lock() {
+        let fake = Arc::new(single_display_vcp());
+        let ctrl = DdcciController::with_ops(
+            None,
+            80,
+            BlankMode::BrightnessZero,
+            Arc::clone(&fake) as Arc<dyn VcpOps>,
+            &PanelLocks::new(),
+        );
+        assert_eq!(ctrl.wear_identity(), None);
+        for claim in ["AOC:AG326UZD:XK2R9JA000013", "AOC:AG326UZD"] {
+            {
+                let mut state = ctrl.state.lock().unwrap();
+                state.matched_ident = Some("i2c-dev:22800 AOC AG326UZD".into());
+                state.claim_identity = Some(claim.into());
+            }
+            assert_eq!(
+                ctrl.panel_identity().as_deref(),
+                Some("i2c-dev:22800 AOC AG326UZD")
+            );
+            let expected = if claim.ends_with("XK2R9JA000013") {
+                claim
+            } else {
+                "i2c-dev:22800 AOC AG326UZD"
+            };
+            assert_eq!(ctrl.wear_identity().as_deref(), Some(expected));
+        }
     }
 
     /// After probe, `panel_identity()` returns the same canonical

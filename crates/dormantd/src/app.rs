@@ -2247,6 +2247,8 @@ pub struct App {
     #[cfg(any(test, feature = "test-util"))]
     force_reload_snapshot_timeout: bool,
     #[cfg(any(test, feature = "test-util"))]
+    reload_ingress_gate: Option<GenerationBarrierGate>,
+    #[cfg(any(test, feature = "test-util"))]
     generation_barrier_gate: Option<GenerationBarrierGate>,
     #[cfg(any(test, feature = "test-util"))]
     force_generation_barrier_timeout: bool,
@@ -2273,7 +2275,7 @@ pub struct App {
 #[cfg(any(test, feature = "test-util"))]
 type BarrierSnapshotProbe = Result<oneshot::Receiver<StateSnapshot>, &'static str>;
 
-/// Test-only rendezvous immediately before the old engine drain barrier.
+/// Test-only rendezvous at a reload boundary.
 #[cfg(any(test, feature = "test-util"))]
 #[derive(Clone)]
 pub struct GenerationBarrierGate {
@@ -2327,7 +2329,7 @@ impl GenerationBarrierGate {
         }
     }
 
-    /// Wait until reload has paused front-door routing before the old drain.
+    /// Wait until reload reaches the configured test boundary.
     pub async fn wait_until_entered(&self) {
         let mut entered = self.entered_rx.clone();
         while !*entered.borrow_and_update() {
@@ -2337,7 +2339,7 @@ impl GenerationBarrierGate {
         }
     }
 
-    /// Permit the reload to send the old-generation drain barrier.
+    /// Permit reload to continue past the configured test boundary.
     pub fn release(&self) {
         self.release.notify_one();
     }
@@ -2434,6 +2436,8 @@ impl App {
             #[cfg(any(test, feature = "test-util"))]
             force_reload_snapshot_timeout: false,
             #[cfg(any(test, feature = "test-util"))]
+            reload_ingress_gate: None,
+            #[cfg(any(test, feature = "test-util"))]
             generation_barrier_gate: None,
             #[cfg(any(test, feature = "test-util"))]
             force_generation_barrier_timeout: false,
@@ -2488,6 +2492,8 @@ impl App {
             force_rebuild_old_spawn_failure: false,
             #[cfg(any(test, feature = "test-util"))]
             force_reload_snapshot_timeout: false,
+            #[cfg(any(test, feature = "test-util"))]
+            reload_ingress_gate: None,
             #[cfg(any(test, feature = "test-util"))]
             generation_barrier_gate: None,
             #[cfg(any(test, feature = "test-util"))]
@@ -2645,6 +2651,14 @@ impl App {
     #[must_use]
     pub fn with_test_force_reload_snapshot_timeout(mut self) -> Self {
         self.force_reload_snapshot_timeout = true;
+        self
+    }
+
+    /// Hold reload before control ingress is frozen.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn with_test_reload_ingress_gate(mut self, gate: GenerationBarrierGate) -> Self {
+        self.reload_ingress_gate = Some(gate);
         self
     }
 
@@ -3381,6 +3395,8 @@ impl App {
             #[cfg(any(test, feature = "test-util"))]
             force_reload_snapshot_timeout: self.force_reload_snapshot_timeout,
             #[cfg(any(test, feature = "test-util"))]
+            reload_ingress_gate: self.reload_ingress_gate,
+            #[cfg(any(test, feature = "test-util"))]
             generation_barrier_gate: self.generation_barrier_gate,
             #[cfg(any(test, feature = "test-util"))]
             force_generation_barrier_timeout: self.force_generation_barrier_timeout,
@@ -3812,6 +3828,8 @@ struct Runner {
     #[cfg(any(test, feature = "test-util"))]
     force_reload_snapshot_timeout: bool,
     #[cfg(any(test, feature = "test-util"))]
+    reload_ingress_gate: Option<GenerationBarrierGate>,
+    #[cfg(any(test, feature = "test-util"))]
     generation_barrier_gate: Option<GenerationBarrierGate>,
     #[cfg(any(test, feature = "test-util"))]
     force_generation_barrier_timeout: bool,
@@ -4203,14 +4221,9 @@ impl Runner {
             .await
             .expect("current engine control route exists before reload");
         #[cfg(any(test, feature = "test-util"))]
-        let preliminary = if self.force_reload_snapshot_timeout {
-            self.record_reload_lifecycle_stage("snapshot_bypassed");
-            None
-        } else {
-            request_snapshot(&old_ctl).await
-        };
-        #[cfg(not(any(test, feature = "test-util")))]
-        let preliminary = request_snapshot(&old_ctl).await;
+        if let Some(gate) = &self.reload_ingress_gate {
+            gate.reach(old_ctl.clone()).await;
+        }
 
         // Validate + assemble the NEW config BEFORE touching the running
         // generation. An invalid or un-assemblable config only flags
@@ -4269,133 +4282,8 @@ impl Runner {
             .cloned()
             .collect();
 
-        // ── Quiesce rule-less displays caught mid-blank ──────────────────────
-        // A rule-less display with phase "blanking" has no result driver after
-        // teardown.  Samsung KEY_PICTURE_OFF is a TOGGLE (re-issuing could
-        // invert the panel), so we must NOT restore a naked Blanking.  Instead,
-        // poll the still-live engine until the phase reaches a terminal state
-        // ("blanked" / "active") or the deadline passes.
-        let quiesce_deadline =
-            tokio::time::Instant::now() + dormant_core::config::defaults::COMMAND_TIMEOUT;
-        let mut snapshot = preliminary;
-        if let Some(ref snap) = snapshot {
-            let need_quiesce: HashSet<String> = snap
-                .displays
-                .iter()
-                .filter(|(id, d)| {
-                    let did = DisplayId((*id).clone());
-                    classify_transient(&d.phase, !ruled.contains(&did)) == TransientClass::Quiesce
-                })
-                .map(|(id, _)| id.clone())
-                .collect();
-            if !need_quiesce.is_empty() {
-                tracing::info!(
-                    event = "reload_quiesce_blanking",
-                    count = need_quiesce.len(),
-                    "rule-less display(s) caught mid-blank; polling until terminal"
-                );
-                loop {
-                    let all_terminal = if let Some(ref s) = snapshot {
-                        need_quiesce.iter().all(|id| {
-                            s.displays
-                                .iter()
-                                .find(|(did, _)| did == id)
-                                .is_none_or(|(_, d)| {
-                                    matches!(d.phase.as_str(), "blanked" | "active")
-                                })
-                        })
-                    } else {
-                        false
-                    };
-                    if all_terminal {
-                        break;
-                    }
-                    if tokio::time::Instant::now() >= quiesce_deadline {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                    if let Some(s) = request_snapshot(&old_ctl).await {
-                        snapshot = Some(s);
-                    }
-                }
-                let stuck_count = snapshot.as_ref().map_or(0, |s| {
-                    need_quiesce
-                        .iter()
-                        .filter(|id| {
-                            s.displays
-                                .iter()
-                                .find(|(did, _)| did == *id)
-                                .is_some_and(|(_, d)| d.phase.as_str() == "blanking")
-                        })
-                        .count()
-                });
-                if stuck_count > 0 {
-                    tracing::warn!(
-                        event = "reload_quiesce_timeout",
-                        count = stuck_count,
-                        "rule-less display(s) still blanking at deadline; defensive-waking"
-                    );
-                }
-            }
-        }
-
-        // Step-boundary ping 2/7 (spec §6.3): after the quiesce loop above
-        // (whether or not any rule-less display actually needed quiescing)
-        // — the second of the two DISTINCT probes-done / quiesce-done
-        // boundaries the spec names; fired unconditionally so the boundary
-        // exists even on a reload with nothing to quiesce.
-        self.ping("after_quiesce");
-
-        let removed = removed_dark_displays(snapshot.as_ref(), &new_assembly.display_executors);
-        let retained_dark =
-            retained_dark_displays(snapshot.as_ref(), &new_assembly.display_executors, &ruled);
-        // Task 8 dispatch-identity invariant: a MANUAL-ONLY (rule-less) dark
-        // display retained under the SAME `DisplayId` but whose
-        // dispatch-relevant config changed is recovery-equivalent to
-        // removal — merged into the same verified old-executor wake loop as
-        // `removed` below (see `changed_dispatch_dark_displays`'s docs,
-        // including why ruled displays are excluded via the same `ruled`
-        // set `retained_dark` above already uses). Computed here, before
-        // `new_assembly.cfg` is consumed by `spawn_generation_for_reload`
-        // below; `self.generation.cfg` is still the OLD config at this
-        // point (`install_generation` hasn't run yet).
-        let changed_identity = changed_dispatch_dark_displays(
-            snapshot.as_ref(),
-            &self.generation.cfg,
-            &new_assembly.cfg,
-            &ruled,
-        );
-
-        // Capture the new config for watch updates + bind change detection
-        // BEFORE new_assembly is consumed by spawn_generation.
-        #[cfg(target_os = "linux")]
-        let previous_active_sampler_cfg = self.generation.cfg.clone();
-        let new_cfg = new_assembly.cfg.clone();
-        let new_creds = new_assembly.creds.clone();
-        self.generation_barrier_ack_timeout = new_cfg.daemon.generation_barrier_ack_timeout;
-
-        // Reload does not rebind a web listener — flag port/bind changes.
-        if new_cfg.daemon.web_port != self.started_web_port
-            || new_cfg.daemon.web_bind != self.started_web_bind
-        {
-            tracing::info!(
-                event = "web_bind_change_ignored",
-                "web_bind/web_port change requires a daemon restart; keeping the current listener"
-            );
-        }
-
-        // Fail-closed during the swap: the wear tracker must never call into
-        // an executor that is about to be torn down (spec §4.3). Empty the
-        // watch BEFORE teardown so a tracker tick racing this window sees no
-        // executors (skips its round) rather than a stale/dying one.
-        self.executors_tx.send_replace(Arc::new(HashMap::new()));
-
-        // Step-boundary ping 3/7 (spec §6.3 F5): right before the teardown +
-        // verified-wake work below, so that gap too is independently
-        // bounded (on top of the after_assemble/after_quiesce boundaries
-        // above covering the two stretches that precede this point).
-        self.ping("before_teardown");
-
+        // Freeze ingress before the drain and snapshot. Controls accepted after
+        // the snapshot would otherwise disappear when the new engine restores it.
         self.ctl_router.pause().await;
         self.events_router.pause().await;
         self.record_reload_lifecycle_stage("routers_paused");
@@ -4443,6 +4331,8 @@ impl Runner {
         if let Some(gate) = &self.generation_barrier_gate {
             gate.reach(old_ctl.clone()).await;
         }
+        self.generation_barrier_ack_timeout =
+            new_assembly.cfg.daemon.generation_barrier_ack_timeout;
         if let Err(detail) = await_generation_barrier(
             &old_ctl,
             self.generation_barrier_ack_timeout,
@@ -4461,6 +4351,166 @@ impl Runner {
             .emit(DaemonObservation::GenerationDrained {
                 generation: self.generation_id,
             });
+
+        #[cfg(any(test, feature = "test-util"))]
+        let preliminary = if self.force_reload_snapshot_timeout {
+            self.record_reload_lifecycle_stage("snapshot_bypassed");
+            None
+        } else {
+            request_snapshot(&old_ctl).await
+        };
+        #[cfg(not(any(test, feature = "test-util")))]
+        let preliminary = request_snapshot(&old_ctl).await;
+
+        // ── Quiesce rule-less displays with pending command results ──────────
+        // A rule-less display with phase "blanking" has no result driver after
+        // teardown.  Samsung KEY_PICTURE_OFF is a TOGGLE (re-issuing could
+        // invert the panel), so we must NOT restore a naked Blanking.  Instead,
+        // poll the still-live engine until the phase reaches a terminal state
+        // ("blanked" / "active") or the deadline passes.
+        // Wait for waking too, so a completed wake does not restore stale state.
+        // At the deadline, restore Waking to retry an unconfirmed physical wake.
+        let quiesce_deadline =
+            tokio::time::Instant::now() + dormant_core::config::defaults::COMMAND_TIMEOUT;
+        let mut snapshot = preliminary;
+        if let Some(ref snap) = snapshot {
+            let need_quiesce: HashSet<String> = snap
+                .displays
+                .iter()
+                .filter(|(id, d)| {
+                    let did = DisplayId((*id).clone());
+                    classify_transient(&d.phase, !ruled.contains(&did)) == TransientClass::Quiesce
+                        || (!ruled.contains(&did) && d.phase == "waking")
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            if !need_quiesce.is_empty() {
+                let pending_in = |phase: &str| {
+                    snap.displays
+                        .iter()
+                        .filter(|(id, d)| need_quiesce.contains(id) && d.phase == phase)
+                        .count()
+                };
+                tracing::info!(
+                    event = "reload_quiesce_pending",
+                    blanking = pending_in("blanking"),
+                    waking = pending_in("waking"),
+                    "rule-less display(s) with pending results; polling until terminal"
+                );
+                loop {
+                    let all_terminal = if let Some(ref s) = snapshot {
+                        need_quiesce.iter().all(|id| {
+                            s.displays
+                                .iter()
+                                .find(|(did, _)| did == id)
+                                .is_none_or(|(_, d)| {
+                                    matches!(d.phase.as_str(), "blanked" | "active")
+                                })
+                        })
+                    } else {
+                        false
+                    };
+                    if all_terminal {
+                        break;
+                    }
+                    if tokio::time::Instant::now() >= quiesce_deadline {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    if let Some(s) = request_snapshot(&old_ctl).await {
+                        snapshot = Some(s);
+                    }
+                }
+                let stuck_in = |phase: &str| {
+                    snapshot.as_ref().map_or(0, |s| {
+                        need_quiesce
+                            .iter()
+                            .filter(|id| {
+                                s.displays
+                                    .iter()
+                                    .find(|(did, _)| did == *id)
+                                    .is_some_and(|(_, d)| d.phase.as_str() == phase)
+                            })
+                            .count()
+                    })
+                };
+                let stuck_blanking = stuck_in("blanking");
+                if stuck_blanking > 0 {
+                    tracing::warn!(
+                        event = "reload_quiesce_timeout",
+                        phase = "blanking",
+                        count = stuck_blanking,
+                        "rule-less display(s) still blanking at deadline; defensive-waking"
+                    );
+                }
+                let stuck_waking = stuck_in("waking");
+                if stuck_waking > 0 {
+                    tracing::warn!(
+                        event = "reload_quiesce_timeout",
+                        phase = "waking",
+                        count = stuck_waking,
+                        "rule-less display(s) still waking at deadline; the wake is retried"
+                    );
+                }
+            }
+        }
+
+        // Step-boundary ping 2/7 (spec §6.3): after the quiesce loop above
+        // (whether or not any rule-less display actually needed quiescing)
+        // — the second of the two DISTINCT probes-done / quiesce-done
+        // boundaries the spec names; fired unconditionally so the boundary
+        // exists even on a reload with nothing to quiesce.
+        self.ping("after_quiesce");
+
+        let removed = removed_dark_displays(snapshot.as_ref(), &new_assembly.display_executors);
+        let retained_dark =
+            retained_dark_displays(snapshot.as_ref(), &new_assembly.display_executors, &ruled);
+        // Task 8 dispatch-identity invariant: a MANUAL-ONLY (rule-less) dark
+        // display retained under the SAME `DisplayId` but whose
+        // dispatch-relevant config changed is recovery-equivalent to
+        // removal — merged into the same verified old-executor wake loop as
+        // `removed` below (see `changed_dispatch_dark_displays`'s docs,
+        // including why ruled displays are excluded via the same `ruled`
+        // set `retained_dark` above already uses). Computed here, before
+        // `new_assembly.cfg` is consumed by `spawn_generation_for_reload`
+        // below; `self.generation.cfg` is still the OLD config at this
+        // point (`install_generation` hasn't run yet).
+        let changed_identity = changed_dispatch_dark_displays(
+            snapshot.as_ref(),
+            &self.generation.cfg,
+            &new_assembly.cfg,
+            &ruled,
+        );
+
+        // Capture the new config for watch updates + bind change detection
+        // BEFORE new_assembly is consumed by spawn_generation.
+        #[cfg(target_os = "linux")]
+        let previous_active_sampler_cfg = self.generation.cfg.clone();
+        let new_cfg = new_assembly.cfg.clone();
+        let new_creds = new_assembly.creds.clone();
+
+        // Reload does not rebind a web listener — flag port/bind changes.
+        if new_cfg.daemon.web_port != self.started_web_port
+            || new_cfg.daemon.web_bind != self.started_web_bind
+        {
+            tracing::info!(
+                event = "web_bind_change_ignored",
+                "web_bind/web_port change requires a daemon restart; keeping the current listener"
+            );
+        }
+
+        // Fail-closed during the swap: the wear tracker must never call into
+        // an executor that is about to be torn down (spec §4.3). Empty the
+        // watch BEFORE teardown so a tracker tick racing this window sees no
+        // executors (skips its round) rather than a stale/dying one.
+        self.executors_tx.send_replace(Arc::new(HashMap::new()));
+
+        // Step-boundary ping 3/7 (spec §6.3 F5): right before the teardown +
+        // verified-wake work below, so that gap too is independently
+        // bounded (on top of the after_assemble/after_quiesce boundaries
+        // above covering the two stretches that precede this point).
+        self.ping("before_teardown");
+
         teardown(&mut self.generation).await;
         self.record_reload_lifecycle_stage("engine_torn_down");
 

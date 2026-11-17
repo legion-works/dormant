@@ -570,6 +570,13 @@ follow-up dormant pull, the panel is already local and that pull is a no-op.
 - A DDC read error holds the last ownership verdict. At cold start or after a
   stale observation, ownership stays conservative. An unknown zone acquiring
   ownership does not wake the panel.
+- `coord_poll_failing` reports `kind=error` with the read error, `kind=skipped`
+  with the sampler-priority skip reason, or `kind=no_readback` when no sample is
+  available. The event remains rate-limited after consecutive failures.
+- `coord_poll_unknown_code` reports a decoded input code that is neither the
+  local nor peer code. It includes the configured read and write codes and is
+  emitted again only when the observed unknown code changes or a known code
+  resets the sequence.
 - Two daemons polling the **same** physical panel will see occasional
   successful-but-wrong reads on each other's bus traffic. The
   `loss_confirmations` debounce holds the prior verdict on a stray "not mine"

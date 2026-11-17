@@ -279,12 +279,12 @@ pub struct LadderStage {
     /// What this rung does.
     pub kind: StageKind,
     /// How long to dwell at this stage before trying the next one.
-    /// Deserialized with `humantime_serde::option`, so TOML values like
+    /// Deserialized with `crate::duration::option`, so TOML values like
     /// `"5m"` or `"30s"` are accepted.  Absent when serialized to JSON
     /// (`skip_serializing_if`) rather than emitted as `null`.
     #[serde(
         default,
-        with = "humantime_serde::option",
+        with = "crate::duration::option",
         skip_serializing_if = "Option::is_none"
     )]
     pub dwell: Option<Duration>,

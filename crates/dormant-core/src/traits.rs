@@ -120,6 +120,11 @@ pub trait SensorSource: Send {
 /// automatically — no per-impl boilerplate required.
 #[async_trait::async_trait]
 pub trait DisplayController: Any + Send + Sync {
+    /// Time of the last power-on write without an error, if known.
+    fn last_power_on(&self) -> Option<tokio::time::Instant> {
+        None
+    }
+
     /// Literal name of this controller (grep-stable, matches config `type`).
     fn name(&self) -> &'static str;
 
@@ -241,19 +246,18 @@ pub trait DisplayController: Any + Send + Sync {
         None
     }
 
-    /// Stable, panel-derived identity for this controller's physical panel,
-    /// if one is available (spec §3 `WearIdentity`).
-    ///
-    /// Default returns `None` — the honest answer for every controller with
-    /// no panel-derived identity (`command`, `kwin-dpms`, `ha-passthrough`).
-    /// `DdcciController` overrides with its canonical panel-lock key
-    /// (resolved during `probe`, before any VCP transaction);
-    /// `SamsungTizenController` overrides with `"samsung:<host>"`. Used
-    /// once, at ledger-creation time, so a wear ledger's identity survives a
-    /// `[displays.*]` config rename instead of following the config key —
-    /// the entire reason `WearIdentity` exists (T7 review finding M1).
+    /// Panel-derived local identity, if available.
+    /// DDC/CI uses its bus-derived panel I/O lock key. Samsung uses
+    /// `"samsung:<host>"`. Controllers without a panel identity use `None`.
+    /// Use [`Self::wear_identity`] for wear history.
     fn panel_identity(&self) -> Option<String> {
         None
+    }
+
+    /// Identity for wear history, not the panel I/O lock key.
+    /// Controllers without a serial-based identity keep their panel identity.
+    fn wear_identity(&self) -> Option<String> {
+        self.panel_identity()
     }
 
     /// Cross-machine claim identity for the shared-panel KVM-switch protocol
@@ -279,6 +283,11 @@ pub trait DisplayController: Any + Send + Sync {
 /// per-display object composed by the daemon.
 #[async_trait::async_trait]
 pub trait CommandSink: Send + Sync {
+    /// Time of the last power-on write without an error, if known.
+    fn last_power_on(&self) -> Option<tokio::time::Instant> {
+        None
+    }
+
     /// Blank the display using the given mode.
     async fn blank(&self, mode: BlankMode) -> Result<(), CmdFailure>;
 
@@ -401,6 +410,12 @@ pub trait CommandSink: Send + Sync {
     /// this with a chain-walk identical in shape to `read_usage_hours`.
     fn panel_identity(&self) -> Option<String> {
         None
+    }
+
+    /// Read the wear identity through the controller chain.
+    /// The default uses the panel identity.
+    fn wear_identity(&self) -> Option<String> {
+        self.panel_identity()
     }
 
     /// Read the cross-machine claim identity through whichever controller in

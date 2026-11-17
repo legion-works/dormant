@@ -4,6 +4,7 @@
 pub mod config;
 pub mod coordination;
 pub mod doctor;
+pub mod duration;
 pub mod error;
 pub mod ipc_proto;
 pub mod mqtt;

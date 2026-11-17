@@ -184,6 +184,7 @@ async fn config_apply_full_loop() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 
@@ -370,6 +371,7 @@ async fn config_apply_wake_command_change_reloads() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_state_dir(dir.path().join("state"))
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 

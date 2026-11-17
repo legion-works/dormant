@@ -58,6 +58,7 @@ struct ReprobeState {
 async fn run(mut deps: CoordinationPollDeps) {
     let mut interval = new_interval(deps.config_rx.borrow().coordination.poll_interval);
     let mut last_failing_log = HashMap::new();
+    let mut last_unknown_code = HashMap::new();
     let mut last_state_read: HashMap<DisplayId, Instant> = HashMap::new();
     let mut reprobe_state: HashMap<DisplayId, ReprobeState> = HashMap::new();
     let mut pending_observed_gain: HashSet<DisplayId> = HashSet::new();
@@ -74,6 +75,7 @@ async fn run(mut deps: CoordinationPollDeps) {
             _ = interval.tick() => poll_once(
                 &deps,
                 &mut last_failing_log,
+                &mut last_unknown_code,
                 &mut last_state_read,
                 &mut reprobe_state,
                 &mut pending_observed_gain,
@@ -149,6 +151,7 @@ async fn maybe_reprobe(
 async fn poll_once(
     deps: &CoordinationPollDeps,
     last_failing_log: &mut HashMap<DisplayId, Instant>,
+    last_unknown_code: &mut HashMap<DisplayId, u8>,
     last_state_read: &mut HashMap<DisplayId, Instant>,
     reprobe_state: &mut HashMap<DisplayId, ReprobeState>,
     pending_observed_gain: &mut HashSet<DisplayId>,
@@ -259,6 +262,18 @@ async fn poll_once(
             let classification = aliases.classify(observed);
             if !panel_mismatch && matches!(classification, InputSourceObservation::Unknown(_)) {
                 deps.state.record_failure(&display_id);
+                if last_unknown_code.get(&display_id) != Some(&observed) {
+                    tracing::warn!(
+                        event = "coord_poll_unknown_code",
+                        display = %display_id,
+                        observed,
+                        local_read = aliases.local_read,
+                        local_write = aliases.local_write,
+                        peer_read = aliases.peer_read.map_or_else(|| "none".to_string(), |code| code.to_string()),
+                        peer_write = aliases.peer_write.map_or_else(|| "none".to_string(), |code| code.to_string()),
+                    );
+                    last_unknown_code.insert(display_id.clone(), observed);
+                }
                 continue; // `for` loop — skip the rest of this display's tick
             }
 
@@ -295,6 +310,7 @@ async fn poll_once(
                 tracing::info!(event = "coord_poll_ok", display = %display_id);
             }
             last_failing_log.remove(&display_id);
+            last_unknown_code.remove(&display_id);
             if let Some(state) = reprobe_state.get_mut(&display_id) {
                 state.next_interval = config.coordination.reprobe_interval;
             }
@@ -430,6 +446,14 @@ async fn poll_once(
             }
         } else {
             deps.state.record_failure(&display_id);
+            let failure_detail = match &input {
+                Err(error) if error == dormant_displays::vcp_ops::INPUT_SOURCE_SKIPPED => {
+                    ("skipped", Some(error.clone()))
+                }
+                Err(error) => ("error", Some(error.clone())),
+                Ok(None) => ("no_readback", None),
+                Ok(Some(_)) => unreachable!("successful readback handled above"),
+            };
             let failures = deps
                 .state
                 .snapshot()
@@ -449,7 +473,7 @@ async fn poll_once(
                     .get(&display_id)
                     .is_none_or(|last| now.duration_since(*last) >= COORD_POLL_FAILING_LOG_INTERVAL)
             {
-                tracing::warn!(event = "coord_poll_failing", display = %display_id, consecutive_failures = failures);
+                tracing::warn!(event = "coord_poll_failing", display = %display_id, consecutive_failures = failures, kind = failure_detail.0, error = failure_detail.1.as_deref().unwrap_or(""));
                 last_failing_log.insert(display_id, now);
             }
         }
@@ -1274,7 +1298,7 @@ mod tests {
             Ok(Some(0x12)),
             Ok(Some(0x12)),
             Ok(Some(0x12)),
-            Err("skipped: command holds panel lock".to_string()),
+            Err(dormant_displays::vcp_ops::INPUT_SOURCE_SKIPPED.to_string()),
         ]));
         let (_config_tx, _executors_tx, mut ctl_rx, state, cancel) = setup(sink);
         tick().await;
@@ -1565,16 +1589,21 @@ mod tests {
 
     struct EventVisitor {
         event: Option<String>,
+        fields: Vec<String>,
     }
 
     impl Visit for EventVisitor {
         fn record_str(&mut self, field: &Field, value: &str) {
             if field.name() == "event" {
                 self.event = Some(value.to_string());
+            } else {
+                self.fields.push(format!("{}={value}", field.name()));
             }
         }
 
-        fn record_debug(&mut self, _field: &Field, _value: &dyn std::fmt::Debug) {}
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.fields.push(format!("{}={value:?}", field.name()));
+        }
     }
 
     #[derive(Clone, Default)]
@@ -1582,10 +1611,16 @@ mod tests {
 
     impl<S: tracing::Subscriber> Layer<S> for EventCapture {
         fn on_event(&self, event: &tracing::Event<'_>, _context: Context<'_, S>) {
-            let mut visitor = EventVisitor { event: None };
+            let mut visitor = EventVisitor {
+                event: None,
+                fields: Vec::new(),
+            };
             event.record(&mut visitor);
             if let Some(event) = visitor.event {
-                self.0.lock().unwrap().push(event);
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(format!("{event} {}", visitor.fields.join(" ")));
             }
         }
     }
@@ -1593,7 +1628,7 @@ mod tests {
     fn count_event(events: &[String], expected: &str) -> usize {
         events
             .iter()
-            .filter(|event| event.as_str() == expected)
+            .filter(|event| event.split_whitespace().next() == Some(expected))
             .count()
     }
 
@@ -1620,6 +1655,7 @@ mod tests {
             direct_switch: None,
         };
         let mut last_failing_log = HashMap::new();
+        let mut last_unknown_code = HashMap::new();
         let mut last_state_read = HashMap::new();
         let mut reprobe_state = HashMap::new();
         let mut pending_observed_gain = HashSet::new();
@@ -1629,6 +1665,7 @@ mod tests {
             poll_once(
                 &deps,
                 &mut last_failing_log,
+                &mut last_unknown_code,
                 &mut last_state_read,
                 &mut reprobe_state,
                 &mut pending_observed_gain,
@@ -1667,6 +1704,7 @@ mod tests {
             direct_switch: None,
         };
         let mut last_failing_log = HashMap::new();
+        let mut last_unknown_code = HashMap::new();
         let mut last_state_read = HashMap::new();
         let mut reprobe_state = HashMap::new();
         let mut pending_observed_gain = HashSet::new();
@@ -1676,6 +1714,7 @@ mod tests {
             poll_once(
                 &deps,
                 &mut last_failing_log,
+                &mut last_unknown_code,
                 &mut last_state_read,
                 &mut reprobe_state,
                 &mut pending_observed_gain,
@@ -1692,7 +1731,8 @@ mod tests {
         assert!(
             captured_events([Ok(Some(0x11))], 1)
                 .await
-                .contains(&"coord_poll_ok".to_string())
+                .iter()
+                .any(|event| event.starts_with("coord_poll_ok "))
         );
     }
 
@@ -1701,8 +1741,58 @@ mod tests {
         assert!(
             captured_events([Err("failed".to_string()), Err("failed".to_string())], 2)
                 .await
-                .contains(&"coord_poll_failing".to_string())
+                .iter()
+                .any(|event| event.starts_with("coord_poll_failing "))
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unknown_input_codes_log_once_until_value_or_known_code_changes() {
+        let events = captured_events(
+            [15, 15, 16, 16, 0x11, 15, 15, 0x11, 15]
+                .into_iter()
+                .map(|code| Ok(Some(code))),
+            9,
+        )
+        .await;
+        let unknown: Vec<_> = events
+            .iter()
+            .filter(|event| event.starts_with("coord_poll_unknown_code "))
+            .collect();
+        assert_eq!(unknown.len(), 4, "{unknown:?}");
+        assert!(unknown[0].contains("observed=15"));
+        assert!(unknown[1].contains("observed=16"));
+        assert!(unknown[2].contains("observed=15"));
+        assert!(unknown[3].contains("observed=15"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poll_failures_log_kind_and_error_detail() {
+        for (input, expected) in [
+            (Err("i2c: Input/output error".to_string()), "kind=error"),
+            (
+                Err(dormant_displays::vcp_ops::INPUT_SOURCE_SKIPPED.to_string()),
+                "kind=skipped",
+            ),
+            (Ok(None), "kind=no_readback"),
+        ] {
+            let events = captured_events(std::iter::repeat_n(input, 2), 2).await;
+            let failing = events
+                .iter()
+                .find(|event| event.starts_with("coord_poll_failing "))
+                .unwrap();
+            assert!(failing.contains(expected), "{failing}");
+            if expected == "kind=error" {
+                assert!(failing.contains("i2c: Input/output error"), "{failing}");
+            } else if expected == "kind=skipped" {
+                assert!(
+                    failing.contains(dormant_displays::vcp_ops::INPUT_SOURCE_SKIPPED),
+                    "{failing}"
+                );
+            } else {
+                assert!(failing.contains("error="), "{failing}");
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -1713,7 +1803,8 @@ mod tests {
         assert!(
             captured_events([Ok(Some(0x12)), Ok(Some(0x12)), Ok(Some(0x12))], 3,)
                 .await
-                .contains(&"coord_ownership_changed".to_string())
+                .iter()
+                .any(|event| event.starts_with("coord_ownership_changed "))
         );
     }
 
@@ -1732,7 +1823,8 @@ mod tests {
                 2,
             )
             .await
-            .contains(&"coord_poll_disagreement".to_string())
+            .iter()
+            .any(|event| event.starts_with("coord_poll_disagreement "))
         );
     }
 
@@ -1750,7 +1842,8 @@ mod tests {
                 2,
             )
             .await
-            .contains(&"coord_ownership_loss_deferred".to_string())
+            .iter()
+            .any(|event| event.starts_with("coord_ownership_loss_deferred "))
         );
     }
 
@@ -1843,13 +1936,13 @@ mod tests {
         assert!(
             !captured
                 .iter()
-                .any(|event| event == "coord_ownership_loss_deferred"),
+                .any(|event| event.starts_with("coord_ownership_loss_deferred ")),
             "unknown code must not trigger loss deferred, got {captured:?}"
         );
         assert!(
             !captured
                 .iter()
-                .any(|event| event == "coord_ownership_changed"),
+                .any(|event| event.starts_with("coord_ownership_changed ")),
             "unknown code must not trigger ownership change, got {captured:?}"
         );
         cancel.cancel();
@@ -1915,7 +2008,7 @@ mod tests {
         assert!(
             captured
                 .iter()
-                .any(|event| event == "coord_poll_disagreement"),
+                .any(|event| event.starts_with("coord_poll_disagreement ")),
             "disagreement must fire when 0x11→0x12 (both configured), got {captured:?}"
         );
         // No loss committed — tick 3 was a failure, and tick 4 only brings
@@ -1923,7 +2016,7 @@ mod tests {
         assert!(
             !captured
                 .iter()
-                .any(|event| event == "coord_ownership_changed"),
+                .any(|event| event.starts_with("coord_ownership_changed ")),
             "no ownership change expected, got {captured:?}"
         );
         cancel.cancel();

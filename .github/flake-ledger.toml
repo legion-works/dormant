@@ -33,7 +33,7 @@ mechanism = "cross-generation-lost-command-window-during-reload-teardown; canoni
 reproduction = "cargo nextest run -p dormantd --test daemon_smoke --stress-count 100 --retries 0 --flaky-result fail -E 'test(manual_only_display_full_lifecycle_across_reload)'"
 root_cause = "Reload takes its restore snapshot while the old generation still accepts controls: Runner::reload snapshots, pauses the control router, drains, tears the engine down and restores that same snapshot. A manual command that completes between the snapshot and the pause is lost, because the next generation restores the earlier phase. Holding controls during the swap (#104) and keeping queued controls after a failed install (#322) do not cover a command already processed after the snapshot. Fix tracked in https://github.com/legion-works/dormant/issues/401."
 fix_pr = ""
-proving_test = ""
+proving_test = "daemon_smoke::manual_blank_completed_during_reload_is_preserved"
 soak_evidence = []
 status = "open"
 
@@ -125,14 +125,14 @@ status = "open"
 id = "FLAKE-0094"
 test = "daemon_smoke::manual_only_display_no_defensive_wake_on_reload"
 first_seen = "2026-07-19"
-signature = "sha256:c89341cc0f4d657ec05d3b06c804309a07f2785f1f2d3edd469297190f79d845"
+signature = "sha256:574a4a213bec6d7a37b044b28ec186aa3775eeb1d8b9a0350c2aac10097ef60b"
 first_run_url = ""
 last_run_url = ""
-mechanism = "marker-write-precedes-phase-landing-and-can-preserve-blanking; distinct symptom anchor resolves the historical FLAKE-0009 same-test collision"
+mechanism = "Two observation races: the marker write precedes phase landing and can preserve blanking; the asynchronous defensive wake can complete after the fixed 500 ms wait. The second symptom first appeared 2026-09-10."
 reproduction = "cargo nextest run -p dormantd --test daemon_smoke --stress-count 100 --retries 0 --flaky-result fail -E 'test(manual_only_display_no_defensive_wake_on_reload)'"
-root_cause = "The command marker is written before the engine consumes the controller result and moves Blanking to Blanked. The test treated the marker as completion, reloaded during the intermediate phase and asserted preservation of a state it had not reached. #95 makes the test wait for Blanked before reloading."
-fix_pr = "https://github.com/legion-works/dormant/pull/95"
-proving_test = "daemon_smoke::manual_only_display_no_defensive_wake_on_reload"
+root_cause = "The command marker is written before the engine moves Blanking to Blanked; #95 added the manual phase guard but not the ruled phase guard. A second race remained: reload spawns its defensive wake without awaiting completion, but the test checked after 500 ms. The current field failure had mon=B; delaying the wake 1.2 s reproduced the assertion 3/3 with mon=BB because re-blanking completed first. A loaded runner could delay both effects; polling accepts either order. A separate probe held mon in blanking with a 2 s blank command delay and confirmed defensive wake 3/3. Both test variants now wait for both blanked phases, poll for the ruled wake for up to 10 s, and observe an additional 1 s before checking that manual received no wake. The forced timing supports a test observation race, not a missing production wake; the original macOS scheduling cause is not directly measured. Latest field run: https://github.com/legion-works/dormant/actions/runs/43586245676."
+fix_pr = ""
+proving_test = "daemon_smoke::manual_only_display_no_defensive_wake_on_reload_with_delayed_wake"
 soak_evidence = [
   "https://github.com/legion-works/dormant/actions/runs/38872774488",
   "https://github.com/legion-works/dormant/actions/runs/38705508855",

@@ -383,6 +383,10 @@ impl DisplayExecutor {
 
 #[async_trait]
 impl CommandSink for DisplayExecutor {
+    fn last_power_on(&self) -> Option<tokio::time::Instant> {
+        self.chain.iter().filter_map(|c| c.last_power_on()).max()
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn blank(&self, mode: BlankMode) -> Result<(), CmdFailure> {
         let _supersede_token = self.rotate_supersede();
@@ -946,6 +950,12 @@ impl CommandSink for DisplayExecutor {
         None
     }
 
+    fn wear_identity(&self) -> Option<String> {
+        self.chain
+            .iter()
+            .find_map(|controller| controller.wear_identity())
+    }
+
     /// Walk the configured chain and return the first non-`None`
     /// cross-machine claim identity — mirrors [`Self::panel_identity`]'s
     /// chain-walk shape exactly (spec F5). Used by the claim broadcast to
@@ -987,6 +997,7 @@ mod tests {
 
     #[derive(Default)]
     struct FakeInner {
+        last_power_on: Option<tokio::time::Instant>,
         modes: Vec<BlankMode>,
         available: bool,
         /// Scripted `probe()` result.  `None` → default `Ok(())`.
@@ -1008,6 +1019,7 @@ mod tests {
         /// Scripted [`DisplayController::panel_identity`] response — used
         /// by the T7 chain-walk test.
         panel_identity: Option<String>,
+        wear_identity: Option<String>,
         /// Scripted [`DisplayController::claim_identity`] response — used
         /// by the F5 chain-walk test.
         claim_identity: Option<String>,
@@ -1143,6 +1155,10 @@ mod tests {
 
     #[async_trait]
     impl DisplayController for FakeController {
+        fn last_power_on(&self) -> Option<tokio::time::Instant> {
+            self.inner.lock().unwrap().last_power_on
+        }
+
         fn name(&self) -> &'static str {
             self.name
         }
@@ -1250,6 +1266,10 @@ mod tests {
             self.inner.lock().unwrap().panel_identity.clone()
         }
 
+        fn wear_identity(&self) -> Option<String> {
+            self.inner.lock().unwrap().wear_identity.clone()
+        }
+
         fn claim_identity(&self) -> Option<String> {
             self.inner.lock().unwrap().claim_identity.clone()
         }
@@ -1282,6 +1302,24 @@ mod tests {
             retry,
         ));
         (exec, controllers)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn last_power_on_returns_latest_across_chain() {
+        let old = FakeController::new("old", vec![]);
+        let new = FakeController::new("new", vec![]);
+        let unsupported = FakeController::new("unsupported", vec![]);
+        let now = tokio::time::Instant::now();
+        old.inner.lock().unwrap().last_power_on = Some(now - Duration::from_secs(3));
+        new.inner.lock().unwrap().last_power_on = Some(now);
+        let (executor, _) = executor_with(
+            vec![old, new, unsupported],
+            RetrySettings {
+                wake_retries: 0,
+                wake_retry_backoff: Duration::ZERO,
+            },
+        );
+        assert_eq!(executor.last_power_on(), Some(now));
     }
 
     #[allow(clippy::needless_pass_by_value)]
@@ -2057,6 +2095,20 @@ mod tests {
         let a = FakeController::new("A", vec![BlankMode::PowerOff]);
         let (exec, _) = executor_with(vec![a], default_retry());
         assert_eq!(exec.panel_identity(), None);
+    }
+
+    #[tokio::test]
+    async fn wear_identity_chain_is_distinct_from_bus_identity() {
+        let a = FakeController::new("A", vec![BlankMode::PowerOff]);
+        let b = FakeController::new("B", vec![BlankMode::PowerOff]);
+        b.set_panel_identity(Some("i2c-dev:22800 AOC AG326UZD".into()));
+        b.inner.lock().unwrap().wear_identity = Some("AOC:AG326UZD:serial".into());
+        let (exec, _) = executor_with(vec![a, b], default_retry());
+        assert_eq!(exec.wear_identity().as_deref(), Some("AOC:AG326UZD:serial"));
+        assert_eq!(
+            exec.panel_identity().as_deref(),
+            Some("i2c-dev:22800 AOC AG326UZD")
+        );
     }
 
     // ── F5: claim_identity chain-walk ───────────────────────────────────────

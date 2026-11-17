@@ -39,10 +39,11 @@
 //! Spec §3's `WearIdentity` exists so a `[displays.*]` config rename or two
 //! differently-named configs for the same panel don't orphan (or collide
 //! with) an existing ledger. `ensure_ledgers_loaded` prefers
-//! `CommandSink::panel_identity()` — ddcci's canonical panel-lock key,
+//! `CommandSink::wear_identity()` — ddcci's EDID identity with a serial,
 //! samsung's `"samsung:<host>"` — over the sanitized config display key,
 //! falling back to the config key only for controllers with no panel-
 //! derived identity (`command`, `kwin-dpms`, `ha-passthrough`). The
+//! DDC/CI falls back to its bus identity without a serial. The
 //! resolved key is cached in `TrackerState::storage_key` and used
 //! consistently for the ledger filename, `WearIdentity.key`, and the
 //! shared [`WearHandle`] map key.
@@ -64,8 +65,8 @@ use dormant_core::types::ScreensaverItemReport;
 use dormant_core::types::{DisplayId, StageKind, Tick};
 use dormant_core::wear::{
     PanelType, WEAR_SCHEMA_VERSION, WearAttributionMode, WearHandle, WearIdentity, WearLedger,
-    advisory_active, brightness_norm, hours_since_effective_dwell, ledger_identity_key,
-    sanitize_identity_key,
+    advisory_active, brightness_norm, hours_since_effective_dwell, ledger_adoption_key,
+    ledger_identity_key, sanitize_identity_key,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
@@ -353,7 +354,7 @@ fn ensure_ledgers_loaded(
         // `ha-passthrough`) fall back to the config key as their identity source.
         let identity_source = executors
             .get(display_id)
-            .and_then(|sink| sink.panel_identity())
+            .and_then(|sink| sink.wear_identity())
             .unwrap_or_else(|| display_id.0.clone());
         let legacy_key = sanitize_identity_key(&identity_source);
         let key = ledger_identity_key(&identity_source);
@@ -364,7 +365,7 @@ fn ensure_ledgers_loaded(
             display_name: display_id.0.clone(),
             config_display_id: Some(display_id.0.clone()),
         };
-        let result = load_or_create_ledger(
+        let mut result = load_or_create_ledger(
             dir,
             &key,
             &legacy_key,
@@ -375,6 +376,17 @@ fn ensure_ledgers_loaded(
             now_epoch_s,
             observations,
         );
+        if let Some(sink) = executors.get(display_id)
+            && sink.claim_identity().as_deref() == Some(identity_source.as_str())
+            && identity_source.split(':').count() == 3
+            && !result.persist_readonly
+        {
+            let mut sources = vec![display_id.0.clone()];
+            if let Some(bus) = sink.panel_identity() {
+                sources.insert(0, bus);
+            }
+            adopt_panel_ledgers(dir, &key, &sources, &mut result);
+        }
         state.ledgers.insert(display_id.clone(), result.ledger);
         if result.needs_seed {
             state.pending_seed.insert(display_id.clone());
@@ -512,7 +524,7 @@ async fn apply_actions(
                 // used to load this ledger (T7 review M1) — recomputing
                 // from `display_id.0` here would silently diverge from the
                 // file this ledger was actually loaded from whenever
-                // `panel_identity()` won over the config key.
+                // `wear_identity()` won over the config key.
                 let key = state
                     .storage_key
                     .get(&display_id)
@@ -571,7 +583,7 @@ async fn apply_actions(
 /// readers (IPC/WebUI) see the latest attribution. Keyed by the same
 /// resolved `storage_key` used for the ledger filename (T7 review M1) — NOT
 /// recomputed from the config display id, which would silently diverge from
-/// the filename whenever `panel_identity()` won.
+/// the filename whenever `wear_identity()` won.
 fn sync_handle(state: &TrackerState, handle: &WearHandle) {
     let Ok(mut guard) = handle.write() else {
         return;
@@ -747,7 +759,7 @@ struct TrackerState {
     /// and advisory math, never as a span source.
     last_tick_at: Option<Instant>,
     /// Resolved on-disk storage key per display (T7 review M1):
-    /// `CommandSink::panel_identity()` when available, else the sanitized
+    /// `CommandSink::wear_identity()` when available, else the encoded
     /// config key. Used consistently for the ledger filename,
     /// `WearIdentity.key`, and the `WearHandle` map key so a config rename
     /// cannot orphan an already-tracked panel's ledger.
@@ -1429,7 +1441,108 @@ fn write_atomic_bytes(dir: &Path, key: &str, bytes: &[u8]) -> std::io::Result<()
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o644))?;
     }
-    std::fs::rename(&tmp_path, &final_path)
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&tmp_path)?
+        .sync_all()?;
+    std::fs::rename(&tmp_path, &final_path)?;
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+/// Add history only from the current panel bus and config display id.
+/// Commit source keys with the summed values before source renames.
+fn adopt_panel_ledgers(dir: &Path, key: &str, sources: &[String], result: &mut LoadResult) {
+    for source in sources {
+        let source_key = ledger_identity_key(source);
+        if source_key == key {
+            continue;
+        }
+        let canonical = dir.join(format!("wear-{source_key}.json"));
+        let legacy = dir.join(format!("wear-{}.json", sanitize_identity_key(source)));
+        // The loader uses a canonical file first.
+        let path = if canonical.exists() {
+            canonical.clone()
+        } else {
+            legacy.clone()
+        };
+        let contents = match std::fs::read(&path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                tracing::warn!(event = "wear_ledger_adoption_failed", source_key, error = %error);
+                continue;
+            }
+        };
+        let source_ledger = match serde_json::from_slice::<WearLedger>(&contents) {
+            Ok(ledger) => ledger,
+            Err(error) => {
+                tracing::warn!(event = "wear_ledger_adoption_failed", source_key, error = %error);
+                continue;
+            }
+        };
+        let generation = format!("{source_key}:{}", source_ledger.advisory_baseline_epoch_s);
+        let marker = ledger_adoption_key(&generation, &contents);
+        if !result.ledger.adopted_sources.contains(&marker) {
+            let prefix = format!("{generation}:");
+            if result
+                .ledger
+                .adopted_sources
+                .iter()
+                .any(|prior| prior.starts_with(&prefix))
+            {
+                tracing::warn!(event = "wear_ledger_adoption_failed", source_key,
+                    path = %path.display(), error = "source history changed after adoption; manual merge required");
+                continue;
+            }
+            let mut merged = result.ledger.clone();
+            if let Err(error) = merged.merge(&source_ledger) {
+                tracing::warn!(event = "wear_ledger_adoption_failed", source_key, error = %error);
+                continue;
+            }
+            merged.adopted_sources.push(marker);
+            // The legacy alias can contain an older snapshot of canonical history.
+            // Record it in the same commit to prevent duplicate history on subsequent starts.
+            if path == canonical
+                && legacy != canonical
+                && let Ok(alias) = std::fs::read(&legacy)
+                && let Ok(alias_ledger) = serde_json::from_slice::<WearLedger>(&alias)
+            {
+                let alias_generation =
+                    format!("{source_key}:{}", alias_ledger.advisory_baseline_epoch_s);
+                let alias_marker = ledger_adoption_key(&alias_generation, &alias);
+                if !merged.adopted_sources.contains(&alias_marker) {
+                    merged.adopted_sources.push(alias_marker);
+                }
+            }
+            let write = serde_json::to_vec(&merged)
+                .map_err(std::io::Error::other)
+                .and_then(|bytes| write_atomic_bytes(dir, key, &bytes));
+            if let Err(error) = write {
+                tracing::warn!(event = "wear_ledger_adoption_failed", source_key, error = %error);
+                continue;
+            }
+            result.ledger = merged;
+            result.needs_seed = false;
+            tracing::info!(
+                event = "wear_ledger_adopted",
+                source_key,
+                hours = source_ledger.total_on_hours,
+                samples = source_ledger.sample_count
+            );
+        }
+        let migrated = path.with_extension("json.migrated");
+        if migrated.exists() {
+            tracing::warn!(
+                event = "wear_ledger_adoption_failed",
+                source_key,
+                error = "migration backup already exists"
+            );
+        } else if let Err(error) = std::fs::rename(&path, &migrated) {
+            tracing::warn!(event = "wear_ledger_adoption_failed", source_key, error = %error);
+        }
+    }
 }
 
 fn read_ledger_contents(
@@ -1915,6 +2028,7 @@ mod tests {
     /// call site is under test here.
     struct FakeCommandSink {
         identity: Option<String>,
+        wear: Option<String>,
     }
 
     #[async_trait::async_trait]
@@ -1937,6 +2051,14 @@ mod tests {
         fn panel_identity(&self) -> Option<String> {
             self.identity.clone()
         }
+
+        fn wear_identity(&self) -> Option<String> {
+            self.wear.clone().or_else(|| self.panel_identity())
+        }
+
+        fn claim_identity(&self) -> Option<String> {
+            self.wear.clone()
+        }
     }
 
     /// Build an executors map from `(display, scripted panel_identity)`
@@ -1949,6 +2071,7 @@ mod tests {
             .map(|(id, ident)| {
                 let sink: Arc<dyn CommandSink> = Arc::new(FakeCommandSink {
                     identity: ident.map(|s| (*s).to_string()),
+                    wear: None,
                 });
                 ((*id).clone(), sink)
             })
@@ -3313,6 +3436,409 @@ mod tests {
             state.ledgers.get(&display).unwrap().identity.key,
             expected_key
         );
+    }
+
+    #[test]
+    fn edid_adopts_config_history_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let display = DisplayId("mon".into());
+        let cfg = minimal_config();
+        let mut source = fresh_ledger(&display, 100);
+        source.attribute_uniform(Duration::from_secs(3600), 1.0);
+        persist_ledger(dir.path(), &ledger_identity_key("mon"), &source).unwrap();
+        let sink: Arc<dyn CommandSink> = Arc::new(FakeCommandSink {
+            identity: Some("i2c-dev:22800 AOC AG326UZD".into()),
+            wear: Some("AOC:AG326UZD:serial".into()),
+        });
+        let executors = HashMap::from([(display.clone(), sink)]);
+        let mut state = TrackerState::default();
+        ensure_ledgers_loaded(
+            &mut state,
+            &cfg,
+            &executors,
+            dir.path(),
+            200,
+            &ObservationHub::new(1),
+        );
+        assert_eq!(
+            state.ledgers[&display].total_on_hours, 1.0,
+            "config history must be adopted"
+        );
+        let key = ledger_identity_key("AOC:AG326UZD:serial");
+        let path = dir.path().join(format!("wear-{key}.json"));
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(
+            dir.path()
+                .join(format!("wear-{}.json.migrated", ledger_identity_key("mon")))
+                .exists()
+        );
+        ensure_ledgers_loaded(
+            &mut TrackerState::default(),
+            &cfg,
+            &executors,
+            dir.path(),
+            300,
+            &ObservationHub::new(1),
+        );
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+
+    fn adoption_fixture(key: &str, hours: f64, samples: u64) -> WearLedger {
+        let mut ledger = fresh_ledger(&DisplayId(key.into()), 100);
+        ledger
+            .cells
+            .fill(dormant_core::wear::WearCell { wear_hours: hours });
+        ledger.total_on_hours = hours;
+        ledger.sample_count = samples;
+        ledger
+    }
+
+    #[test]
+    fn edid_existing_ledger_adds_config_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let display = DisplayId("mon".into());
+        let cfg = minimal_config();
+        let edid = "AOC:AG326UZD:serial";
+        let key = ledger_identity_key(edid);
+        persist_ledger(dir.path(), &key, &adoption_fixture(&key, 127.5, 179_447)).unwrap();
+        persist_ledger(
+            dir.path(),
+            &ledger_identity_key("mon"),
+            &adoption_fixture("mon", 9.0, 15_121),
+        )
+        .unwrap();
+        let sink: Arc<dyn CommandSink> = Arc::new(FakeCommandSink {
+            identity: Some("i2c-dev:22800 AOC AG326UZD".into()),
+            wear: Some(edid.into()),
+        });
+        let executors = HashMap::from([(display.clone(), sink)]);
+        let mut state = TrackerState::default();
+        ensure_ledgers_loaded(
+            &mut state,
+            &cfg,
+            &executors,
+            dir.path(),
+            200,
+            &ObservationHub::new(1),
+        );
+        assert_eq!(state.ledgers[&display].total_on_hours, 136.5);
+        assert_eq!(state.ledgers[&display].sample_count, 194_568);
+        let persisted: WearLedger = serde_json::from_slice(
+            &std::fs::read(dir.path().join(format!("wear-{key}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted.total_on_hours, 136.5);
+    }
+
+    #[test]
+    fn serial_less_identity_keeps_bus_history_and_config_source_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let display = DisplayId("mon".into());
+        let cfg = minimal_config();
+        let bus = "i2c-dev:22800 AOC AG326UZD";
+        let bus_key = ledger_identity_key(bus);
+        persist_ledger(dir.path(), &bus_key, &adoption_fixture(bus, 9.0, 15_121)).unwrap();
+        persist_ledger(
+            dir.path(),
+            &ledger_identity_key("mon"),
+            &adoption_fixture("mon", 61.7, 14_545),
+        )
+        .unwrap();
+        let sink: Arc<dyn CommandSink> = Arc::new(FakeCommandSink {
+            identity: Some(bus.into()),
+            wear: None,
+        });
+        let executors = HashMap::from([(display.clone(), sink)]);
+        let mut state = TrackerState::default();
+        ensure_ledgers_loaded(
+            &mut state,
+            &cfg,
+            &executors,
+            dir.path(),
+            200,
+            &ObservationHub::new(1),
+        );
+        assert_eq!(state.storage_key[&display], bus_key);
+        assert_eq!(state.ledgers[&display].total_on_hours, 9.0);
+        let source = dir
+            .path()
+            .join(format!("wear-{}.json", ledger_identity_key("mon")));
+        assert!(source.exists());
+        assert!(!source.with_extension("json.migrated").exists());
+    }
+
+    #[test]
+    fn edid_adopts_current_bus_and_config_but_not_another_bus() {
+        let dir = tempfile::tempdir().unwrap();
+        let display = DisplayId("mon".into());
+        let cfg = minimal_config();
+        let bus = "i2c-dev:22800 AOC AG326UZD";
+        let other = "i2c-dev:22786 AOC AG326UZD";
+        let edid = "AOC:AG326UZD:XK2R9JA000013";
+        for (identity, hours, samples) in [
+            (bus, 9.0, 15_121),
+            ("mon", 61.7, 14_545),
+            (other, 127.5, 179_447),
+        ] {
+            persist_ledger(
+                dir.path(),
+                &ledger_identity_key(identity),
+                &adoption_fixture(identity, hours, samples),
+            )
+            .unwrap();
+        }
+        let other_path = dir
+            .path()
+            .join(format!("wear-{}.json", ledger_identity_key(other)));
+        let other_bytes = std::fs::read(&other_path).unwrap();
+        let sink: Arc<dyn CommandSink> = Arc::new(FakeCommandSink {
+            identity: Some(bus.into()),
+            wear: Some(edid.into()),
+        });
+        let executors = HashMap::from([(display.clone(), sink)]);
+        let mut state = TrackerState::default();
+        ensure_ledgers_loaded(
+            &mut state,
+            &cfg,
+            &executors,
+            dir.path(),
+            200,
+            &ObservationHub::new(1),
+        );
+        let ledger = &state.ledgers[&display];
+        assert_eq!(ledger.total_on_hours, 70.7);
+        assert_eq!(ledger.sample_count, 29_666);
+        assert!(ledger.cells.iter().all(|c| c.wear_hours == 70.7));
+        assert!(!state.pending_seed.contains(&display));
+        for identity in [bus, "mon"] {
+            let path = dir
+                .path()
+                .join(format!("wear-{}.json", ledger_identity_key(identity)));
+            assert!(!path.exists());
+            assert!(path.with_extension("json.migrated").exists());
+        }
+        assert_eq!(std::fs::read(other_path).unwrap(), other_bytes);
+        let path = dir
+            .path()
+            .join(format!("wear-{}.json", ledger_identity_key(edid)));
+        let bytes = std::fs::read(&path).unwrap();
+        ensure_ledgers_loaded(
+            &mut TrackerState::default(),
+            &cfg,
+            &executors,
+            dir.path(),
+            300,
+            &ObservationHub::new(1),
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn adoption_preserves_existing_history_and_survives_interrupted_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = ledger_identity_key("AOC:AG326UZD:serial");
+        let mut result = LoadResult {
+            ledger: adoption_fixture(&key, 127.5, 179_447),
+            needs_seed: false,
+            persist_readonly: false,
+        };
+        let source_key = ledger_identity_key("mon");
+        let source_path = dir.path().join(format!("wear-{source_key}.json"));
+        persist_ledger(
+            dir.path(),
+            &source_key,
+            &adoption_fixture("mon", 9.0, 15_121),
+        )
+        .unwrap();
+        // An existing backup prevents the rename, as can a crash after the write.
+        std::fs::write(source_path.with_extension("json.migrated"), b"older backup").unwrap();
+        adopt_panel_ledgers(dir.path(), &key, &["mon".into()], &mut result);
+        assert_eq!(result.ledger.total_on_hours, 136.5);
+        assert_eq!(result.ledger.sample_count, 194_568);
+        assert!(source_path.exists());
+        let path = dir.path().join(format!("wear-{key}.json"));
+        let bytes = std::fs::read(&path).unwrap();
+        result.ledger = serde_json::from_slice(&bytes).unwrap();
+        adopt_panel_ledgers(dir.path(), &key, &["mon".into()], &mut result);
+        assert_eq!(
+            result.ledger.total_on_hours, 136.5,
+            "committed source must not be added twice"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        std::fs::remove_file(source_path.with_extension("json.migrated")).unwrap();
+        adopt_panel_ledgers(dir.path(), &key, &["mon".into()], &mut result);
+        assert!(
+            !source_path.exists(),
+            "a committed source rename must be retried when possible"
+        );
+        assert!(source_path.with_extension("json.migrated").exists());
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn adoption_failed_write_leaves_sources_unrenamed() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = ledger_identity_key("AOC:AG326UZD:serial");
+        let mut result = LoadResult {
+            ledger: adoption_fixture(&key, 127.5, 179_447),
+            needs_seed: false,
+            persist_readonly: false,
+        };
+        let before = result.ledger.clone();
+        persist_ledger(
+            dir.path(),
+            &ledger_identity_key("mon"),
+            &adoption_fixture("mon", 9.0, 15_121),
+        )
+        .unwrap();
+        let source_path = dir
+            .path()
+            .join(format!("wear-{}.json", ledger_identity_key("mon")));
+        let bytes = std::fs::read(&source_path).unwrap();
+        std::fs::create_dir(dir.path().join(format!("wear-{key}.json"))).unwrap();
+        adopt_panel_ledgers(dir.path(), &key, &["mon".into()], &mut result);
+        assert!(
+            source_path.exists(),
+            "a failed merged write must not rename the source"
+        );
+        assert_eq!(std::fs::read(&source_path).unwrap(), bytes);
+        assert!(!source_path.with_extension("json.migrated").exists());
+        assert_eq!(result.ledger, before);
+    }
+
+    #[test]
+    fn adoption_accepts_new_config_history_after_a_later_unresolved_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = ledger_identity_key("AOC:AG326UZD:serial");
+        let mut result = LoadResult {
+            ledger: adoption_fixture(&key, 127.5, 179_447),
+            needs_seed: false,
+            persist_readonly: false,
+        };
+        for (hours, baseline) in [(9.0, 100), (12.0, 200)] {
+            let mut source = adoption_fixture("mon", hours, 15_121);
+            source.advisory_baseline_epoch_s = baseline;
+            persist_ledger(dir.path(), &ledger_identity_key("mon"), &source).unwrap();
+            adopt_panel_ledgers(dir.path(), &key, &["mon".into()], &mut result);
+        }
+        assert_eq!(
+            result.ledger.total_on_hours, 148.5,
+            "a new source snapshot must not be mistaken for the old adopted snapshot"
+        );
+    }
+
+    #[test]
+    fn adoption_refuses_changed_history_from_an_already_adopted_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = ledger_identity_key("AOC:AG326UZD:serial");
+        let mut result = LoadResult {
+            ledger: adoption_fixture(&key, 127.5, 179_447),
+            needs_seed: false,
+            persist_readonly: false,
+        };
+        let source_key = ledger_identity_key("mon");
+        let source_path = dir.path().join(format!("wear-{source_key}.json"));
+        std::fs::write(source_path.with_extension("json.migrated"), b"older backup").unwrap();
+        persist_ledger(
+            dir.path(),
+            &source_key,
+            &adoption_fixture("mon", 9.0, 15_121),
+        )
+        .unwrap();
+        adopt_panel_ledgers(dir.path(), &key, &["mon".into()], &mut result);
+        let path = dir.path().join(format!("wear-{key}.json"));
+        let dest_bytes = std::fs::read(&path).unwrap();
+        result.ledger = serde_json::from_slice(&dest_bytes).unwrap();
+        persist_ledger(
+            dir.path(),
+            &source_key,
+            &adoption_fixture("mon", 12.0, 20_000),
+        )
+        .unwrap();
+        let source_bytes = std::fs::read(&source_path).unwrap();
+        let logs =
+            capture_tracing(|| adopt_panel_ledgers(dir.path(), &key, &["mon".into()], &mut result));
+        assert_eq!(
+            result.ledger.total_on_hours, 136.5,
+            "changed history with an adopted baseline must not duplicate its old prefix"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), dest_bytes);
+        assert_eq!(std::fs::read(&source_path).unwrap(), source_bytes);
+        assert!(logs.contains("WARN"));
+        assert!(logs.contains("manual merge required"));
+        assert!(logs.contains(source_path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn adoption_does_not_add_a_stale_legacy_alias_on_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = ledger_identity_key("AOC:AG326UZD:serial");
+        let mut result = LoadResult {
+            ledger: adoption_fixture(&key, 127.5, 179_447),
+            needs_seed: false,
+            persist_readonly: false,
+        };
+        persist_ledger(
+            dir.path(),
+            &ledger_identity_key("mon"),
+            &adoption_fixture("mon", 9.0, 15_121),
+        )
+        .unwrap();
+        let legacy = dir.path().join("wear-mon.json");
+        std::fs::write(
+            &legacy,
+            serde_json::to_vec(&adoption_fixture("mon", 3.0, 100)).unwrap(),
+        )
+        .unwrap();
+        adopt_panel_ledgers(dir.path(), &key, &["mon".into()], &mut result);
+        let path = dir.path().join(format!("wear-{key}.json"));
+        let bytes = std::fs::read(&path).unwrap();
+        result.ledger = serde_json::from_slice(&bytes).unwrap();
+        adopt_panel_ledgers(dir.path(), &key, &["mon".into()], &mut result);
+        assert_eq!(
+            result.ledger.total_on_hours, 136.5,
+            "legacy alias must not add duplicated older history"
+        );
+        assert!(!legacy.exists());
+        assert!(legacy.with_extension("json.migrated").exists());
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn adoption_accepts_legacy_names_and_refuses_mismatches() {
+        for source_identity in ["mon", "i2c-dev:22800 AOC AG326UZD"] {
+            for mismatch in [0, 1, 2] {
+                let dir = tempfile::tempdir().unwrap();
+                let key = ledger_identity_key("AOC:AG326UZD:serial");
+                let mut result = LoadResult {
+                    ledger: adoption_fixture(&key, 127.5, 179_447),
+                    needs_seed: false,
+                    persist_readonly: false,
+                };
+                let before = result.ledger.clone();
+                let mut source = adoption_fixture(source_identity, 9.0, 15_121);
+                if mismatch == 1 {
+                    source.schema_version += 1;
+                }
+                if mismatch == 2 {
+                    source.grid_rows += 1;
+                }
+                let path = dir.path().join(format!(
+                    "wear-{}.json",
+                    sanitize_identity_key(source_identity)
+                ));
+                std::fs::write(&path, serde_json::to_vec(&source).unwrap()).unwrap();
+                adopt_panel_ledgers(dir.path(), &key, &[source_identity.into()], &mut result);
+                if mismatch == 0 {
+                    assert_eq!(result.ledger.total_on_hours, 136.5);
+                    assert!(path.with_extension("json.migrated").exists());
+                } else {
+                    assert_eq!(result.ledger, before);
+                    assert!(path.exists());
+                    assert!(!path.with_extension("json.migrated").exists());
+                }
+            }
+        }
     }
 
     /// The property M1 exists for (spec §3): the SAME physical panel

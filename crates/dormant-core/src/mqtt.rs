@@ -39,15 +39,15 @@ pub enum BrokerUrlError {
 /// Recognised shapes (after stripping the optional `tcp://`/`mqtt://`
 /// scheme):
 ///
-/// | input                | host       | port  |
-/// |----------------------|------------|-------|
-/// | `mqtt.local`         | `mqtt.local` | 1883 |
-/// | `mqtt.local:1883`    | `mqtt.local` | 1883 |
-/// | `tcp://::1`          | `::1`      | 1883  | (bare IPv6, multiple colons)
-/// | `tcp://[::1]`        | `::1`      | 1883  | (bracketed IPv6, default port)
-/// | `tcp://[::1]:1884`   | `::1`      | 1884  | (bracketed IPv6, explicit port)
-/// | `tcp://host:1883x`   | _error_ — `MalformedPort` |
-/// | `tcp://`             | _error_ — `EmptyHost`     |
+/// | input                | host         | port               | note                          |
+/// |----------------------|--------------|--------------------|-------------------------------|
+/// | `mqtt.local`         | `mqtt.local` | 1883               |                               |
+/// | `mqtt.local:1883`    | `mqtt.local` | 1883               |                               |
+/// | `tcp://::1`          | `::1`        | 1883               | bare IPv6, multiple colons    |
+/// | `tcp://[::1]`        | `::1`        | 1883               | bracketed IPv6, default port  |
+/// | `tcp://[::1]:1884`   | `::1`        | 1884               | bracketed IPv6, explicit port |
+/// | `tcp://host:1883x`   | _error_      | `MalformedPort`    |                               |
+/// | `tcp://`             | _error_      | `EmptyHost`        |                               |
 ///
 /// # Errors
 ///

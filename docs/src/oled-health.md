@@ -75,20 +75,17 @@ $XDG_STATE_HOME/dormant/wear/          # when XDG_STATE_HOME is set
 ```
 
 The filename uses the DDC/CI EDID manufacturer/model/serial when a serial is
-available. Without a serial, DDC/CI uses the current bus identity. Other
-controllers use their panel identity (for example, `samsung:<host>`) or the
-config display id.
-
-At startup, dormant adds history from the panel's current bus and config id
-to its EDID ledger. It also reads legacy filenames. It saves the history
-before it renames source files to `.json.migrated`. Stored source keys and
-snapshot digests prevent duplicate history if a rename does not finish.
-Ledgers for other buses or config ids stay unchanged. A schema or grid mismatch
-prevents adoption and logs a warning.
+available, or the current bus identity without a serial. Other controllers use
+their panel identity (for example, `samsung:<host>`) or the config display id.
+At startup, EDID ledgers add history only from the current bus and config
+display id, from encoded or legacy filenames. After an atomic mode `0644`
+write, dormant renames source files to `.json.migrated`. Stored source keys,
+baselines, and snapshot digests prevent duplicate history. A schema or grid
+mismatch prevents adoption and logs a warning.
 
 If a source with a saved baseline changes after a rename failure, dormant keeps
-the two files. It logs the source path for a manual merge. Writes are atomic
-and mode `0644`.
+the two files. It logs the source path for a manual merge. Ledgers contain no
+credentials.
 
 dormant persists every `wear.persist_interval` (default `5m`), on shutdown, and
 when tracking is disabled at runtime. A crash can lose at most one persistence

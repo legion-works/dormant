@@ -1451,8 +1451,8 @@ fn write_atomic_bytes(dir: &Path, key: &str, bytes: &[u8]) -> std::io::Result<()
     Ok(())
 }
 
-/// Adopt only the current panel bus and the current config binding.
-/// Commit source keys with the summed values before any source rename.
+/// Add history only from the current panel bus and config display id.
+/// Commit source keys with the summed values before source renames.
 fn adopt_panel_ledgers(dir: &Path, key: &str, sources: &[String], result: &mut LoadResult) {
     for source in sources {
         let source_key = ledger_identity_key(source);
@@ -1461,7 +1461,7 @@ fn adopt_panel_ledgers(dir: &Path, key: &str, sources: &[String], result: &mut L
         }
         let canonical = dir.join(format!("wear-{source_key}.json"));
         let legacy = dir.join(format!("wear-{}.json", sanitize_identity_key(source)));
-        // A canonical file takes precedence over its legacy alias, as in the loader.
+        // The loader uses a canonical file first.
         let path = if canonical.exists() {
             canonical.clone()
         } else {
@@ -1503,7 +1503,7 @@ fn adopt_panel_ledgers(dir: &Path, key: &str, sources: &[String], result: &mut L
             }
             merged.adopted_sources.push(marker);
             // The legacy alias can contain an older snapshot of canonical history.
-            // Record it in the same commit so it cannot be added on a later start.
+            // Record it in the same commit to prevent duplicate history on subsequent starts.
             if path == canonical
                 && legacy != canonical
                 && let Ok(alias) = std::fs::read(&legacy)

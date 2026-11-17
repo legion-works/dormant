@@ -247,15 +247,15 @@ pub trait DisplayController: Any + Send + Sync {
     }
 
     /// Panel-derived local identity, if available.
-    /// DDC/CI returns its bus-derived panel I/O lock key. Samsung returns
-    /// `"samsung:<host>"`. Controllers without a panel identity return `None`.
-    /// Use [`Self::wear_identity`] for wear history instead of the local key.
+    /// DDC/CI uses its bus-derived panel I/O lock key. Samsung uses
+    /// `"samsung:<host>"`. Controllers without a panel identity use `None`.
+    /// Use [`Self::wear_identity`] for wear history.
     fn panel_identity(&self) -> Option<String> {
         None
     }
 
-    /// Identity for wear history, independent of the panel I/O lock key.
-    /// Controllers without a serial-based identity retain their panel identity.
+    /// Identity for wear history, not the panel I/O lock key.
+    /// Controllers without a serial-based identity keep their panel identity.
     fn wear_identity(&self) -> Option<String> {
         self.panel_identity()
     }
@@ -413,7 +413,7 @@ pub trait CommandSink: Send + Sync {
     }
 
     /// Read the wear identity through the controller chain.
-    /// The default retains the existing panel identity.
+    /// The default uses the panel identity.
     fn wear_identity(&self) -> Option<String> {
         self.panel_identity()
     }

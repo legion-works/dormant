@@ -177,16 +177,16 @@ pub struct WearLedger {
     pub adopted_sources: Vec<String>,
 }
 
-/// Failure to combine ledgers without a schema or grid conversion.
+/// Failure to add histories without a schema or grid conversion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum WearMergeError {
-    /// The ledger schemas differ.
+    /// The ledger schemas are different.
     #[error("wear ledger schema mismatch")]
     SchemaMismatch,
-    /// The grid dimensions or cell counts differ or are invalid.
+    /// The grid dimensions or cell counts are different or invalid.
     #[error("wear ledger grid mismatch")]
     GridMismatch,
-    /// The combined sample count exceeds its storage range.
+    /// The sample count sum is more than its storage range.
     #[error("wear ledger sample count overflow")]
     SampleCountOverflow,
 }
@@ -424,13 +424,14 @@ impl WearLedger {
         }
     }
 
-    /// Add disjoint recorded history and retain the destination identity.
-    /// Prior usage is a panel counter snapshot: retain the largest known value.
-    /// Retain the earliest advisory baseline and the latest observed timestamps.
+    /// Add disjoint recorded history. Keep the destination identity.
+    /// Prior usage is a panel counter snapshot. Keep the largest known value.
+    /// Keep the earliest advisory baseline and the latest sample and long-dwell timestamps.
     ///
     /// # Errors
-    /// Returns an error without changes if schemas or grids differ, a grid has
-    /// an invalid cell count, or the combined sample count overflows.
+    /// An error does not change this ledger.
+    /// The result is an error if schemas or grids are different, a cell count is
+    /// invalid, or the sample count sum overflows.
     pub fn merge(&mut self, source: &Self) -> Result<(), WearMergeError> {
         if self.schema_version != source.schema_version {
             return Err(WearMergeError::SchemaMismatch);

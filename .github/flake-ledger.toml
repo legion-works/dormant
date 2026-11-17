@@ -33,7 +33,7 @@ mechanism = "cross-generation-lost-command-window-during-reload-teardown; canoni
 reproduction = "cargo nextest run -p dormantd --test daemon_smoke --stress-count 100 --retries 0 --flaky-result fail -E 'test(manual_only_display_full_lifecycle_across_reload)'"
 root_cause = "Reload takes its restore snapshot while the old generation still accepts controls: Runner::reload snapshots, pauses the control router, drains, tears the engine down and restores that same snapshot. A manual command that completes between the snapshot and the pause is lost, because the next generation restores the earlier phase. Holding controls during the swap (#104) and keeping queued controls after a failed install (#322) do not cover a command already processed after the snapshot. Fix tracked in https://github.com/legion-works/dormant/issues/401."
 fix_pr = ""
-proving_test = ""
+proving_test = "daemon_smoke::manual_blank_completed_during_reload_is_preserved"
 soak_evidence = []
 status = "open"
 

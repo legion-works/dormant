@@ -2247,6 +2247,8 @@ pub struct App {
     #[cfg(any(test, feature = "test-util"))]
     force_reload_snapshot_timeout: bool,
     #[cfg(any(test, feature = "test-util"))]
+    reload_ingress_gate: Option<GenerationBarrierGate>,
+    #[cfg(any(test, feature = "test-util"))]
     generation_barrier_gate: Option<GenerationBarrierGate>,
     #[cfg(any(test, feature = "test-util"))]
     force_generation_barrier_timeout: bool,
@@ -2273,7 +2275,7 @@ pub struct App {
 #[cfg(any(test, feature = "test-util"))]
 type BarrierSnapshotProbe = Result<oneshot::Receiver<StateSnapshot>, &'static str>;
 
-/// Test-only rendezvous immediately before the old engine drain barrier.
+/// Test-only rendezvous at a reload boundary.
 #[cfg(any(test, feature = "test-util"))]
 #[derive(Clone)]
 pub struct GenerationBarrierGate {
@@ -2327,7 +2329,7 @@ impl GenerationBarrierGate {
         }
     }
 
-    /// Wait until reload has paused front-door routing before the old drain.
+    /// Wait until reload reaches the configured test boundary.
     pub async fn wait_until_entered(&self) {
         let mut entered = self.entered_rx.clone();
         while !*entered.borrow_and_update() {
@@ -2337,7 +2339,7 @@ impl GenerationBarrierGate {
         }
     }
 
-    /// Permit the reload to send the old-generation drain barrier.
+    /// Permit reload to continue past the configured test boundary.
     pub fn release(&self) {
         self.release.notify_one();
     }
@@ -2434,6 +2436,8 @@ impl App {
             #[cfg(any(test, feature = "test-util"))]
             force_reload_snapshot_timeout: false,
             #[cfg(any(test, feature = "test-util"))]
+            reload_ingress_gate: None,
+            #[cfg(any(test, feature = "test-util"))]
             generation_barrier_gate: None,
             #[cfg(any(test, feature = "test-util"))]
             force_generation_barrier_timeout: false,
@@ -2488,6 +2492,8 @@ impl App {
             force_rebuild_old_spawn_failure: false,
             #[cfg(any(test, feature = "test-util"))]
             force_reload_snapshot_timeout: false,
+            #[cfg(any(test, feature = "test-util"))]
+            reload_ingress_gate: None,
             #[cfg(any(test, feature = "test-util"))]
             generation_barrier_gate: None,
             #[cfg(any(test, feature = "test-util"))]
@@ -2645,6 +2651,14 @@ impl App {
     #[must_use]
     pub fn with_test_force_reload_snapshot_timeout(mut self) -> Self {
         self.force_reload_snapshot_timeout = true;
+        self
+    }
+
+    /// Hold reload before control ingress is frozen.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn with_test_reload_ingress_gate(mut self, gate: GenerationBarrierGate) -> Self {
+        self.reload_ingress_gate = Some(gate);
         self
     }
 
@@ -3381,6 +3395,8 @@ impl App {
             #[cfg(any(test, feature = "test-util"))]
             force_reload_snapshot_timeout: self.force_reload_snapshot_timeout,
             #[cfg(any(test, feature = "test-util"))]
+            reload_ingress_gate: self.reload_ingress_gate,
+            #[cfg(any(test, feature = "test-util"))]
             generation_barrier_gate: self.generation_barrier_gate,
             #[cfg(any(test, feature = "test-util"))]
             force_generation_barrier_timeout: self.force_generation_barrier_timeout,
@@ -3812,6 +3828,8 @@ struct Runner {
     #[cfg(any(test, feature = "test-util"))]
     force_reload_snapshot_timeout: bool,
     #[cfg(any(test, feature = "test-util"))]
+    reload_ingress_gate: Option<GenerationBarrierGate>,
+    #[cfg(any(test, feature = "test-util"))]
     generation_barrier_gate: Option<GenerationBarrierGate>,
     #[cfg(any(test, feature = "test-util"))]
     force_generation_barrier_timeout: bool,
@@ -4203,14 +4221,9 @@ impl Runner {
             .await
             .expect("current engine control route exists before reload");
         #[cfg(any(test, feature = "test-util"))]
-        let preliminary = if self.force_reload_snapshot_timeout {
-            self.record_reload_lifecycle_stage("snapshot_bypassed");
-            None
-        } else {
-            request_snapshot(&old_ctl).await
-        };
-        #[cfg(not(any(test, feature = "test-util")))]
-        let preliminary = request_snapshot(&old_ctl).await;
+        if let Some(gate) = &self.reload_ingress_gate {
+            gate.reach(old_ctl.clone()).await;
+        }
 
         // Validate + assemble the NEW config BEFORE touching the running
         // generation. An invalid or un-assemblable config only flags
@@ -4269,12 +4282,94 @@ impl Runner {
             .cloned()
             .collect();
 
-        // ── Quiesce rule-less displays caught mid-blank ──────────────────────
+        // Freeze ingress before the drain and snapshot. Controls accepted after
+        // the snapshot would otherwise disappear when the new engine restores it.
+        self.ctl_router.pause().await;
+        self.events_router.pause().await;
+        self.record_reload_lifecycle_stage("routers_paused");
+        self.operation_registry.begin_quiesce(self.generation_id);
+        if matches!(
+            quiesce_operations(
+                &self.operation_registry,
+                self.generation_id,
+                QUIESCE_OPERATION_TIMEOUT,
+                QUIESCE_OPERATION_TIMEOUT,
+            )
+            .await,
+            QuiesceOutcome::Busy
+        ) {
+            tracing::warn!(
+                event = "operation_quiesce_cancelled",
+                generation = self.generation_id.0
+            );
+            let executors = self
+                .generation
+                .display_executors
+                .iter()
+                .map(|(id, exec)| (id.clone(), exec.clone() as Arc<dyn CommandSink>))
+                .collect();
+            self.executors_tx.send_replace(Arc::new(executors));
+            self.ctl_router
+                .install_generation(old_ctl.clone(), self.generation_id)
+                .await;
+            if let Some(events) = self.generation.engine_events_tx.clone() {
+                self.events_router.install(events).await;
+            }
+            let detail = "E_OPERATION_BUSY: active hardware operation did not quiesce".to_string();
+            self.operation_registry.end_quiesce(self.generation_id);
+            tracing::warn!(
+                event = "reload_rejected_operation_busy",
+                generation = self.generation_id.0
+            );
+            let outcome = ReloadOutcome::Rejected(detail);
+            let _ = self.reload_tx.send(outcome.clone());
+            return self.reload_receipt(request_ids, sources, requested_revision, outcome, false);
+        }
+        quiesce_inputs(&mut self.generation).await;
+        self.record_reload_lifecycle_stage("inputs_quiesced");
+        #[cfg(any(test, feature = "test-util"))]
+        if let Some(gate) = &self.generation_barrier_gate {
+            gate.reach(old_ctl.clone()).await;
+        }
+        self.generation_barrier_ack_timeout =
+            new_assembly.cfg.daemon.generation_barrier_ack_timeout;
+        if let Err(detail) = await_generation_barrier(
+            &old_ctl,
+            self.generation_barrier_ack_timeout,
+            self.force_generation_barrier_timeout_for_test(),
+        )
+        .await
+        {
+            tracing::error!(event = "generation_barrier_invariant_failed", detail);
+            self.root.cancel();
+            let outcome = ReloadOutcome::Rejected(detail.to_string());
+            let _ = self.reload_tx.send(outcome.clone());
+            return self.reload_receipt(request_ids, sources, requested_revision, outcome, false);
+        }
+        self.record_reload_lifecycle_stage("barrier_acknowledged");
+        self.observations
+            .emit(DaemonObservation::GenerationDrained {
+                generation: self.generation_id,
+            });
+
+        #[cfg(any(test, feature = "test-util"))]
+        let preliminary = if self.force_reload_snapshot_timeout {
+            self.record_reload_lifecycle_stage("snapshot_bypassed");
+            None
+        } else {
+            request_snapshot(&old_ctl).await
+        };
+        #[cfg(not(any(test, feature = "test-util")))]
+        let preliminary = request_snapshot(&old_ctl).await;
+
+        // ── Quiesce rule-less displays with pending command results ──────────
         // A rule-less display with phase "blanking" has no result driver after
         // teardown.  Samsung KEY_PICTURE_OFF is a TOGGLE (re-issuing could
         // invert the panel), so we must NOT restore a naked Blanking.  Instead,
         // poll the still-live engine until the phase reaches a terminal state
         // ("blanked" / "active") or the deadline passes.
+        // Wait for waking too, so a completed wake does not restore stale state.
+        // At the deadline, restore Waking to retry an unconfirmed physical wake.
         let quiesce_deadline =
             tokio::time::Instant::now() + dormant_core::config::defaults::COMMAND_TIMEOUT;
         let mut snapshot = preliminary;
@@ -4285,6 +4380,7 @@ impl Runner {
                 .filter(|(id, d)| {
                     let did = DisplayId((*id).clone());
                     classify_transient(&d.phase, !ruled.contains(&did)) == TransientClass::Quiesce
+                        || (!ruled.contains(&did) && d.phase == "waking")
                 })
                 .map(|(id, _)| id.clone())
                 .collect();
@@ -4292,7 +4388,7 @@ impl Runner {
                 tracing::info!(
                     event = "reload_quiesce_blanking",
                     count = need_quiesce.len(),
-                    "rule-less display(s) caught mid-blank; polling until terminal"
+                    "rule-less display(s) with pending results; polling until terminal"
                 );
                 loop {
                     let all_terminal = if let Some(ref s) = snapshot {
@@ -4372,7 +4468,6 @@ impl Runner {
         let previous_active_sampler_cfg = self.generation.cfg.clone();
         let new_cfg = new_assembly.cfg.clone();
         let new_creds = new_assembly.creds.clone();
-        self.generation_barrier_ack_timeout = new_cfg.daemon.generation_barrier_ack_timeout;
 
         // Reload does not rebind a web listener — flag port/bind changes.
         if new_cfg.daemon.web_port != self.started_web_port
@@ -4396,71 +4491,6 @@ impl Runner {
         // above covering the two stretches that precede this point).
         self.ping("before_teardown");
 
-        self.ctl_router.pause().await;
-        self.events_router.pause().await;
-        self.record_reload_lifecycle_stage("routers_paused");
-        self.operation_registry.begin_quiesce(self.generation_id);
-        if matches!(
-            quiesce_operations(
-                &self.operation_registry,
-                self.generation_id,
-                QUIESCE_OPERATION_TIMEOUT,
-                QUIESCE_OPERATION_TIMEOUT,
-            )
-            .await,
-            QuiesceOutcome::Busy
-        ) {
-            tracing::warn!(
-                event = "operation_quiesce_cancelled",
-                generation = self.generation_id.0
-            );
-            let executors = self
-                .generation
-                .display_executors
-                .iter()
-                .map(|(id, exec)| (id.clone(), exec.clone() as Arc<dyn CommandSink>))
-                .collect();
-            self.executors_tx.send_replace(Arc::new(executors));
-            self.ctl_router
-                .install_generation(old_ctl.clone(), self.generation_id)
-                .await;
-            if let Some(events) = self.generation.engine_events_tx.clone() {
-                self.events_router.install(events).await;
-            }
-            let detail = "E_OPERATION_BUSY: active hardware operation did not quiesce".to_string();
-            self.operation_registry.end_quiesce(self.generation_id);
-            tracing::warn!(
-                event = "reload_rejected_operation_busy",
-                generation = self.generation_id.0
-            );
-            let outcome = ReloadOutcome::Rejected(detail);
-            let _ = self.reload_tx.send(outcome.clone());
-            return self.reload_receipt(request_ids, sources, requested_revision, outcome, false);
-        }
-        quiesce_inputs(&mut self.generation).await;
-        self.record_reload_lifecycle_stage("inputs_quiesced");
-        #[cfg(any(test, feature = "test-util"))]
-        if let Some(gate) = &self.generation_barrier_gate {
-            gate.reach(old_ctl.clone()).await;
-        }
-        if let Err(detail) = await_generation_barrier(
-            &old_ctl,
-            self.generation_barrier_ack_timeout,
-            self.force_generation_barrier_timeout_for_test(),
-        )
-        .await
-        {
-            tracing::error!(event = "generation_barrier_invariant_failed", detail);
-            self.root.cancel();
-            let outcome = ReloadOutcome::Rejected(detail.to_string());
-            let _ = self.reload_tx.send(outcome.clone());
-            return self.reload_receipt(request_ids, sources, requested_revision, outcome, false);
-        }
-        self.record_reload_lifecycle_stage("barrier_acknowledged");
-        self.observations
-            .emit(DaemonObservation::GenerationDrained {
-                generation: self.generation_id,
-            });
         teardown(&mut self.generation).await;
         self.record_reload_lifecycle_stage("engine_torn_down");
 

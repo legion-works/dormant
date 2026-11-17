@@ -447,7 +447,7 @@ async fn poll_once(
         } else {
             deps.state.record_failure(&display_id);
             let failure_detail = match &input {
-                Err(error) if error.to_string().contains("INPUT_SOURCE_SKIPPED") => {
+                Err(error) if error == "skipped: command holds panel lock" => {
                     ("skipped", Some(error.to_string()))
                 }
                 Err(error) => ("error", Some(error.to_string())),
@@ -1589,16 +1589,21 @@ mod tests {
 
     struct EventVisitor {
         event: Option<String>,
+        fields: Vec<String>,
     }
 
     impl Visit for EventVisitor {
         fn record_str(&mut self, field: &Field, value: &str) {
             if field.name() == "event" {
                 self.event = Some(value.to_string());
+            } else {
+                self.fields.push(format!("{}={value}", field.name()));
             }
         }
 
-        fn record_debug(&mut self, _field: &Field, _value: &dyn std::fmt::Debug) {}
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.fields.push(format!("{}={value:?}", field.name()));
+        }
     }
 
     #[derive(Clone, Default)]
@@ -1606,10 +1611,16 @@ mod tests {
 
     impl<S: tracing::Subscriber> Layer<S> for EventCapture {
         fn on_event(&self, event: &tracing::Event<'_>, _context: Context<'_, S>) {
-            let mut visitor = EventVisitor { event: None };
+            let mut visitor = EventVisitor {
+                event: None,
+                fields: Vec::new(),
+            };
             event.record(&mut visitor);
             if let Some(event) = visitor.event {
-                self.0.lock().unwrap().push(event);
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(format!("{event} {}", visitor.fields.join(" ")));
             }
         }
     }
@@ -1617,7 +1628,7 @@ mod tests {
     fn count_event(events: &[String], expected: &str) -> usize {
         events
             .iter()
-            .filter(|event| event.as_str() == expected)
+            .filter(|event| event.split_whitespace().next() == Some(expected))
             .count()
     }
 
@@ -1644,6 +1655,7 @@ mod tests {
             direct_switch: None,
         };
         let mut last_failing_log = HashMap::new();
+        let mut last_unknown_code = HashMap::new();
         let mut last_state_read = HashMap::new();
         let mut reprobe_state = HashMap::new();
         let mut pending_observed_gain = HashSet::new();
@@ -1653,6 +1665,7 @@ mod tests {
             poll_once(
                 &deps,
                 &mut last_failing_log,
+                &mut last_unknown_code,
                 &mut last_state_read,
                 &mut reprobe_state,
                 &mut pending_observed_gain,
@@ -1691,6 +1704,7 @@ mod tests {
             direct_switch: None,
         };
         let mut last_failing_log = HashMap::new();
+        let mut last_unknown_code = HashMap::new();
         let mut last_state_read = HashMap::new();
         let mut reprobe_state = HashMap::new();
         let mut pending_observed_gain = HashSet::new();
@@ -1700,6 +1714,7 @@ mod tests {
             poll_once(
                 &deps,
                 &mut last_failing_log,
+                &mut last_unknown_code,
                 &mut last_state_read,
                 &mut reprobe_state,
                 &mut pending_observed_gain,
@@ -1716,7 +1731,8 @@ mod tests {
         assert!(
             captured_events([Ok(Some(0x11))], 1)
                 .await
-                .contains(&"coord_poll_ok".to_string())
+                .iter()
+                .any(|event| event.starts_with("coord_poll_ok "))
         );
     }
 
@@ -1725,8 +1741,58 @@ mod tests {
         assert!(
             captured_events([Err("failed".to_string()), Err("failed".to_string())], 2)
                 .await
-                .contains(&"coord_poll_failing".to_string())
+                .iter()
+                .any(|event| event.starts_with("coord_poll_failing "))
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unknown_input_codes_log_once_until_value_or_known_code_changes() {
+        let events = captured_events(
+            [15, 15, 16, 16, 0x11, 15, 15, 0x11, 15]
+                .into_iter()
+                .map(|code| Ok(Some(code))),
+            9,
+        )
+        .await;
+        let unknown: Vec<_> = events
+            .iter()
+            .filter(|event| event.starts_with("coord_poll_unknown_code "))
+            .collect();
+        assert_eq!(unknown.len(), 4, "{unknown:?}");
+        assert!(unknown[0].contains("observed=15"));
+        assert!(unknown[1].contains("observed=16"));
+        assert!(unknown[2].contains("observed=15"));
+        assert!(unknown[3].contains("observed=15"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poll_failures_log_kind_and_error_detail() {
+        for (input, expected) in [
+            (Err("i2c: Input/output error".to_string()), "kind=error"),
+            (
+                Err("skipped: command holds panel lock".to_string()),
+                "kind=skipped",
+            ),
+            (Ok(None), "kind=no_readback"),
+        ] {
+            let events = captured_events(std::iter::repeat_n(input, 2), 2).await;
+            let failing = events
+                .iter()
+                .find(|event| event.starts_with("coord_poll_failing "))
+                .unwrap();
+            assert!(failing.contains(expected), "{failing}");
+            if expected == "kind=error" {
+                assert!(failing.contains("i2c: Input/output error"), "{failing}");
+            } else if expected == "kind=skipped" {
+                assert!(
+                    failing.contains("skipped: command holds panel lock"),
+                    "{failing}"
+                );
+            } else {
+                assert!(failing.contains("error="), "{failing}");
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -1756,7 +1822,8 @@ mod tests {
                 2,
             )
             .await
-            .contains(&"coord_poll_disagreement".to_string())
+            .iter()
+            .any(|event| event.starts_with("coord_poll_disagreement "))
         );
     }
 

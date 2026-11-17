@@ -448,9 +448,9 @@ async fn poll_once(
             deps.state.record_failure(&display_id);
             let failure_detail = match &input {
                 Err(error) if error == "skipped: command holds panel lock" => {
-                    ("skipped", Some(error.to_string()))
+                    ("skipped", Some(error.clone()))
                 }
-                Err(error) => ("error", Some(error.to_string())),
+                Err(error) => ("error", Some(error.clone())),
                 Ok(None) => ("no_readback", None),
                 Ok(Some(_)) => unreachable!("successful readback handled above"),
             };
@@ -1803,7 +1803,8 @@ mod tests {
         assert!(
             captured_events([Ok(Some(0x12)), Ok(Some(0x12)), Ok(Some(0x12))], 3,)
                 .await
-                .contains(&"coord_ownership_changed".to_string())
+                .iter()
+                .any(|event| event.starts_with("coord_ownership_changed "))
         );
     }
 
@@ -1841,7 +1842,8 @@ mod tests {
                 2,
             )
             .await
-            .contains(&"coord_ownership_loss_deferred".to_string())
+            .iter()
+            .any(|event| event.starts_with("coord_ownership_loss_deferred "))
         );
     }
 
@@ -1934,13 +1936,13 @@ mod tests {
         assert!(
             !captured
                 .iter()
-                .any(|event| event == "coord_ownership_loss_deferred"),
+                .any(|event| event.starts_with("coord_ownership_loss_deferred ")),
             "unknown code must not trigger loss deferred, got {captured:?}"
         );
         assert!(
             !captured
                 .iter()
-                .any(|event| event == "coord_ownership_changed"),
+                .any(|event| event.starts_with("coord_ownership_changed ")),
             "unknown code must not trigger ownership change, got {captured:?}"
         );
         cancel.cancel();
@@ -2006,7 +2008,7 @@ mod tests {
         assert!(
             captured
                 .iter()
-                .any(|event| event == "coord_poll_disagreement"),
+                .any(|event| event.starts_with("coord_poll_disagreement ")),
             "disagreement must fire when 0x11→0x12 (both configured), got {captured:?}"
         );
         // No loss committed — tick 3 was a failure, and tick 4 only brings
@@ -2014,7 +2016,7 @@ mod tests {
         assert!(
             !captured
                 .iter()
-                .any(|event| event == "coord_ownership_changed"),
+                .any(|event| event.starts_with("coord_ownership_changed ")),
             "no ownership change expected, got {captured:?}"
         );
         cancel.cancel();

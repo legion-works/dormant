@@ -58,6 +58,7 @@ struct ReprobeState {
 async fn run(mut deps: CoordinationPollDeps) {
     let mut interval = new_interval(deps.config_rx.borrow().coordination.poll_interval);
     let mut last_failing_log = HashMap::new();
+    let mut last_unknown_code = HashMap::new();
     let mut last_state_read: HashMap<DisplayId, Instant> = HashMap::new();
     let mut reprobe_state: HashMap<DisplayId, ReprobeState> = HashMap::new();
     let mut pending_observed_gain: HashSet<DisplayId> = HashSet::new();
@@ -74,6 +75,7 @@ async fn run(mut deps: CoordinationPollDeps) {
             _ = interval.tick() => poll_once(
                 &deps,
                 &mut last_failing_log,
+                &mut last_unknown_code,
                 &mut last_state_read,
                 &mut reprobe_state,
                 &mut pending_observed_gain,
@@ -149,6 +151,7 @@ async fn maybe_reprobe(
 async fn poll_once(
     deps: &CoordinationPollDeps,
     last_failing_log: &mut HashMap<DisplayId, Instant>,
+    last_unknown_code: &mut HashMap<DisplayId, u8>,
     last_state_read: &mut HashMap<DisplayId, Instant>,
     reprobe_state: &mut HashMap<DisplayId, ReprobeState>,
     pending_observed_gain: &mut HashSet<DisplayId>,
@@ -259,6 +262,18 @@ async fn poll_once(
             let classification = aliases.classify(observed);
             if !panel_mismatch && matches!(classification, InputSourceObservation::Unknown(_)) {
                 deps.state.record_failure(&display_id);
+                if last_unknown_code.get(&display_id) != Some(&observed) {
+                    tracing::warn!(
+                        event = "coord_poll_unknown_code",
+                        display = %display_id,
+                        observed,
+                        local_read = aliases.local_read,
+                        local_write = aliases.local_write,
+                        peer_read = aliases.peer_read.map_or_else(|| "none".to_string(), |code| code.to_string()),
+                        peer_write = aliases.peer_write.map_or_else(|| "none".to_string(), |code| code.to_string()),
+                    );
+                    last_unknown_code.insert(display_id.clone(), observed);
+                }
                 continue; // `for` loop — skip the rest of this display's tick
             }
 
@@ -295,6 +310,7 @@ async fn poll_once(
                 tracing::info!(event = "coord_poll_ok", display = %display_id);
             }
             last_failing_log.remove(&display_id);
+            last_unknown_code.remove(&display_id);
             if let Some(state) = reprobe_state.get_mut(&display_id) {
                 state.next_interval = config.coordination.reprobe_interval;
             }
@@ -430,6 +446,14 @@ async fn poll_once(
             }
         } else {
             deps.state.record_failure(&display_id);
+            let failure_detail = match &input {
+                Err(error) if error.to_string().contains("INPUT_SOURCE_SKIPPED") => {
+                    ("skipped", Some(error.to_string()))
+                }
+                Err(error) => ("error", Some(error.to_string())),
+                Ok(None) => ("no_readback", None),
+                Ok(Some(_)) => unreachable!("successful readback handled above"),
+            };
             let failures = deps
                 .state
                 .snapshot()
@@ -449,7 +473,7 @@ async fn poll_once(
                     .get(&display_id)
                     .is_none_or(|last| now.duration_since(*last) >= COORD_POLL_FAILING_LOG_INTERVAL)
             {
-                tracing::warn!(event = "coord_poll_failing", display = %display_id, consecutive_failures = failures);
+                tracing::warn!(event = "coord_poll_failing", display = %display_id, consecutive_failures = failures, kind = failure_detail.0, error = failure_detail.1.as_deref().unwrap_or(""));
                 last_failing_log.insert(display_id, now);
             }
         }

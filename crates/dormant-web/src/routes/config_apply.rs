@@ -699,12 +699,14 @@ mod tests {
 
     // ── backup_filename tests ───────────────────────────────────────────────
 
+    // Windows `SystemTime` counts in 100 ns units, so every fixture value is a
+    // multiple of 100 ns. The trailing zeros still prove nine digits.
     #[test]
     fn backup_filename_keeps_nine_fractional_digits() {
         for (nanos, suffix) in [
             (0, "000000000"),
-            (1, "000000001"),
-            (123_456_789, "123456789"),
+            (100, "000000100"),
+            (123_456_700, "123456700"),
         ] {
             let now = std::time::UNIX_EPOCH + std::time::Duration::new(42, nanos);
             assert_eq!(
@@ -712,10 +714,10 @@ mod tests {
                 format!("config.toml.1970-01-01T00-00-42.{suffix}Z.abcd")
             );
         }
-        let leap_day = std::time::UNIX_EPOCH + std::time::Duration::new(951_827_696, 123_456_789);
+        let leap_day = std::time::UNIX_EPOCH + std::time::Duration::new(951_827_696, 123_456_700);
         assert_eq!(
             backup_filename(leap_day, "abcd"),
-            "config.toml.2000-02-29T12-34-56.123456789Z.abcd"
+            "config.toml.2000-02-29T12-34-56.123456700Z.abcd"
         );
     }
 

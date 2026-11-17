@@ -288,7 +288,7 @@ ladder = [
 #### `dwell`
 
 An optional duration string (for example, `"30s"` or `"5m"`) sets how long
-the ladder stays at this stage before it advances.
+the ladder stays at this stage before it goes to the next stage.
 Omitting `dwell` (or setting it to `None`) makes the stage terminal — the
 ladder stops here and waits for an external event.
 

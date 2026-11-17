@@ -447,7 +447,7 @@ async fn poll_once(
         } else {
             deps.state.record_failure(&display_id);
             let failure_detail = match &input {
-                Err(error) if error == "skipped: command holds panel lock" => {
+                Err(error) if error == dormant_displays::vcp_ops::INPUT_SOURCE_SKIPPED => {
                     ("skipped", Some(error.clone()))
                 }
                 Err(error) => ("error", Some(error.clone())),
@@ -1298,7 +1298,7 @@ mod tests {
             Ok(Some(0x12)),
             Ok(Some(0x12)),
             Ok(Some(0x12)),
-            Err("skipped: command holds panel lock".to_string()),
+            Err(dormant_displays::vcp_ops::INPUT_SOURCE_SKIPPED.to_string()),
         ]));
         let (_config_tx, _executors_tx, mut ctl_rx, state, cancel) = setup(sink);
         tick().await;
@@ -1771,7 +1771,7 @@ mod tests {
         for (input, expected) in [
             (Err("i2c: Input/output error".to_string()), "kind=error"),
             (
-                Err("skipped: command holds panel lock".to_string()),
+                Err(dormant_displays::vcp_ops::INPUT_SOURCE_SKIPPED.to_string()),
                 "kind=skipped",
             ),
             (Ok(None), "kind=no_readback"),
@@ -1786,7 +1786,7 @@ mod tests {
                 assert!(failing.contains("i2c: Input/output error"), "{failing}");
             } else if expected == "kind=skipped" {
                 assert!(
-                    failing.contains("skipped: command holds panel lock"),
+                    failing.contains(dormant_displays::vcp_ops::INPUT_SOURCE_SKIPPED),
                     "{failing}"
                 );
             } else {

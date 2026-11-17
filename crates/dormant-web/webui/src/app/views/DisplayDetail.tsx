@@ -180,13 +180,12 @@ export default function DisplayDetail({ id, snapshot, config, rule, wear, wearEr
     }
   }, [ruleName]);
 
-  // Compute current time for staleness + seeded/measured split.
+  // Compute current time for staleness.
   const nowS = useMemo(() => Math.floor(Date.now() / 1000), []);
   const legendGradient = useMemo(() => heatRampGradient(), []);
+  // The panel's own lifetime counter, read once when the ledger was created.
+  // It is a separate figure: `total_on_hours` never includes it.
   const seededHours = wear?.seeded_usage_hours ?? null;
-  const measuredHours = seededHours != null
-    ? Math.max(0, (wear?.total_on_hours ?? 0) - seededHours)
-    : (wear?.total_on_hours ?? 0);
 
   // Uniform / no-data classification — operates on the absolute `cells`
   // (issue #108: a uniformly-worn panel collapses to flat grey under
@@ -393,17 +392,11 @@ export default function DisplayDetail({ id, snapshot, config, rule, wear, wearEr
                   <span className="display-detail__exposure-value">{wear.total_on_hours.toFixed(0)}</span>
                 </div>
                 {seededHours != null && (
-                  <>
-                    <div className="display-detail__exposure-row">
-                      <span className="display-detail__exposure-label">Seeded from panel</span>
-                      <span className="display-detail__exposure-value">{seededHours}</span>
-                      <span className="display-detail__exposure-hint">VCP 0xC0</span>
-                    </div>
-                    <div className="display-detail__exposure-row">
-                      <span className="display-detail__exposure-label">dormant-measured</span>
-                      <span className="display-detail__exposure-value">{measuredHours.toFixed(0)}</span>
-                    </div>
-                  </>
+                  <div className="display-detail__exposure-row">
+                    <span className="display-detail__exposure-label">Seeded from panel</span>
+                    <span className="display-detail__exposure-value">{seededHours}</span>
+                    <span className="display-detail__exposure-hint">panel lifetime counter · VCP 0xC0</span>
+                  </div>
                 )}
                 <div className="display-detail__exposure-row">
                   <span className="display-detail__exposure-label">Samples</span>

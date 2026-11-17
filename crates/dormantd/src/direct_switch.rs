@@ -116,6 +116,9 @@ pub fn switch_outcome_label(outcome: &SwitchOutcome) -> &'static str {
 /// suppression is cleared on every exit path, including Drop.
 const SUPPRESSION_DURATION: Duration = Duration::from_secs(5);
 
+// DDC readback can fail while a panel starts after a power-on write.
+const POWER_ON_SETTLE: Duration = Duration::from_secs(8);
+
 /// RAII guard that publishes a `ControlMsg::SetClaimSuppression` clear
 /// on Drop when not explicitly cleared first.  Clears synchronously via
 /// `try_send` — the channel is dimensioned for bursts much larger than
@@ -281,10 +284,13 @@ impl DirectSwitchHandle {
         };
 
         if !force
-            && self.observation_agrees_local(&display, local_code)
-            && tokio::time::timeout(Duration::from_secs(2), executor.read_input_source())
-                .await
-                .is_ok_and(|result| result == Ok(Some(local_code)))
+            && Self::input_already_selected(
+                &display,
+                executor.as_ref(),
+                local_code,
+                self.observation_agrees_local(&display, local_code),
+            )
+            .await
         {
             let display_name = display.0.clone();
             tracing::debug!(
@@ -474,10 +480,13 @@ impl DirectSwitchHandle {
         // active, so the guard cannot fire — always proceed.
         if !force
             && let Some(peer_code) = dc.shared_peer_input_code
-            && self.observation_agrees_peer(&display, peer_code)
-            && tokio::time::timeout(Duration::from_secs(2), executor.read_input_source())
-                .await
-                .is_ok_and(|result| result == Ok(Some(peer_code)))
+            && Self::input_already_selected(
+                &display,
+                executor.as_ref(),
+                peer_code,
+                self.observation_agrees_peer(&display, peer_code),
+            )
+            .await
         {
             let display_name = display.0.clone();
             tracing::debug!(
@@ -703,6 +712,56 @@ impl DirectSwitchHandle {
             && record.last_observed_code == Some(local_code)
     }
 
+    async fn input_already_selected(
+        display_id: &DisplayId,
+        executor: &dyn CommandSink,
+        target: u8,
+        observation_agrees: bool,
+    ) -> bool {
+        let deadline = executor
+            .last_power_on()
+            .map(|time| time + POWER_ON_SETTLE)
+            .filter(|&end| end > tokio::time::Instant::now());
+        // Cached observations can be stale during wake. Fresh readback remains authoritative.
+        if deadline.is_none() && !observation_agrees {
+            return false;
+        }
+        let mut attempt = 0;
+        loop {
+            let read_end = tokio::time::Instant::now() + Duration::from_secs(2);
+            let read_end = deadline.map_or(read_end, |end| end.min(read_end));
+            let outcome =
+                match tokio::time::timeout_at(read_end, executor.read_input_source()).await {
+                    Ok(Ok(code)) => return code == Some(target),
+                    Ok(Err(_)) => "error",
+                    Err(_) => "timeout",
+                };
+            let Some(end) = deadline else {
+                return false;
+            };
+            if tokio::time::Instant::now() >= end {
+                return false;
+            }
+            attempt += 1;
+            tracing::debug!(
+                event = "switch_readback_settle_retry",
+                display = %display_id,
+                attempt,
+                outcome,
+                "retry input readback while the panel starts"
+            );
+            let backoff = if attempt == 1 {
+                Duration::from_millis(500)
+            } else {
+                Duration::from_secs(1)
+            };
+            tokio::time::sleep_until(end.min(tokio::time::Instant::now() + backoff)).await;
+            if tokio::time::Instant::now() >= end {
+                return false;
+            }
+        }
+    }
+
     /// Symmetric counterpart of [`Self::observation_agrees_local`]:
     /// returns `true` only when the cached verdict is not-owned and the
     /// most recent observation matches the configured peer read alias.
@@ -907,6 +966,10 @@ mod tests {
     }
 
     struct FakeSinkInner {
+        last_power_on: Option<TokioInstant>,
+        input_reads: std::collections::VecDeque<Result<Option<u8>, String>>,
+        read_times: Vec<TokioInstant>,
+        read_hangs: bool,
         write_result: Option<Result<(), CmdFailure>>,
         input_read_result: Option<Result<Option<u8>, String>>,
         power_result: Option<Result<bool, String>>,
@@ -920,6 +983,10 @@ mod tests {
             Self {
                 _name: name,
                 inner: Arc::new(Mutex::new(FakeSinkInner {
+                    last_power_on: None,
+                    input_reads: std::collections::VecDeque::new(),
+                    read_times: vec![],
+                    read_hangs: false,
                     write_result: Some(Ok(())),
                     input_read_result: Some(Ok(None)),
                     power_result: Some(Ok(true)),
@@ -957,6 +1024,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CommandSink for FakeSink {
+        fn last_power_on(&self) -> Option<TokioInstant> {
+            self.inner.lock().unwrap().last_power_on
+        }
+
         async fn blank(&self, _mode: dormant_core::types::BlankMode) -> Result<(), CmdFailure> {
             Ok(())
         }
@@ -970,12 +1041,19 @@ mod tests {
         }
 
         async fn read_input_source(&self) -> Result<Option<u8>, String> {
-            self.inner
-                .lock()
-                .unwrap()
-                .input_read_result
-                .take()
-                .unwrap_or(Ok(None))
+            let (result, hangs) = {
+                let mut inner = self.inner.lock().unwrap();
+                inner.read_times.push(TokioInstant::now());
+                let result = inner
+                    .input_reads
+                    .pop_front()
+                    .unwrap_or_else(|| inner.input_read_result.take().unwrap_or(Ok(None)));
+                (result, inner.read_hangs)
+            };
+            if hangs {
+                pending::<()>().await;
+            }
+            result
         }
 
         async fn ensure_powered_on(&self) -> Result<bool, String> {
@@ -1003,6 +1081,218 @@ mod tests {
             SwitchOutcome::Switched
         );
         assert_eq!(sink.calls(), ["ensure_powered_on", "write_input_source"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pull_retries_readback_after_power_on() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        let start = TokioInstant::now();
+        {
+            let mut inner = sink.inner.lock().unwrap();
+            inner.last_power_on = Some(start - Duration::from_secs(1));
+            inner.input_reads = [
+                Err("waking".into()),
+                Err("waking".into()),
+                Ok(Some(LOCAL_READ)),
+            ]
+            .into();
+        }
+        let (tx, mut rx) = mpsc::channel(16);
+        let handle = build_handle(display_config(), sink.clone(), noop_hook_engine(), tx);
+        let outcome = handle.pull(display_id(), SwitchReason::Cli, false).await;
+        assert_eq!(
+            sink.write_calls(),
+            0,
+            "must not write while readback settles"
+        );
+        assert_eq!(outcome, SwitchOutcome::AlreadyLocal);
+        assert_eq!(sink.inner.lock().unwrap().read_times.len(), 3);
+        assert_eq!(TokioInstant::now() - start, Duration::from_millis(1500));
+        assert_eq!(input_wake_count(&mut rx), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pull_settle_stops_at_window_end() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        let start = TokioInstant::now();
+        {
+            let mut inner = sink.inner.lock().unwrap();
+            inner.last_power_on = Some(start - Duration::from_secs(1));
+            inner.input_reads = std::iter::repeat_n(Err("waking".into()), 20).collect();
+        }
+        let (tx, _rx) = mpsc::channel(16);
+        let handle = build_handle(display_config(), sink.clone(), noop_hook_engine(), tx);
+        assert_eq!(
+            handle.pull(display_id(), SwitchReason::Cli, false).await,
+            SwitchOutcome::Switched
+        );
+        assert_eq!(sink.write_calls(), 1);
+        assert_eq!(TokioInstant::now() - start, Duration::from_secs(7));
+        assert!(sink.inner.lock().unwrap().read_times.len() > 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pull_settle_bypasses_failed_observation() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        sink.inner.lock().unwrap().last_power_on =
+            Some(TokioInstant::now() - Duration::from_secs(1));
+        sink.set_input_read_result(Ok(Some(LOCAL_READ)));
+        let coordination = dormant_core::coordination::CoordinationHandle::new([display_id()]);
+        record_observation(&coordination, LOCAL_READ);
+        coordination.record_failure(&display_id());
+        let (tx, _rx) = mpsc::channel(16);
+        let handle = build_handle_with_coordination(
+            display_config(),
+            sink.clone(),
+            noop_hook_engine(),
+            tx,
+            Some(coordination),
+        );
+        assert!(!handle.observation_agrees_local(&display_id(), LOCAL_READ));
+        assert_eq!(
+            handle.pull(display_id(), SwitchReason::Cli, false).await,
+            SwitchOutcome::AlreadyLocal
+        );
+        assert_eq!(sink.write_calls(), 0);
+        assert_eq!(sink.inner.lock().unwrap().read_times.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pull_without_power_on_does_not_retry() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        sink.set_input_read_result(Err("unavailable".into()));
+        let coordination = dormant_core::coordination::CoordinationHandle::new([display_id()]);
+        record_observation(&coordination, LOCAL_READ);
+        let (tx, _rx) = mpsc::channel(16);
+        let handle = build_handle_with_coordination(
+            display_config(),
+            sink.clone(),
+            noop_hook_engine(),
+            tx,
+            Some(coordination),
+        );
+        let start = TokioInstant::now();
+        assert_eq!(
+            handle.pull(display_id(), SwitchReason::Cli, false).await,
+            SwitchOutcome::Switched
+        );
+        assert_eq!(sink.inner.lock().unwrap().read_times, [start]);
+        assert_eq!(TokioInstant::now(), start);
+        assert_eq!(sink.calls(), ["ensure_powered_on", "write_input_source"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pull_settle_timeouts_stay_within_window() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        let start = TokioInstant::now();
+        {
+            let mut inner = sink.inner.lock().unwrap();
+            inner.last_power_on = Some(start - Duration::from_secs(1));
+            inner.read_hangs = true;
+        }
+        let (tx, _rx) = mpsc::channel(16);
+        let handle = build_handle(display_config(), sink.clone(), noop_hook_engine(), tx);
+        assert_eq!(
+            handle.pull(display_id(), SwitchReason::Cli, false).await,
+            SwitchOutcome::Switched
+        );
+        assert_eq!(sink.write_calls(), 1);
+        assert_eq!(TokioInstant::now() - start, Duration::from_secs(7));
+        assert_eq!(sink.inner.lock().unwrap().read_times.len(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn force_bypasses_power_on_settle_for_both_directions() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        sink.inner.lock().unwrap().last_power_on =
+            Some(TokioInstant::now() - Duration::from_secs(1));
+        let mut dc = display_config();
+        dc.shared_peer_input_code = Some(PEER_READ);
+        dc.shared_peer_input_write_code = Some(PEER_WRITE);
+        let (tx, _rx) = mpsc::channel(16);
+        let handle = build_handle(dc, sink.clone(), noop_hook_engine(), tx);
+        let start = TokioInstant::now();
+        assert_eq!(
+            handle.pull(display_id(), SwitchReason::Cli, true).await,
+            SwitchOutcome::Switched
+        );
+        assert_eq!(
+            handle.push(display_id(), SwitchReason::Release, true).await,
+            SwitchOutcome::Switched
+        );
+        assert_eq!(sink.write_calls(), 2);
+        assert_eq!(
+            sink.inner.lock().unwrap().read_times,
+            [] as [TokioInstant; 0]
+        );
+        assert_eq!(TokioInstant::now(), start);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pull_settle_other_input_writes_without_retry() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        sink.inner.lock().unwrap().last_power_on =
+            Some(TokioInstant::now() - Duration::from_secs(1));
+        sink.set_input_read_result(Ok(Some(PEER_READ)));
+        let (tx, _rx) = mpsc::channel(16);
+        let handle = build_handle(display_config(), sink.clone(), noop_hook_engine(), tx);
+        let start = TokioInstant::now();
+        assert_eq!(
+            handle.pull(display_id(), SwitchReason::Cli, false).await,
+            SwitchOutcome::Switched
+        );
+        assert_eq!(sink.write_calls(), 1);
+        assert_eq!(sink.inner.lock().unwrap().read_times, [start]);
+        assert_eq!(TokioInstant::now(), start);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pull_expired_power_on_does_not_bypass_observation() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        sink.inner.lock().unwrap().last_power_on =
+            Some(TokioInstant::now() - Duration::from_secs(8));
+        sink.set_input_read_result(Ok(Some(LOCAL_READ)));
+        let (tx, _rx) = mpsc::channel(16);
+        let handle = build_handle(display_config(), sink.clone(), noop_hook_engine(), tx);
+        let start = TokioInstant::now();
+        assert_eq!(
+            handle.pull(display_id(), SwitchReason::Cli, false).await,
+            SwitchOutcome::Switched
+        );
+        assert_eq!(sink.write_calls(), 1);
+        assert_eq!(
+            sink.inner.lock().unwrap().read_times,
+            [] as [TokioInstant; 0]
+        );
+        assert_eq!(TokioInstant::now(), start);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn push_retries_readback_after_power_on() {
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        {
+            let mut inner = sink.inner.lock().unwrap();
+            inner.last_power_on = Some(TokioInstant::now() - Duration::from_secs(1));
+            inner.input_reads = [
+                Err("waking".into()),
+                Err("waking".into()),
+                Ok(Some(PEER_READ)),
+            ]
+            .into();
+        }
+        let mut dc = display_config();
+        dc.shared_peer_input_code = Some(PEER_READ);
+        dc.shared_peer_input_write_code = Some(PEER_WRITE);
+        let (tx, _rx) = mpsc::channel(16);
+        let handle = build_handle(dc, sink.clone(), noop_hook_engine(), tx);
+        assert_eq!(
+            handle
+                .push(display_id(), SwitchReason::Release, false)
+                .await,
+            SwitchOutcome::AlreadyPeer
+        );
+        assert_eq!(sink.write_calls(), 0);
+        assert_eq!(sink.inner.lock().unwrap().read_times.len(), 3);
     }
 
     #[tokio::test]

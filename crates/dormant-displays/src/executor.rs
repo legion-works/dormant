@@ -383,6 +383,10 @@ impl DisplayExecutor {
 
 #[async_trait]
 impl CommandSink for DisplayExecutor {
+    fn last_power_on(&self) -> Option<tokio::time::Instant> {
+        self.chain.iter().filter_map(|c| c.last_power_on()).max()
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn blank(&self, mode: BlankMode) -> Result<(), CmdFailure> {
         let _supersede_token = self.rotate_supersede();
@@ -987,6 +991,7 @@ mod tests {
 
     #[derive(Default)]
     struct FakeInner {
+        last_power_on: Option<tokio::time::Instant>,
         modes: Vec<BlankMode>,
         available: bool,
         /// Scripted `probe()` result.  `None` → default `Ok(())`.
@@ -1143,6 +1148,10 @@ mod tests {
 
     #[async_trait]
     impl DisplayController for FakeController {
+        fn last_power_on(&self) -> Option<tokio::time::Instant> {
+            self.inner.lock().unwrap().last_power_on
+        }
+
         fn name(&self) -> &'static str {
             self.name
         }
@@ -1282,6 +1291,24 @@ mod tests {
             retry,
         ));
         (exec, controllers)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn last_power_on_returns_latest_across_chain() {
+        let old = FakeController::new("old", vec![]);
+        let new = FakeController::new("new", vec![]);
+        let unsupported = FakeController::new("unsupported", vec![]);
+        let now = tokio::time::Instant::now();
+        old.inner.lock().unwrap().last_power_on = Some(now - Duration::from_secs(3));
+        new.inner.lock().unwrap().last_power_on = Some(now);
+        let (executor, _) = executor_with(
+            vec![old, new, unsupported],
+            RetrySettings {
+                wake_retries: 0,
+                wake_retry_backoff: Duration::ZERO,
+            },
+        );
+        assert_eq!(executor.last_power_on(), Some(now));
     }
 
     #[allow(clippy::needless_pass_by_value)]

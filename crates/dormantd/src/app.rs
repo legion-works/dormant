@@ -4385,9 +4385,16 @@ impl Runner {
                 .map(|(id, _)| id.clone())
                 .collect();
             if !need_quiesce.is_empty() {
+                let pending_in = |phase: &str| {
+                    snap.displays
+                        .iter()
+                        .filter(|(id, d)| need_quiesce.contains(id) && d.phase == phase)
+                        .count()
+                };
                 tracing::info!(
-                    event = "reload_quiesce_blanking",
-                    count = need_quiesce.len(),
+                    event = "reload_quiesce_pending",
+                    blanking = pending_in("blanking"),
+                    waking = pending_in("waking"),
                     "rule-less display(s) with pending results; polling until terminal"
                 );
                 loop {
@@ -4414,22 +4421,35 @@ impl Runner {
                         snapshot = Some(s);
                     }
                 }
-                let stuck_count = snapshot.as_ref().map_or(0, |s| {
-                    need_quiesce
-                        .iter()
-                        .filter(|id| {
-                            s.displays
-                                .iter()
-                                .find(|(did, _)| did == *id)
-                                .is_some_and(|(_, d)| d.phase.as_str() == "blanking")
-                        })
-                        .count()
-                });
-                if stuck_count > 0 {
+                let stuck_in = |phase: &str| {
+                    snapshot.as_ref().map_or(0, |s| {
+                        need_quiesce
+                            .iter()
+                            .filter(|id| {
+                                s.displays
+                                    .iter()
+                                    .find(|(did, _)| did == *id)
+                                    .is_some_and(|(_, d)| d.phase.as_str() == phase)
+                            })
+                            .count()
+                    })
+                };
+                let stuck_blanking = stuck_in("blanking");
+                if stuck_blanking > 0 {
                     tracing::warn!(
                         event = "reload_quiesce_timeout",
-                        count = stuck_count,
+                        phase = "blanking",
+                        count = stuck_blanking,
                         "rule-less display(s) still blanking at deadline; defensive-waking"
+                    );
+                }
+                let stuck_waking = stuck_in("waking");
+                if stuck_waking > 0 {
+                    tracing::warn!(
+                        event = "reload_quiesce_timeout",
+                        phase = "waking",
+                        count = stuck_waking,
+                        "rule-less display(s) still waking at deadline; the wake is retried"
                     );
                 }
             }

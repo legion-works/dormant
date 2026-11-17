@@ -55,10 +55,18 @@ struct ReprobeState {
     next_interval: Duration,
 }
 
+/// Rate-limit state for `coord_poll_unknown_code`, one entry per display.
+#[derive(Default)]
+struct UnknownCodeLog {
+    last_logged: Option<Instant>,
+    unlogged: std::collections::BTreeSet<u8>,
+    unlogged_reads: u32,
+}
+
 async fn run(mut deps: CoordinationPollDeps) {
     let mut interval = new_interval(deps.config_rx.borrow().coordination.poll_interval);
     let mut last_failing_log = HashMap::new();
-    let mut last_unknown_code = HashMap::new();
+    let mut unknown_code_log = HashMap::new();
     let mut last_state_read: HashMap<DisplayId, Instant> = HashMap::new();
     let mut reprobe_state: HashMap<DisplayId, ReprobeState> = HashMap::new();
     let mut pending_observed_gain: HashSet<DisplayId> = HashSet::new();
@@ -75,7 +83,7 @@ async fn run(mut deps: CoordinationPollDeps) {
             _ = interval.tick() => poll_once(
                 &deps,
                 &mut last_failing_log,
-                &mut last_unknown_code,
+                &mut unknown_code_log,
                 &mut last_state_read,
                 &mut reprobe_state,
                 &mut pending_observed_gain,
@@ -151,7 +159,7 @@ async fn maybe_reprobe(
 async fn poll_once(
     deps: &CoordinationPollDeps,
     last_failing_log: &mut HashMap<DisplayId, Instant>,
-    last_unknown_code: &mut HashMap<DisplayId, u8>,
+    unknown_code_log: &mut HashMap<DisplayId, UnknownCodeLog>,
     last_state_read: &mut HashMap<DisplayId, Instant>,
     reprobe_state: &mut HashMap<DisplayId, ReprobeState>,
     pending_observed_gain: &mut HashSet<DisplayId>,
@@ -262,17 +270,36 @@ async fn poll_once(
             let classification = aliases.classify(observed);
             if !panel_mismatch && matches!(classification, InputSourceObservation::Unknown(_)) {
                 deps.state.record_failure(&display_id);
-                if last_unknown_code.get(&display_id) != Some(&observed) {
+                // A panel without a signal scans its inputs, so unknown codes
+                // can alternate on every tick. Log at most once per interval
+                // and name every unknown code seen since the previous line.
+                let log = unknown_code_log.entry(display_id.clone()).or_default();
+                log.unlogged.insert(observed);
+                log.unlogged_reads = log.unlogged_reads.saturating_add(1);
+                if log
+                    .last_logged
+                    .is_none_or(|last| now.duration_since(last) >= COORD_POLL_FAILING_LOG_INTERVAL)
+                {
+                    let codes = log
+                        .unlogged
+                        .iter()
+                        .map(u8::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",");
                     tracing::warn!(
                         event = "coord_poll_unknown_code",
                         display = %display_id,
                         observed,
+                        codes = %codes,
+                        unknown_reads = log.unlogged_reads,
                         local_read = aliases.local_read,
                         local_write = aliases.local_write,
                         peer_read = aliases.peer_read.map_or_else(|| "none".to_string(), |code| code.to_string()),
                         peer_write = aliases.peer_write.map_or_else(|| "none".to_string(), |code| code.to_string()),
                     );
-                    last_unknown_code.insert(display_id.clone(), observed);
+                    log.unlogged.clear();
+                    log.unlogged_reads = 0;
+                    log.last_logged = Some(now);
                 }
                 continue; // `for` loop — skip the rest of this display's tick
             }
@@ -310,7 +337,6 @@ async fn poll_once(
                 tracing::info!(event = "coord_poll_ok", display = %display_id);
             }
             last_failing_log.remove(&display_id);
-            last_unknown_code.remove(&display_id);
             if let Some(state) = reprobe_state.get_mut(&display_id) {
                 state.next_interval = config.coordination.reprobe_interval;
             }
@@ -1655,7 +1681,7 @@ mod tests {
             direct_switch: None,
         };
         let mut last_failing_log = HashMap::new();
-        let mut last_unknown_code = HashMap::new();
+        let mut unknown_code_log = HashMap::new();
         let mut last_state_read = HashMap::new();
         let mut reprobe_state = HashMap::new();
         let mut pending_observed_gain = HashSet::new();
@@ -1665,7 +1691,7 @@ mod tests {
             poll_once(
                 &deps,
                 &mut last_failing_log,
-                &mut last_unknown_code,
+                &mut unknown_code_log,
                 &mut last_state_read,
                 &mut reprobe_state,
                 &mut pending_observed_gain,
@@ -1704,7 +1730,7 @@ mod tests {
             direct_switch: None,
         };
         let mut last_failing_log = HashMap::new();
-        let mut last_unknown_code = HashMap::new();
+        let mut unknown_code_log = HashMap::new();
         let mut last_state_read = HashMap::new();
         let mut reprobe_state = HashMap::new();
         let mut pending_observed_gain = HashSet::new();
@@ -1714,7 +1740,7 @@ mod tests {
             poll_once(
                 &deps,
                 &mut last_failing_log,
-                &mut last_unknown_code,
+                &mut unknown_code_log,
                 &mut last_state_read,
                 &mut reprobe_state,
                 &mut pending_observed_gain,
@@ -1747,23 +1773,40 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn unknown_input_codes_log_once_until_value_or_known_code_changes() {
+    async fn unknown_input_codes_log_at_most_once_per_interval_with_every_code_seen() {
+        // Ticks are 6 s apart (t = 6, 12, ... 84 s) and the interval is 30 s.
+        // Local is 0x11 and peer is 0x12, so 15, 16 and 20 are unknown.
+        // A known code between unknown reads does not reset the limit: a
+        // panel without a signal alternates scanned and real inputs.
         let events = captured_events(
-            [15, 15, 16, 16, 0x11, 15, 15, 0x11, 15]
-                .into_iter()
-                .map(|code| Ok(Some(code))),
-            9,
+            [
+                15, 16, 0x11, 15, 16, 15, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 20,
+            ]
+            .into_iter()
+            .map(|code| Ok(Some(code))),
+            14,
         )
         .await;
         let unknown: Vec<_> = events
             .iter()
             .filter(|event| event.starts_with("coord_poll_unknown_code "))
             .collect();
-        assert_eq!(unknown.len(), 4, "{unknown:?}");
-        assert!(unknown[0].contains("observed=15"));
-        assert!(unknown[1].contains("observed=16"));
-        assert!(unknown[2].contains("observed=15"));
-        assert!(unknown[3].contains("observed=15"));
+        assert_eq!(unknown.len(), 3, "{unknown:?}");
+        // t = 6: first unknown read.
+        assert!(
+            unknown[0].contains("observed=15 codes=15 unknown_reads=1"),
+            "{unknown:?}"
+        );
+        // t = 36: the reads at 12, 24, 30 and 36 s.
+        assert!(
+            unknown[1].contains("observed=15 codes=15,16 unknown_reads=4"),
+            "{unknown:?}"
+        );
+        // t = 84: only the new code; earlier codes were already logged.
+        assert!(
+            unknown[2].contains("observed=20 codes=20 unknown_reads=1"),
+            "{unknown:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]

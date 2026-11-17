@@ -116,7 +116,7 @@ pub fn switch_outcome_label(outcome: &SwitchOutcome) -> &'static str {
 /// suppression is cleared on every exit path, including Drop.
 const SUPPRESSION_DURATION: Duration = Duration::from_secs(5);
 
-// DDC readback can fail while a panel starts after a power-on write.
+// DDC readback can be unavailable while a panel starts after a power-on write.
 const POWER_ON_SETTLE: Duration = Duration::from_secs(8);
 
 /// RAII guard that publishes a `ControlMsg::SetClaimSuppression` clear
@@ -722,7 +722,7 @@ impl DirectSwitchHandle {
             .last_power_on()
             .map(|time| time + POWER_ON_SETTLE)
             .filter(|&end| end > tokio::time::Instant::now());
-        // Cached observations can be stale during wake. Fresh readback remains authoritative.
+        // Cached observations can be stale during wake. Use a new input read.
         if deadline.is_none() && !observation_agrees {
             return false;
         }

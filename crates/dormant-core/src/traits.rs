@@ -120,7 +120,7 @@ pub trait SensorSource: Send {
 /// automatically — no per-impl boilerplate required.
 #[async_trait::async_trait]
 pub trait DisplayController: Any + Send + Sync {
-    /// Time of the most recent successful power-on write, if known.
+    /// Time of the last power-on write without an error, if known.
     fn last_power_on(&self) -> Option<tokio::time::Instant> {
         None
     }
@@ -284,7 +284,7 @@ pub trait DisplayController: Any + Send + Sync {
 /// per-display object composed by the daemon.
 #[async_trait::async_trait]
 pub trait CommandSink: Send + Sync {
-    /// Time of the most recent successful power-on write, if known.
+    /// Time of the last power-on write without an error, if known.
     fn last_power_on(&self) -> Option<tokio::time::Instant> {
         None
     }

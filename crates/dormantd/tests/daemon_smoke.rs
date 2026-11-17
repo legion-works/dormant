@@ -3068,13 +3068,32 @@ wake_retry_interval = "1s"
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_only_display_no_defensive_wake_on_reload() {
+    check_manual_only_display_no_defensive_wake_on_reload(|cfg, _| cfg).await;
+}
+
+/// The delayed command detects a fixed-sleep wait that checks before completion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_only_display_no_defensive_wake_on_reload_with_delayed_wake() {
+    check_manual_only_display_no_defensive_wake_on_reload(|cfg, mon| {
+        cfg.replace(
+            &format!("wake_command = \"printf W >> '{}'\"", mon.display()),
+            &format!(
+                "wake_command = \"sleep 1.2; printf W >> '{}'\"",
+                mon.display()
+            ),
+        )
+    })
+    .await;
+}
+
 #[allow(
     clippy::await_holding_lock,
-    reason = "capture_count_lock() serializes this test's reload() call against the exact- \
-              count step-boundary tests it would otherwise contaminate — test-local, always \
-              released promptly at test end"
+    reason = "capture_count_lock() serializes reload against the exact-count tests"
 )]
-async fn manual_only_display_no_defensive_wake_on_reload() {
+async fn check_manual_only_display_no_defensive_wake_on_reload(
+    rewrite: impl FnOnce(String, &Path) -> String,
+) {
     let _capture_guard = capture_count_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3083,7 +3102,6 @@ async fn manual_only_display_no_defensive_wake_on_reload() {
     let manual_marker = dir.path().join("manual");
     let cfg = manual_and_ruled_config(&mon_marker, &manual_marker, "300ms");
     let cfg_path = write_file(dir.path(), "config.toml", &cfg);
-    let creds_path = dir.path().join("credentials.toml");
 
     // Absent shortly after start → the rule-driven "mon" blanks.  The manual
     // display never blanks on its own (no rule drives it), but we can
@@ -3091,7 +3109,7 @@ async fn manual_only_display_no_defensive_wake_on_reload() {
     let script = vec![(Duration::from_millis(100), ev("desk", SensorState::Absent))];
     let app = App::build_with_sources(
         cfg_path.clone(),
-        creds_path,
+        dir.path().join("credentials.toml"),
         Strictness::Strict,
         fake_factory("desk", script),
     )
@@ -3132,6 +3150,12 @@ async fn manual_only_display_no_defensive_wake_on_reload() {
         "manual display's phase must settle to blanked before reload"
     );
 
+    // The command marker precedes the engine's terminal phase for both displays.
+    assert!(
+        wait_for_phase(&ctl, "mon", "blanked", Duration::from_secs(10)).await,
+        "rule-driven display's phase must settle to blanked before reload"
+    );
+
     // Clear any W that may have been written (defensive wake at initial
     // holdoff expiry, etc.) and track the exact counts before reload.
     let mon_wake_before = count(&mon_marker, 'W');
@@ -3140,11 +3164,8 @@ async fn manual_only_display_no_defensive_wake_on_reload() {
 
     // Reload: rewrite the same config with a different grace so the reload
     // actually takes effect (identical config is a no-op).
-    fs::write(
-        &cfg_path,
-        manual_and_ruled_config(&mon_marker, &manual_marker, "150ms"),
-    )
-    .unwrap();
+    let new_cfg = manual_and_ruled_config(&mon_marker, &manual_marker, "150ms");
+    fs::write(&cfg_path, rewrite(new_cfg, &mon_marker)).unwrap();
     assert!(handle.trigger_reload().await);
 
     let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
@@ -3153,8 +3174,16 @@ async fn manual_only_display_no_defensive_wake_on_reload() {
         .expect("reload bus open");
     assert_eq!(outcome, ReloadOutcome::Reloaded);
 
-    // Give the defensive wake a moment to fire.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Reload spawns the defensive wake without waiting for the command result.
+    assert!(
+        wait_for(
+            || count(&mon_marker, 'W') > mon_wake_before,
+            Duration::from_secs(10),
+        )
+        .await
+    );
+    // Observe late duplicate wakes before checking the manual display.
+    tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Check the manual display: NO additional wake (defensive wake must NOT
     // fire for the rule-less display).
@@ -3172,8 +3201,7 @@ async fn manual_only_display_no_defensive_wake_on_reload() {
     let manual_snap = snap
         .displays
         .iter()
-        .find(|(id, _)| id == "manual")
-        .map(|(_, ds)| ds);
+        .find_map(|(id, ds)| (id == "manual").then_some(ds));
     assert!(
         manual_snap.is_some(),
         "manual display must still be present in snapshot after reload"

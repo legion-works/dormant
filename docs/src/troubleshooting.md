@@ -89,7 +89,6 @@ Local Network privacy can cause `No route to host (os error 65)`.
 A connection from `nc` to the same broker does not show that `dormantd` has access.
 Open **System Settings → Privacy & Security → Local Network**.
 Enable access for `dormantd`.
-If `dormantctl doctor mqtt` shows the same error, enable access for `dormantctl`.
 After a rebuild or update, macOS can show the prompt again.
 
 ## Display will not blank

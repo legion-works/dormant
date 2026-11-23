@@ -26,12 +26,18 @@ if [[ -n "$upstream" ]]; then
 else
   push_line="$(cat)"
   if [[ -n "$push_line" ]]; then
-    read -r _local_ref _local_sha remote_ref remote_sha <<<"$push_line"
+    read -r _local_ref _local_sha _remote_ref remote_sha <<<"$push_line"
     if [[ "$remote_sha" != "0000000000000000000000000000000000000000" ]]; then
       base="$(git merge-base HEAD "$remote_sha" 2>/dev/null || true)"
     fi
-    if [[ -z "$base" && -n "${remote_ref:-}" ]]; then
-      base="$(git merge-base HEAD "$remote_ref" 2>/dev/null || true)"
+    # The pushed remote ref names a ref on the remote. Resolved in this
+    # repository, `refs/heads/<branch>` is the local branch being pushed, so its
+    # merge-base is HEAD and every gate would skip. For a branch the remote
+    # does not have yet, compare with the integration branch that pull
+    # requests target; if that ref is missing, the base stays unknown and
+    # the gate runs.
+    if [[ -z "$base" ]] && git rev-parse --verify --quiet refs/remotes/origin/dev >/dev/null; then
+      base="$(git merge-base HEAD refs/remotes/origin/dev 2>/dev/null || true)"
     fi
   fi
 fi

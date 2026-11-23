@@ -39,12 +39,10 @@
 //! 2. Every subsequent call includes
 //!    `"params":{"AccessToken":"<tok>", ...}`.
 //!
-//! The token is cached in-memory keyed by host and **persisted to a 0600
-//! state file** so a known-good token survives daemon restarts (the TV
-//! intermittently fails to re-grant a fresh token on a subsequent
-//! `createAccessToken`, so re-acquisition is not always reliable). A
-//! `-32010` unauthorized response drops both the in-memory and the
-//! persisted entry so the next call re-acquires and writes a fresh token.
+//! The transport caches each host's token and saves it to a state file
+//! (mode `0o600` on Unix). The TV does not always grant a new token after
+//! a daemon restart. A `-32010` response removes the token from the
+//! cache and the file. The next call can then get a new token.
 //!
 //! ## Methods
 //!
@@ -78,6 +76,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use dormant_core::error::E_DISPLAY_IO;
+use dormant_core::paths::{PathEnv, TargetOs};
 use dormant_core::types::CmdFailure;
 use serde_json::Value;
 use serde_json::json;
@@ -100,6 +99,7 @@ const TOKEN_REACQUIRED: &str = "samsung_ip_token_reacquired";
 /// Distinct from `TOKEN_REACQUIRED` so a reader can tell the two apart.
 const TOKEN_STATE_LOADED: &str = "samsung_ip_token_state_loaded";
 const TOKEN_STATE_WRITTEN: &str = "samsung_ip_token_state_written";
+const TOKEN_STATE_FILENAME: &str = "samsung-ip-tokens.json";
 
 /// The PID separates writers in separate processes; the counter separates
 /// concurrent writes from the same process.
@@ -205,8 +205,7 @@ pub struct RealBacklightTransport {
     /// `Some` for tests that point the transport at a mock URL; `None`
     /// (the production default) uses the LAN-HTTPS pattern.
     base_url: Option<String>,
-    /// Production path to the daemon-owned token state file
-    /// (`$XDG_STATE_HOME/dormant/samsung-ip-tokens.json` or fallback).
+    /// Production path to `samsung-ip-tokens.json` in the daemon state directory.
     /// `None` disables persistence — used by `for_test_with_base_url`
     /// (no real state file in unit/wiremock tests) and by `for_test_with_state_path`
     /// (which points at a caller-supplied temp path).
@@ -216,12 +215,8 @@ pub struct RealBacklightTransport {
 }
 
 impl RealBacklightTransport {
-    /// Build a new transport with the default 5-second request timeout
-    /// and persistence to the daemon-owned state file
-    /// (`$XDG_STATE_HOME/dormant/samsung-ip-tokens.json` or
-    /// `~/.local/state/dormant/samsung-ip-tokens.json`). On construction
-    /// the state file is loaded (if present) into the in-memory cache so
-    /// a known-good token survives restarts.
+    /// Build a transport with the default 5-second request timeout.
+    /// Load saved tokens from the daemon state directory to reuse them after a restart.
     #[must_use]
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
@@ -568,21 +563,16 @@ impl BacklightTransport for RealBacklightTransport {
 
 // ── State-file plumbing ─────────────────────────────────────────────────────────
 
-/// Default location of the daemon-owned token state file.
-///
-/// 1. `$XDG_STATE_HOME/dormant/samsung-ip-tokens.json`
-/// 2. `~/.local/state/dormant/samsung-ip-tokens.json`
-///
-/// Directory precedence is owned by
-/// [`dormant_core::paths::state_dir_from_env`] — this function only
-/// decides whether persistence is possible at all (`None` only when
-/// NEITHER `XDG_STATE_HOME` nor `HOME` is set, which is exceedingly rare
-/// in practice: the daemon would still start, only the in-memory cache
-/// would be used) and appends the token file name. Kept private to
-/// `samsung_ip` because it is daemon-internal state — distinct from
-/// `credentials.toml`, which the user owns.
+/// Get the default path to the token state file for the current platform.
 fn default_state_path() -> Option<PathBuf> {
-    state_path_from(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+    token_state_path_with(TargetOs::current(), PathEnv::from_process())
+}
+
+fn token_state_path_with(target: TargetOs, env: PathEnv) -> Option<PathBuf> {
+    if target == TargetOs::Windows {
+        return Some(dormant_core::paths::state_dir_with(target, &env).join(TOKEN_STATE_FILENAME));
+    }
+    state_path_from(env.xdg_state_home, env.home)
 }
 
 /// Internal: derive the token state path from explicit env values (test
@@ -595,7 +585,7 @@ fn state_path_from(xdg: Option<OsString>, home: Option<OsString>) -> Option<Path
     if xdg.is_none() && home.is_none() {
         return None;
     }
-    Some(dormant_core::paths::state_dir_from_env(xdg, home).join("samsung-ip-tokens.json"))
+    Some(dormant_core::paths::state_dir_from_env(xdg, home).join(TOKEN_STATE_FILENAME))
 }
 
 /// Load the persisted token map from `path`. Returns an empty map when
@@ -655,11 +645,52 @@ fn with_token_state_file_lock<T>(
             .map_err(|e| format!("lock samsung-ip token state '{}': {e}", lock_path.display()))?;
         write()
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LockFileEx};
+        use windows_sys::Win32::System::IO::OVERLAPPED;
+
+        ensure_token_state_parent(path)?;
+        let lock_path = token_state_lock_path(path);
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|e| {
+                format!(
+                    "open samsung-ip token state lock '{}': {e}",
+                    lock_path.display()
+                )
+            })?;
+        let mut overlapped = OVERLAPPED::default();
+        // SAFETY: The file owns a valid synchronous handle. `overlapped` is
+        // writable for the full blocking call and sets the offset to zero.
+        let locked = unsafe {
+            LockFileEx(
+                lock_file.as_raw_handle(),
+                LOCKFILE_EXCLUSIVE_LOCK,
+                0,
+                1,
+                0,
+                std::ptr::from_mut(&mut overlapped),
+            )
+        };
+        if locked == 0 {
+            let e = std::io::Error::last_os_error();
+            return Err(format!(
+                "lock samsung-ip token state '{}': {e}",
+                lock_path.display()
+            ));
+        }
+        // The file handle closes and releases the lock even if `write` returns an error.
+        write()
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (path, write);
-        // Persisting without an exercised advisory lock would silently revive
-        // the token-loss race; Windows remains disabled until it is tested.
         Err("samsung-ip token state persistence requires a supported advisory file lock on this platform".to_string())
     }
 }
@@ -684,10 +715,7 @@ fn ensure_token_state_parent(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-// Sole caller is `with_token_state_file_lock`'s `#[cfg(unix)]` arm; matching
-// that gate keeps this equal-or-wider than its only consumer (project rule
-// #2584) instead of dead on Windows.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn token_state_lock_path(path: &Path) -> PathBuf {
     let file_name = path
         .file_name()
@@ -727,10 +755,8 @@ fn remove_token_state_tmp(path: &Path) -> Result<(), String> {
 /// file briefly readable under a permissive umask, and the token bytes
 /// are already on disk by then.
 ///
-/// Not reachable on non-Unix: [`with_token_state_file_lock`] refuses to
-/// run its write closure at all without a supported advisory file lock,
-/// so the `cfg(not(unix))` arm below exists only to keep portability
-/// builds compiling.
+/// On Unix and Windows, the caller holds a file lock during the write.
+/// Other platforms do not write the state file.
 fn write_token_state(path: &Path, map: &HashMap<String, String>) -> Result<(), String> {
     use std::io::Write as _;
 
@@ -1270,6 +1296,106 @@ mod tests {
     #[test]
     fn state_path_from_no_env_returns_none() {
         assert!(state_path_from(None, None).is_none());
+    }
+
+    #[test]
+    fn windows_token_state_path_does_not_require_home() {
+        let localappdata = PathBuf::from(r"C:\Users\test\AppData\Local");
+        let userprofile = PathBuf::from(r"C:\Users\test");
+        let env = PathEnv {
+            localappdata: Some(localappdata.clone().into_os_string()),
+            userprofile: Some(userprofile.clone().into_os_string()),
+            ..PathEnv::default()
+        };
+        let suffix = Path::new("dormant")
+            .join("state")
+            .join("samsung-ip-tokens.json");
+        assert_eq!(
+            token_state_path_with(TargetOs::Windows, env),
+            Some(localappdata.join(&suffix)),
+            "Windows must use LOCALAPPDATA without HOME or XDG_STATE_HOME"
+        );
+        assert_eq!(
+            token_state_path_with(
+                TargetOs::Windows,
+                PathEnv {
+                    userprofile: Some(userprofile.clone().into_os_string()),
+                    ..PathEnv::default()
+                },
+            ),
+            Some(userprofile.join("AppData").join("Local").join(&suffix)),
+            "Windows must fall back to USERPROFILE without LOCALAPPDATA"
+        );
+        assert_eq!(
+            token_state_path_with(TargetOs::Windows, PathEnv::default()),
+            Some(Path::new(r"C:\ProgramData").join(&suffix)),
+            "Windows must use the shared state directory fallback without either variable"
+        );
+    }
+
+    #[test]
+    fn unix_token_state_path_keeps_xdg_precedence_and_no_env_behavior() {
+        let xdg = PathBuf::from("xdg-state");
+        let env = PathEnv {
+            xdg_state_home: Some(xdg.clone().into_os_string()),
+            home: Some(OsString::from("home")),
+            ..PathEnv::default()
+        };
+        for target in [TargetOs::Linux, TargetOs::Macos] {
+            assert_eq!(
+                token_state_path_with(target, env.clone()),
+                Some(xdg.join("dormant").join("samsung-ip-tokens.json"))
+            );
+            assert_eq!(token_state_path_with(target, PathEnv::default()), None);
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn token_state_file_lock_excludes_second_writer() {
+        use std::sync::mpsc::{RecvTimeoutError, channel};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = &dir.path().join("samsung-ip-tokens.json");
+        let deadline = Duration::from_secs(5);
+        std::thread::scope(|threads| {
+            let (first_entered_tx, first_entered_rx) = channel();
+            let (release_tx, release_rx) = channel();
+            let first = threads.spawn(move || {
+                with_token_state_file_lock(path, || {
+                    first_entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Err::<(), _>("first write failed".to_string())
+                })
+            });
+            first_entered_rx
+                .recv_timeout(deadline)
+                .expect("first writer could not acquire the token state lock");
+
+            let (second_started_tx, second_started_rx) = channel();
+            let (second_entered_tx, second_entered_rx) = channel();
+            // Separate opens in one process conflict for both `flock` and `LockFileEx`.
+            let second = threads.spawn(move || {
+                second_started_tx.send(()).unwrap();
+                with_token_state_file_lock(path, || {
+                    second_entered_tx.send(()).unwrap();
+                    Ok(())
+                })
+            });
+            second_started_rx.recv_timeout(deadline).unwrap();
+            let while_locked = second_entered_rx.recv_timeout(Duration::from_millis(250));
+            release_tx.send(()).unwrap();
+            assert_eq!(
+                while_locked,
+                Err(RecvTimeoutError::Timeout),
+                "second writer must wait while the first holds the token state lock"
+            );
+            assert_eq!(first.join().unwrap(), Err("first write failed".to_string()));
+            second_entered_rx
+                .recv_timeout(deadline)
+                .expect("second writer could not acquire the token state lock after a write error");
+            second.join().unwrap().unwrap();
+        });
     }
 
     /// `write_token_state` creates the file with mode `0o600` on Unix
@@ -2242,11 +2368,7 @@ mod tests {
 
     /// A successful `acquire_token` MUST persist the token to the state
     /// file so it survives the next daemon restart.
-    ///
-    /// Unix-only: `with_token_state_file_lock` refuses to run its write
-    /// closure without a supported advisory file lock, so persistence is
-    /// deliberately disabled on Windows and there is no behaviour to assert.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn real_transport_persists_acquired_token_to_state_file() {
         use wiremock::matchers::{body_partial_json, method, path};
@@ -2276,7 +2398,8 @@ mod tests {
         let tok = transport.acquire_token("192.0.2.7").await.unwrap();
         assert_eq!(tok, "freshly-acquired-tok");
 
-        let raw = std::fs::read_to_string(&state_path).unwrap();
+        let raw = std::fs::read_to_string(&state_path)
+            .expect("state file must persist the acquired token");
         assert!(
             raw.contains("freshly-acquired-tok"),
             "state file must persist the acquired token: {raw}"
@@ -2290,11 +2413,7 @@ mod tests {
     /// A `-32010` unauthorized response invalidates BOTH the in-memory
     /// cache and the persisted entry — the next `acquire_token` calls
     /// `createAccessToken` and overwrites the persisted entry.
-    ///
-    /// Unix-only for the same reason as
-    /// `real_transport_persists_acquired_token_to_state_file`: the persisted
-    /// half of the invariant does not exist on Windows.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn real_transport_unauthorized_invalidates_persisted_token() {
         use wiremock::matchers::{body_partial_json, method, path};

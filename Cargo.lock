@@ -1066,6 +1066,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
+ "windows-sys 0.61.2",
  "wiremock",
 ]
 

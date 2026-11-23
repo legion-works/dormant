@@ -87,6 +87,16 @@ class ChangedFilesTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("GATE-RAN", result.stdout)
 
+    def test_remote_commit_missing_locally_runs_gate_for_matching_change(self):
+        # A force push after a rebase can name a remote commit this clone does
+        # not have; the merge-base with it is unknown.
+        self.branch_from_sha("feature", "src/lib.rs")
+        head = git(self.work, "rev-parse", "HEAD")
+        missing = "1234567890abcdef1234567890abcdef12345678"
+        result = self.run_filter(f"refs/heads/feature {head} refs/heads/feature {missing}\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("GATE-RAN", result.stdout)
+
     def test_existing_remote_branch_checks_only_unpushed_commits(self):
         self.branch_from_sha("feature", "src/lib.rs")
         pushed = git(self.work, "rev-parse", "HEAD")

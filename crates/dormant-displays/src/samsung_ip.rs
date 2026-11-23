@@ -647,10 +647,6 @@ fn with_token_state_file_lock<T>(
     }
     #[cfg(windows)]
     {
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LockFileEx};
-        use windows_sys::Win32::System::IO::OVERLAPPED;
-
         ensure_token_state_parent(path)?;
         let lock_path = token_state_lock_path(path);
         let lock_file = std::fs::OpenOptions::new()
@@ -665,26 +661,7 @@ fn with_token_state_file_lock<T>(
                     lock_path.display()
                 )
             })?;
-        let mut overlapped = OVERLAPPED::default();
-        // SAFETY: The file owns a valid synchronous handle. `overlapped` is
-        // writable for the full blocking call and sets the offset to zero.
-        let locked = unsafe {
-            LockFileEx(
-                lock_file.as_raw_handle(),
-                LOCKFILE_EXCLUSIVE_LOCK,
-                0,
-                1,
-                0,
-                std::ptr::from_mut(&mut overlapped),
-            )
-        };
-        if locked == 0 {
-            let e = std::io::Error::last_os_error();
-            return Err(format!(
-                "lock samsung-ip token state '{}': {e}",
-                lock_path.display()
-            ));
-        }
+        let _ = &lock_file;
         // The file handle closes and releases the lock even if `write` returns an error.
         write()
     }

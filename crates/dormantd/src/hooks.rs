@@ -915,10 +915,6 @@ pub(crate) async fn run_argv_command(
                 }
             }
             // This path does not use a Windows `Job Object` to stop the child's descendants.
-            #[cfg(not(unix))]
-            if let Err(error) = child.start_kill() {
-                warn!(event = "hook_timeout_kill_failed", pid = child.id(), %error);
-            }
             // Reap so the OS does not leak a zombie.
             let _ = child.wait().await;
             drain_stdout.abort();

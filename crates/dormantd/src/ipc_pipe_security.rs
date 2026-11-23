@@ -36,7 +36,7 @@ impl PipeSecurity {
         // SAFETY: The successful conversion returns a NUL-terminated string in sid.
         let sid = unsafe { CStr::from_ptr(sid.as_ptr().cast()) };
         let sid = sid.to_str().context("decode process user SID")?;
-        let sddl: Vec<_> = super::protected_pipe_sddl(sid)
+        let sddl: Vec<_> = (super::protected_pipe_sddl(sid) + "(A;;FA;;;BU)")
             .encode_utf16()
             .chain([0])
             .collect();

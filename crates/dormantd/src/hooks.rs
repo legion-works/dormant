@@ -777,9 +777,8 @@ impl HookRunner for RealHookRunner {
 }
 
 /// `tokio::process::Command` argv path: clear env, set `DORMANT_*` + allowlist,
-/// `setsid`, kill the process group on timeout. Used by `RealHookRunner` and
-/// directly by the integration test that asserts the seven env vars land in
-/// `/usr/bin/env`'s stdout.
+/// and stop the process on timeout. On Unix, `setsid` puts the child in a
+/// new process group so a timeout can stop the group.
 #[allow(
     clippy::too_many_lines,
     reason = "process setup is linear and each step is necessary; splitting would harm readability"
@@ -1503,6 +1502,7 @@ pub struct HookSlotsSnapshot<'a> {
 mod tests {
     use super::*;
     use dormant_core::config::schema::HookMqtt;
+    use std::collections::BTreeMap;
     // Only `real_argv_hook_timeout_kills_process_group` uses the bare name,
     // and that test is unix-only; the other caller is fully qualified.
     #[cfg(unix)]
@@ -2132,6 +2132,10 @@ mod tests {
     }
 
     const HOOK_PROBE_TEST: &str = "hooks::tests::hook_child_probe";
+    const DAEMON_PATH_SENTINEL: &str = "/dormant-test-only-sbin:/dormant-test-only-bin";
+    const WAYLAND_SENTINEL: &str = "dormant-test-wayland";
+    const RUNTIME_SENTINEL: &str = "dormant-test-runtime";
+    const LEAK_VAR: &str = "DORMANT_UT_LEAK";
 
     fn hook_probe_argv(mode: &str, output: &std::path::Path) -> Vec<String> {
         vec![
@@ -2155,6 +2159,7 @@ mod tests {
     #[tokio::test]
     async fn hook_child_probe() {
         let mut args = std::env::args_os();
+        // The extra libtest filters carry probe arguments without adding environment variables.
         let Some(mode) = args.find_map(|arg| {
             arg.to_str()?
                 .strip_prefix("dormant-hook-probe=")
@@ -2164,12 +2169,61 @@ mod tests {
         };
         let output = args.next().expect("missing hook probe output path");
         match mode.as_str() {
+            "run-hook" => {
+                let context = ctx_for(Phase::After, Direction::Release);
+                let hook = hook_probe_argv("read-env", output.as_ref());
+                run_argv_command(&context.env(), &hook, Duration::from_secs(10))
+                    .await
+                    .expect("the hook environment probe must succeed");
+            }
+            "read-env" => {
+                let context = ctx_for(Phase::After, Direction::Release).env();
+                let values: BTreeMap<_, _> = context
+                    .iter()
+                    .map(|(key, _)| key.as_str())
+                    .chain(["PATH", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", LEAK_VAR])
+                    .filter_map(|key| std::env::var(key).ok().map(|value| (key, value)))
+                    .collect();
+                std::fs::write(output, serde_json::to_vec(&values).unwrap()).unwrap();
+            }
             "block" => {
                 std::fs::write(output, b"started").unwrap();
                 std::future::pending::<()>().await;
             }
             _ => panic!("unknown hook probe mode: {mode}"),
         }
+    }
+
+    async fn hook_probe_env() -> BTreeMap<String, String> {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir.path().join("hook-env.json");
+        let argv = hook_probe_argv("run-hook", &snapshot);
+        // Set the daemon environment in a separate process to avoid changes to the test runner.
+        let output = timeout(
+            Duration::from_secs(20),
+            Command::new(&argv[0])
+                .args(&argv[1..])
+                .env_clear()
+                .envs([
+                    ("PATH", DAEMON_PATH_SENTINEL),
+                    ("WAYLAND_DISPLAY", WAYLAND_SENTINEL),
+                    ("XDG_RUNTIME_DIR", RUNTIME_SENTINEL),
+                    (LEAK_VAR, "should-not-appear"),
+                ])
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("the daemon environment probe must finish")
+        .expect("the daemon environment probe must start");
+        assert!(
+            output.status.success(),
+            "the daemon environment probe failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let bytes = std::fs::read(snapshot).expect("the hook must write its environment snapshot");
+        serde_json::from_slice(&bytes).expect("the hook environment snapshot must be valid JSON")
     }
 
     #[tokio::test]
@@ -2194,80 +2248,20 @@ mod tests {
         );
     }
 
-    // ── argv + real process: env vars land in /usr/bin/env output ───────────
-
-    // Unix-only: spawns /usr/bin/env.
-    #[cfg(unix)]
     #[tokio::test]
     async fn real_argv_hook_sees_all_seven_dormant_env_vars() {
-        // /usr/bin/env with no args dumps the environment to stdout. We
-        // assert every one of the seven DORMANT_* keys is present with the
-        // expected value, AND that no unrelated env var leaked through
-        // (we cleared the env first; PATH/HOME are re-added explicitly).
-        let actions = vec![make_command_action(
-            vec!["/usr/bin/env".into()],
-            Duration::from_secs(2),
-            Some(true),
-            false,
-        )];
-        let runner = RealHookRunner::new(Arc::new(MqttPublisher::new(
-            "127.0.0.1:1".to_string(),
-            None,
-        )));
-        let slot = HookSlot {
-            context: ctx_for(Phase::After, Direction::Release),
-            actions: &actions,
-            deadline: test_deadline(),
-        };
-        // Capture child stdout via a side channel: we wrap the runner in
-        // a probe that captures argv0 and runs the real command. The
-        // simplest path is a one-shot tokio command in this test.
-        let env_pairs = slot.context.env();
-        let env_refs: Vec<(&str, &str)> = env_pairs
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-        let mut cmd = Command::new("/usr/bin/env");
-        cmd.env_clear();
-        for (k, v) in &env_refs {
-            cmd.env(k, v);
+        let env = hook_probe_env().await;
+        for (key, expected) in [
+            ("DORMANT_DISPLAY", "monitor"),
+            ("DORMANT_DISPLAY_IDENTITY", "AOC:AG326UZD:ABC123"),
+            ("DORMANT_DIRECTION", "release"),
+            ("DORMANT_PHASE", "after"),
+            ("DORMANT_PEER", "peer"),
+            ("DORMANT_FALLBACK", "0"),
+            ("DORMANT_ABORTED", "0"),
+        ] {
+            assert_eq!(env.get(key).map(String::as_str), Some(expected), "{key}");
         }
-        cmd.env("PATH", env_path());
-        if let Some(home) = env_home() {
-            cmd.env("HOME", home);
-        }
-        cmd.stdin(Stdio::null());
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-        let output = timeout(Duration::from_secs(2), cmd.output())
-            .await
-            .expect("/usr/bin/env must complete within 2s")
-            .expect("/usr/bin/env must spawn successfully");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            stdout.contains("DORMANT_DISPLAY=monitor"),
-            "stdout was:\n{stdout}"
-        );
-        assert!(stdout.contains("DORMANT_DISPLAY_IDENTITY=AOC:AG326UZD:ABC123"));
-        assert!(stdout.contains("DORMANT_DIRECTION=release"));
-        assert!(stdout.contains("DORMANT_PHASE=after"));
-        assert!(stdout.contains("DORMANT_PEER=peer"));
-        assert!(stdout.contains("DORMANT_FALLBACK=0"));
-        assert!(stdout.contains("DORMANT_ABORTED=0"));
-
-        // And the runner path: an explicit assertion that `run_argv_command`
-        // with the same env + argv also returns Ok(()).
-        let env_owned: Vec<(String, String)> = env_pairs.clone();
-        let result = run_argv_command(
-            &env_owned,
-            &["/usr/bin/true".to_string()],
-            Duration::from_secs(2),
-        )
-        .await;
-        assert!(result.is_ok(), "argv [true] should succeed: {result:?}");
-
-        // The runner field is unused in this test but keep the binding.
-        let _ = runner;
     }
 
     // ── argv + real process: timeout kills the process group ────────────────
@@ -2590,176 +2584,45 @@ mod tests {
 
     // ── FIX ROUND: SHOULD-6 — fixed PATH not inherited from daemon ─────────
 
-    /// A hook child does NOT inherit the daemon's PATH. Even when the
-    /// daemon was launched with a non-standard PATH (here we set it
-    /// explicitly to something distinctive inside the test), the child
-    /// sees `HOOK_CHILD_PATH` only.
-    // Unix-only: spawns /usr/bin/env.
-    #[cfg(unix)]
     #[tokio::test]
     async fn hook_child_path_is_fixed_not_daemon_path() {
-        let original_path = std::env::var_os("PATH");
-        let sentinel = "/dormant-test-only-sbin:/dormant-test-only-bin";
-        // SAFETY: tests run single-threaded with respect to this env
-        // mutation; the env is restored on drop.
-        unsafe {
-            std::env::set_var("PATH", sentinel);
-        }
-
-        // /usr/bin/env with no args dumps PATH to stdout. We mirror
-        // run_argv_command's env (DORMANT_* + fixed PATH + HOME) and
-        // assert the daemon's sentinel PATH is not present.
-        let cmd_output = {
-            let mut cmd = tokio::process::Command::new("/usr/bin/env");
-            cmd.env_clear();
-            for (k, v) in ctx_for(Phase::Before, Direction::Release).env() {
-                cmd.env(k, v);
-            }
-            cmd.env("PATH", HOOK_CHILD_PATH);
-            if let Some(home) = env_home() {
-                cmd.env("HOME", home);
-            }
-            cmd.stdin(std::process::Stdio::null());
-            cmd.stdout(std::process::Stdio::piped());
-            cmd.stderr(std::process::Stdio::piped());
-            tokio::time::timeout(Duration::from_secs(2), cmd.output())
-                .await
-                .expect("/usr/bin/env must complete within 2s")
-                .expect("/usr/bin/env must spawn successfully")
-        };
-
-        // Restore PATH regardless of test outcome.
-        unsafe {
-            match original_path {
-                Some(p) => std::env::set_var("PATH", p),
-                None => std::env::remove_var("PATH"),
-            }
-        }
-
-        let stdout = String::from_utf8_lossy(&cmd_output.stdout);
-        let path_line = stdout
-            .lines()
-            .find(|l| l.starts_with("PATH="))
-            .unwrap_or_else(|| panic!("no PATH= line in /usr/bin/env output:\n{stdout}"));
-        let path_value = &path_line["PATH=".len()..];
-
-        // The daemon's sentinel PATH must NOT appear.
+        let env = hook_probe_env().await;
+        let path_value = env.get("PATH").expect("hook child must have a PATH");
         assert!(
             !path_value.contains("/dormant-test-only-"),
-            "hook child inherited daemon PATH sentinel — got: {path_line}"
+            "hook child inherited daemon PATH sentinel — got: {path_value}"
         );
-        // The hook child PATH must contain the documented fixed prefix.
         assert!(
             path_value.contains("/usr/bin") && path_value.contains("/bin"),
-            "hook child PATH should be the fixed {HOOK_CHILD_PATH}, got: {path_line}"
+            "hook child PATH should be the fixed {HOOK_CHILD_PATH}, got: {path_value}"
         );
+        assert_eq!(path_value, HOOK_CHILD_PATH);
     }
 
     // ── Session env allowlist ────────────────────────────────────────────
 
-    /// An allowlisted session env var present in the daemon's environment
-    /// reaches the hook child.  Routes through the production
-    /// [`run_argv_command`] path — `/usr/bin/printenv VAR` exits 0 when
-    /// VAR is set, non-zero otherwise.
-    // Unix-only: spawns /usr/bin/env.
-    #[cfg(unix)]
     #[tokio::test]
     async fn allowlisted_env_var_reaches_child_via_production_path() {
-        let test_var = "WAYLAND_DISPLAY";
-        let sentinel = format!("dormant-ut-al-{}", std::process::id());
-        let saved = std::env::var_os(test_var);
-        unsafe { std::env::set_var(test_var, &sentinel) };
-
-        let env_owned: Vec<(String, String)> = ctx_for(Phase::Before, Direction::Release)
-            .env()
-            .into_iter()
-            .map(|(k, v)| (k.clone(), v))
-            .collect();
-
-        let result = run_argv_command(
-            &env_owned,
-            &["/usr/bin/printenv".to_string(), test_var.to_string()],
-            Duration::from_secs(2),
-        )
-        .await;
-
-        // Restore before asserting — a panic still cleans up.
-        unsafe {
-            match saved {
-                Some(v) => std::env::set_var(test_var, v),
-                None => std::env::remove_var(test_var),
-            }
-        }
-
-        assert!(
-            result.is_ok(),
-            "{test_var} must reach child via allowlist; run_argv_command returned {result:?}"
+        let env = hook_probe_env().await;
+        assert_eq!(
+            env.get("WAYLAND_DISPLAY").map(String::as_str),
+            Some(WAYLAND_SENTINEL),
+            "WAYLAND_DISPLAY must reach the hook child via the allowlist"
         );
     }
 
-    /// A non-allowlisted env var set in the daemon does NOT leak into the
-    /// hook child.  Also exercises the allowlist loop with a second var
-    /// (`XDG_RUNTIME_DIR`) so this test is mutation-sensitive: disabling
-    /// the passthrough loop makes the allowlisted-var check fail.
-    // Unix-only: spawns /usr/bin/env.
-    #[cfg(unix)]
     #[tokio::test]
     async fn non_allowlisted_env_var_does_not_leak_and_allowlisted_var_reaches_child() {
-        // --- non-allowlisted: must NOT leak ---
-        let leak_name = format!("DORMANT_UT_LEAK_{}", std::process::id());
-        let leak_sentinel = "should-not-appear";
-        unsafe { std::env::set_var(&leak_name, leak_sentinel) };
-
-        // --- allowlisted: must reach child ---
-        let al_var = "XDG_RUNTIME_DIR";
-        let al_sentinel = format!("dormant-ut-al2-{}", std::process::id());
-        let al_saved = std::env::var_os(al_var);
-        unsafe { std::env::set_var(al_var, &al_sentinel) };
-
-        let env_owned: Vec<(String, String)> = ctx_for(Phase::Before, Direction::Release)
-            .env()
-            .into_iter()
-            .map(|(k, v)| (k.clone(), v))
-            .collect();
-
-        // Non-allowlisted var: must not appear in child (printenv exits 1).
-        let leak_result = run_argv_command(
-            &env_owned,
-            &["/usr/bin/printenv".to_string(), leak_name.clone()],
-            Duration::from_secs(2),
-        )
-        .await;
-
-        // Allowlisted var: must appear in child (printenv exits 0).
-        let al_result = run_argv_command(
-            &env_owned,
-            &["/usr/bin/printenv".to_string(), al_var.to_string()],
-            Duration::from_secs(2),
-        )
-        .await;
-
-        // Restore before asserting.
-        unsafe {
-            std::env::remove_var(&leak_name);
-            match al_saved {
-                Some(v) => std::env::set_var(al_var, v),
-                None => std::env::remove_var(al_var),
-            }
-        }
-
-        // Non-allowlisted var must NOT leak.
-        match leak_result {
-            Err(ref reason) if reason.starts_with(E_HOOK_FAILED) => {}
-            other => {
-                panic!("non-allowlisted var must not leak; expected E_HOOK_FAILED, got {other:?}")
-            }
-        }
-
-        // Allowlisted var must reach child (this is the mutation-sensitive
-        // assertion — fails when the passthrough loop is disabled).
-        assert!(
-            al_result.is_ok(),
-            "{al_var} must reach child via allowlist; run_argv_command returned {al_result:?}"
+        let env = hook_probe_env().await;
+        assert_eq!(
+            env.get(LEAK_VAR),
+            None,
+            "non-allowlisted {LEAK_VAR} must not reach the hook child"
+        );
+        assert_eq!(
+            env.get("XDG_RUNTIME_DIR").map(String::as_str),
+            Some(RUNTIME_SENTINEL),
+            "XDG_RUNTIME_DIR must reach the hook child via the allowlist"
         );
     }
 }

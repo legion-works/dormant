@@ -452,7 +452,7 @@ before you have configured it).
 
 ### Local Network access (macOS)
 
-If you use a local MQTT broker, give `dormantd` access to the local network.
+If `dormantd` connects to devices on your network (an MQTT broker, Home Assistant, or a Samsung TV), give it access to the local network.
 At the Local Network prompt, select **Allow**.
 If you denied access, open **System Settings → Privacy & Security → Local Network**.
 Enable access for `dormantd`.

@@ -790,31 +790,19 @@ mod tests {
         );
     }
 
-    #[derive(Default)]
-    struct HintCapture(Arc<AtomicU64>);
+    #[derive(Clone, Default)]
+    struct CaptureWriter(Arc<Mutex<Vec<String>>>);
 
-    impl tracing::Subscriber for HintCapture {
-        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-            metadata.fields().field("local_network_hint").is_some()
-        }
-
-        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::Id {
-            tracing::Id::from_u64(1)
-        }
-
-        fn record(&self, _: &tracing::Id, _: &tracing::span::Record<'_>) {}
-
-        fn record_follows_from(&self, _: &tracing::Id, _: &tracing::Id) {}
-
-        fn event(&self, event: &tracing::Event<'_>) {
-            if self.enabled(event.metadata()) {
-                self.0.fetch_add(1, Ordering::Relaxed);
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Ok(s) = std::str::from_utf8(buf) {
+                self.0.lock().unwrap().push(s.to_string());
             }
+            Ok(buf.len())
         }
-
-        fn enter(&self, _: &tracing::Id) {}
-
-        fn exit(&self, _: &tracing::Id) {}
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     #[derive(Clone)]
@@ -1654,9 +1642,13 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn local_network_hint_logs_once_until_connack() {
-        let capture = HintCapture::default();
-        let hints = Arc::clone(&capture.0);
-        let _guard = tracing::subscriber::set_default(capture);
+        let writer = CaptureWriter::default();
+        let lines = Arc::clone(&writer.0);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
         let source = MqttSource::new(
             "tcp://localhost:1883".into(),
             vec![(SensorId("desk".into()), make_cfg("/occupancy"))],
@@ -1690,11 +1682,13 @@ mod tests {
         })
         .await
         .expect("script did not report both outages");
-        assert_eq!(
-            hints.load(Ordering::Relaxed),
-            2,
-            "expected one hint per outage"
-        );
+        let hints = lines
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.contains("local_network_hint=true"))
+            .count();
+        assert_eq!(hints, 2, "expected one hint per outage");
     }
 
     #[tokio::test(flavor = "current_thread")]

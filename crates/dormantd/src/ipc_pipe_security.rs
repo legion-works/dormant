@@ -1,4 +1,4 @@
-//! Windows IPC security descriptor and DACL readback.
+//! Security descriptor for the Windows IPC named pipe, plus a test-only DACL readback.
 
 use std::ffi::{CStr, OsStr, c_void};
 use std::io;
@@ -17,14 +17,14 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-pub(super) struct PipeSecurity(LocalAllocation<c_void>);
+pub(crate) struct PipeSecurity(LocalAllocation<c_void>);
 
 // SAFETY: Win32 returns a self-relative descriptor with no pointers into other allocations.
 // LocalFree can release it on any thread. PipeSecurity owns the allocation exclusively.
 unsafe impl Send for PipeSecurity {}
 
 impl PipeSecurity {
-    pub(super) fn for_current_user() -> Result<Self> {
+    pub(crate) fn for_current_user() -> Result<Self> {
         let user = ProcessTokenUser::query()?;
         let mut sid = ptr::null_mut();
         // SAFETY: user keeps the SID valid. sid is a writable pointer slot.
@@ -36,7 +36,7 @@ impl PipeSecurity {
         // SAFETY: The successful conversion returns a NUL-terminated string in sid.
         let sid = unsafe { CStr::from_ptr(sid.as_ptr().cast()) };
         let sid = sid.to_str().context("decode process user SID")?;
-        let sddl: Vec<_> = super::protected_pipe_sddl(sid)
+        let sddl: Vec<_> = crate::ipc::protected_pipe_sddl(sid)
             .encode_utf16()
             .chain([0])
             .collect();
@@ -59,7 +59,7 @@ impl PipeSecurity {
         Ok(Self(LocalAllocation(descriptor)))
     }
 
-    pub(super) fn create(&self, name: &OsStr, first: bool) -> io::Result<NamedPipeServer> {
+    pub(crate) fn create(&self, name: &OsStr, first: bool) -> io::Result<NamedPipeServer> {
         // SECURITY: Every instance uses a protected DACL that grants access only to the
         // current user's SID. A second-user test on Windows hardware is still necessary.
         let mut attrs = SECURITY_ATTRIBUTES {
@@ -150,7 +150,7 @@ impl ProcessTokenUser {
 }
 
 #[cfg(test)]
-pub(super) fn assert_current_user_dacl(
+pub(crate) fn assert_current_user_dacl(
     server: &tokio::net::windows::named_pipe::NamedPipeServer,
     instance: &str,
 ) {

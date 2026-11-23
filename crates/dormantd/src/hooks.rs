@@ -917,7 +917,7 @@ pub(crate) async fn run_argv_command(
             // This path does not use a Windows `Job Object` to stop the child's descendants.
             #[cfg(not(unix))]
             if let Err(error) = child.start_kill() {
-                warn!(event = "hook_timeout_kill_failed", pid = child.id(), %error);
+                warn!(event = "hook_timeout_kill_failed", pid = child.id().unwrap_or_default(), error = %error);
             }
             // Reap so the OS does not leak a zombie.
             let _ = child.wait().await;
@@ -2346,7 +2346,7 @@ mod tests {
         assert_eq!(Phase::After.as_str(), "after");
     }
 
-    // ── FIX ROUND: MUST-1 — connect bounded by per-hook timeout ────────────
+    // ── connect bounded by per-hook timeout ────────────
 
     /// Real-broker-down test (MUST-1): an unreachable broker must NOT
     /// block the hook forever. The per-hook timeout bounds the whole
@@ -2382,7 +2382,7 @@ mod tests {
         }
     }
 
-    // ── FIX ROUND: SHOULD-3 — client reuse across calls ────────────────────
+    // ── client reuse across calls ────────────────────
 
     /// Client-reuse test (SHOULD-3): after a successful publish the
     /// publisher caches the `AsyncClient` + `EventLoop`; a second call
@@ -2487,7 +2487,7 @@ mod tests {
         );
     }
 
-    // ── FIX ROUND: SHOULD-4 — direction-gated abort event names ──────────
+    // ── direction-gated abort event names ──────────
 
     /// Release abort emits `claim_release_aborted`; acquire abort emits
     /// `claim_acquire_aborted`. Captured via a custom tracing subscriber.
@@ -2545,7 +2545,7 @@ mod tests {
         }
     }
 
-    // ── FIX ROUND: SHOULD-5 — hook error codes ────────────────────────────
+    // ── hook error codes ────────────────────────────
 
     /// Hook timeouts use `E_HOOK_TIMEOUT`; other hook failures use
     /// `E_HOOK_FAILED`. The discriminator is `is_timeout_error`.
@@ -2579,7 +2579,7 @@ mod tests {
         assert!(err.to_string().starts_with(E_HOOK_TIMEOUT));
     }
 
-    // ── FIX ROUND: SHOULD-6 — fixed PATH not inherited from daemon ─────────
+    // ── fixed PATH not inherited from daemon ─────────
 
     #[tokio::test]
     async fn hook_child_path_is_fixed_not_daemon_path() {

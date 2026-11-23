@@ -39,13 +39,10 @@ use crate::direct_switch::{DirectSwitchHandle, SwitchReason, switch_outcome_labe
 use crate::state_publisher::SnapshotResult;
 
 #[cfg(windows)]
-#[path = "ipc_pipe_security.rs"]
-mod pipe_security;
-#[cfg(windows)]
-use pipe_security::PipeSecurity;
+use crate::ipc_pipe_security::PipeSecurity;
 
 #[cfg(any(windows, test))]
-fn protected_pipe_sddl(user_sid: &str) -> String {
+pub(crate) fn protected_pipe_sddl(user_sid: &str) -> String {
     // FA includes FILE_CREATE_PIPE_INSTANCE, which the daemon needs for replacement instances.
     format!("D:P(A;;FA;;;{user_sid})")
 }
@@ -2163,12 +2160,12 @@ mod tests {
             super::PipeSecurity::for_current_user().expect("build pipe security descriptor");
         let first =
             super::create_first_pipe_instance(name, &security).expect("create first pipe instance");
-        super::pipe_security::assert_current_user_dacl(&first, "first instance");
+        crate::ipc_pipe_security::assert_current_user_dacl(&first, "first instance");
 
         let next = security
             .create(name, false)
             .expect("create replacement pipe while the first instance is open");
-        super::pipe_security::assert_current_user_dacl(&next, "replacement instance");
+        crate::ipc_pipe_security::assert_current_user_dacl(&next, "replacement instance");
     }
 
     /// Round-trip over a real Windows named pipe: create a server instance,

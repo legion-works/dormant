@@ -33,7 +33,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 time = { workspace = true }
 [target.'cfg(windows)'.dependencies]
-# Single-instance guard uses LockFileEx. Pinned to 0.61.2 — already in the lock
+# The single-instance guard (LockFileEx) and the IPC pipe security
+# descriptor use these APIs. Pinned to 0.61.2 — already in the lock
 # (tokio, zbus, mio, …) so this adds no fourth duplicate build.
 windows-sys = { version = "0.61.2", features = [
   "Win32_Foundation",

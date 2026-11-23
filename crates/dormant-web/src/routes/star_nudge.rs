@@ -426,28 +426,31 @@ mod tests {
         assert!(flag_path.exists());
     }
 
-    // Unix-only: resolves the stub through PATH; Rust's Command on Windows only tries the bare name and `.exe`, never PATHEXT, so a `.cmd` stub is unreachable by PATH lookup (real `gh` is `gh.exe`, so production lookup is unaffected).
-    #[cfg(unix)]
     #[tokio::test]
     async fn post_star_route_returns_starred_true_with_stub_injected() {
-        // Uses the test-only PATH override on GhStar (via star_test_path
-        // seam) so the stub directory is injected without mutating global
-        // PATH — no parallel-test race.
         let dir = tempfile::tempdir().unwrap();
-        write_stub_gh(dir.path());
+        let stub = write_stub_gh(dir.path());
         let (mut state, _cancel) = state_in_dir(dir.path());
         let flag_path = dir.path().join("star-nudge-dismissed");
         assert!(!flag_path.exists());
 
         let inner_ref =
             Arc::get_mut(&mut state.inner).expect("state must have a unique strong reference");
-        inner_ref.star_test_path = Some(dir.path().to_path_buf());
+        // Windows PATH lookup for `gh` does not try the `.cmd` extension.
+        #[cfg(unix)]
+        {
+            inner_ref.star_test_path = Some(stub.parent().unwrap().to_path_buf());
+        }
+        #[cfg(not(unix))]
+        {
+            inner_ref.star_gh_path = Some(stub);
+        }
 
         let result = post_star_nudge_star(State(state)).await;
         assert!(result.is_ok());
         assert!(
             result.unwrap().starred,
-            "starred must be true when stub gh is on the injected test PATH"
+            "starred must be true when the injected gh stub succeeds"
         );
 
         assert!(flag_path.exists());

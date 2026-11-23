@@ -35,13 +35,10 @@
 //! 5. Everything else is cleared — a hook child cannot read unrelated
 //!    secrets or the daemon's build environment out of its parent's env.
 //!
-//! On Unix, each child is started in a fresh session via `setsid(2)` in
-//! `pre_exec` so its process-group id is itself. On timeout the engine
-//! `kill(-pid, SIGKILL)`s the entire group, taking any grandchildren
-//! with it (the existing `CommandSink` controller's timeout only kills the
-//! direct child — KVM hooks may shell out to bash, which forks helpers, and
-//! a stuck helper must not outlive the hook's bound).
-//! On Windows, a timeout stops only the direct child.
+//! On Unix, the runner calls `setsid(2)` in `pre_exec` to give the child its
+//! own process group. On timeout, `kill(-pid, SIGKILL)` stops the group.
+//! This stops the child and its descendants. On Windows, a timeout stops
+//! the child but not its descendants.
 //!
 //! ## MQTT action
 //!
@@ -917,7 +914,7 @@ pub(crate) async fn run_argv_command(
                     }
                 }
             }
-            // Windows stops only the direct child. There is no job object to stop its children.
+            // This path does not use a Windows `Job Object` to stop the child's descendants.
             #[cfg(not(unix))]
             if let Err(error) = child.start_kill() {
                 warn!(event = "hook_timeout_kill_failed", pid = child.id(), %error);
@@ -2159,7 +2156,7 @@ mod tests {
     #[tokio::test]
     async fn hook_child_probe() {
         let mut args = std::env::args_os();
-        // The extra libtest filters carry probe arguments without adding environment variables.
+        // Libtest accepts the probe arguments as filters, so argv can include the output path.
         let Some(mode) = args.find_map(|arg| {
             arg.to_str()?
                 .strip_prefix("dormant-hook-probe=")
@@ -2198,7 +2195,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let snapshot = dir.path().join("hook-env.json");
         let argv = hook_probe_argv("run-hook", &snapshot);
-        // Set the daemon environment in a separate process to avoid changes to the test runner.
+        // Set the daemon environment in the probe process, not in the test runner.
         let output = timeout(
             Duration::from_secs(20),
             Command::new(&argv[0])
@@ -2266,7 +2263,7 @@ mod tests {
 
     // ── argv + real process: timeout kills the process group ────────────────
 
-    // POSIX process groups do not exist on Windows. Windows stops only the direct child.
+    // Windows does not use POSIX process groups.
     #[cfg(unix)]
     #[tokio::test]
     async fn real_argv_hook_timeout_kills_process_group() {

@@ -570,6 +570,12 @@ fn default_state_path() -> Option<PathBuf> {
 
 fn token_state_path_with(target: TargetOs, env: PathEnv) -> Option<PathBuf> {
     if target == TargetOs::Windows {
+        // Without a per-user base, `state_dir_with` falls back to
+        // `C:\ProgramData`, which every local user can read. The token stays
+        // in memory only in that case.
+        if env.localappdata.is_none() && env.userprofile.is_none() {
+            return None;
+        }
         return Some(dormant_core::paths::state_dir_with(target, &env).join(TOKEN_STATE_FILENAME));
     }
     state_path_from(env.xdg_state_home, env.home)
@@ -1327,9 +1333,15 @@ mod tests {
             "Windows must fall back to USERPROFILE without LOCALAPPDATA"
         );
         assert_eq!(
-            token_state_path_with(TargetOs::Windows, PathEnv::default()),
-            Some(Path::new(r"C:\ProgramData").join(&suffix)),
-            "Windows must use the shared state directory fallback without either variable"
+            token_state_path_with(
+                TargetOs::Windows,
+                PathEnv {
+                    programdata: Some(OsString::from(r"C:\ProgramData")),
+                    ..PathEnv::default()
+                },
+            ),
+            None,
+            "Windows must not persist the token to the machine-wide fallback directory"
         );
     }
 

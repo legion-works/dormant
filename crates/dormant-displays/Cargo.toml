@@ -41,6 +41,12 @@ ddc-hi = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", default-features = false, features = ["fs", "std"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+  "Win32_Storage_FileSystem",
+  "Win32_System_IO",
+] }
+
 # Thin macOS-only FFI surface for `macos_display_catalog` (stable-UUID
 # display resolution via CFUUID + the raw Quartz gamma-table calls).
 # `core-foundation-sys` is the minimal, no-abstraction binding crate — this

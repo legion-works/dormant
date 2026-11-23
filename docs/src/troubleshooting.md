@@ -83,6 +83,19 @@ The two flags are mutually exclusive with each other and with any doctor subcomm
 | `E_DISPLAY_IO` | Display controller I/O error | Network controller: host reachable? DDC/CI: I2C bus accessible? Command: binary exists? |
 | `E_IPC` | Inter-process communication error | Check that `dormantd` is running. Verify the socket path matches between daemon and CLI. |
 
+## Local network connections fail on macOS
+
+**Symptom:** `dormantd` cannot reach the MQTT broker, Home Assistant, or the
+Samsung TV, and the log shows `No route to host (os error 65)`. A connection
+from `nc` to the same address succeeds.
+
+**Cause:** macOS Local Network privacy blocks `dormantd`. A rebuild or an
+update can make macOS ask for access again.
+
+Open **System Settings → Privacy & Security → Local Network**. Enable access
+for `dormantd`. For the MQTT broker, the daemon log and
+`dormantctl doctor mqtt` show this hint.
+
 ## Display will not blank
 
 ### Sensor is stale

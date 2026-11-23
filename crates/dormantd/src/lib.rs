@@ -25,6 +25,8 @@ pub mod idle_source;
 pub mod inhibit_activity;
 pub mod inhibit_audio;
 pub mod ipc;
+#[cfg(windows)]
+mod ipc_pipe_security;
 pub mod logging;
 #[cfg(target_os = "macos")]
 pub mod macos_input_filter;

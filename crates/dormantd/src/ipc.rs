@@ -27,7 +27,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use tokio::net::UnixListener;
 #[cfg(windows)]
-use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+use tokio::net::windows::named_pipe::NamedPipeServer;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -37,6 +37,15 @@ use crate::active_sampler::{
 };
 use crate::direct_switch::{DirectSwitchHandle, SwitchReason, switch_outcome_label};
 use crate::state_publisher::SnapshotResult;
+
+#[cfg(windows)]
+use crate::ipc_pipe_security::PipeSecurity;
+
+#[cfg(any(windows, test))]
+pub(crate) fn protected_pipe_sddl(user_sid: &str) -> String {
+    // FA includes FILE_CREATE_PIPE_INSTANCE, which the daemon needs for replacement instances.
+    format!("D:P(A;;FA;;;{user_sid})")
+}
 
 /// Maximum line length for IPC requests/responses (1 MB).
 const MAX_LINE_BYTES: usize = 1_048_576;
@@ -290,12 +299,14 @@ pub fn spawn(
     #[cfg(windows)]
     {
         let pipe_name = socket_path.as_os_str().to_os_string();
-        let first = create_first_pipe_instance(&pipe_name)?;
+        let security = PipeSecurity::for_current_user()?;
+        let first = create_first_pipe_instance(&pipe_name, &security)?;
         tracing::info!(event = "ipc_listening", pipe = %pipe_name.to_string_lossy());
         Ok(tokio::spawn(async move {
             run_pipe(
                 first,
                 pipe_name,
+                security,
                 ctl_tx,
                 reload_requester,
                 doctor_service,
@@ -326,35 +337,28 @@ pub fn spawn(
 /// owns the first instance" failure to the same error shape the Unix path
 /// produces for a live daemon.
 #[cfg(windows)]
-fn create_first_pipe_instance(pipe_name: &std::ffi::OsStr) -> Result<NamedPipeServer> {
+fn create_first_pipe_instance(
+    pipe_name: &std::ffi::OsStr,
+    security: &PipeSecurity,
+) -> Result<NamedPipeServer> {
     // ERROR_ACCESS_DENIED (Win32 error 5) is what `CreateNamedPipe` returns
     // when `first_pipe_instance(true)` is requested but another process already
     // holds the first instance — the named-pipe analogue of a live daemon's
     // socket.
     const ERROR_ACCESS_DENIED: i32 = 5;
-    ServerOptions::new()
-        .first_pipe_instance(true)
-        // SECURITY: the default named-pipe DACL is NOT equivalent to the Unix
-        // socket's 0600 mode — it grants access to the local Users group, not
-        // just the owning user.  A per-user security descriptor is NOT yet
-        // applied; tightening the pipe ACL is tracked as follow-up work.
-        // `reject_remote_clients(true)` is tokio's default, but it is set
-        // explicitly here so a future edit cannot silently drop it.
-        .reject_remote_clients(true)
-        .create(pipe_name)
-        .map_err(|e| {
-            if e.raw_os_error() == Some(ERROR_ACCESS_DENIED) {
-                anyhow::anyhow!(
-                    "pipe '{}' is already in use by a running daemon",
-                    pipe_name.to_string_lossy()
-                )
-            } else {
-                anyhow::Error::new(e).context(format!(
-                    "create named pipe '{}'",
-                    pipe_name.to_string_lossy()
-                ))
-            }
-        })
+    security.create(pipe_name, true).map_err(|e| {
+        if e.raw_os_error() == Some(ERROR_ACCESS_DENIED) {
+            anyhow::anyhow!(
+                "pipe '{}' is already in use by a running daemon",
+                pipe_name.to_string_lossy()
+            )
+        } else {
+            anyhow::Error::new(e).context(format!(
+                "create named pipe '{}'",
+                pipe_name.to_string_lossy()
+            ))
+        }
+    })
 }
 
 /// Spawn a per-connection handler task, cloning the shared dependencies.
@@ -435,6 +439,7 @@ async fn run_unix(
 async fn run_pipe(
     mut server: NamedPipeServer,
     pipe_name: std::ffi::OsString,
+    security: PipeSecurity,
     ctl_tx: mpsc::Sender<ControlMsg>,
     reload_requester: ReloadRequester,
     doctor_service: DoctorService,
@@ -466,7 +471,7 @@ async fn run_pipe(
                     &direct_switch,
                     &wear_sampling,
                 );
-                server = match ServerOptions::new().create(&pipe_name) {
+                server = match security.create(&pipe_name, false) {
                     Ok(next) => next,
                     Err(e) => {
                         tracing::error!(event = "ipc_pipe_create_error", error = %e);
@@ -2128,6 +2133,15 @@ mod tests {
 
     // ── Windows named-pipe transport ─────────────────────────────────────
 
+    #[test]
+    fn windows_pipe_sddl_grants_file_all_access_to_only_the_user_sid() {
+        assert_eq!(
+            super::protected_pipe_sddl("S-1-5-21-123-456-789-1001"),
+            "D:P(A;;FA;;;S-1-5-21-123-456-789-1001)",
+            "SDDL must protect the DACL and grant file all access to one SID"
+        );
+    }
+
     /// Unique pipe name per test so parallel runs cannot collide.
     #[cfg(windows)]
     fn unique_pipe_name(tag: &str) -> String {
@@ -2137,6 +2151,23 @@ mod tests {
         format!(r"\\.\pipe\dormant-test-{tag}-{}-{n}", std::process::id())
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_named_pipe_dacl_is_protected_and_user_only() {
+        let pipe_name = unique_pipe_name("protected-dacl");
+        let name = std::ffi::OsStr::new(&pipe_name);
+        let security =
+            super::PipeSecurity::for_current_user().expect("build pipe security descriptor");
+        let first =
+            super::create_first_pipe_instance(name, &security).expect("create first pipe instance");
+        crate::ipc_pipe_security::assert_current_user_dacl(&first, "first instance");
+
+        let next = security
+            .create(name, false)
+            .expect("create replacement pipe while the first instance is open");
+        crate::ipc_pipe_security::assert_current_user_dacl(&next, "replacement instance");
+    }
+
     /// Round-trip over a real Windows named pipe: create a server instance,
     /// connect a client, send a request, and read the response.  The handler
     /// is the same generic `handle_connection` the Unix path uses.
@@ -2144,12 +2175,13 @@ mod tests {
     #[tokio::test]
     async fn windows_named_pipe_round_trip() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+        use tokio::net::windows::named_pipe::ClientOptions;
 
         let pipe_name = unique_pipe_name("round-trip");
-        let server = ServerOptions::new()
-            .first_pipe_instance(true)
-            .create(&pipe_name)
+        let name = std::ffi::OsString::from(&pipe_name);
+        let security =
+            super::PipeSecurity::for_current_user().expect("build pipe security descriptor");
+        let server = super::create_first_pipe_instance(&name, &security)
             .expect("create first pipe instance");
 
         let (ctl_tx, _cancel) = fake_engine();
@@ -2165,18 +2197,18 @@ mod tests {
             consent_gate: ConsentGate::default(),
         };
 
-        let server_task = tokio::spawn(async move {
-            server.connect().await.expect("client connects to the pipe");
-            super::handle_connection(
-                server,
-                ctl_tx,
-                dormant_core::reload::ReloadRequester::new(reload_tx),
-                doctor,
-                ds,
-                wear_sampling,
-            )
-            .await;
-        });
+        let cancel = CancellationToken::new();
+        let server_task = tokio::spawn(super::run_pipe(
+            server,
+            name,
+            security,
+            ctl_tx,
+            dormant_core::reload::ReloadRequester::new(reload_tx),
+            doctor,
+            ds,
+            cancel.clone(),
+            wear_sampling,
+        ));
 
         let mut client = ClientOptions::new()
             .open(&pipe_name)
@@ -2204,7 +2236,11 @@ mod tests {
             "a dropped engine must yield an error response over the named pipe"
         );
 
-        drop(client);
+        let replacement = ClientOptions::new()
+            .open(&pipe_name)
+            .expect("open another client while the first client is connected");
+        drop((replacement, client));
+        cancel.cancel();
         server_task
             .await
             .expect("server task completes on disconnect");
@@ -2248,11 +2284,13 @@ mod tests {
     async fn windows_second_daemon_gets_the_already_running_error() {
         let pipe_name = unique_pipe_name("already-running");
         let name = std::ffi::OsString::from(&pipe_name);
+        let security =
+            super::PipeSecurity::for_current_user().expect("build pipe security descriptor");
 
-        let _first =
-            super::create_first_pipe_instance(&name).expect("first daemon creates the pipe");
+        let _first = super::create_first_pipe_instance(&name, &security)
+            .expect("first daemon creates the pipe");
 
-        let error = super::create_first_pipe_instance(&name)
+        let error = super::create_first_pipe_instance(&name, &security)
             .expect_err("a second daemon must be refused the pipe");
         let rendered = format!("{error}");
         assert!(

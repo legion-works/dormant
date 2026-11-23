@@ -34,3 +34,4 @@ test-util = []
 
 [dev-dependencies]
 dormant-sensors = { path = ".", features = ["test-util"] }
+tracing-subscriber = { workspace = true }

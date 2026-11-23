@@ -232,6 +232,8 @@ using the setup script below. Windows has not yet been verified on hardware.
 - **Sensors.** MQTT, Home Assistant WebSocket, and USB-serial mmWave radar all
   work; serial ports are named `COM3` rather than `/dev/ttyUSB0`.
 - **The daemon, CLI, and Web UI**, including config apply and reload.
+- **Samsung IP Control tokens survive a restart.** The daemon saves these
+  tokens to `samsung-ip-tokens.json` in the state directory.
 - **User-activity inhibition**, via `GetLastInputInfo`. `idle_source = "auto"`
   selects it; `"windows"` forces it.
 
@@ -253,9 +255,6 @@ using the setup script below. Windows has not yet been verified on hardware.
   systemd-only, exactly as on macOS. Crash-loop detection and last-known-good
   rollback still work — they count process starts from dormant's own state
   files, not from a supervisor.
-- **Samsung TV tokens do not survive a restart.** Token persistence is
-  fail-closed on Windows pending an exercised file lock, so pairing is
-  re-requested after each daemon start.
 
 The available controllers are exactly `command`, `ddcci`, `ha-passthrough`, and
 `samsung-tizen`. Config validation rejects anything else, so a Linux config
@@ -450,6 +449,14 @@ Binaries land in `~/.local/bin/`, same as Linux. The installer also prints
 the next step — it deliberately does not run `dormantctl launchd install`
 or `launchctl bootstrap` for you (that would start a background daemon
 before you have configured it).
+
+### Local Network access (macOS)
+
+If `dormantd` connects to devices on your network (an MQTT broker, Home Assistant, or a Samsung TV), give it access to the local network.
+At the Local Network prompt, select **Allow**.
+If you denied access, open **System Settings → Privacy & Security → Local Network**.
+Enable access for `dormantd`.
+After a rebuild or update, macOS can show the prompt again.
 
 ### LaunchAgent (macOS)
 

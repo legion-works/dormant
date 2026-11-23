@@ -222,6 +222,14 @@ mod tests {
     use indexmap::IndexMap;
 
     #[test]
+    fn broker_connection_failure_has_no_hint_off_macos() {
+        let error = rumqttc::ConnectionError::Io(std::io::Error::from_raw_os_error(65));
+        let result = broker_connection_failure("mqtt desk".into(), &error, false);
+        assert_eq!(result.status, crate::types::ProbeStatus::Fail);
+        assert_eq!(result.detail, format!("broker connection error: {error}"));
+    }
+
+    #[test]
     fn broker_connection_failure_includes_macos_local_network_hint() {
         let error = rumqttc::ConnectionError::Io(std::io::Error::from_raw_os_error(65));
         let result = broker_connection_failure("mqtt desk".into(), &error, true);

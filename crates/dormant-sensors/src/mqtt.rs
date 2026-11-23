@@ -454,7 +454,7 @@ impl MqttSource {
             self.topics.len(),
             self.credential.as_ref(),
         )?;
-        self.run_with_event_loop(eventloop, tx, ctl_tx, cancel)
+        self.run_with_event_loop(eventloop, tx, ctl_tx, cancel, cfg!(target_os = "macos"))
             .await
     }
 
@@ -464,6 +464,7 @@ impl MqttSource {
         tx: mpsc::Sender<PresenceEvent>,
         ctl_tx: mpsc::Sender<ControlMsg>,
         cancel: CancellationToken,
+        is_macos: bool,
     ) -> anyhow::Result<()> {
         let topics = self.topics.clone();
 
@@ -472,6 +473,7 @@ impl MqttSource {
         let mut warned_topics: HashSet<String> = HashSet::new();
         let mut warned_availability: HashSet<(String, String)> = HashSet::new();
         let mut outage_reported = false;
+        let mut local_network_hint_logged = false;
 
         let mut pending_subacks: HashMap<u16, String> = HashMap::new();
         let mut acknowledged_subscriptions = 0;
@@ -529,6 +531,7 @@ impl MqttSource {
                                 Self::subscribe_topics(eventloop.as_mut(), &topics, lifecycle).await;
                             backoff = BACKOFF_MIN;
                             outage_reported = false;
+                            local_network_hint_logged = false;
                         }
                         Ok(Event::Outgoing(Outgoing::Subscribe(pkid))) => {
                             if let Some(topic) = topics.get(outgoing_subscriptions) {
@@ -561,6 +564,14 @@ impl MqttSource {
                         Ok(_) => {}
                         Err(e) => {
                             warn!("mqtt: connection error on '{}': {e}", self.broker_url);
+                            if !local_network_hint_logged
+                                && let Some(rumqttc::ConnectionError::Io(error)) =
+                                    e.downcast_ref::<rumqttc::ConnectionError>()
+                                && let Some(hint) = macos_local_network_hint(is_macos, error)
+                            {
+                                warn!(local_network_hint = true, "mqtt: '{}': {hint}", self.broker_url);
+                                local_network_hint_logged = true;
+                            }
                             if !outage_reported {
                                 self.emit_unavailable_all(&tx).await;
                                 outage_reported = true;
@@ -602,6 +613,16 @@ impl SensorSource for MqttSource {
     ) -> anyhow::Result<()> {
         self.run_source(tx, ctl_tx, cancel).await
     }
+}
+
+/// Return a Local Network privacy hint for a macOS host-unreachable error.
+#[must_use]
+pub fn macos_local_network_hint(is_macos: bool, error: &std::io::Error) -> Option<&'static str> {
+    const MACOS_EHOSTUNREACH: i32 = 65;
+    (is_macos && error.raw_os_error() == Some(MACOS_EHOSTUNREACH)).then_some(
+        "macOS Local Network privacy can block access to the broker. \
+         Open System Settings → Privacy & Security → Local Network and enable access for dormantd.",
+    )
 }
 
 // ── Payload parsing ───────────────────────────────────────────────────────────
@@ -739,14 +760,75 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
+    #[test]
+    fn local_network_hint_requires_macos() {
+        let error = std::io::Error::from_raw_os_error(65);
+        assert!(
+            macos_local_network_hint(true, &error).is_some(),
+            "macOS error 65 must have a hint"
+        );
+        assert_eq!(
+            macos_local_network_hint(false, &error),
+            None,
+            "error 65 on another OS must not have a hint"
+        );
+        assert_eq!(
+            macos_local_network_hint(false, &std::io::Error::from_raw_os_error(113)),
+            None
+        );
+    }
+
+    #[test]
+    fn local_network_hint_requires_macos_host_unreachable_errno() {
+        assert_eq!(
+            macos_local_network_hint(true, &std::io::Error::from_raw_os_error(61)),
+            None
+        );
+        assert_eq!(
+            macos_local_network_hint(true, &std::io::Error::other("no route")),
+            None
+        );
+    }
+
+    #[derive(Default)]
+    struct HintCapture(Arc<AtomicU64>);
+
+    impl tracing::Subscriber for HintCapture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.fields().field("local_network_hint").is_some()
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::Id {
+            tracing::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::Id, _: &tracing::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            if self.enabled(event.metadata()) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        fn enter(&self, _: &tracing::Id) {}
+
+        fn exit(&self, _: &tracing::Id) {}
+    }
+
     #[derive(Clone)]
     struct ScriptedEventLoop {
-        events: Arc<Mutex<VecDeque<Event>>>,
+        events: Arc<Mutex<VecDeque<anyhow::Result<Event>>>>,
         subscriptions: Arc<Mutex<Vec<String>>>,
     }
 
     impl ScriptedEventLoop {
         fn new(events: impl IntoIterator<Item = Event>) -> Self {
+            Self::from_results(events.into_iter().map(Ok))
+        }
+
+        fn from_results(events: impl IntoIterator<Item = anyhow::Result<Event>>) -> Self {
             Self {
                 events: Arc::new(Mutex::new(events.into_iter().collect())),
                 subscriptions: Arc::new(Mutex::new(Vec::new())),
@@ -763,7 +845,7 @@ mod tests {
         async fn poll(&mut self) -> anyhow::Result<Event> {
             loop {
                 if let Some(event) = self.events.lock().expect("script lock").pop_front() {
-                    return Ok(event);
+                    return event;
                 }
                 tokio::task::yield_now().await;
             }
@@ -1571,6 +1653,51 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn local_network_hint_logs_once_until_connack() {
+        let capture = HintCapture::default();
+        let hints = Arc::clone(&capture.0);
+        let _guard = tracing::subscriber::set_default(capture);
+        let source = MqttSource::new(
+            "tcp://localhost:1883".into(),
+            vec![(SensorId("desk".into()), make_cfg("/occupancy"))],
+            None,
+        );
+        let unreachable =
+            || Err(rumqttc::ConnectionError::Io(std::io::Error::from_raw_os_error(65)).into());
+        let fake = ScriptedEventLoop::from_results([
+            unreachable(),
+            unreachable(),
+            Ok(Event::Incoming(Packet::ConnAck(rumqttc::ConnAck {
+                session_present: false,
+                code: ConnectReturnCode::Success,
+            }))),
+            unreachable(),
+        ]);
+        let (tx, mut rx) = mpsc::channel(4);
+        let (ctl_tx, _ctl_rx) = mpsc::channel(4);
+        let cancel = CancellationToken::new();
+        let run =
+            Box::new(source).run_with_event_loop(Box::new(fake), tx, ctl_tx, cancel.clone(), true);
+        let check = async {
+            for _ in 0..2 {
+                assert!(rx.recv().await.is_some(), "source must report each outage");
+            }
+            cancel.cancel();
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (result, ()) = tokio::join!(run, check);
+            result.expect("source run");
+        })
+        .await
+        .expect("script did not report both outages");
+        assert_eq!(
+            hints.load(Ordering::Relaxed),
+            2,
+            "expected one hint per outage"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn scripted_connack_queues_one_batch_and_no_batch_before_connack() {
         let source = MqttSource::new(
             "tcp://localhost:1883".into(),
@@ -1603,6 +1730,7 @@ mod tests {
                 tx,
                 ctl_tx,
                 cancel.clone(),
+                cfg!(target_os = "macos"),
             ),
         );
         let mut lifecycle = Vec::new();
@@ -1669,6 +1797,7 @@ mod tests {
                 tx,
                 ctl_tx,
                 cancel.clone(),
+                cfg!(target_os = "macos"),
             ),
         );
         let mut subscribed = 0;
@@ -1719,6 +1848,7 @@ mod tests {
                 tx,
                 ctl_tx,
                 cancel.clone(),
+                cfg!(target_os = "macos"),
             ),
         );
         assert_eq!(lifecycle_rx.recv().await, Some(MqttLifecycle::Connected));

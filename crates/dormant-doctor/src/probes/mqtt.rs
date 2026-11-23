@@ -4,7 +4,7 @@ use crate::types::ProbeResult;
 use dormant_core::config::schema::{Credentials, MqttCredential, MqttSensorCfg};
 use dormant_core::mqtt::parse_broker_url;
 use dormant_core::types::SensorState;
-use dormant_sensors::mqtt::parse_payload;
+use dormant_sensors::mqtt::{macos_local_network_hint, parse_payload};
 use rumqttc::{AsyncClient, MqttOptions, QoS};
 use std::time::Duration;
 
@@ -90,7 +90,7 @@ pub(crate) async fn probe_mqtt_one(
                         not_authorized_detail(&cfg.broker_url, credential_lookup),
                     );
                 }
-                return ProbeResult::fail(name, format!("broker connection error: {e}"));
+                return broker_connection_failure(name, &e, cfg!(target_os = "macos"));
             }
             Err(_elapsed) => break, // timeout
         }
@@ -102,6 +102,20 @@ pub(crate) async fn probe_mqtt_one(
 }
 
 // ── Pure helpers — testable without a broker ─────────────────────────────────────
+
+fn broker_connection_failure(
+    name: String,
+    error: &rumqttc::ConnectionError,
+    is_macos: bool,
+) -> ProbeResult {
+    let detail = format!("broker connection error: {error}");
+    if let rumqttc::ConnectionError::Io(io_error) = error
+        && let Some(hint) = macos_local_network_hint(is_macos, io_error)
+    {
+        return ProbeResult::fail(name, format!("{detail}. {hint}"));
+    }
+    ProbeResult::fail(name, detail)
+}
 
 /// Map one incoming publish to `(state, was_retained)`.
 ///
@@ -206,6 +220,25 @@ fn not_authorized_detail(broker_url: &str, credential: Option<&MqttCredential>) 
 mod tests {
     use super::*;
     use indexmap::IndexMap;
+
+    #[test]
+    fn broker_connection_failure_includes_macos_local_network_hint() {
+        let error = rumqttc::ConnectionError::Io(std::io::Error::from_raw_os_error(65));
+        let result = broker_connection_failure("mqtt desk".into(), &error, true);
+        assert_eq!(result.status, crate::types::ProbeStatus::Fail);
+        assert!(
+            result
+                .detail
+                .starts_with(&format!("broker connection error: {error}"))
+        );
+        assert!(
+            result
+                .detail
+                .contains("System Settings → Privacy & Security → Local Network"),
+            "missing Local Network instructions: {}",
+            result.detail
+        );
+    }
 
     fn test_creds(mqtt_entries: IndexMap<String, MqttCredential>) -> Credentials {
         Credentials {

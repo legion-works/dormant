@@ -35,12 +35,13 @@
 //! 5. Everything else is cleared — a hook child cannot read unrelated
 //!    secrets or the daemon's build environment out of its parent's env.
 //!
-//! Each child is started in a fresh session via `setsid(2)` in
+//! On Unix, each child is started in a fresh session via `setsid(2)` in
 //! `pre_exec` so its process-group id is itself. On timeout the engine
 //! `kill(-pid, SIGKILL)`s the entire group, taking any grandchildren
 //! with it (the existing `CommandSink` controller's timeout only kills the
 //! direct child — KVM hooks may shell out to bash, which forks helpers, and
 //! a stuck helper must not outlive the hook's bound).
+//! On Windows, a timeout stops only the direct child.
 //!
 //! ## MQTT action
 //!
@@ -916,6 +917,11 @@ pub(crate) async fn run_argv_command(
                         );
                     }
                 }
+            }
+            // Windows stops only the direct child. There is no job object to stop its children.
+            #[cfg(not(unix))]
+            if let Err(error) = child.start_kill() {
+                warn!(event = "hook_timeout_kill_failed", pid = child.id(), %error);
             }
             // Reap so the OS does not leak a zombie.
             let _ = child.wait().await;
@@ -2125,6 +2131,69 @@ mod tests {
         assert_eq!(runner.command_argvs(), vec![vec!["/bin/true".to_string()]]);
     }
 
+    const HOOK_PROBE_TEST: &str = "hooks::tests::hook_child_probe";
+
+    fn hook_probe_argv(mode: &str, output: &std::path::Path) -> Vec<String> {
+        vec![
+            std::env::current_exe()
+                .unwrap()
+                .into_os_string()
+                .into_string()
+                .expect("hook argv requires a UTF-8 executable path"),
+            "--exact".into(),
+            HOOK_PROBE_TEST.into(),
+            "--nocapture".into(),
+            "--".into(),
+            format!("dormant-hook-probe={mode}"),
+            output
+                .to_str()
+                .expect("hook argv requires a UTF-8 output path")
+                .into(),
+        ]
+    }
+
+    #[tokio::test]
+    async fn hook_child_probe() {
+        let mut args = std::env::args_os();
+        let Some(mode) = args.find_map(|arg| {
+            arg.to_str()?
+                .strip_prefix("dormant-hook-probe=")
+                .map(str::to_owned)
+        }) else {
+            return;
+        };
+        let output = args.next().expect("missing hook probe output path");
+        match mode.as_str() {
+            "block" => {
+                std::fs::write(output, b"started").unwrap();
+                std::future::pending::<()>().await;
+            }
+            _ => panic!("unknown hook probe mode: {mode}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn real_argv_hook_timeout_stops_direct_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("hook-started");
+        let argv = hook_probe_argv("block", &marker);
+        let result = timeout(
+            Duration::from_secs(10),
+            run_argv_command(&Vec::new(), &argv, Duration::from_secs(3)),
+        )
+        .await
+        .expect("timed-out hook did not stop and reap its direct child");
+
+        assert_eq!(
+            std::fs::read(marker).expect("hook probe must start before the timeout"),
+            b"started"
+        );
+        assert!(
+            matches!(result, Err(ref reason) if reason.starts_with(E_HOOK_TIMEOUT)),
+            "expected hook timeout, got {result:?}"
+        );
+    }
+
     // ── argv + real process: env vars land in /usr/bin/env output ───────────
 
     // Unix-only: spawns /usr/bin/env.
@@ -2203,7 +2272,7 @@ mod tests {
 
     // ── argv + real process: timeout kills the process group ────────────────
 
-    // Unix-only: spawns /bin/sleep and asserts POSIX process-group kill.
+    // POSIX process groups do not exist on Windows. Windows stops only the direct child.
     #[cfg(unix)]
     #[tokio::test]
     async fn real_argv_hook_timeout_kills_process_group() {

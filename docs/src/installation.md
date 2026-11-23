@@ -450,6 +450,14 @@ the next step — it deliberately does not run `dormantctl launchd install`
 or `launchctl bootstrap` for you (that would start a background daemon
 before you have configured it).
 
+### Local Network access (macOS)
+
+If you use a local MQTT broker, give `dormantd` access to the local network.
+At the Local Network prompt, select **Allow**.
+If you denied access, open **System Settings → Privacy & Security → Local Network**.
+Enable access for `dormantd`.
+After a rebuild or update, macOS can show the prompt again.
+
 ### LaunchAgent (macOS)
 
 dormant ships per-user `LaunchAgents` — the macOS analog of the systemd user

@@ -83,6 +83,15 @@ The two flags are mutually exclusive with each other and with any doctor subcomm
 | `E_DISPLAY_IO` | Display controller I/O error | Network controller: host reachable? DDC/CI: I2C bus accessible? Command: binary exists? |
 | `E_IPC` | Inter-process communication error | Check that `dormantd` is running. Verify the socket path matches between daemon and CLI. |
 
+## MQTT: No route to host on macOS
+
+Local Network privacy can cause `No route to host (os error 65)`.
+A connection from `nc` to the same broker does not show that `dormantd` has access.
+Open **System Settings → Privacy & Security → Local Network**.
+Enable access for `dormantd`.
+If `dormantctl doctor mqtt` shows the same error, enable access for `dormantctl`.
+After a rebuild or update, macOS can show the prompt again.
+
 ## Display will not blank
 
 ### Sensor is stale

@@ -20,24 +20,31 @@ fi
 shift
 
 zero=0000000000000000000000000000000000000000
-changed=""
+gate=("$@")
+changed=()
+list="$(mktemp)"
+trap 'rm -f -- "$list"' EXIT
 
-# Add the files that `commit` changes since `base` to `changed`. An unknown
-# base or a failed diff runs the gate.
-add_changes() {
-  local base="$1" commit="$2" files
-  if [[ -z "$base" ]]; then
-    printf '%s\n' 'Changed-file base is unknown; running gate.' >&2
-    exec "${gate[@]}"
-  fi
-  if ! files="$(git diff --name-only "$base"..."$commit")"; then
-    printf '%s\n' 'Changed-file diff is unavailable; running gate.' >&2
-    exec "${gate[@]}"
-  fi
-  changed+="$files"$'\n'
+run_gate() {
+  printf '%s\n' "$1" >&2
+  rm -f -- "$list"
+  exec "${gate[@]}"
 }
 
-gate=("$@")
+# Add the paths of a diff to `changed`. The arguments are the diff endpoints:
+# `<old> <new>` compares two trees, `<base>...<new>` compares <new> with the
+# merge-base. -z gives raw paths (no quoting), and --no-renames lists both
+# names of a rename. A failed diff runs the gate.
+add_changes() {
+  if ! git diff --no-renames --name-only -z "$@" >"$list"; then
+    run_gate 'Changed-file diff is unavailable; running gate.'
+  fi
+  local path
+  while IFS= read -r -d '' path; do
+    changed+=("$path")
+  done <"$list"
+}
+
 push_lines=""
 if [[ ! -t 0 ]]; then
   push_lines="$(cat)"
@@ -51,36 +58,39 @@ if [[ -n "$push_lines" ]]; then
       # A deletion pushes no commit.
       continue
     fi
-    base=""
     if [[ "$remote_sha" != "$zero" ]]; then
-      base="$(git merge-base "$local_sha" "$remote_sha" 2>/dev/null || true)"
+      # An existing ref: compare the old and the new remote tree, so a forced
+      # update also shows the paths that it removes. If this clone cannot
+      # read the old commit, the change is unknown.
+      if ! git cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
+        run_gate 'Old remote commit is not available; running gate.'
+      fi
+      add_changes "$remote_sha" "$local_sha"
+      continue
     fi
-    # The pushed remote ref names a ref on the remote. Resolved in this
-    # repository, `refs/heads/<branch>` is the local branch being pushed, so its
-    # merge-base is the pushed commit and every gate would skip. For a branch
-    # the remote does not have yet, compare with the integration branch that
-    # pull requests target; if that ref is missing, the base stays unknown and
-    # the gate runs.
-    if [[ -z "$base" ]] && git rev-parse --verify --quiet refs/remotes/origin/dev >/dev/null; then
-      base="$(git merge-base "$local_sha" refs/remotes/origin/dev 2>/dev/null || true)"
+    # A new ref: compare with the integration branch that pull requests
+    # target. If that ref is missing, the base is unknown.
+    if ! git rev-parse --verify --quiet refs/remotes/origin/dev >/dev/null; then
+      run_gate 'Changed-file base is unknown; running gate.'
     fi
-    add_changes "$base" "$local_sha"
+    add_changes refs/remotes/origin/dev..."$local_sha"
   done <<<"$push_lines"
 else
   # A run outside a push compares HEAD with its upstream.
   upstream="$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)"
-  base=""
-  if [[ -n "$upstream" ]]; then
-    base="$(git merge-base HEAD "$upstream" 2>/dev/null || true)"
+  if [[ -z "$upstream" ]]; then
+    run_gate 'Changed-file base is unknown; running gate.'
   fi
-  add_changes "$base" HEAD
+  add_changes "$upstream"...HEAD
 fi
+rm -f -- "$list"
 
-while IFS= read -r path; do
+# The guarded expansion keeps an empty list valid under `set -u` on bash 3.2.
+for path in ${changed[@]+"${changed[@]}"}; do
   for pattern in "${patterns[@]}"; do
     # shellcheck disable=SC2053 # Gate patterns are intentionally shell globs.
     if [[ "$path" == $pattern ]]; then
-      exec "$@"
+      exec "${gate[@]}"
     fi
   done
-done <<<"$changed"
+done

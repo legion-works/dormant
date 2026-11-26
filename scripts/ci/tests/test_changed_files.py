@@ -147,6 +147,53 @@ class ChangedFilesTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("GATE-RAN", result.stdout)
 
+    def commit_file(self, path: str, text: str = "change\n") -> str:
+        (self.work / path).parent.mkdir(parents=True, exist_ok=True)
+        (self.work / path).write_text(text)
+        git(self.work, "add", "-A")
+        git(self.work, "commit", "-q", "-m", f"add {path}")
+        return git(self.work, "rev-parse", "HEAD")
+
+    def test_force_rewind_that_removes_a_matching_file_runs_gate(self):
+        # The remote tip has the Rust change; the push rewinds to its parent.
+        self.branch_from_sha("feature", "docs/page.md")
+        parent = git(self.work, "rev-parse", "HEAD")
+        tip = self.commit_file("src/lib.rs")
+        git(self.work, "push", "-q", "origin", "feature")
+        git(self.work, "reset", "-q", "--hard", parent)
+        result = self.run_filter(f"refs/heads/feature {parent} refs/heads/feature {tip}\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("GATE-RAN", result.stdout)
+
+    def test_existing_ref_with_old_commit_missing_locally_runs_gate(self):
+        # Another clone moved the remote ref; this clone cannot read the old
+        # commit, so it cannot know what the push removes.
+        self.branch_from_sha("docs-only", "docs/page.md")
+        head = git(self.work, "rev-parse", "HEAD")
+        missing = "1234567890abcdef1234567890abcdef12345678"
+        result = self.run_filter(f"refs/heads/dev {head} refs/heads/dev {missing}\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("GATE-RAN", result.stdout)
+
+    def test_rename_away_from_a_matching_path_runs_gate(self):
+        self.branch_from_sha("feature", "src/lib.rs")
+        pushed = git(self.work, "rev-parse", "HEAD")
+        git(self.work, "push", "-q", "origin", "feature")
+        (self.work / "docs").mkdir()
+        git(self.work, "mv", "src/lib.rs", "docs/lib.txt")
+        git(self.work, "commit", "-q", "-m", "rename")
+        head = git(self.work, "rev-parse", "HEAD")
+        result = self.run_filter(f"refs/heads/feature {head} refs/heads/feature {pushed}\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("GATE-RAN", result.stdout)
+
+    def test_non_ascii_matching_path_runs_gate(self):
+        # Without -z, git quotes this path and the quote ends the name.
+        self.branch_from_sha("feature", "src/\u00fcb.rs")
+        result = self.run_filter(self.new_branch_push_line("feature"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("GATE-RAN", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -320,6 +320,29 @@ rename to crates/example/tests/renamed.rs
 
         self.assertEqual(selected, [])
 
+    def test_support_module_skips_integration_targets_gated_off_the_platform(self):
+        # A support change selects every integration target; a target that is
+        # compiled only on Linux has zero tests on macOS and is not selected there.
+        change = diff(
+            "crates/example/tests/support/helpers.rs",
+            "1,0",
+            "1,1",
+            "+pub fn helper() {}",
+        )
+        linux_only = "#![cfg(target_os = \"linux\")]\n#[test]\nfn checks_value() {}\n"
+        portable = "#[test]\nfn checks_value() {}\n"
+        sources = {
+            "crates/example/tests/alpha.rs": (None, linux_only),
+            "crates/example/tests/beta.rs": (None, portable),
+            "crates/example/tests/renamed.rs": (None, portable),
+        }
+
+        on_macos = select_changed_tests.select_targets(change, self.metadata, "macos", sources)
+        on_linux = select_changed_tests.select_targets(change, self.metadata, "linux", sources)
+
+        self.assertEqual([target.name for target in on_macos], ["beta", "renamed"])
+        self.assertEqual([target.name for target in on_linux], ["alpha", "beta", "renamed"])
+
     def test_policy_fixture_is_explicitly_skipped(self):
         change = diff(
             ".github/fixtures/nextest-policy/flaky/src/lib.rs",

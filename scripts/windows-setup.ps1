@@ -486,12 +486,14 @@ function Register-LogonTask {
     # Interactive, NOT a service account: DDC/CI enumeration needs the desktop
     # session, which session 0 does not have.
     $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
-    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+    # Task Scheduler stops a task 72 hours after it starts unless the limit is
+    # zero (PT0S, no limit). The daemon runs for the whole session.
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)
 
     Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
         -Principal $principal -Settings $settings -Force | Out-Null
 
-    Write-Pass 'Scheduled task' "'$taskName' runs dormantd at logon (restart up to 3x)"
+    Write-Pass 'Scheduled task' "'$taskName' runs dormantd at logon (no time limit, restart up to 3x)"
     Write-Step "Remove with: Unregister-ScheduledTask -TaskName $taskName -Confirm:`$false"
 }
 

@@ -1335,12 +1335,12 @@ fn two_display_config(
 [displays.mon2]
 controllers = ["command"]
 blank_mode = "power_off"
-blank_command = "printf B >> '{m2}'"
-wake_command = "{w2}"
+blank_command = {b2}
+wake_command = {w2}
 modes = ["power_off"]
 "#,
-            m2 = m2.display(),
-            w2 = wake2,
+            b2 = toml_string(&shell::append(m2, "B")),
+            w2 = toml_string(wake2),
         )
     } else {
         String::new()
@@ -1367,8 +1367,8 @@ members = ["desk"]
 [displays.mon1]
 controllers = ["command"]
 blank_mode = "power_off"
-blank_command = "printf B >> '{m1}'"
-wake_command = "printf W >> '{m1}'"
+blank_command = {b1}
+wake_command = {w1}
 modes = ["power_off"]
 {mon2_block}
 [rules.r]
@@ -1380,7 +1380,8 @@ wake_retries = 0
 wake_retry_backoff = "10ms"
 wake_retry_interval = "1s"
 "#,
-        m1 = m1.display(),
+        b1 = toml_string(&shell::append(m1, "B")),
+        w1 = toml_string(&shell::append(m1, "W")),
         mon2_block = mon2_block,
         displays = displays,
     )
@@ -1400,7 +1401,7 @@ async fn removed_display_verified_wake() {
     let dir = TempDir::new().unwrap();
     let m1 = dir.path().join("mon1");
     let m2 = dir.path().join("mon2");
-    let wake2 = format!("printf W >> '{}'", m2.display());
+    let wake2 = shell::append(&m2, "W");
     let cfg_path = write_file(
         dir.path(),
         "config.toml",
@@ -1473,7 +1474,7 @@ async fn removed_display_wake_failure_aborts() {
     let cfg_path = write_file(
         dir.path(),
         "config.toml",
-        &two_display_config(&m1, &m2, "false", true, true),
+        &two_display_config(&m1, &m2, shell::fail(), true, true),
     );
     let creds_path = dir.path().join("credentials.toml");
 
@@ -1502,7 +1503,7 @@ async fn removed_display_wake_failure_aborts() {
 
     fs::write(
         &cfg_path,
-        two_display_config(&m1, &m2, "false", false, false),
+        two_display_config(&m1, &m2, shell::fail(), false, false),
     )
     .unwrap();
     assert!(handle.trigger_reload().await);
@@ -1621,7 +1622,7 @@ async fn ruleless_display_preserves_phase_on_reload() {
     let dir = TempDir::new().unwrap();
     let m1 = dir.path().join("mon1");
     let m2 = dir.path().join("mon2");
-    let wake2 = format!("printf W >> '{}'", m2.display());
+    let wake2 = shell::append(&m2, "W");
     let cfg_path = write_file(
         dir.path(),
         "config.toml",
@@ -2144,10 +2145,10 @@ async fn concurrent_reload_inputs_are_delivered_exactly_once() {
     let new_control_marker = dir.path().join("new-control-marker");
     let generation_swap_config = |event_marker: &Path, control_marker: &Path| {
         format!(
-            "{}\n[displays.manual]\ncontrollers = [\"command\"]\nblank_mode = \"power_off\"\nblank_command = \"printf B >> '{}'\"\nwake_command = \"printf W >> '{}'\"\nmodes = [\"power_off\"]\n",
+            "{}\n[displays.manual]\ncontrollers = [\"command\"]\nblank_mode = \"power_off\"\nblank_command = {}\nwake_command = {}\nmodes = [\"power_off\"]\n",
             one_display_config(event_marker, "0s"),
-            control_marker.display(),
-            control_marker.display(),
+            toml_string(&shell::append(control_marker, "B")),
+            toml_string(&shell::append(control_marker, "W")),
         )
     };
     let cfg_path = write_file(
@@ -2948,15 +2949,15 @@ members = ["desk"]
 [displays.mon]
 controllers = ["command"]
 blank_mode = "power_off"
-blank_command = "printf B >> '{m1}'"
-wake_command = "printf W >> '{m1}'"
+blank_command = {b1}
+wake_command = {w1}
 modes = ["power_off"]
 
 [displays.manual]
 controllers = ["command"]
 blank_mode = "power_off"
-blank_command = "printf B >> '{m2}'"
-wake_command = "printf W >> '{m2}'"
+blank_command = {b2}
+wake_command = {w2}
 modes = ["power_off"]
 
 [rules.r]
@@ -2968,8 +2969,10 @@ wake_retries = 0
 wake_retry_backoff = "10ms"
 wake_retry_interval = "1s"
 "#,
-        m1 = mon_marker.display(),
-        m2 = manual_marker.display(),
+        b1 = toml_string(&shell::append(mon_marker, "B")),
+        w1 = toml_string(&shell::append(mon_marker, "W")),
+        b2 = toml_string(&shell::append(manual_marker, "B")),
+        w2 = toml_string(&shell::append(manual_marker, "W")),
     )
 }
 
@@ -3048,15 +3051,15 @@ members = ["desk"]
 [displays.mon]
 controllers = ["command"]
 blank_mode = "power_off"
-blank_command = "printf B >> '{m1}'"
-wake_command = "printf W >> '{m1}'"
+blank_command = {b1}
+wake_command = {w1}
 modes = ["power_off"]
 
 [displays.manual]
 controllers = ["command"]
 blank_mode = "power_off"
-blank_command = "printf B >> '{m2}'"
-wake_command = "printf W >> '{m2}'"
+blank_command = {b2}
+wake_command = {w2}
 modes = ["power_off"]
 
 [rules.r]
@@ -3068,45 +3071,73 @@ wake_retries = 0
 wake_retry_backoff = "10ms"
 wake_retry_interval = "1s"
 "#,
-        m1 = mon_marker.display(),
-        m2 = manual_marker.display(),
+        b1 = toml_string(&shell::append(mon_marker, "B")),
+        w1 = toml_string(&shell::append(mon_marker, "W")),
+        b2 = toml_string(&shell::append(manual_marker, "B")),
+        w2 = toml_string(&shell::append(manual_marker, "W")),
         g = grace,
     )
 }
 
+fn gate_marker_command(
+    config: &str,
+    command_key: &str,
+    marker: &Path,
+    text: &str,
+    release: &Path,
+) -> String {
+    let command = toml_string(&shell::append(marker, text));
+    let gated = toml_string(&shell::append_after_release(marker, text, release));
+    config.replacen(
+        &format!("{command_key} = {command}"),
+        &format!("{command_key} = {gated}"),
+        1,
+    )
+}
+
+async fn check_defensive_wake_marker(marker: &Path, before: usize, release: Option<&Path>) {
+    let woke = || count(marker, 'W') > before;
+    let ((), saw_wake) = tokio::join!(
+        async {
+            if let Some(release) = release {
+                assert!(
+                    !wait_for(woke, Duration::from_millis(1200)).await,
+                    "the delayed wake must not write its marker before release"
+                );
+                fs::write(release, "").unwrap();
+            }
+        },
+        wait_for(woke, Duration::from_secs(10)),
+    );
+    assert!(
+        saw_wake,
+        "the rule-driven display must write its wake marker"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manual_only_display_no_defensive_wake_on_reload() {
-    check_manual_only_display_no_defensive_wake_on_reload(|cfg, _| cfg).await;
+    check_manual_only_display_no_defensive_wake_on_reload(false).await;
 }
 
 /// The delayed command detects a fixed-sleep wait that checks before completion.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manual_only_display_no_defensive_wake_on_reload_with_delayed_wake() {
-    check_manual_only_display_no_defensive_wake_on_reload(|cfg, mon| {
-        cfg.replace(
-            &format!("wake_command = \"printf W >> '{}'\"", mon.display()),
-            &format!(
-                "wake_command = \"sleep 1.2; printf W >> '{}'\"",
-                mon.display()
-            ),
-        )
-    })
-    .await;
+    check_manual_only_display_no_defensive_wake_on_reload(true).await;
 }
 
 #[allow(
     clippy::await_holding_lock,
     reason = "capture_count_lock() serializes reload against the exact-count tests"
 )]
-async fn check_manual_only_display_no_defensive_wake_on_reload(
-    rewrite: impl FnOnce(String, &Path) -> String,
-) {
+async fn check_manual_only_display_no_defensive_wake_on_reload(delayed: bool) {
     let _capture_guard = capture_count_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = TempDir::new().unwrap();
     let mon_marker = dir.path().join("mon");
     let manual_marker = dir.path().join("manual");
+    let release = dir.path().join("release-wake");
     let cfg = manual_and_ruled_config(&mon_marker, &manual_marker, "300ms");
     let cfg_path = write_file(dir.path(), "config.toml", &cfg);
 
@@ -3171,8 +3202,11 @@ async fn check_manual_only_display_no_defensive_wake_on_reload(
 
     // Reload: rewrite the same config with a different grace so the reload
     // actually takes effect (identical config is a no-op).
-    let new_cfg = manual_and_ruled_config(&mon_marker, &manual_marker, "150ms");
-    fs::write(&cfg_path, rewrite(new_cfg, &mon_marker)).unwrap();
+    let mut new_cfg = manual_and_ruled_config(&mon_marker, &manual_marker, "150ms");
+    if delayed {
+        new_cfg = gate_marker_command(&new_cfg, "wake_command", &mon_marker, "W", &release);
+    }
+    fs::write(&cfg_path, new_cfg).unwrap();
     assert!(handle.trigger_reload().await);
 
     let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
@@ -3182,13 +3216,7 @@ async fn check_manual_only_display_no_defensive_wake_on_reload(
     assert_eq!(outcome, ReloadOutcome::Reloaded);
 
     // Reload spawns the defensive wake without waiting for the command result.
-    assert!(
-        wait_for(
-            || count(&mon_marker, 'W') > mon_wake_before,
-            Duration::from_secs(10),
-        )
-        .await
-    );
+    check_defensive_wake_marker(&mon_marker, mon_wake_before, delayed.then_some(&release)).await;
     // Observe late duplicate wakes before checking the manual display.
     tokio::time::sleep(Duration::from_secs(1)).await;
 
@@ -3260,13 +3288,46 @@ async fn manual_wake_pending_during_reload_settles_before_restore() {
     check_manual_control_during_reload_is_preserved(true, false).await;
 }
 
+async fn release_manual_command_during_quiesce(release: Option<&Path>) {
+    if let Some(release) = release {
+        assert!(
+            wait_for(
+                || capture_contains("reload_quiesce_pending"),
+                Duration::from_secs(5),
+            )
+            .await,
+            "reload must observe the pending manual command before release"
+        );
+        fs::write(release, "").unwrap();
+    }
+}
+
+#[allow(
+    clippy::await_holding_lock,
+    reason = "the capture lock prevents other reloads from supplying the quiesce event"
+)]
 async fn check_manual_control_during_reload_is_preserved(wake: bool, completed: bool) {
+    let _guard = capture_count_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    install_capture_subscriber();
     let dir = TempDir::new().unwrap();
     let mon_marker = dir.path().join("mon");
     let manual_marker = dir.path().join("manual");
+    let release = dir.path().join("release-control");
+    let (command_key, text) = if wake {
+        ("wake_command", "W")
+    } else {
+        ("blank_command", "B")
+    };
     let config = |grace| {
-        manual_and_ruled_config(&mon_marker, &manual_marker, grace)
-            .replace("command = \"printf", "command = \"sleep 0.6; printf")
+        gate_marker_command(
+            &manual_and_ruled_config(&mon_marker, &manual_marker, grace),
+            command_key,
+            &manual_marker,
+            text,
+            &release,
+        )
     };
     let cfg_path = write_file(dir.path(), "config.toml", &config("300ms"));
     let gate = GenerationBarrierGate::new();
@@ -3312,6 +3373,7 @@ async fn check_manual_control_during_reload_is_preserved(wake: bool, completed: 
         .await
         .unwrap();
         let before_release = if completed {
+            fs::write(&release, "").unwrap();
             expected
         } else if wake {
             "waking"
@@ -3319,14 +3381,28 @@ async fn check_manual_control_during_reload_is_preserved(wake: bool, completed: 
             "blanking"
         };
         assert!(wait_for_phase(&ctl, "manual", before_release, Duration::from_secs(10)).await);
+        drain_capture();
         gate.release();
-        let (_, receipt) = tokio::time::timeout(Duration::from_secs(10), reload)
-            .await
+        let ((), receipt) = tokio::join!(
+            release_manual_command_during_quiesce((!completed).then_some(&release)),
+            tokio::time::timeout(Duration::from_secs(10), reload),
+        );
+        let (_, receipt) = receipt
             .expect("reload completes after ingress gate release")
             .expect("reload receipt");
         assert_eq!(receipt.outcome, ReloadOutcome::Reloaded);
     }
-    let snapshot = snapshot_with_retry(&ctl).await;
+    assert_manual_control_preserved(&ctl, &manual_marker, expected, wake).await;
+    shutdown(handle, join).await;
+}
+
+async fn assert_manual_control_preserved(
+    ctl: &mpsc::Sender<ControlMsg>,
+    manual_marker: &Path,
+    expected: &str,
+    wake: bool,
+) {
+    let snapshot = snapshot_with_retry(ctl).await;
     let (_, manual) = snapshot
         .displays
         .iter()
@@ -3336,17 +3412,12 @@ async fn check_manual_control_during_reload_is_preserved(wake: bool, completed: 
         manual.phase, expected,
         "reload must preserve the manual control completed before ingress freeze"
     );
+    assert_eq!(count(manual_marker, 'B'), 1, "manual blank is not replayed");
     assert_eq!(
-        count(&manual_marker, 'B'),
-        1,
-        "manual blank is not replayed"
-    );
-    assert_eq!(
-        count(&manual_marker, 'W'),
+        count(manual_marker, 'W'),
         usize::from(wake),
         "manual wake is not replayed"
     );
-    shutdown(handle, join).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3357,10 +3428,13 @@ async fn manual_wake_at_reload_quiesce_deadline_restores_waking() {
     let release = dir.path().join("release-wake");
     let config = |grace| {
         manual_and_ruled_config(&mon, &manual, grace).replace(
-            &format!("wake_command = \"printf W >> '{}'\"", manual.display()),
             &format!(
-                "wake_command = \"printf W >> '{}'; while ! test -f '{}'; do sleep 0.01; done; printf R >> '{}'\"\ncommand_timeout = \"30s\"",
-                manual.display(), release.display(), manual.display()
+                "wake_command = {}",
+                toml_string(&shell::append(&manual, "W"))
+            ),
+            &format!(
+                "wake_command = {}\ncommand_timeout = \"30s\"",
+                toml_string(&shell::append_wake_then_release(&manual, &release)),
             ),
         )
     };

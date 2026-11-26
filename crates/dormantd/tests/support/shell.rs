@@ -44,13 +44,17 @@ fn sh_path(path: &Path) -> String {
     format!("'{}'", path.replace('\'', "'\\''"))
 }
 
-// Keep the hold in cmd so killing the shell also stops the hold.
-const CMD_HOLD: &str = "for /l %i in (1,1,2147483647) do @rem";
+// Keep the loop in cmd so killing the shell also stops the loop.
+const CMD_LOOP: &str = "for /l %i in (1,1,2147483647) do";
+
+fn cmd_hold() -> String {
+    format!("{CMD_LOOP} @set DORMANT_TEST_HOLD=1")
+}
 
 /// Hold until the controller cancels the command or its timeout expires.
 pub fn hold(path: &Path) -> String {
     if cfg!(windows) {
-        CMD_HOLD.to_owned()
+        cmd_hold()
     } else {
         format!("exec tail -f {}", sh_path(path))
     }
@@ -59,8 +63,34 @@ pub fn hold(path: &Path) -> String {
 /// Write the start marker before holding the command open.
 pub fn append_start_then_hold(marker: &Path, hold_path: &Path) -> String {
     if cfg!(windows) {
-        format!("<nul set /p =START>>{}& {CMD_HOLD}", cmd_path(marker))
+        format!("<nul set /p =START>>{}& {}", cmd_path(marker), cmd_hold())
     } else {
         format!("{}; {}", append(marker, "START"), hold(hold_path))
+    }
+}
+
+/// Write the marker only after the release file exists.
+pub fn append_after_release(marker: &Path, text: &str, release: &Path) -> String {
+    if cfg!(windows) {
+        let release = cmd_path(release);
+        let append = append(marker, text);
+        // Exit on the first write. If redirection fails, report failure.
+        format!("{CMD_LOOP} @if exist {release} ({append} & exit 1) & exit 1")
+    } else {
+        format!(
+            "while ! test -f {}; do sleep 0.01; done; {}",
+            sh_path(release),
+            append(marker, text),
+        )
+    }
+}
+
+/// Write `W` before the wait and `R` after the release file exists.
+pub fn append_wake_then_release(marker: &Path, release: &Path) -> String {
+    let after_release = append_after_release(marker, "R", release);
+    if cfg!(windows) {
+        format!("<nul set /p =W>>{}& {after_release}", cmd_path(marker))
+    } else {
+        format!("{}; {after_release}", append(marker, "W"))
     }
 }

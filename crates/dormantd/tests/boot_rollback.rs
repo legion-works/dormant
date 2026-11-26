@@ -1,12 +1,3 @@
-#![cfg(unix)]
-//! Unix-only: the fixtures drive the daemon's `command` display controller
-//! with POSIX shell text — `printf X >> 'file'`, `test -e`, `true`/`false` —
-//! and observe behaviour by counting marker bytes those commands append.
-//! `cmd /C` has no equivalent spelling, so the suite needs a platform-aware
-//! fixture helper before it can run on Windows. Tracked in the Windows
-//! support issue (#265); the IPC transport that previously blocked it is
-//! done (#371, #373).
-//!
 //! Integration tests for `dormantd::boot` (T5, spec §5.1): `prepare()` +
 //! `boot()` driven end to end with real tempdir state, real (per-test)
 //! sockets, and the production `App::build`/`App::start` path — `boot()` is
@@ -14,13 +5,9 @@
 //! tests exercise it directly rather than through `App::build_with_sources`
 //! fakes.
 //!
-//! **Isolation (spec Global Constraints + plan P5):** every seeded config
-//! sets `daemon.socket_path` to a per-test tempdir path (the
-//! `ipc_roundtrip.rs`/`daemon_smoke.rs` tempdir-socket pattern) — real IPC
-//! is left ENABLED (never `.disable_ipc()`) because `boot()` drives
-//! `App::start`, which binds it for real; the tempdir path is what isolates
-//! each test from the others and from a real daemon, not a `disable_ipc()`
-//! call that `boot()` has no seam for anyway. `state_dir`/`lock_path` are
+//! **Isolation (spec Global Constraints + plan P5):** a per-test IPC endpoint
+//! isolates each test from other tests and from a running daemon. `boot()`
+//! starts the real IPC server. `state_dir` and `lock_path` are
 //! likewise per-test tempdirs threaded through `BootInputs` directly — no
 //! `XDG_STATE_HOME`/`XDG_RUNTIME_DIR` env manipulation, so no cross-test
 //! lock is needed for any test except the lock-failure one, which shares a
@@ -51,9 +38,13 @@ use tokio::sync::oneshot;
 
 mod support {
     pub mod app_paths;
+    pub mod config;
+    pub mod shell;
 }
 
 use support::app_paths::TestAppPaths;
+use support::config::toml_string;
+use support::shell;
 
 // ── Config fixtures ──────────────────────────────────────────────────────
 
@@ -70,7 +61,7 @@ fn good_config(socket_path: &Path) -> String {
         r#"config_version = 1
 [daemon]
 startup_holdoff = "0s"
-socket_path = "{sock}"
+socket_path = {sock}
 
 [sensors.desk]
 type = "mqtt"
@@ -84,8 +75,8 @@ members = ["desk"]
 [displays.mon]
 controllers = ["command"]
 blank_mode = "power_off"
-blank_command = "true"
-wake_command = "true"
+blank_command = {ok}
+wake_command = {ok}
 modes = ["power_off"]
 
 [rules.r]
@@ -97,7 +88,8 @@ wake_retries = 0
 wake_retry_backoff = "10ms"
 wake_retry_interval = "1s"
 "#,
-        sock = socket_path.display(),
+        sock = toml_string(socket_path.to_str().expect("UTF-8 IPC path")),
+        ok = toml_string(shell::ok()),
     )
 }
 
@@ -112,7 +104,7 @@ fn bad_config(socket_path: &Path) -> String {
 config_version = 1
 [daemon]
 startup_holdoff = "0s"
-socket_path = "{sock}"
+socket_path = {sock}
 
 [sensors.desk]
 type = "mqtt"
@@ -126,8 +118,8 @@ members = ["desk"]
 [displays.mon]
 controllers = ["command"]
 blank_mode = "power_off"
-blank_command = "true"
-wake_command = "true"
+blank_command = {ok}
+wake_command = {ok}
 modes = ["power_off"]
 
 [rules.r]
@@ -139,7 +131,8 @@ wake_retries = 0
 wake_retry_backoff = "10ms"
 wake_retry_interval = "1s"
 "#,
-        sock = socket_path.display(),
+        sock = toml_string(socket_path.to_str().expect("UTF-8 IPC path")),
+        ok = toml_string(shell::ok()),
     )
 }
 
@@ -158,8 +151,8 @@ fn watcher_drill_config(socket_path: &Path, log_level: &str) -> String {
 [daemon]
 startup_holdoff = "0s"
 reload_debounce = "10ms"
-log_level = "{log_level}"
-socket_path = "{sock}"
+log_level = {log_level}
+socket_path = {sock}
 
 [sensors.desk]
 type = "mqtt"
@@ -173,8 +166,8 @@ members = ["desk"]
 [displays.mon]
 controllers = ["command"]
 blank_mode = "power_off"
-blank_command = "true"
-wake_command = "true"
+blank_command = {ok}
+wake_command = {ok}
 modes = ["power_off"]
 
 [rules.r]
@@ -186,7 +179,9 @@ wake_retries = 0
 wake_retry_backoff = "10ms"
 wake_retry_interval = "1s"
 "#,
-        sock = socket_path.display(),
+        sock = toml_string(socket_path.to_str().expect("UTF-8 IPC path")),
+        ok = toml_string(shell::ok()),
+        log_level = toml_string(log_level),
     )
 }
 
@@ -227,11 +222,21 @@ impl Harness {
     }
 
     fn socket_path(&self) -> PathBuf {
-        // A SEPARATE tempdir-ish subpath for the socket, mirroring
-        // `ipc_roundtrip.rs`/`daemon_smoke.rs`'s "never the default path"
-        // isolation note (kept short — abstract/unix socket path length
-        // limits).
-        self.paths.ipc_socket.clone()
+        if cfg!(windows) {
+            // Windows IPC requires a named pipe, not a filesystem path.
+            let tag = self
+                .paths
+                .root()
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .expect("UTF-8 test tempdir name");
+            PathBuf::from(format!(
+                r"\\.\pipe\dormant-boot-test-{}-{tag}",
+                std::process::id()
+            ))
+        } else {
+            self.paths.ipc_socket.clone()
+        }
     }
 
     fn inputs(&self) -> BootInputs {
@@ -1339,7 +1344,7 @@ async fn ddc_probe_failure_starts_with_degraded_health_no_crash_loop() {
             r#"config_version = 1
 [daemon]
 startup_holdoff = "0s"
-socket_path = "{sock}"
+socket_path = {sock}
 
 [sensors.desk]
 type = "mqtt"
@@ -1364,7 +1369,7 @@ wake_retries = 0
 wake_retry_backoff = "10ms"
 wake_retry_interval = "1s"
 "#,
-            sock = h.socket_path().display(),
+            sock = toml_string(h.socket_path().to_str().expect("UTF-8 IPC path")),
         ),
     );
     let cfg_bytes = std::fs::read(&cfg_path).unwrap();
@@ -1445,7 +1450,7 @@ wake_retry_interval = "1s"
             r#"config_version = 1
 [daemon]
 startup_holdoff = "0s"
-socket_path = "{sock}"
+socket_path = {sock}
 
 [sensors.desk]
 type = "mqtt"
@@ -1470,7 +1475,7 @@ wake_retries = 0
 wake_retry_backoff = "10ms"
 wake_retry_interval = "1s"
 "#,
-            sock = h2.socket_path().display(),
+            sock = toml_string(h2.socket_path().to_str().expect("UTF-8 IPC path")),
         ),
     );
     let cfg_bytes2 = std::fs::read(&cfg_path2).unwrap();

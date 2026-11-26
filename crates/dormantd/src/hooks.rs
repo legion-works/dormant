@@ -2639,8 +2639,10 @@ mod tests {
         .await;
 
         let process = open_grandchild(&marker).expect("normal hook exit stopped the grandchild");
+        // A job termination is asynchronous: a zero wait can see the grandchild
+        // still running while it is being stopped.
         assert!(
-            !grandchild_exited(&process, 0),
+            !grandchild_exited(&process, 1_000),
             "normal hook exit stopped the grandchild"
         );
         stop_probe_grandchild(&process);

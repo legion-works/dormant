@@ -12,6 +12,15 @@ pub fn fail() -> &'static str {
     if cfg!(windows) { "exit 1" } else { "false" }
 }
 
+/// Succeed only if the fixture path exists.
+pub fn file_exists(path: &Path) -> String {
+    if cfg!(windows) {
+        format!("if exist {} (exit 0) else (exit 1)", cmd_path(path))
+    } else {
+        format!("test -e {}", sh_path(path))
+    }
+}
+
 /// Append letters or digits without a newline: `printf` on Unix and `set /p` on Windows.
 pub fn append(path: &Path, text: &str) -> String {
     assert!(

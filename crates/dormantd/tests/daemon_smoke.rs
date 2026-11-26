@@ -1,12 +1,3 @@
-#![cfg(unix)]
-//! Unix-only: the fixtures drive the daemon's `command` display controller
-//! with POSIX shell text — `printf X >> 'file'`, `test -e`, `true`/`false` —
-//! and observe behaviour by counting marker bytes those commands append.
-//! `cmd /C` has no equivalent spelling, so the suite needs a platform-aware
-//! fixture helper before it can run on Windows. Tracked in the Windows
-//! support issue (#265); the IPC transport that previously blocked it is
-//! done (#371, #373).
-//!
 //! Real-time daemon smoke tests.
 //!
 //! These wire a full [`App`] over a tempdir config with `command` display
@@ -666,6 +657,7 @@ async fn ownership_poll_after_reload_reflects_cache_round_trip_through_wire() {
 fn write_credentials(dir: &Path, toml: &str) -> PathBuf {
     let path = dir.join("credentials.toml");
     fs::write(&path, toml).unwrap();
+    // Strict validation checks the credential file mode on Unix.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -4279,14 +4271,13 @@ async fn wear_park_persists_final_ledger() {
 // reload happens here, so this test is orthogonal to the dispatch-relevant
 // voiding gate exercised by test 18 below.
 
-/// One ruled `command` display whose blank succeeds iff `flag` exists
-/// (`test -e`), real IPC via `socket_path`.
+/// The blank command succeeds only if `flag` exists. IPC uses `socket_path`.
 fn ipc_failure_config(socket_path: &Path, flag: &Path, grace: &str) -> String {
     format!(
         r#"config_version = 1
 [daemon]
 startup_holdoff = "0s"
-socket_path = "{sock}"
+socket_path = {sock}
 
 [sensors.desk]
 type = "mqtt"
@@ -4300,8 +4291,8 @@ members = ["desk"]
 [displays.mon]
 controllers = ["command"]
 blank_mode = "power_off"
-blank_command = "test -e '{flag}'"
-wake_command = "/bin/true"
+blank_command = {blank}
+wake_command = {wake}
 modes = ["power_off"]
 
 [rules.r]
@@ -4313,8 +4304,9 @@ wake_retries = 0
 wake_retry_backoff = "10ms"
 wake_retry_interval = "1s"
 "#,
-        sock = socket_path.display(),
-        flag = flag.display(),
+        sock = toml_string(socket_path.to_str().expect("UTF-8 test IPC endpoint")),
+        blank = toml_string(&shell::file_exists(flag)),
+        wake = toml_string(shell::ok()),
         g = grace,
     )
 }
@@ -4323,9 +4315,20 @@ wake_retry_interval = "1s"
 #[allow(clippy::too_many_lines)]
 async fn ipc_event_stream_surfaces_blank_failure_then_recovery() {
     let dir = TempDir::new().unwrap();
-    // A separate tempdir for the socket — never the daemon's default path.
-    let sock_dir = TempDir::new().unwrap();
-    let socket_path = sock_dir.path().join("dormant.sock");
+    // Use a private IPC endpoint, not the daemon's default endpoint.
+    let socket_path = if cfg!(windows) {
+        let tag = dir
+            .path()
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .expect("UTF-8 test tempdir name");
+        PathBuf::from(format!(
+            r"\\.\pipe\dormant-test-smoke-{}-{tag}",
+            std::process::id()
+        ))
+    } else {
+        dir.path().join("dormant.sock")
+    };
     let flag = dir.path().join("blank_ok_flag");
 
     let cfg = ipc_failure_config(&socket_path, &flag, "50ms");
@@ -4352,10 +4355,13 @@ async fn ipc_event_stream_surfaces_blank_failure_then_recovery() {
     // Real IPC — this test needs the actual socket for event subscription.
     let (handle, join) = app.start().await.expect("start app");
 
-    assert!(
-        wait_for(|| socket_path.exists(), Duration::from_secs(3)).await,
-        "IPC socket must be bound"
-    );
+    // App::start binds both transports. Only Unix creates a filesystem entry.
+    if cfg!(unix) {
+        assert!(
+            wait_for(|| socket_path.exists(), Duration::from_secs(3)).await,
+            "IPC socket must be bound"
+        );
+    }
 
     let connect_path = socket_path.clone();
     let (event_stream, event_shutdown) =
@@ -4490,8 +4496,8 @@ members = ["desk"]
 [displays.mon]
 controllers = ["command"]
 blank_mode = "power_off"
-blank_command = "{blank_cmd}"
-wake_command = "printf W >> '{m}'"
+blank_command = {blank_cmd}
+wake_command = {wake}
 modes = ["power_off"]
 
 [rules.r]
@@ -4504,8 +4510,8 @@ wake_retry_backoff = "10ms"
 wake_retry_interval = "1s"
 "#,
         log_level = log_level,
-        blank_cmd = blank_cmd,
-        m = marker.display(),
+        blank_cmd = toml_string(blank_cmd),
+        wake = toml_string(&shell::append(marker, "W")),
         g = grace,
     )
 }
@@ -4524,7 +4530,7 @@ async fn reload_carries_last_blank_failed_until_dispatch_relevant_edit() {
     let dir = TempDir::new().unwrap();
     let marker = dir.path().join("marker");
     let flag = dir.path().join("blank_ok_flag"); // never created in this test
-    let blank_cmd = format!("test -e '{}'", flag.display());
+    let blank_cmd = shell::file_exists(&flag);
 
     let cfg_path = write_file(
         dir.path(),
@@ -4581,8 +4587,8 @@ async fn reload_carries_last_blank_failed_until_dispatch_relevant_edit() {
 
     // ── Reload #2: dispatch-relevant edit that STAYS FAILING ───────────────
     //
-    // `blank_command` changes to a DIFFERENT command ("false" instead of
-    // `test -e '<flag>'`) — dispatch-relevant per `dispatch_relevant_eq`
+    // The new `blank_command` fails whether or not the flag exists.
+    // The command change is dispatch-relevant per `dispatch_relevant_eq`
     // (the literal string differs), but the new command never succeeds
     // either. If `last_blank_failed` reads `false` after this reload it can
     // ONLY be explained by the voiding gate proactively zeroing the carried
@@ -4600,7 +4606,7 @@ async fn reload_carries_last_blank_failed_until_dispatch_relevant_edit() {
     // pin the assertion window before any new dispatch can occur.
     fs::write(
         &cfg_path,
-        reload_carry_config(&marker, "false", "debug", "10s"),
+        reload_carry_config(&marker, shell::fail(), "debug", "10s"),
     )
     .unwrap();
     assert!(handle.trigger_reload().await);
@@ -4716,8 +4722,8 @@ cooldown = "1m"
 [displays.mon]
 controllers = ["command"]
 blank_mode = "power_off"
-blank_command = "printf B >> '{m}'"
-wake_command = "{wake_cmd}"
+blank_command = {blank}
+wake_command = {wake_cmd}
 modes = ["power_off"]
 
 [rules.r]
@@ -4729,8 +4735,8 @@ wake_retries = 0
 wake_retry_backoff = "10ms"
 wake_retry_interval = "1s"
 "#,
-        m = marker.display(),
-        wake_cmd = wake_cmd,
+        blank = toml_string(&shell::append(marker, "B")),
+        wake_cmd = toml_string(wake_cmd),
         g = grace,
     )
 }
@@ -4752,13 +4758,13 @@ async fn notifier_closes_stale_episode_from_new_generation_startup_reconcile() {
     let cfg_path = write_file(
         dir.path(),
         "config.toml",
-        &notifier_reload_config(&marker, "false", "20ms"),
+        &notifier_reload_config(&marker, shell::fail(), "20ms"),
     );
     let creds_path = dir.path().join("credentials.toml");
 
     // Absent long enough for the grace period to elapse (blank succeeds via
     // the marker-writing command), then present again to trigger a wake —
-    // `wake_command = "false"` always fails, so the state machine retries on
+    // The wake command always fails, so the state machine retries on
     // `wake_retry_interval` (20ms) indefinitely (the wake-wedge invariant),
     // giving the notifier several `WakeRetry` events past the threshold.
     let script = vec![
@@ -4797,10 +4803,10 @@ async fn notifier_closes_stale_episode_from_new_generation_startup_reconcile() {
     );
 
     // ── Reload: dispatch-relevant wake_command edit, STILL always-failing ──
-    // (never `/bin/true` — see test 18's comment on why that would confound
+    // (never a successful command; see test 18's comment on why that would confound
     // the assertion with a coincidental real recovery).
     let mut reloads = handle.subscribe_reload();
-    fs::write(&cfg_path, notifier_reload_config(&marker, "exit 1", "20ms")).unwrap();
+    fs::write(&cfg_path, notifier_reload_config(&marker, "exit 2", "20ms")).unwrap();
     assert!(handle.trigger_reload().await);
     let outcome = tokio::time::timeout(Duration::from_secs(3), reloads.recv())
         .await
@@ -4858,8 +4864,8 @@ cooldown = "1m"
 [displays.mon]
 controllers = ["command"]
 blank_mode = "power_off"
-blank_command = "printf B >> '{m}'"
-wake_command = "{wake_cmd}"
+blank_command = {blank}
+wake_command = {wake_cmd}
 modes = ["power_off"]
 
 [rules.r]
@@ -4871,8 +4877,8 @@ wake_retries = 0
 wake_retry_backoff = "10ms"
 wake_retry_interval = "1s"
 "#,
-        m = marker.display(),
-        wake_cmd = wake_cmd,
+        blank = toml_string(&shell::append(marker, "B")),
+        wake_cmd = toml_string(wake_cmd),
         g = grace,
     )
 }
@@ -4885,12 +4891,12 @@ async fn notifier_disabled_records_zero_sink_calls_after_failure_burst() {
     let cfg_path = write_file(
         dir.path(),
         "config.toml",
-        &notifier_disabled_config(&marker, "false", "20ms"),
+        &notifier_disabled_config(&marker, shell::fail(), "20ms"),
     );
     let creds_path = dir.path().join("credentials.toml");
 
-    // Same absent→present script as test 19, driving several `wake_command
-    // = "false"` failures well past `wake_attempt_threshold = 2` — the only
+    // The absent-to-present script from test 19 drives wake failures past
+    // `wake_attempt_threshold = 2` — the only
     // difference is `[notifications].enabled = false`.
     let script = vec![
         (Duration::from_millis(0), ev("desk", SensorState::Absent)),
@@ -4961,8 +4967,8 @@ members = ["desk"]
 [displays.mon]
 controllers = ["command"]
 blank_mode = "power_off"
-blank_command = "true"
-wake_command = "true"
+blank_command = {ok}
+wake_command = {ok}
 modes = ["power_off"]
 
 [rules.r]
@@ -4974,6 +4980,7 @@ wake_retries = 0
 wake_retry_backoff = "10ms"
 wake_retry_interval = "1s"
 "#,
+        ok = toml_string(shell::ok()),
     )
 }
 
@@ -5113,8 +5120,8 @@ unavailable_policy = "absent"
 [displays.mon]
 controllers = ["command"]
 blank_mode = "power_off"
-blank_command = "true"
-wake_command = "true"
+blank_command = {ok}
+wake_command = {ok}
 modes = ["power_off"]
 
 [rules.r]
@@ -5126,6 +5133,7 @@ wake_retries = 0
 wake_retry_backoff = "10ms"
 wake_retry_interval = "1s"
 "#,
+        ok = toml_string(shell::ok()),
     )
 }
 
@@ -5237,7 +5245,6 @@ async fn absent_mqtt_hazard_warns_at_startup_and_not_on_rejected_reload() {
 // suite keeps growing. A new HEAVY (multi-second real sleep) test in half
 // (2) should be weighed against that shrinking margin before it lands.
 
-#[cfg(unix)]
 use dormantd::sd_notify::SdNotify;
 
 /// `install_capture_subscriber`'s buffer is process-global and, once
@@ -5275,7 +5282,6 @@ fn capture_count_lock() -> &'static Mutex<()> {
 }
 
 /// [`one_display_config`] plus a `[watchdog]` section.
-#[cfg(unix)]
 fn watchdog_config(marker: &Path, stability_window: &str, lkg_enabled: bool) -> String {
     format!(
         "{}\n[watchdog]\nlkg_enabled = {lkg_enabled}\nstability_window = \"{stability_window}\"\n",
@@ -5283,15 +5289,9 @@ fn watchdog_config(marker: &Path, stability_window: &str, lkg_enabled: bool) -> 
     )
 }
 
-/// Bind a fresh `UnixDatagram` "systemd" listener at a tempdir path and
-/// build an `SdNotify` targeting it (the `from_socket_for_test` seam,
-/// R2-M8/T4 fix).
-// Unix-only scaffolding: binds a `UnixDatagram` and builds an `SdNotify`
-// targeting it. The four tests below that assert LKG/sidecar writes are
-// portable logic that only needs this unix setup — gated for now, listed as
-// lost Windows coverage.
+/// Use a private Unix datagram socket so the test does not notify systemd.
 #[cfg(unix)]
-fn fake_systemd_socket(dir: &Path) -> (std::os::unix::net::UnixDatagram, SdNotify) {
+fn test_sd_notify(dir: &Path) -> (std::os::unix::net::UnixDatagram, SdNotify) {
     let path = dir.join("notify.sock");
     let listener = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
     let addr = std::os::unix::net::SocketAddr::from_pathname(&path).unwrap();
@@ -5299,7 +5299,12 @@ fn fake_systemd_socket(dir: &Path) -> (std::os::unix::net::UnixDatagram, SdNotif
     (listener, sd)
 }
 
-#[cfg(unix)]
+/// The Windows LKG tests need the watchdog probe, not systemd notifications.
+#[cfg(not(unix))]
+fn test_sd_notify(_dir: &Path) -> (Option<()>, SdNotify) {
+    (None, SdNotify::from_env())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn watchdog_healthy_run_writes_lkg_and_sidecar() {
     let dir = TempDir::new().unwrap();
@@ -5310,7 +5315,7 @@ async fn watchdog_healthy_run_writes_lkg_and_sidecar() {
         &watchdog_config(&marker, "30s", true),
     );
     let creds_path = dir.path().join("credentials.toml");
-    let (_listener, sd) = fake_systemd_socket(dir.path());
+    let (_listener, sd) = test_sd_notify(dir.path());
 
     let app = App::build_with_sources(
         cfg_path,
@@ -5352,7 +5357,6 @@ async fn watchdog_healthy_run_writes_lkg_and_sidecar() {
     );
 }
 
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn watchdog_lkg_disabled_writes_nothing() {
     let dir = TempDir::new().unwrap();
@@ -5363,7 +5367,7 @@ async fn watchdog_lkg_disabled_writes_nothing() {
         &watchdog_config(&marker, "30s", false),
     );
     let creds_path = dir.path().join("credentials.toml");
-    let (_listener, sd) = fake_systemd_socket(dir.path());
+    let (_listener, sd) = test_sd_notify(dir.path());
 
     let app = App::build_with_sources(
         cfg_path,
@@ -5391,7 +5395,6 @@ async fn watchdog_lkg_disabled_writes_nothing() {
     );
 }
 
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(
     clippy::await_holding_lock,
@@ -5414,7 +5417,7 @@ async fn watchdog_reload_mid_window_resets_candidate() {
         &watchdog_config(&marker, "30s", true),
     );
     let creds_path = dir.path().join("credentials.toml");
-    let (_listener, sd) = fake_systemd_socket(dir.path());
+    let (_listener, sd) = test_sd_notify(dir.path());
 
     let app = App::build_with_sources(
         cfg_path.clone(),
@@ -5462,6 +5465,7 @@ async fn watchdog_reload_mid_window_resets_candidate() {
 /// (and, via `include_displays`, from `[displays]` entirely) on reload —
 /// enough removed displays to distinguish "one ping per removed display"
 /// from "one ping for the whole loop" (P9).
+// The Linux systemd tests use this fixture to count reload boundaries.
 #[cfg(target_os = "linux")]
 fn three_display_config(
     m1: &Path,
@@ -5536,8 +5540,7 @@ wake_retry_interval = "1s"
     )
 }
 
-// Linux-only: datagram-count assertion on the systemd-only ping arm —
-// see the cadence test's note above.
+// This test checks reload ping order on the Linux systemd path.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(
@@ -5569,7 +5572,7 @@ async fn watchdog_in_reload_pings_healthy_boundaries() {
         &three_display_config(&m1, &m2, &m3, &wake2, &wake3, true, true),
     );
     let creds_path = dir.path().join("credentials.toml");
-    let (_listener, sd) = fake_systemd_socket(dir.path());
+    let (_listener, sd) = test_sd_notify(dir.path());
 
     let script = vec![(Duration::from_millis(100), ev("desk", SensorState::Absent))];
     let app = App::build_with_sources(
@@ -5687,8 +5690,7 @@ async fn watchdog_in_reload_pings_healthy_boundaries() {
     );
 }
 
-// Linux-only: datagram-count assertion on the systemd-only ping arm —
-// see the cadence test's note above.
+// This test checks the Linux systemd ping before wake-failure rollback.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(
@@ -5716,7 +5718,7 @@ async fn watchdog_ping_before_rebuild_old_on_verified_wake_failure() {
         &three_display_config(&m1, &m2, &m3, &wake2, "false", true, true),
     );
     let creds_path = dir.path().join("credentials.toml");
-    let (_listener, sd) = fake_systemd_socket(dir.path());
+    let (_listener, sd) = test_sd_notify(dir.path());
 
     let script = vec![(Duration::from_millis(100), ev("desk", SensorState::Absent))];
     let app = App::build_with_sources(
@@ -5796,8 +5798,7 @@ async fn watchdog_ping_before_rebuild_old_on_verified_wake_failure() {
 /// arm in `Runner::reload` to run, with a synthetic cause — everything
 /// downstream of that point (the ping, `rebuild_old`, the `Rejected`
 /// outcome) is production code, unmodified.
-// Linux-only: datagram-count assertion on the systemd-only ping arm —
-// see the cadence test's note above.
+// This test checks the Linux systemd ping before spawn-failure rollback.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(
@@ -5820,7 +5821,7 @@ async fn watchdog_ping_before_rebuild_old_on_spawn_generation_failure() {
         &one_display_config(&marker, "0s"),
     );
     let creds_path = dir.path().join("credentials.toml");
-    let (_listener, sd) = fake_systemd_socket(dir.path());
+    let (_listener, sd) = test_sd_notify(dir.path());
 
     let script = vec![(Duration::from_millis(100), ev("desk", SensorState::Absent))];
     let app = App::build_with_sources(
@@ -5882,6 +5883,7 @@ async fn watchdog_ping_before_rebuild_old_on_spawn_generation_failure() {
 /// must fire BEFORE `assemble_loaded` is called), then releases and
 /// asserts `after_assemble` fires once the probe unblocks and assembly
 /// completes.
+// This test uses a Unix notify socket for the systemd assembly pings.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(
@@ -5904,7 +5906,7 @@ async fn watchdog_ping_brackets_reload_assembly_boundary() {
         &one_display_config(&marker, "0s"),
     );
     let creds_path = dir.path().join("credentials.toml");
-    let (_listener, sd) = fake_systemd_socket(dir.path());
+    let (_listener, sd) = test_sd_notify(dir.path());
 
     // Gate the source_builder so the assembly probe phase parks on a
     // `Condvar` until the test releases it. The first call (initial
@@ -6716,8 +6718,8 @@ controllers = ["command", "ddcci"]
 scope = "shared"
 shared_input_code = 0x0f
 blank_mode = "brightness_zero"
-blank_command = "printf B >> '{m}'"
-wake_command = "printf W >> '{m}'"
+blank_command = {blank}
+wake_command = {wake}
 modes = ["brightness_zero"]
 
 [coordination]
@@ -6734,7 +6736,8 @@ wake_retries = 0
 wake_retry_backoff = "10ms"
 wake_retry_interval = "1s"
 "#,
-        m = marker.display(),
+        blank = toml_string(&shell::append(marker, "B")),
+        wake = toml_string(&shell::append(marker, "W")),
     )
 }
 

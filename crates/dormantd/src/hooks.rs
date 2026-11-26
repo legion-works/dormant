@@ -23,16 +23,19 @@
 //! — the existing `command` display controller's shell invocation is NOT
 //! reused (F7). The child's environment is deliberately minimal:
 //!
-//! 1. `PATH` is hard-coded to `HOOK_CHILD_PATH` — the daemon's toolchain /
-//!    Nix paths must not leak into a hook child.
+//! 1. On Windows, `PATH` lists system directories under `SystemRoot`.
+//!    On other platforms, it uses `HOOK_CHILD_PATH`. The daemon's `PATH`
+//!    does not pass to the child.
 //! 2. `HOME` is inherited from the daemon so the child can resolve `~`.
 //! 3. `HOOK_SESSION_ENV_ALLOWLIST` vars (`WAYLAND_DISPLAY`,
 //!    `XDG_RUNTIME_DIR`, `DISPLAY`, `XDG_SESSION_TYPE`,
 //!    `DBUS_SESSION_BUS_ADDRESS`) are passed through when present in the
 //!    daemon's environment — compositor and session commands need these to
 //!    reach the display server and D-Bus.
-//! 4. The seven `DORMANT_*` context vars from [`HookContext::env`].
-//! 5. Everything else is cleared — a hook child cannot read unrelated
+//! 4. On Windows, the child also receives the variables in
+//!    `HOOK_WINDOWS_ENV_ALLOWLIST` that the daemon has.
+//! 5. The seven `DORMANT_*` context vars from [`HookContext::env`].
+//! 6. Everything else is cleared — a hook child cannot read unrelated
 //!    secrets or the daemon's build environment out of its parent's env.
 //!
 //! On Unix, the runner calls `setsid(2)` in `pre_exec` to give the child its
@@ -797,7 +800,7 @@ pub(crate) async fn run_argv_command(
     for (k, v) in env {
         cmd.env(k, v);
     }
-    // PATH is hard-coded (daemon's toolchain paths must not leak).
+    // The daemon's toolchain paths must not pass to the hook.
     cmd.env("PATH", env_path());
     // HOME inherited from the daemon so the child can resolve ~.
     if let Some(home) = env_home() {
@@ -808,6 +811,12 @@ pub(crate) async fn run_argv_command(
     // Only vars present in the daemon's environment are passed through;
     // absent vars are not injected at all.
     for var_name in HOOK_SESSION_ENV_ALLOWLIST {
+        if let Some(value) = std::env::var_os(var_name) {
+            cmd.env(var_name, value);
+        }
+    }
+    #[cfg(windows)]
+    for var_name in HOOK_WINDOWS_ENV_ALLOWLIST {
         if let Some(value) = std::env::var_os(var_name) {
             cmd.env(var_name, value);
         }
@@ -933,8 +942,7 @@ pub(crate) async fn run_argv_command(
 
 /// Session environment variables inherited from the daemon when present.
 ///
-/// A hook child receives a deliberately minimal environment — PATH is
-/// hard-coded (`HOOK_CHILD_PATH`) and HOME is inherited from the daemon.
+/// A hook child receives a restricted `PATH` and the daemon's `HOME`.
 /// These additional vars are needed by compositor and session-aware
 /// commands that would otherwise abort or fail silently in a cleared env:
 ///
@@ -958,6 +966,29 @@ const HOOK_SESSION_ENV_ALLOWLIST: &[&str] = &[
     "DBUS_SESSION_BUS_ADDRESS",
 ];
 
+/// Windows environment variables that the child needs when present:
+///
+/// * `SystemRoot` and `windir`: Paths to the Windows installation.
+/// * `SystemDrive`: Drive that contains the Windows installation.
+/// * `ComSpec`: Path to the command interpreter.
+/// * `PATHEXT`: Extensions that command interpreters search for executables.
+/// * `TEMP` and `TMP`: Temporary directories.
+/// * `USERPROFILE`: User profile directory.
+/// * `LOCALAPPDATA` and `APPDATA`: Local and roaming application data directories.
+#[cfg(windows)]
+const HOOK_WINDOWS_ENV_ALLOWLIST: &[&str] = &[
+    "SystemRoot",
+    "windir",
+    "SystemDrive",
+    "ComSpec",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "LOCALAPPDATA",
+    "APPDATA",
+];
+
 /// Fixed, minimal PATH for hook children.
 ///
 /// Deliberately does NOT inherit the daemon's PATH — the daemon may have
@@ -966,14 +997,29 @@ const HOOK_SESSION_ENV_ALLOWLIST: &[&str] = &[
 /// absolute-path argv case (`["/usr/bin/env"]`, `["/bin/sh", ...]`) and
 /// lets hooks resolve unqualified commands like `notify-send`, `mosquitto_pub`,
 /// or shell builtins via `sh`.
+#[cfg(not(windows))]
 const HOOK_CHILD_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
+#[cfg(not(windows))]
 fn env_path() -> OsString {
     OsString::from(HOOK_CHILD_PATH)
 }
 
-/// HOME for the child. Inherits the daemon's HOME so the child can resolve
-/// `~`; PATH is the only thing we deliberately do NOT inherit (see above).
+#[cfg(windows)]
+fn env_path() -> OsString {
+    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| OsString::from(r"C:\Windows"));
+    let root = std::path::Path::new(&root);
+    let mut path = root.join("System32").into_os_string();
+    path.push(";");
+    path.push(root);
+    path.push(";");
+    path.push(root.join(r"System32\Wbem"));
+    path.push(";");
+    path.push(root.join(r"System32\WindowsPowerShell\v1.0"));
+    path
+}
+
+/// The child receives the daemon's `HOME` so that it can resolve `~`.
 fn env_home() -> Option<OsString> {
     std::env::var_os("HOME")
 }
@@ -2134,6 +2180,25 @@ mod tests {
     const RUNTIME_SENTINEL: &str = "dormant-test-runtime";
     const LEAK_VAR: &str = "DORMANT_UT_LEAK";
 
+    #[cfg(windows)]
+    const WINDOWS_ENV_PROBE_VALUES: [(&str, &str); 9] = [
+        ("windir", r"C:\dormant-test-windows"),
+        ("SystemDrive", "D:"),
+        ("ComSpec", r"C:\dormant-test-cmd.exe"),
+        ("PATHEXT", ".EXE;.CMD"),
+        ("TEMP", r"C:\dormant-test-temp"),
+        ("TMP", r"C:\dormant-test-tmp"),
+        ("USERPROFILE", r"C:\dormant-test-user"),
+        ("LOCALAPPDATA", r"C:\dormant-test-local"),
+        ("APPDATA", r"C:\dormant-test-roaming"),
+    ];
+
+    #[cfg(windows)]
+    fn hook_probe_system_root() -> String {
+        let root = std::env::var("SystemRoot").expect("the Windows test runner needs SystemRoot");
+        format!(r"{}\.", root.trim_end_matches('\\'))
+    }
+
     fn hook_probe_argv(mode: &str, output: &std::path::Path) -> Vec<String> {
         vec![
             std::env::current_exe()
@@ -2175,10 +2240,26 @@ mod tests {
             }
             "read-env" => {
                 let context = ctx_for(Phase::After, Direction::Release).env();
-                let values: BTreeMap<_, _> = context
-                    .iter()
-                    .map(|(key, _)| key.as_str())
-                    .chain(["PATH", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", LEAK_VAR])
+                let keys = context.iter().map(|(key, _)| key.as_str()).chain([
+                    "PATH",
+                    "WAYLAND_DISPLAY",
+                    "XDG_RUNTIME_DIR",
+                    LEAK_VAR,
+                ]);
+                #[cfg(windows)]
+                let keys = keys.chain([
+                    "SystemRoot",
+                    "windir",
+                    "SystemDrive",
+                    "ComSpec",
+                    "PATHEXT",
+                    "TEMP",
+                    "TMP",
+                    "USERPROFILE",
+                    "LOCALAPPDATA",
+                    "APPDATA",
+                ]);
+                let values: BTreeMap<_, _> = keys
                     .filter_map(|key| std::env::var(key).ok().map(|value| (key, value)))
                     .collect();
                 std::fs::write(output, serde_json::to_vec(&values).unwrap()).unwrap();
@@ -2196,23 +2277,20 @@ mod tests {
         let snapshot = dir.path().join("hook-env.json");
         let argv = hook_probe_argv("run-hook", &snapshot);
         // Set the daemon environment in the probe process, not in the test runner.
-        let output = timeout(
-            Duration::from_secs(20),
-            Command::new(&argv[0])
-                .args(&argv[1..])
-                .env_clear()
-                .envs([
-                    ("PATH", DAEMON_PATH_SENTINEL),
-                    ("WAYLAND_DISPLAY", WAYLAND_SENTINEL),
-                    ("XDG_RUNTIME_DIR", RUNTIME_SENTINEL),
-                    (LEAK_VAR, "should-not-appear"),
-                ])
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await
-        .expect("the daemon environment probe must finish")
-        .expect("the daemon environment probe must start");
+        let mut cmd = Command::new(&argv[0]);
+        cmd.args(&argv[1..]).env_clear().envs([
+            ("PATH", DAEMON_PATH_SENTINEL),
+            ("WAYLAND_DISPLAY", WAYLAND_SENTINEL),
+            ("XDG_RUNTIME_DIR", RUNTIME_SENTINEL),
+            (LEAK_VAR, "should-not-appear"),
+        ]);
+        #[cfg(windows)]
+        cmd.env("SystemRoot", hook_probe_system_root())
+            .envs(WINDOWS_ENV_PROBE_VALUES);
+        let output = timeout(Duration::from_secs(20), cmd.kill_on_drop(true).output())
+            .await
+            .expect("the daemon environment probe must finish")
+            .expect("the daemon environment probe must start");
         assert!(
             output.status.success(),
             "the daemon environment probe failed: {}\n{}",
@@ -2581,6 +2659,7 @@ mod tests {
 
     // ── fixed PATH not inherited from daemon ─────────
 
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn hook_child_path_is_fixed_not_daemon_path() {
         let env = hook_probe_env().await;
@@ -2594,6 +2673,35 @@ mod tests {
             "hook child PATH should be the fixed {HOOK_CHILD_PATH}, got: {path_value}"
         );
         assert_eq!(path_value, HOOK_CHILD_PATH);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn hook_child_path_uses_windows_system_directories_not_daemon_path() {
+        let env = hook_probe_env().await;
+        let path = env.get("PATH").expect("hook child must have a PATH");
+        assert!(
+            !path.contains(DAEMON_PATH_SENTINEL),
+            "hook child inherited the daemon PATH: {path}"
+        );
+        let root = hook_probe_system_root();
+        assert_eq!(
+            path,
+            &format!(
+                r"{root}\System32;{root};{root}\System32\Wbem;{root}\System32\WindowsPowerShell\v1.0"
+            ),
+            "hook child PATH must use the daemon's SystemRoot"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_allowlisted_env_vars_reach_hook_child() {
+        let env = hook_probe_env().await;
+        assert_eq!(env.get("SystemRoot"), Some(&hook_probe_system_root()));
+        for (key, expected) in WINDOWS_ENV_PROBE_VALUES {
+            assert_eq!(env.get(key).map(String::as_str), Some(expected), "{key}");
+        }
     }
 
     // ── Session env allowlist ────────────────────────────────────────────

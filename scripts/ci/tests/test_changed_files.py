@@ -110,6 +110,43 @@ class ChangedFilesTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("GATE-RAN", result.stdout)
 
+    def test_second_pushed_ref_with_matching_change_runs_gate(self):
+        # `git push origin a b` sends one stdin line for each ref.
+        self.branch_from_sha("docs-only", "docs/page.md")
+        docs_line = self.new_branch_push_line("docs-only")
+        self.branch_from_sha("feature", "src/lib.rs")
+        feature_line = self.new_branch_push_line("feature")
+        # HEAD must not carry the matching change, or the test passes on HEAD alone.
+        git(self.work, "checkout", "-q", "docs-only")
+        result = self.run_filter(docs_line + feature_line)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("GATE-RAN", result.stdout)
+
+    def test_pushed_commit_is_checked_not_the_checked_out_branch(self):
+        # `git push origin feature` from another branch pushes feature's commit.
+        self.branch_from_sha("feature", "src/lib.rs")
+        feature = git(self.work, "rev-parse", "HEAD")
+        self.branch_from_sha("docs-only", "docs/page.md")
+        result = self.run_filter(f"refs/heads/feature {feature} refs/heads/feature {ZERO}\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("GATE-RAN", result.stdout)
+
+    def test_unmatched_pushed_commit_skips_gate_while_head_matches(self):
+        # The control for the test above: HEAD has a matching change, the pushed commit does not.
+        self.branch_from_sha("docs-only", "docs/page.md")
+        docs = git(self.work, "rev-parse", "HEAD")
+        self.branch_from_sha("feature", "src/lib.rs")
+        result = self.run_filter(f"refs/heads/docs-only {docs} refs/heads/docs-only {ZERO}\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("GATE-RAN", result.stdout)
+
+    def test_branch_deletion_only_skips_gate(self):
+        self.branch_from_sha("feature", "src/lib.rs")
+        head = git(self.work, "rev-parse", "HEAD")
+        result = self.run_filter(f"(delete) {ZERO} refs/heads/old {head}\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("GATE-RAN", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

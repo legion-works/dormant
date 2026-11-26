@@ -209,7 +209,12 @@ def _integration_target(path: str, metadata: Metadata) -> Target:
     raise SelectionError(f"{path}: integration target {name!r} is absent from cargo metadata")
 
 
-def _support_targets(path: str, metadata: Metadata) -> Iterable[Target]:
+def _support_targets(
+    path: str,
+    metadata: Metadata,
+    platform: str,
+    source_files: Mapping[str, tuple[str | None, str | None]] | None,
+) -> Iterable[Target]:
     match = SUPPORT_MODULE.match(path)
     if match is None:
         raise AssertionError("support target lookup requires a support module path")
@@ -219,7 +224,16 @@ def _support_targets(path: str, metadata: Metadata) -> Iterable[Target]:
     targets = [target for target in package.targets if target.kind == "test"]
     if not targets:
         raise SelectionError(f"{path}: package has no integration targets to select")
-    return targets
+    if source_files is None:
+        return targets
+    # An integration target that a top-level cfg compiles out on this platform
+    # has zero tests here; the same check applies when its own file changes.
+    roots = {target: root for root, target in package.source_paths.items()}
+    return [
+        target
+        for target in targets
+        if _platform_compatible(source_files.get(roots.get(target, ""), (None, None))[1], platform)
+    ]
 
 
 def _is_fixture(path: str) -> bool:
@@ -305,7 +319,7 @@ def select_targets(
             if _is_fixture(path):
                 continue
             if SUPPORT_MODULE.match(path):
-                selected.update(_support_targets(path, metadata))
+                selected.update(_support_targets(path, metadata, platform, source_files))
                 continue
             if path.startswith("vendor/ddc-macos/"):
                 if change.is_test_range() and platform == "macos":

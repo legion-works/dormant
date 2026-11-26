@@ -40,7 +40,10 @@ render = ["dormant-core/render"]
 # already in the lock (tokio, mio, …) so this adds no duplicate build.
 windows-sys = { version = "0.61.2", features = [
   "Win32_Foundation",
+  "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem",
   "Win32_System_IO",
+  "Win32_System_Threading",
 ] }
 
 [package.metadata.dist]

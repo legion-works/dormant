@@ -8,3 +8,5 @@
 
 pub mod client;
 pub mod cmd_wear;
+#[cfg(windows)]
+mod ipc_pipe_security;

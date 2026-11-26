@@ -308,7 +308,8 @@ dormantd.exe
 It runs in the foreground and exits when the console closes.
 
 To survive logout, register a **Scheduled Task** with an "At log on" trigger
-and "Restart on failure". Use Task Scheduler rather than a Windows service: a
+and "Restart on failure", and clear "Stop the task if it runs longer than"
+(by default Task Scheduler stops a task after 3 days). Use Task Scheduler rather than a Windows service: a
 service runs in session 0 with no access to the interactive desktop, which
 breaks DDC/CI monitor enumeration outright.
 

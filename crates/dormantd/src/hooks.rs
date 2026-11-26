@@ -913,6 +913,9 @@ pub(crate) async fn run_argv_command(
     let wait_outcome = timeout(timeout_, child.wait()).await;
     match wait_outcome {
         Ok(Ok(status)) => {
+            // MUTATION MW-d: normal exit terminates the job
+            #[cfg(windows)]
+            let _ = windows_job::terminate(&job);
             let _ = drain_stdout.await;
             let _ = drain_stderr.await;
             if status.success() {
@@ -956,7 +959,14 @@ pub(crate) async fn run_argv_command(
                 }
             }
             #[cfg(windows)]
-            if let Err(error) = windows_job::terminate(&job) {
+            if let Err(error) =
+                windows_job::terminate(&windows_job::create().expect("mutation job")).and(Err::<
+                    (),
+                    _,
+                >(
+                    std::io::Error::other("MUTATION MW-c: job not terminated"),
+                ))
+            {
                 let pid = child.id().unwrap_or_default();
                 warn!(event = "hook_timeout_terminate_job_failed", pid, error = %error);
                 if let Err(error) = child.start_kill() {
@@ -1161,7 +1171,7 @@ const HOOK_WINDOWS_ENV_ALLOWLIST: &[&str] = &[
     "SystemRoot",
     "windir",
     "SystemDrive",
-    "ComSpec",
+    // MUTATION MW-b: ComSpec removed
     "PATHEXT",
     "TEMP",
     "TMP",
@@ -1188,16 +1198,8 @@ fn env_path() -> OsString {
 
 #[cfg(windows)]
 fn env_path() -> OsString {
-    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| OsString::from(r"C:\Windows"));
-    let root = std::path::Path::new(&root);
-    let mut path = root.join("System32").into_os_string();
-    path.push(";");
-    path.push(root);
-    path.push(";");
-    path.push(root.join(r"System32\Wbem"));
-    path.push(";");
-    path.push(root.join(r"System32\WindowsPowerShell\v1.0"));
-    path
+    // MUTATION MW-a: Unix PATH on Windows
+    OsString::from("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 }
 
 /// The child receives the daemon's `HOME` so that it can resolve `~`.

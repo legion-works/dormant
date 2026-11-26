@@ -1,12 +1,3 @@
-#![cfg(unix)]
-//! Unix-only: the fixtures drive the daemon's `command` display controller
-//! with POSIX shell text — `printf X >> 'file'`, `test -e`, `true`/`false` —
-//! and observe behaviour by counting marker bytes those commands append.
-//! `cmd /C` has no equivalent spelling, so the suite needs a platform-aware
-//! fixture helper before it can run on Windows. Tracked in the Windows
-//! support issue (#265); the IPC transport that previously blocked it is
-//! done (#371, #373).
-//!
 //! Integration tests for the config-apply full loop: web UI → daemon reload
 //! → filesystem artifacts.
 //!
@@ -28,11 +19,25 @@ use std::time::Duration;
 use dormant_core::config::Strictness;
 use dormant_core::config::schema::Credentials;
 use dormant_core::fakes::FakeSensorSource;
+use dormant_core::observation::{DaemonObservation, ObservationHub};
+use dormant_core::state_machine::Phase;
 use dormant_core::traits::SensorSource;
 use dormant_core::types::{PresenceEvent, SensorId, SensorState, Timestamp};
 use dormantd::app::App;
 use reqwest::header;
 use tempfile::TempDir;
+
+mod support {
+    pub mod config;
+    #[allow(
+        dead_code,
+        reason = "each integration test binary uses a subset of the shared support helpers"
+    )]
+    pub mod shell;
+}
+
+use support::config::toml_string;
+use support::shell;
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -101,22 +106,23 @@ members = ["desk"]
 [displays.mon]
 controllers = ["command"]
 blank_mode = "power_off"
-blank_command = "printf B >> '{m}'"
-wake_command = "printf W >> '{m}'"
+blank_command = {blank}
+wake_command = {wake}
 modes = ["power_off"]
 
 [rules.r]
 zone = "office"
 displays = ["mon"]
-grace_period = "{g}"
+grace_period = {g}
 min_wake_time = "0s"
 wake_retries = 0
 wake_retry_backoff = "10ms"
 wake_retry_interval = "1s"
 "#,
         wp = web_port,
-        m = marker.display(),
-        g = grace,
+        blank = toml_string(&shell::append(marker, "B")),
+        wake = toml_string(&shell::append(marker, "W")),
+        g = toml_string(grace),
     )
 }
 
@@ -363,6 +369,8 @@ async fn config_apply_wake_command_change_reloads() {
     // retained-dark display gets a defensive wake — but that's fire-and-
     // forget, so the reload still succeeds.
     let script = vec![(Duration::from_millis(100), ev("desk", SensorState::Absent))];
+    let observations = ObservationHub::new(32);
+    let mut phases = observations.subscribe();
     let app = App::build_with_sources(
         cfg_path.clone(),
         creds_path,
@@ -371,16 +379,32 @@ async fn config_apply_wake_command_change_reloads() {
     )
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
+    .with_observation_hub(observations)
     .with_state_dir(dir.path().join("state"))
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 
-    // Wait for the display to blank, confirming it's in a dark phase.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // The marker can appear before the engine processes the command result.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(
+                phases.recv().await.expect("receive display observation"),
+                DaemonObservation::DisplayPhaseChanged {
+                    display_id,
+                    new_phase: Phase::Blanked,
+                    ..
+                } if display_id.0 == "mon"
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("display should reach Blanked before apply (blank command must succeed)");
     let marker_content = std::fs::read_to_string(&marker).unwrap_or_default();
-    assert!(
-        marker_content.contains('B'),
-        "display should have blanked before apply; marker content: {marker_content:?}"
+    assert_eq!(
+        marker_content, "B",
+        "blank command must append exactly one marker byte"
     );
 
     let client = reqwest::Client::new();
@@ -398,7 +422,7 @@ async fn config_apply_wake_command_change_reloads() {
         .expect("parse config JSON");
     let fingerprint = cfg_resp["fingerprint"].as_str().unwrap().to_string();
 
-    // Patch wake_command to "false" (always fails).  The daemon's
+    // Patch wake_command to a command that always fails. The daemon's
     // defensive wake on reload will fail, but that failure is logged at
     // WARN and the reload proceeds to Reloaded.
     let apply_body = serde_json::json!({
@@ -407,7 +431,7 @@ async fn config_apply_wake_command_change_reloads() {
             {
                 "op": "set",
                 "path": ["displays", "mon", "wake_command"],
-                "value": "false",
+                "value": shell::fail(),
             }
         ]
     });

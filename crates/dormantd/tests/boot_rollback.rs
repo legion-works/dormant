@@ -39,6 +39,10 @@ use tokio::sync::oneshot;
 mod support {
     pub mod app_paths;
     pub mod config;
+    #[allow(
+        dead_code,
+        reason = "each integration test binary uses a subset of the shared support helpers"
+    )]
     pub mod shell;
 }
 

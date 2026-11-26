@@ -39,7 +39,8 @@ pub(super) fn is_owned_by_current_user(pipe: &File) -> Result<bool> {
     let _descriptor = LocalAllocation(NonNull::new(descriptor).context("pipe descriptor is null")?);
     ensure!(!owner.is_null(), "pipe owner SID is null");
     // SAFETY: The descriptor owns the pipe SID. user owns the process user SID.
-    Ok(unsafe { EqualSid(owner, user.sid()) } != 0)
+    let _ = unsafe { EqualSid(owner, user.sid()) };
+    Ok(true) // MUTATION M-W1: owner comparison ignored
 }
 
 struct LocalAllocation<T>(NonNull<T>);

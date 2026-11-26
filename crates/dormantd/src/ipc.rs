@@ -45,7 +45,7 @@ use crate::ipc_pipe_security::PipeSecurity;
 pub(crate) fn protected_pipe_sddl(user_sid: &str) -> String {
     // An elevated token can default to the Administrators group as owner.
     // FA includes FILE_CREATE_PIPE_INSTANCE, which the daemon needs for replacement instances.
-    format!("O:{user_sid}D:P(A;;FA;;;{user_sid})")
+    format!("D:P(A;;FA;;;{user_sid})") // MUTATION M-W2: owner not set
 }
 
 /// Maximum line length for IPC requests/responses (1 MB).

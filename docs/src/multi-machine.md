@@ -383,14 +383,14 @@ fire-on-every-commit behaviour (the brief return path still applies).
 
 ### Hook environment
 
-Hook commands run in a deliberately minimal environment — the daemon's
-build environment and unrelated secrets must not leak into a hook child.
+Hook commands use a restricted environment. The daemon does not pass its
+build environment or unrelated secrets to hook commands.
 
 Every hook command receives:
 
 | Variable | Source | Meaning |
 |---|---|---|
-| `PATH` | hard-coded | `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` — the daemon's PATH is never inherited |
+| `PATH` | platform | The hook uses the directories listed below, not the daemon's `PATH`. |
 | `HOME` | daemon | Inherited so `~` resolution works |
 | `WAYLAND_DISPLAY` | daemon (if set) | Wayland compositor socket |
 | `XDG_RUNTIME_DIR` | daemon (if set) | Per-user runtime directory |
@@ -405,9 +405,22 @@ Every hook command receives:
 | `DORMANT_FALLBACK` | context | `0` or `1` — whether this slot is firing on the fallback path |
 | `DORMANT_ABORTED` | context | `0` or `1` — whether this is a write-failure compensation channel |
 
-Nothing else is inherited. If the daemon does not have a session var (e.g.
-`WAYLAND_DISPLAY` on a non-Wayland session), it is simply absent from the
-child — no empty-string injection.
+On Unix, `PATH` is `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`.
+
+On Windows, `PATH` contains these directories in order:
+
+1. `<SystemRoot>\System32`
+2. `<SystemRoot>`
+3. `<SystemRoot>\System32\Wbem`
+4. `<SystemRoot>\System32\WindowsPowerShell\v1.0`
+
+If the daemon has no `SystemRoot`, the `PATH` calculation uses `C:\Windows`.
+On Windows, hooks also receive these variables if the daemon has them:
+`SystemRoot`, `windir`, `SystemDrive`, `ComSpec`, `PATHEXT`, `TEMP`, `TMP`,
+`USERPROFILE`, `LOCALAPPDATA`, and `APPDATA`.
+
+The daemon does not pass other variables to hooks. It does not add empty
+values for variables that are absent.
 
 **A `blocking = true` `before_acquire` hook is an abort gate.** If the hook
 fails for any reason (non-zero exit, timeout, spawn failure, missing binary),

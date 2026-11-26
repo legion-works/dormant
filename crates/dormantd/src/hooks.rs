@@ -23,22 +23,26 @@
 //! — the existing `command` display controller's shell invocation is NOT
 //! reused (F7). The child's environment is deliberately minimal:
 //!
-//! 1. `PATH` is hard-coded to `HOOK_CHILD_PATH` — the daemon's toolchain /
-//!    Nix paths must not leak into a hook child.
+//! 1. On Windows, `PATH` lists system directories under `SystemRoot`.
+//!    On other platforms, it uses `HOOK_CHILD_PATH`. The daemon's `PATH`
+//!    does not pass to the child.
 //! 2. `HOME` is inherited from the daemon so the child can resolve `~`.
 //! 3. `HOOK_SESSION_ENV_ALLOWLIST` vars (`WAYLAND_DISPLAY`,
 //!    `XDG_RUNTIME_DIR`, `DISPLAY`, `XDG_SESSION_TYPE`,
 //!    `DBUS_SESSION_BUS_ADDRESS`) are passed through when present in the
 //!    daemon's environment — compositor and session commands need these to
 //!    reach the display server and D-Bus.
-//! 4. The seven `DORMANT_*` context vars from [`HookContext::env`].
-//! 5. Everything else is cleared — a hook child cannot read unrelated
+//! 4. On Windows, the child also receives the variables in
+//!    `HOOK_WINDOWS_ENV_ALLOWLIST` that the daemon has.
+//! 5. The seven `DORMANT_*` context vars from [`HookContext::env`].
+//! 6. Everything else is cleared — a hook child cannot read unrelated
 //!    secrets or the daemon's build environment out of its parent's env.
 //!
 //! On Unix, the runner calls `setsid(2)` in `pre_exec` to give the child its
 //! own process group. On timeout, `kill(-pid, SIGKILL)` stops the group.
-//! This stops the child and its descendants. On Windows, a timeout stops
-//! the child but not its descendants.
+//! This stops the child and its descendants. On Windows, the runner assigns
+//! the suspended child to a job before it resumes the primary thread.
+//! On timeout, the runner stops all processes in that job.
 //!
 //! ## MQTT action
 //!
@@ -774,8 +778,8 @@ impl HookRunner for RealHookRunner {
 }
 
 /// `tokio::process::Command` argv path: clear env, set `DORMANT_*` + allowlist,
-/// and stop the process on timeout. On Unix, `setsid` puts the child in a
-/// new process group so a timeout can stop the group.
+/// and stop the process tree on timeout. Unix uses a process group.
+/// Windows uses a job object.
 #[allow(
     clippy::too_many_lines,
     reason = "process setup is linear and each step is necessary; splitting would harm readability"
@@ -797,7 +801,7 @@ pub(crate) async fn run_argv_command(
     for (k, v) in env {
         cmd.env(k, v);
     }
-    // PATH is hard-coded (daemon's toolchain paths must not leak).
+    // The daemon's toolchain paths must not pass to the hook.
     cmd.env("PATH", env_path());
     // HOME inherited from the daemon so the child can resolve ~.
     if let Some(home) = env_home() {
@@ -812,9 +816,23 @@ pub(crate) async fn run_argv_command(
             cmd.env(var_name, value);
         }
     }
+    #[cfg(windows)]
+    for var_name in HOOK_WINDOWS_ENV_ALLOWLIST {
+        if let Some(value) = std::env::var_os(var_name) {
+            cmd.env(var_name, value);
+        }
+    }
     cmd.stdin(Stdio::null());
+    #[cfg(not(windows))]
     cmd.stdout(Stdio::piped());
+    #[cfg(not(windows))]
     cmd.stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        // The runner discards all output. An inherited pipe would keep it
+        // waiting for EOF after a successful hook started a background process.
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    }
     cmd.kill_on_drop(true);
 
     // setsid(2): the child becomes the leader of a new session AND process
@@ -833,9 +851,32 @@ pub(crate) async fn run_argv_command(
         });
     }
 
+    #[cfg(windows)]
+    let job = windows_job::create().map_err(|error| {
+        warn!(event = "hook_job_create_failed", error = %error);
+        format!(
+            "{E_HOOK_FAILED}: CreateJobObjectW failed for argv[0]={}: {error}",
+            argv[0]
+        )
+    })?;
+    #[cfg(windows)]
+    cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
+
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("{E_HOOK_FAILED}: spawn failed for argv[0]={}: {e}", argv[0]))?;
+
+    #[cfg(windows)]
+    if let Err(error) = windows_job::assign_and_resume(&job, &child) {
+        let pid = child.id().unwrap_or_default();
+        if let Err(cleanup_error) = child.kill().await {
+            warn!(event = "hook_job_cleanup_failed", pid, error = %cleanup_error);
+        }
+        return Err(format!(
+            "{E_HOOK_FAILED}: job setup failed for argv[0]={}: {error:#}",
+            argv[0]
+        ));
+    }
 
     // Drain stdout concurrently — same reason as the existing `command`
     // controller: a child that writes more than the pipe buffer blocks on
@@ -914,8 +955,15 @@ pub(crate) async fn run_argv_command(
                     }
                 }
             }
-            // This path does not use a Windows `Job Object` to stop the child's descendants.
-            #[cfg(not(unix))]
+            #[cfg(windows)]
+            if let Err(error) = windows_job::terminate(&job) {
+                let pid = child.id().unwrap_or_default();
+                warn!(event = "hook_timeout_terminate_job_failed", pid, error = %error);
+                if let Err(error) = child.start_kill() {
+                    warn!(event = "hook_timeout_kill_failed", pid, error = %error);
+                }
+            }
+            #[cfg(not(any(unix, windows)))]
             if let Err(error) = child.start_kill() {
                 warn!(event = "hook_timeout_kill_failed", pid = child.id().unwrap_or_default(), error = %error);
             }
@@ -931,10 +979,151 @@ pub(crate) async fn run_argv_command(
     }
 }
 
+#[cfg(windows)]
+mod windows_job {
+    use std::io;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::ptr::null;
+
+    use anyhow::{Context, Result, ensure};
+    use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, TerminateJobObject,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetProcessId, GetProcessIdOfThread, OpenThread, ResumeThread,
+        THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
+    };
+
+    pub(super) fn create() -> io::Result<OwnedHandle> {
+        // SAFETY: Null arguments request a new, unnamed, noninheritable job.
+        let raw = unsafe { CreateJobObjectW(null(), null()) };
+        if raw.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // Do not set KILL_ON_JOB_CLOSE. Background processes must survive a normal hook exit.
+        // SAFETY: CreateJobObjectW returned a new handle. OwnedHandle closes it.
+        Ok(unsafe { OwnedHandle::from_raw_handle(raw) })
+    }
+
+    pub(super) fn assign_and_resume(
+        job: &OwnedHandle,
+        child: &tokio::process::Child,
+    ) -> Result<()> {
+        let process = child
+            .raw_handle()
+            .context("missing suspended child handle")?;
+        // SAFETY: The child owns this process handle and stays borrowed during setup.
+        let pid = unsafe { GetProcessId(process) };
+        if pid == 0 {
+            return Err(io::Error::last_os_error()).context("GetProcessId");
+        }
+        let thread = primary_thread(pid)?;
+        // SAFETY: The thread handle has query access and remains open during the call.
+        let owner = unsafe { GetProcessIdOfThread(thread.as_raw_handle()) };
+        if owner == 0 {
+            return Err(io::Error::last_os_error()).context("GetProcessIdOfThread");
+        }
+        ensure!(
+            owner == pid,
+            "GetProcessIdOfThread: thread no longer belongs to the suspended child"
+        );
+
+        // SAFETY: The job and process handles stay open and have assignment access.
+        if unsafe { AssignProcessToJobObject(job.as_raw_handle(), process) } == 0 {
+            return Err(io::Error::last_os_error()).context("AssignProcessToJobObject");
+        }
+        // SAFETY: The thread handle has resume access and stays open during the call.
+        let suspend_count = unsafe { ResumeThread(thread.as_raw_handle()) };
+        if suspend_count == u32::MAX {
+            return Err(io::Error::last_os_error()).context("ResumeThread");
+        }
+        ensure!(
+            suspend_count == 1,
+            "ResumeThread: expected suspend count 1, got {suspend_count}"
+        );
+        Ok(())
+    }
+
+    fn primary_thread(pid: u32) -> Result<OwnedHandle> {
+        // Stable Rust does not expose the primary thread handle. This costs one thread
+        // snapshot per Windows hook spawn. A suspended primary thread cannot start another thread.
+        // SAFETY: TH32CS_SNAPTHREAD takes no process-specific input and returns an owned handle.
+        let raw = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        if raw == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error()).context("CreateToolhelp32Snapshot");
+        }
+        // SAFETY: The snapshot call returned a new handle. OwnedHandle closes it.
+        let snapshot = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let size = u32::try_from(std::mem::size_of::<THREADENTRY32>())?;
+        let mut entry = THREADENTRY32 {
+            dwSize: size,
+            ..THREADENTRY32::default()
+        };
+        // SAFETY: The snapshot stays open. The output has the size required by Thread32First.
+        if unsafe { Thread32First(snapshot.as_raw_handle(), &raw mut entry) } == 0 {
+            return Err(io::Error::last_os_error()).context("Thread32First");
+        }
+        let mut thread_id = None;
+        loop {
+            ensure!(
+                entry.dwSize == size,
+                "thread snapshot returned an incomplete entry"
+            );
+            if entry.th32OwnerProcessID == pid {
+                ensure!(
+                    thread_id.is_none(),
+                    "thread snapshot found more than one thread for the suspended child"
+                );
+                thread_id = Some(entry.th32ThreadID);
+            }
+            entry.dwSize = size;
+            // SAFETY: The snapshot stays open. The output has the size required by Thread32Next.
+            if unsafe { Thread32Next(snapshot.as_raw_handle(), &raw mut entry) } == 0 {
+                let error = io::Error::last_os_error();
+                if error
+                    .raw_os_error()
+                    .and_then(|code| u32::try_from(code).ok())
+                    != Some(ERROR_NO_MORE_FILES)
+                {
+                    return Err(error).context("Thread32Next");
+                }
+                break;
+            }
+        }
+
+        let thread_id =
+            thread_id.context("thread snapshot found no thread for the suspended child")?;
+        // SAFETY: OpenThread returns a new noninheritable handle or null for this ID.
+        let raw = unsafe {
+            OpenThread(
+                THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION,
+                0,
+                thread_id,
+            )
+        };
+        if raw.is_null() {
+            return Err(io::Error::last_os_error()).context("OpenThread");
+        }
+        // SAFETY: OpenThread returned a new handle. OwnedHandle closes it.
+        Ok(unsafe { OwnedHandle::from_raw_handle(raw) })
+    }
+
+    pub(super) fn terminate(job: &OwnedHandle) -> io::Result<()> {
+        // SAFETY: The job handle stays open and has termination access.
+        if unsafe { TerminateJobObject(job.as_raw_handle(), 1) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
 /// Session environment variables inherited from the daemon when present.
 ///
-/// A hook child receives a deliberately minimal environment — PATH is
-/// hard-coded (`HOOK_CHILD_PATH`) and HOME is inherited from the daemon.
+/// A hook child receives a restricted `PATH` and the daemon's `HOME`.
 /// These additional vars are needed by compositor and session-aware
 /// commands that would otherwise abort or fail silently in a cleared env:
 ///
@@ -958,6 +1147,29 @@ const HOOK_SESSION_ENV_ALLOWLIST: &[&str] = &[
     "DBUS_SESSION_BUS_ADDRESS",
 ];
 
+/// Windows environment variables that the child needs when present:
+///
+/// * `SystemRoot` and `windir`: Paths to the Windows installation.
+/// * `SystemDrive`: Drive that contains the Windows installation.
+/// * `ComSpec`: Path to the command interpreter.
+/// * `PATHEXT`: Extensions that command interpreters search for executables.
+/// * `TEMP` and `TMP`: Temporary directories.
+/// * `USERPROFILE`: User profile directory.
+/// * `LOCALAPPDATA` and `APPDATA`: Local and roaming application data directories.
+#[cfg(windows)]
+const HOOK_WINDOWS_ENV_ALLOWLIST: &[&str] = &[
+    "SystemRoot",
+    "windir",
+    "SystemDrive",
+    "ComSpec",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "LOCALAPPDATA",
+    "APPDATA",
+];
+
 /// Fixed, minimal PATH for hook children.
 ///
 /// Deliberately does NOT inherit the daemon's PATH — the daemon may have
@@ -966,14 +1178,29 @@ const HOOK_SESSION_ENV_ALLOWLIST: &[&str] = &[
 /// absolute-path argv case (`["/usr/bin/env"]`, `["/bin/sh", ...]`) and
 /// lets hooks resolve unqualified commands like `notify-send`, `mosquitto_pub`,
 /// or shell builtins via `sh`.
+#[cfg(not(windows))]
 const HOOK_CHILD_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
+#[cfg(not(windows))]
 fn env_path() -> OsString {
     OsString::from(HOOK_CHILD_PATH)
 }
 
-/// HOME for the child. Inherits the daemon's HOME so the child can resolve
-/// `~`; PATH is the only thing we deliberately do NOT inherit (see above).
+#[cfg(windows)]
+fn env_path() -> OsString {
+    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| OsString::from(r"C:\Windows"));
+    let root = std::path::Path::new(&root);
+    let mut path = root.join("System32").into_os_string();
+    path.push(";");
+    path.push(root);
+    path.push(";");
+    path.push(root.join(r"System32\Wbem"));
+    path.push(";");
+    path.push(root.join(r"System32\WindowsPowerShell\v1.0"));
+    path
+}
+
+/// The child receives the daemon's `HOME` so that it can resolve `~`.
 fn env_home() -> Option<OsString> {
     std::env::var_os("HOME")
 }
@@ -2134,6 +2361,25 @@ mod tests {
     const RUNTIME_SENTINEL: &str = "dormant-test-runtime";
     const LEAK_VAR: &str = "DORMANT_UT_LEAK";
 
+    #[cfg(windows)]
+    const WINDOWS_ENV_PROBE_VALUES: [(&str, &str); 9] = [
+        ("windir", r"C:\dormant-test-windows"),
+        ("SystemDrive", "D:"),
+        ("ComSpec", r"C:\dormant-test-cmd.exe"),
+        ("PATHEXT", ".EXE;.CMD"),
+        ("TEMP", r"C:\dormant-test-temp"),
+        ("TMP", r"C:\dormant-test-tmp"),
+        ("USERPROFILE", r"C:\dormant-test-user"),
+        ("LOCALAPPDATA", r"C:\dormant-test-local"),
+        ("APPDATA", r"C:\dormant-test-roaming"),
+    ];
+
+    #[cfg(windows)]
+    fn hook_probe_system_root() -> String {
+        let root = std::env::var("SystemRoot").expect("the Windows test runner needs SystemRoot");
+        format!(r"{}\.", root.trim_end_matches('\\'))
+    }
+
     fn hook_probe_argv(mode: &str, output: &std::path::Path) -> Vec<String> {
         vec![
             std::env::current_exe()
@@ -2175,10 +2421,26 @@ mod tests {
             }
             "read-env" => {
                 let context = ctx_for(Phase::After, Direction::Release).env();
-                let values: BTreeMap<_, _> = context
-                    .iter()
-                    .map(|(key, _)| key.as_str())
-                    .chain(["PATH", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", LEAK_VAR])
+                let keys = context.iter().map(|(key, _)| key.as_str()).chain([
+                    "PATH",
+                    "WAYLAND_DISPLAY",
+                    "XDG_RUNTIME_DIR",
+                    LEAK_VAR,
+                ]);
+                #[cfg(windows)]
+                let keys = keys.chain([
+                    "SystemRoot",
+                    "windir",
+                    "SystemDrive",
+                    "ComSpec",
+                    "PATHEXT",
+                    "TEMP",
+                    "TMP",
+                    "USERPROFILE",
+                    "LOCALAPPDATA",
+                    "APPDATA",
+                ]);
+                let values: BTreeMap<_, _> = keys
                     .filter_map(|key| std::env::var(key).ok().map(|value| (key, value)))
                     .collect();
                 std::fs::write(output, serde_json::to_vec(&values).unwrap()).unwrap();
@@ -2186,6 +2448,38 @@ mod tests {
             "block" => {
                 std::fs::write(output, b"started").unwrap();
                 std::future::pending::<()>().await;
+            }
+            #[cfg(windows)]
+            "spawn-grandchild" | "spawn-grandchild-and-exit" => {
+                let grandchild = hook_probe_argv("block-grandchild", output.as_ref());
+                let mut child = Command::new(&grandchild[0])
+                    .args(&grandchild[1..])
+                    .kill_on_drop(mode == "spawn-grandchild")
+                    .spawn()
+                    .expect("the grandchild probe must start");
+                let mut poll = tokio::time::interval(Duration::from_millis(10));
+                timeout(Duration::from_secs(10), async {
+                    loop {
+                        poll.tick().await;
+                        if std::path::Path::new(&output).exists() {
+                            break;
+                        }
+                    }
+                })
+                .await
+                .expect("the grandchild must publish its PID");
+                if mode == "spawn-grandchild" {
+                    child.wait().await.expect("wait for grandchild probe");
+                }
+            }
+            #[cfg(windows)]
+            "block-grandchild" => {
+                let output = std::path::Path::new(&output);
+                let pending_pid = output.with_extension("pending");
+                std::fs::write(&pending_pid, std::process::id().to_string()).unwrap();
+                std::fs::rename(pending_pid, output).unwrap();
+                // Bound the lifetime if a test cannot retrieve or stop this process.
+                let _ = timeout(Duration::from_secs(30), std::future::pending::<()>()).await;
             }
             _ => panic!("unknown hook probe mode: {mode}"),
         }
@@ -2196,23 +2490,20 @@ mod tests {
         let snapshot = dir.path().join("hook-env.json");
         let argv = hook_probe_argv("run-hook", &snapshot);
         // Set the daemon environment in the probe process, not in the test runner.
-        let output = timeout(
-            Duration::from_secs(20),
-            Command::new(&argv[0])
-                .args(&argv[1..])
-                .env_clear()
-                .envs([
-                    ("PATH", DAEMON_PATH_SENTINEL),
-                    ("WAYLAND_DISPLAY", WAYLAND_SENTINEL),
-                    ("XDG_RUNTIME_DIR", RUNTIME_SENTINEL),
-                    (LEAK_VAR, "should-not-appear"),
-                ])
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await
-        .expect("the daemon environment probe must finish")
-        .expect("the daemon environment probe must start");
+        let mut cmd = Command::new(&argv[0]);
+        cmd.args(&argv[1..]).env_clear().envs([
+            ("PATH", DAEMON_PATH_SENTINEL),
+            ("WAYLAND_DISPLAY", WAYLAND_SENTINEL),
+            ("XDG_RUNTIME_DIR", RUNTIME_SENTINEL),
+            (LEAK_VAR, "should-not-appear"),
+        ]);
+        #[cfg(windows)]
+        cmd.env("SystemRoot", hook_probe_system_root())
+            .envs(WINDOWS_ENV_PROBE_VALUES);
+        let output = timeout(Duration::from_secs(20), cmd.kill_on_drop(true).output())
+            .await
+            .expect("the daemon environment probe must finish")
+            .expect("the daemon environment probe must start");
         assert!(
             output.status.success(),
             "the daemon environment probe failed: {}\n{}",
@@ -2242,6 +2533,122 @@ mod tests {
         assert!(
             matches!(result, Err(ref reason) if reason.starts_with(E_HOOK_TIMEOUT)),
             "expected hook timeout, got {result:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    fn open_grandchild(marker: &std::path::Path) -> Option<std::os::windows::io::OwnedHandle> {
+        use std::os::windows::io::{FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+        };
+
+        let pid = std::fs::read_to_string(marker)
+            .expect("the grandchild must start and write its PID before the hook exits")
+            .parse()
+            .expect("the grandchild must write a valid PID");
+        // SAFETY: The call returns a new handle for the probe PID or null.
+        let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, pid) };
+        if raw.is_null() {
+            let error = std::io::Error::last_os_error();
+            assert_eq!(
+                error
+                    .raw_os_error()
+                    .and_then(|code| u32::try_from(code).ok()),
+                Some(ERROR_INVALID_PARAMETER),
+                "could not open grandchild process {pid}: {error}"
+            );
+            None
+        } else {
+            // SAFETY: OpenProcess returned a new handle. OwnedHandle closes it.
+            Some(unsafe { OwnedHandle::from_raw_handle(raw) })
+        }
+    }
+
+    #[cfg(windows)]
+    fn grandchild_exited(process: &std::os::windows::io::OwnedHandle, wait_ms: u32) -> bool {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+        // SAFETY: The process handle stays open and has PROCESS_SYNCHRONIZE access.
+        match unsafe { WaitForSingleObject(process.as_raw_handle(), wait_ms) } {
+            WAIT_OBJECT_0 => true,
+            WAIT_TIMEOUT => false,
+            result => panic!(
+                "grandchild wait returned {result}: {}",
+                std::io::Error::last_os_error()
+            ),
+        }
+    }
+
+    #[cfg(windows)]
+    fn stop_probe_grandchild(process: &std::os::windows::io::OwnedHandle) {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Threading::TerminateProcess;
+
+        // SAFETY: The process handle stays open and has PROCESS_TERMINATE access.
+        let stopped = unsafe { TerminateProcess(process.as_raw_handle(), 1) };
+        assert_ne!(
+            stopped,
+            0,
+            "could not stop grandchild probe: {}",
+            std::io::Error::last_os_error()
+        );
+        assert!(
+            grandchild_exited(process, 5_000),
+            "grandchild probe did not stop"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn real_argv_hook_timeout_stops_windows_grandchild() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("grandchild.pid");
+        let argv = hook_probe_argv("spawn-grandchild", &marker);
+        let result = timeout(
+            Duration::from_secs(15),
+            run_argv_command(&Vec::new(), &argv, Duration::from_secs(5)),
+        )
+        .await;
+
+        if let Some(process) = open_grandchild(&marker)
+            && !grandchild_exited(&process, 3_000)
+        {
+            stop_probe_grandchild(&process);
+            panic!("hook timeout left the Windows grandchild running");
+        }
+        assert!(
+            matches!(result, Ok(Err(ref reason)) if reason.starts_with(E_HOOK_TIMEOUT)),
+            "expected hook timeout, got {result:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn real_argv_hook_normal_exit_leaves_windows_grandchild_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("grandchild.pid");
+        let argv = hook_probe_argv("spawn-grandchild-and-exit", &marker);
+        let result = timeout(
+            Duration::from_secs(15),
+            run_argv_command(&Vec::new(), &argv, Duration::from_secs(10)),
+        )
+        .await;
+
+        let process = open_grandchild(&marker).expect("normal hook exit stopped the grandchild");
+        // A job termination is asynchronous: a zero wait can see the grandchild
+        // still running while it is being stopped.
+        assert!(
+            !grandchild_exited(&process, 1_000),
+            "normal hook exit stopped the grandchild"
+        );
+        stop_probe_grandchild(&process);
+        assert!(
+            matches!(result, Ok(Ok(()))),
+            "the spawning hook must exit normally, got {result:?}"
         );
     }
 
@@ -2581,6 +2988,7 @@ mod tests {
 
     // ── fixed PATH not inherited from daemon ─────────
 
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn hook_child_path_is_fixed_not_daemon_path() {
         let env = hook_probe_env().await;
@@ -2594,6 +3002,35 @@ mod tests {
             "hook child PATH should be the fixed {HOOK_CHILD_PATH}, got: {path_value}"
         );
         assert_eq!(path_value, HOOK_CHILD_PATH);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn hook_child_path_uses_windows_system_directories_not_daemon_path() {
+        let env = hook_probe_env().await;
+        let path = env.get("PATH").expect("hook child must have a PATH");
+        assert!(
+            !path.contains(DAEMON_PATH_SENTINEL),
+            "hook child inherited the daemon PATH: {path}"
+        );
+        let root = hook_probe_system_root();
+        assert_eq!(
+            path,
+            &format!(
+                r"{root}\System32;{root};{root}\System32\Wbem;{root}\System32\WindowsPowerShell\v1.0"
+            ),
+            "hook child PATH must use the daemon's SystemRoot"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_allowlisted_env_vars_reach_hook_child() {
+        let env = hook_probe_env().await;
+        assert_eq!(env.get("SystemRoot"), Some(&hook_probe_system_root()));
+        for (key, expected) in WINDOWS_ENV_PROBE_VALUES {
+            assert_eq!(env.get(key).map(String::as_str), Some(expected), "{key}");
+        }
     }
 
     // ── Session env allowlist ────────────────────────────────────────────

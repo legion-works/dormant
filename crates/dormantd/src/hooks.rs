@@ -40,8 +40,9 @@
 //!
 //! On Unix, the runner calls `setsid(2)` in `pre_exec` to give the child its
 //! own process group. On timeout, `kill(-pid, SIGKILL)` stops the group.
-//! This stops the child and its descendants. On Windows, a timeout stops
-//! the child but not its descendants.
+//! This stops the child and its descendants. On Windows, the runner assigns
+//! the suspended child to a job before it resumes the primary thread.
+//! On timeout, the runner stops all processes in that job.
 //!
 //! ## MQTT action
 //!
@@ -777,8 +778,8 @@ impl HookRunner for RealHookRunner {
 }
 
 /// `tokio::process::Command` argv path: clear env, set `DORMANT_*` + allowlist,
-/// and stop the process on timeout. On Unix, `setsid` puts the child in a
-/// new process group so a timeout can stop the group.
+/// and stop the process tree on timeout. Unix uses a process group.
+/// Windows uses a job object.
 #[allow(
     clippy::too_many_lines,
     reason = "process setup is linear and each step is necessary; splitting would harm readability"
@@ -822,8 +823,16 @@ pub(crate) async fn run_argv_command(
         }
     }
     cmd.stdin(Stdio::null());
+    #[cfg(not(windows))]
     cmd.stdout(Stdio::piped());
+    #[cfg(not(windows))]
     cmd.stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        // The runner discards all output. An inherited pipe would keep it
+        // waiting for EOF after a successful hook started a background process.
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    }
     cmd.kill_on_drop(true);
 
     // setsid(2): the child becomes the leader of a new session AND process
@@ -842,9 +851,32 @@ pub(crate) async fn run_argv_command(
         });
     }
 
+    #[cfg(windows)]
+    let job = windows_job::create().map_err(|error| {
+        warn!(event = "hook_job_create_failed", error = %error);
+        format!(
+            "{E_HOOK_FAILED}: CreateJobObjectW failed for argv[0]={}: {error}",
+            argv[0]
+        )
+    })?;
+    #[cfg(windows)]
+    cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
+
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("{E_HOOK_FAILED}: spawn failed for argv[0]={}: {e}", argv[0]))?;
+
+    #[cfg(windows)]
+    if let Err(error) = windows_job::assign_and_resume(&job, &child) {
+        let pid = child.id().unwrap_or_default();
+        if let Err(cleanup_error) = child.kill().await {
+            warn!(event = "hook_job_cleanup_failed", pid, error = %cleanup_error);
+        }
+        return Err(format!(
+            "{E_HOOK_FAILED}: job setup failed for argv[0]={}: {error:#}",
+            argv[0]
+        ));
+    }
 
     // Drain stdout concurrently — same reason as the existing `command`
     // controller: a child that writes more than the pipe buffer blocks on
@@ -923,8 +955,15 @@ pub(crate) async fn run_argv_command(
                     }
                 }
             }
-            // This path does not use a Windows `Job Object` to stop the child's descendants.
-            #[cfg(not(unix))]
+            #[cfg(windows)]
+            if let Err(error) = windows_job::terminate(&job) {
+                let pid = child.id().unwrap_or_default();
+                warn!(event = "hook_timeout_terminate_job_failed", pid, error = %error);
+                if let Err(error) = child.start_kill() {
+                    warn!(event = "hook_timeout_kill_failed", pid, error = %error);
+                }
+            }
+            #[cfg(not(any(unix, windows)))]
             if let Err(error) = child.start_kill() {
                 warn!(event = "hook_timeout_kill_failed", pid = child.id().unwrap_or_default(), error = %error);
             }
@@ -937,6 +976,148 @@ pub(crate) async fn run_argv_command(
                 argv[0]
             ))
         }
+    }
+}
+
+#[cfg(windows)]
+mod windows_job {
+    use std::io;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::ptr::null;
+
+    use anyhow::{Context, Result, ensure};
+    use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, TerminateJobObject,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetProcessId, GetProcessIdOfThread, OpenThread, ResumeThread,
+        THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
+    };
+
+    pub(super) fn create() -> io::Result<OwnedHandle> {
+        // SAFETY: Null arguments request a new, unnamed, noninheritable job.
+        let raw = unsafe { CreateJobObjectW(null(), null()) };
+        if raw.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // Do not set KILL_ON_JOB_CLOSE. Background processes must survive a normal hook exit.
+        // SAFETY: CreateJobObjectW returned a new handle. OwnedHandle closes it.
+        Ok(unsafe { OwnedHandle::from_raw_handle(raw) })
+    }
+
+    pub(super) fn assign_and_resume(
+        job: &OwnedHandle,
+        child: &tokio::process::Child,
+    ) -> Result<()> {
+        let process = child
+            .raw_handle()
+            .context("missing suspended child handle")?;
+        // SAFETY: The child owns this process handle and stays borrowed during setup.
+        let pid = unsafe { GetProcessId(process) };
+        if pid == 0 {
+            return Err(io::Error::last_os_error()).context("GetProcessId");
+        }
+        let thread = primary_thread(pid)?;
+        // SAFETY: The thread handle has query access and remains open during the call.
+        let owner = unsafe { GetProcessIdOfThread(thread.as_raw_handle()) };
+        if owner == 0 {
+            return Err(io::Error::last_os_error()).context("GetProcessIdOfThread");
+        }
+        ensure!(
+            owner == pid,
+            "GetProcessIdOfThread: thread no longer belongs to the suspended child"
+        );
+
+        // SAFETY: The job and process handles stay open and have assignment access.
+        if unsafe { AssignProcessToJobObject(job.as_raw_handle(), process) } == 0 {
+            return Err(io::Error::last_os_error()).context("AssignProcessToJobObject");
+        }
+        // SAFETY: The thread handle has resume access and stays open during the call.
+        let suspend_count = unsafe { ResumeThread(thread.as_raw_handle()) };
+        if suspend_count == u32::MAX {
+            return Err(io::Error::last_os_error()).context("ResumeThread");
+        }
+        ensure!(
+            suspend_count == 1,
+            "ResumeThread: expected suspend count 1, got {suspend_count}"
+        );
+        Ok(())
+    }
+
+    fn primary_thread(pid: u32) -> Result<OwnedHandle> {
+        // Stable Rust does not expose the primary thread handle. This costs one thread
+        // snapshot per Windows hook spawn. A suspended primary thread cannot start another thread.
+        // SAFETY: TH32CS_SNAPTHREAD takes no process-specific input and returns an owned handle.
+        let raw = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        if raw == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error()).context("CreateToolhelp32Snapshot");
+        }
+        // SAFETY: The snapshot call returned a new handle. OwnedHandle closes it.
+        let snapshot = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let size = u32::try_from(std::mem::size_of::<THREADENTRY32>())?;
+        let mut entry = THREADENTRY32 {
+            dwSize: size,
+            ..THREADENTRY32::default()
+        };
+        // SAFETY: The snapshot stays open. The output has the size required by Thread32First.
+        if unsafe { Thread32First(snapshot.as_raw_handle(), &raw mut entry) } == 0 {
+            return Err(io::Error::last_os_error()).context("Thread32First");
+        }
+        let mut thread_id = None;
+        loop {
+            ensure!(
+                entry.dwSize == size,
+                "thread snapshot returned an incomplete entry"
+            );
+            if entry.th32OwnerProcessID == pid {
+                ensure!(
+                    thread_id.is_none(),
+                    "thread snapshot found more than one thread for the suspended child"
+                );
+                thread_id = Some(entry.th32ThreadID);
+            }
+            entry.dwSize = size;
+            // SAFETY: The snapshot stays open. The output has the size required by Thread32Next.
+            if unsafe { Thread32Next(snapshot.as_raw_handle(), &raw mut entry) } == 0 {
+                let error = io::Error::last_os_error();
+                if error
+                    .raw_os_error()
+                    .and_then(|code| u32::try_from(code).ok())
+                    != Some(ERROR_NO_MORE_FILES)
+                {
+                    return Err(error).context("Thread32Next");
+                }
+                break;
+            }
+        }
+
+        let thread_id =
+            thread_id.context("thread snapshot found no thread for the suspended child")?;
+        // SAFETY: OpenThread returns a new noninheritable handle or null for this ID.
+        let raw = unsafe {
+            OpenThread(
+                THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION,
+                0,
+                thread_id,
+            )
+        };
+        if raw.is_null() {
+            return Err(io::Error::last_os_error()).context("OpenThread");
+        }
+        // SAFETY: OpenThread returned a new handle. OwnedHandle closes it.
+        Ok(unsafe { OwnedHandle::from_raw_handle(raw) })
+    }
+
+    pub(super) fn terminate(job: &OwnedHandle) -> io::Result<()> {
+        // SAFETY: The job handle stays open and has termination access.
+        if unsafe { TerminateJobObject(job.as_raw_handle(), 1) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 }
 
@@ -2268,6 +2449,38 @@ mod tests {
                 std::fs::write(output, b"started").unwrap();
                 std::future::pending::<()>().await;
             }
+            #[cfg(windows)]
+            "spawn-grandchild" | "spawn-grandchild-and-exit" => {
+                let grandchild = hook_probe_argv("block-grandchild", output.as_ref());
+                let mut child = Command::new(&grandchild[0])
+                    .args(&grandchild[1..])
+                    .kill_on_drop(mode == "spawn-grandchild")
+                    .spawn()
+                    .expect("the grandchild probe must start");
+                let mut poll = tokio::time::interval(Duration::from_millis(10));
+                timeout(Duration::from_secs(10), async {
+                    loop {
+                        poll.tick().await;
+                        if std::path::Path::new(&output).exists() {
+                            break;
+                        }
+                    }
+                })
+                .await
+                .expect("the grandchild must publish its PID");
+                if mode == "spawn-grandchild" {
+                    child.wait().await.expect("wait for grandchild probe");
+                }
+            }
+            #[cfg(windows)]
+            "block-grandchild" => {
+                let output = std::path::Path::new(&output);
+                let pending_pid = output.with_extension("pending");
+                std::fs::write(&pending_pid, std::process::id().to_string()).unwrap();
+                std::fs::rename(pending_pid, output).unwrap();
+                // Bound the lifetime if a test cannot retrieve or stop this process.
+                let _ = timeout(Duration::from_secs(30), std::future::pending::<()>()).await;
+            }
             _ => panic!("unknown hook probe mode: {mode}"),
         }
     }
@@ -2320,6 +2533,120 @@ mod tests {
         assert!(
             matches!(result, Err(ref reason) if reason.starts_with(E_HOOK_TIMEOUT)),
             "expected hook timeout, got {result:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    fn open_grandchild(marker: &std::path::Path) -> Option<std::os::windows::io::OwnedHandle> {
+        use std::os::windows::io::{FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+        };
+
+        let pid = std::fs::read_to_string(marker)
+            .expect("the grandchild must start and write its PID before the hook exits")
+            .parse()
+            .expect("the grandchild must write a valid PID");
+        // SAFETY: The call returns a new handle for the probe PID or null.
+        let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, pid) };
+        if raw.is_null() {
+            let error = std::io::Error::last_os_error();
+            assert_eq!(
+                error
+                    .raw_os_error()
+                    .and_then(|code| u32::try_from(code).ok()),
+                Some(ERROR_INVALID_PARAMETER),
+                "could not open grandchild process {pid}: {error}"
+            );
+            None
+        } else {
+            // SAFETY: OpenProcess returned a new handle. OwnedHandle closes it.
+            Some(unsafe { OwnedHandle::from_raw_handle(raw) })
+        }
+    }
+
+    #[cfg(windows)]
+    fn grandchild_exited(process: &std::os::windows::io::OwnedHandle, wait_ms: u32) -> bool {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+        // SAFETY: The process handle stays open and has PROCESS_SYNCHRONIZE access.
+        match unsafe { WaitForSingleObject(process.as_raw_handle(), wait_ms) } {
+            WAIT_OBJECT_0 => true,
+            WAIT_TIMEOUT => false,
+            result => panic!(
+                "grandchild wait returned {result}: {}",
+                std::io::Error::last_os_error()
+            ),
+        }
+    }
+
+    #[cfg(windows)]
+    fn stop_probe_grandchild(process: &std::os::windows::io::OwnedHandle) {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Threading::TerminateProcess;
+
+        // SAFETY: The process handle stays open and has PROCESS_TERMINATE access.
+        let stopped = unsafe { TerminateProcess(process.as_raw_handle(), 1) };
+        assert_ne!(
+            stopped,
+            0,
+            "could not stop grandchild probe: {}",
+            std::io::Error::last_os_error()
+        );
+        assert!(
+            grandchild_exited(process, 5_000),
+            "grandchild probe did not stop"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn real_argv_hook_timeout_stops_windows_grandchild() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("grandchild.pid");
+        let argv = hook_probe_argv("spawn-grandchild", &marker);
+        let result = timeout(
+            Duration::from_secs(15),
+            run_argv_command(&Vec::new(), &argv, Duration::from_secs(5)),
+        )
+        .await;
+
+        if let Some(process) = open_grandchild(&marker)
+            && !grandchild_exited(&process, 3_000)
+        {
+            stop_probe_grandchild(&process);
+            panic!("hook timeout left the Windows grandchild running");
+        }
+        assert!(
+            matches!(result, Ok(Err(ref reason)) if reason.starts_with(E_HOOK_TIMEOUT)),
+            "expected hook timeout, got {result:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn real_argv_hook_normal_exit_leaves_windows_grandchild_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("grandchild.pid");
+        let argv = hook_probe_argv("spawn-grandchild-and-exit", &marker);
+        let result = timeout(
+            Duration::from_secs(15),
+            run_argv_command(&Vec::new(), &argv, Duration::from_secs(10)),
+        )
+        .await;
+
+        let process = open_grandchild(&marker).expect("normal hook exit stopped the grandchild");
+        assert!(
+            !grandchild_exited(&process, 0),
+            "normal hook exit stopped the grandchild"
+        );
+        stop_probe_grandchild(&process);
+        assert!(
+            matches!(result, Ok(Ok(()))),
+            "the spawning hook must exit normally, got {result:?}"
         );
     }
 

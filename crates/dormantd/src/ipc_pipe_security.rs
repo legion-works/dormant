@@ -1,4 +1,4 @@
-//! Security descriptor for the Windows IPC named pipe, plus a test-only DACL readback.
+//! Security descriptor for the Windows IPC named pipe, plus test-only owner and DACL checks.
 
 use std::ffi::{CStr, OsStr, c_void};
 use std::io;
@@ -150,27 +150,28 @@ impl ProcessTokenUser {
 }
 
 #[cfg(test)]
-pub(crate) fn assert_current_user_dacl(
+pub(crate) fn assert_current_user_pipe_security(
     server: &tokio::net::windows::named_pipe::NamedPipeServer,
     instance: &str,
 ) {
     use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
     use windows_sys::Win32::Security::{
         ACCESS_ALLOWED_ACE, ACE_HEADER, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
-        GetSecurityDescriptorControl, SE_DACL_PROTECTED,
+        GetSecurityDescriptorControl, OWNER_SECURITY_INFORMATION, SE_DACL_PROTECTED,
     };
     use windows_sys::Win32::Storage::FileSystem::FILE_CREATE_PIPE_INSTANCE;
     use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
 
+    let mut owner = ptr::null_mut();
     let mut dacl = ptr::null_mut();
     let mut descriptor = ptr::null_mut();
-    // SAFETY: The pipe is open. The two non-null outputs point to writable pointer slots.
+    // SAFETY: The pipe is open. The non-null outputs point to writable pointer slots.
     let status = unsafe {
         GetSecurityInfo(
             server.as_raw_handle(),
             SE_KERNEL_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            ptr::null_mut(),
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &raw mut owner,
             ptr::null_mut(),
             &raw mut dacl,
             ptr::null_mut(),
@@ -179,6 +180,14 @@ pub(crate) fn assert_current_user_dacl(
     };
     assert_eq!(status, 0, "{instance}: GetSecurityInfo failed: {status}");
     let descriptor = LocalAllocation(NonNull::new(descriptor).expect("security descriptor"));
+    assert!(!owner.is_null(), "{instance}: pipe owner SID is null");
+    let expected = ProcessTokenUser::query().expect("query current process token SID");
+    // SAFETY: Both SIDs are live in descriptor and expected, respectively.
+    let same_owner = unsafe { EqualSid(owner, expected.sid()) };
+    assert_ne!(
+        same_owner, 0,
+        "{instance}: pipe owner is not the current user's SID"
+    );
     let mut control = 0;
     let mut revision = 0;
     // SAFETY: The descriptor is live and both output parameters are writable.
@@ -217,7 +226,6 @@ pub(crate) fn assert_current_user_dacl(
         0,
         "{instance}: ACE must permit another pipe instance"
     );
-    let expected = ProcessTokenUser::query().expect("query current process token SID");
     // SAFETY: Both SIDs are live. SidStart begins the variable-length SID in the ACE.
     let same_sid = unsafe {
         EqualSid(

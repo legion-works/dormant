@@ -43,8 +43,9 @@ use crate::ipc_pipe_security::PipeSecurity;
 
 #[cfg(any(windows, test))]
 pub(crate) fn protected_pipe_sddl(user_sid: &str) -> String {
+    // An elevated token can default to the Administrators group as owner.
     // FA includes FILE_CREATE_PIPE_INSTANCE, which the daemon needs for replacement instances.
-    format!("D:P(A;;FA;;;{user_sid})")
+    format!("O:{user_sid}D:P(A;;FA;;;{user_sid})")
 }
 
 /// Maximum line length for IPC requests/responses (1 MB).
@@ -2137,8 +2138,8 @@ mod tests {
     fn windows_pipe_sddl_grants_file_all_access_to_only_the_user_sid() {
         assert_eq!(
             super::protected_pipe_sddl("S-1-5-21-123-456-789-1001"),
-            "D:P(A;;FA;;;S-1-5-21-123-456-789-1001)",
-            "SDDL must protect the DACL and grant file all access to one SID"
+            "O:S-1-5-21-123-456-789-1001D:P(A;;FA;;;S-1-5-21-123-456-789-1001)",
+            "SDDL must set the user SID as owner and grant only that SID full access"
         );
     }
 
@@ -2160,12 +2161,12 @@ mod tests {
             super::PipeSecurity::for_current_user().expect("build pipe security descriptor");
         let first =
             super::create_first_pipe_instance(name, &security).expect("create first pipe instance");
-        crate::ipc_pipe_security::assert_current_user_dacl(&first, "first instance");
+        crate::ipc_pipe_security::assert_current_user_pipe_security(&first, "first instance");
 
         let next = security
             .create(name, false)
             .expect("create replacement pipe while the first instance is open");
-        crate::ipc_pipe_security::assert_current_user_dacl(&next, "replacement instance");
+        crate::ipc_pipe_security::assert_current_user_pipe_security(&next, "replacement instance");
     }
 
     /// Round-trip over a real Windows named pipe: create a server instance,
@@ -2240,6 +2241,18 @@ mod tests {
             .open(&pipe_name)
             .expect("open another client while the first client is connected");
         drop((replacement, client));
+
+        let response = tokio::task::spawn_blocking(move || {
+            dormantctl::client::send_request(
+                std::path::Path::new(&pipe_name),
+                &dormant_core::ipc_proto::IpcRequest::Status,
+            )
+        })
+        .await
+        .expect("client task joins")
+        .expect("production client accepts the daemon pipe owner and gets a response");
+        assert!(!response.ok, "the engine is still disconnected");
+
         cancel.cancel();
         server_task
             .await

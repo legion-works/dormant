@@ -39,9 +39,17 @@ use tracing_subscriber::fmt::MakeWriter;
 
 mod support {
     pub mod app_paths;
+    pub mod config;
+    #[allow(
+        dead_code,
+        reason = "each integration test binary uses a subset of the shared support helpers"
+    )]
+    pub mod shell;
 }
 
 use support::app_paths::TestAppPaths;
+use support::config::toml_string;
+use support::shell;
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -297,8 +305,8 @@ members = ["desk"]
 [displays.mon]
 controllers = ["command"]
 blank_mode = "power_off"
-blank_command = "printf B >> '{m}'"
-wake_command = "printf W >> '{m}'"
+blank_command = {blank}
+wake_command = {wake}
 modes = ["power_off"]
 
 [rules.r]
@@ -310,25 +318,22 @@ wake_retries = 0
 wake_retry_backoff = "10ms"
 wake_retry_interval = "1s"
 "#,
-        m = marker.display(),
+        blank = toml_string(&shell::append(marker, "B")),
+        wake = toml_string(&shell::append(marker, "W")),
         g = grace,
     )
 }
 
 fn operation_config(marker: &Path, hold: &Path, wake_holds: bool) -> String {
     let blank = if wake_holds {
-        format!(
-            "printf START >> '{}'; tail -f '{}'",
-            marker.display(),
-            hold.display()
-        )
+        shell::append_start_then_hold(marker, hold)
     } else {
-        format!("printf START >> '{}'", marker.display())
+        shell::append(marker, "START")
     };
     let wake = if wake_holds {
-        format!("tail -f '{}'", hold.display())
+        shell::hold(hold)
     } else {
-        format!("printf WAKE >> '{}'", marker.display())
+        shell::append(marker, "WAKE")
     };
     format!(
         r#"config_version = 1
@@ -348,8 +353,8 @@ members = ["desk"]
 controllers = ["command"]
 command_timeout = "30s"
 blank_mode = "power_off"
-blank_command = "{blank}"
-wake_command = "{wake}"
+blank_command = {blank}
+wake_command = {wake}
 modes = ["power_off"]
 
 [rules.r]
@@ -361,6 +366,8 @@ wake_retries = 0
 wake_retry_backoff = "10ms"
 wake_retry_interval = "1s"
 "#,
+        blank = toml_string(&blank),
+        wake = toml_string(&wake),
     )
 }
 
@@ -415,9 +422,9 @@ fn shared_display_config(marker: &Path) -> String {
 
 fn additional_shared_display(name: &str, marker: &Path) -> String {
     format!(
-        "\n[displays.{name}]\ncontrollers = [\"command\", \"ddcci\"]\nscope = \"shared\"\nshared_input_code = 0x0f\nblank_mode = \"brightness_zero\"\nblank_command = \"printf B >> '{}'\"\nwake_command = \"printf W >> '{}'\"\nmodes = [\"brightness_zero\"]\n",
-        marker.display(),
-        marker.display(),
+        "\n[displays.{name}]\ncontrollers = [\"command\", \"ddcci\"]\nscope = \"shared\"\nshared_input_code = 0x0f\nblank_mode = \"brightness_zero\"\nblank_command = {}\nwake_command = {}\nmodes = [\"brightness_zero\"]\n",
+        toml_string(&shell::append(marker, "B")),
+        toml_string(&shell::append(marker, "W")),
     )
 }
 

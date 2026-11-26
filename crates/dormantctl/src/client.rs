@@ -675,13 +675,10 @@ mod windows_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn windows_named_pipe_round_trip() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        use tokio::net::windows::named_pipe::ServerOptions;
 
         let pipe_name = unique_pipe_name("round-trip");
-        let server = ServerOptions::new()
-            .first_pipe_instance(true)
-            .create(&pipe_name)
-            .expect("create first pipe instance");
+        let server = crate::ipc_pipe_security::create_current_user_test_pipe(&pipe_name)
+            .expect("create a pipe with the current user as owner");
 
         let server_task = tokio::spawn(async move {
             server.connect().await.expect("client connects to the pipe");
@@ -713,13 +710,9 @@ mod windows_tests {
     /// timeout fails the test instead of parking the suite.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn windows_send_request_times_out_when_daemon_never_replies() {
-        use tokio::net::windows::named_pipe::ServerOptions;
-
         let pipe_name = unique_pipe_name("timeout");
-        let server = ServerOptions::new()
-            .first_pipe_instance(true)
-            .create(&pipe_name)
-            .expect("create first pipe instance");
+        let server = crate::ipc_pipe_security::create_current_user_test_pipe(&pipe_name)
+            .expect("create a pipe with the current user as owner");
 
         let server_task = tokio::spawn(async move {
             server.connect().await.expect("client connects to the pipe");
@@ -749,6 +742,27 @@ mod windows_tests {
         assert!(
             elapsed < Duration::from_secs(30),
             "timeout must fire within the bound, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn windows_named_pipe_rejects_another_owner() {
+        let pipe_name = unique_pipe_name("other-owner");
+        let _server = crate::ipc_pipe_security::create_test_pipe(&pipe_name, "O:BAD:(A;;FA;;;WD)")
+            .expect(
+                "test runner must be elevated to create a pipe owned by BUILTIN\\Administrators",
+            );
+
+        let error = connect(Path::new(&pipe_name))
+            .expect_err("the client must refuse a pipe not owned by the current user");
+        let error = error.to_string();
+        assert!(
+            error.contains(&pipe_name),
+            "error must name the pipe: {error}"
+        );
+        assert!(
+            error.contains("not owned by the current user"),
+            "error must identify the owner mismatch: {error}"
         );
     }
 
@@ -939,6 +953,8 @@ fn connect(socket_path: &Path) -> Result<Transport> {
 #[cfg(windows)]
 fn connect(socket_path: &Path) -> Result<Transport> {
     use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::SECURITY_IDENTIFICATION;
 
     /// `CreateFile` on a pipe whose instances are all busy.
     const ERROR_PIPE_BUSY: i32 = 231;
@@ -948,10 +964,29 @@ fn connect(socket_path: &Path) -> Result<Transport> {
     const PIPE_BUSY_RETRIES: u32 = 5;
     const PIPE_BUSY_BACKOFF: Duration = Duration::from_millis(50);
 
+    // A server must not get an impersonation-level token before the owner check.
+    // security_qos_flags adds SECURITY_SQOS_PRESENT.
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .security_qos_flags(SECURITY_IDENTIFICATION);
     let mut attempt = 0;
     loop {
-        match OpenOptions::new().read(true).write(true).open(socket_path) {
-            Ok(file) => return Ok(file),
+        match options.open(socket_path) {
+            Ok(file) => {
+                // Check the open handle. The name lookup can refer to a different object later.
+                let owned = crate::ipc_pipe_security::is_owned_by_current_user(&file)
+                    .with_context(|| {
+                        format!("check owner of named pipe '{}'", socket_path.display())
+                    })?;
+                anyhow::ensure!(
+                    owned,
+                    "named pipe '{}' is not owned by the current user",
+                    socket_path.display()
+                );
+                return Ok(file);
+            }
             Err(error)
                 if error.raw_os_error() == Some(ERROR_PIPE_BUSY) && attempt < PIPE_BUSY_RETRIES =>
             {

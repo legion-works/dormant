@@ -17,8 +17,11 @@ runs:
         # version and hash match the package lists, so an unknown image name
         # costs a cache miss, not a wrong package.
         digest=$(printf '%s' "$APT_PACKAGES" | sha256sum)
-        printf 'value=apt-debs-v1-%s-%s-%s-%s\n' \
-          "${ImageOS:-unknown}" "${ImageVersion:-unknown}" "${RUNNER_ARCH:-unknown}" "${digest%% *}" >> "$GITHUB_OUTPUT"
+        # The image version comes last so a job on a newer image can restore
+        # the previous image's archives through the prefix below.
+        prefix="apt-debs-v2-${ImageOS:-unknown}-${RUNNER_ARCH:-unknown}-${digest%% *}-"
+        printf 'prefix=%s\n' "$prefix" >> "$GITHUB_OUTPUT"
+        printf 'value=%s%s\n' "$prefix" "${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
     - name: Restore apt archives
       id: restore
       continue-on-error: true
@@ -26,6 +29,7 @@ runs:
       with:
         path: ${{ runner.temp }}/dormant-apt-debs
         key: ${{ steps.key.outputs.value }}
+        restore-keys: ${{ steps.key.outputs.prefix }}
     - name: Install apt packages
       id: install
       shell: bash

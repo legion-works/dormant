@@ -100,8 +100,27 @@ restore_debs() (
 stage_debs() (
   [[ -n ${APT_DEB_CACHE_DIR:-} ]] || return 0
   shopt -s nullglob
+  # A restore from an older image can bring superseded versions. autoclean
+  # removes every archive that the current package lists no longer name, so
+  # the saved cache holds only installable versions.
+  local before=("$archives_dir"/*.deb)
+  if timeout 60 sudo apt-get autoclean -y "${archive_options[@]}" >/dev/null; then
+    local after=("$archives_dir"/*.deb)
+    printf 'apt_install: autoclean removed %d superseded .deb file(s)\n' \
+      "$(( ${#before[@]} - ${#after[@]} ))"
+  else
+    printf '%s\n' 'apt_install: apt-get autoclean failed; staging all archives' >&2
+  fi
   local debs=("$archives_dir"/*.deb)
   (( ${#debs[@]} > 0 )) || return 0
+  local stale=()
+  if [[ -d $APT_DEB_CACHE_DIR ]]; then
+    stale=("$APT_DEB_CACHE_DIR"/*.deb)
+  fi
+  if (( ${#stale[@]} > 0 )) && ! rm -f -- "${stale[@]}"; then
+    printf '%s\n' 'apt_install: could not clear the cache directory; cache save skipped' >&2
+    return 0
+  fi
   if ! mkdir -p -- "$APT_DEB_CACHE_DIR" || ! cp -- "${debs[@]}" "$APT_DEB_CACHE_DIR/"; then
     printf '%s\n' 'apt_install: could not stage apt archives; cache save skipped' >&2
     return 0

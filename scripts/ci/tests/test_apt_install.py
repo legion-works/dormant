@@ -21,9 +21,11 @@ class AptInstallTests(unittest.TestCase):
             cache_dir = temp / "cache"
             output = temp / "output"
             output.touch()
-            if cache == "warm":
+            if cache in ("warm", "warm_superseded"):
                 cache_dir.mkdir()
                 (cache_dir / "example.deb").write_text("cached deb")
+            if cache == "warm_superseded":
+                (cache_dir / "superseded-old.deb").write_text("old deb")
             fake_sudo.write_text(
                 "#!/usr/bin/env bash\n"
                 "set -euo pipefail\n"
@@ -66,6 +68,9 @@ class AptInstallTests(unittest.TestCase):
                 "        ;;\n"
                 "    esac\n"
                 "    ;;\n"
+                "  'apt-get autoclean')\n"
+                "    rm -f -- \"$APT_ARCHIVES_DIR\"/superseded-*.deb\n"
+                "    ;;\n"
                 "  'install -m') \"$@\" ;;\n"
                 "  'sed -i') exit 0 ;;\n"
                 "esac\n",
@@ -95,6 +100,7 @@ class AptInstallTests(unittest.TestCase):
             commands = command_log.read_text(encoding="utf-8").splitlines()
             deb = cache_dir / "example.deb"
             cached_deb = deb.read_text() if deb.exists() else None
+            self.cache_files = sorted(path.name for path in cache_dir.glob("*.deb"))
             cache_output = output.read_text()
 
         return result, commands, cached_deb, cache_output
@@ -151,3 +157,16 @@ class AptInstallTests(unittest.TestCase):
         self.assertIn("Need to get 1 B of archives.", result.stdout)
         self.assertIsNone(deb)
         self.assertEqual(output, "")
+
+    def test_stage_drops_superseded_archives_from_the_cache(self):
+        result, commands, _, output = self.run_apt_install(
+            "stale_lists", cache="warm_superseded"
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("apt_install: restored 2 cached .deb file(s)", result.stdout)
+        self.assertTrue(any("apt-get autoclean" in command for command in commands))
+        self.assertIn("apt_install: autoclean removed 1 superseded .deb file(s)", result.stdout)
+        self.assertIn("apt_install: staged 1 .deb file(s) for cache save", result.stdout)
+        self.assertEqual(self.cache_files, ["example.deb"])
+        self.assertEqual(output, "cache-ready=true\n")

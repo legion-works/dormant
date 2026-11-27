@@ -65,12 +65,9 @@ The transport differs per platform, the VCP semantics do not: `/dev/i2c-*` on
 Linux, the `ddc-macos` fork on macOS, and `ddc-winapi`'s Monitor Configuration
 API on Windows. Linux is the only one needing the udev rule below.
 
-On Windows this is the **only** local blanking controller, and the whole
-blanking story — there is no `kwin-dpms` equivalent, no software-blank render
-fallback, and deliberately no `SC_MONITORPOWER` path (it would tear down the
-output and take audio with it). A Windows display without working DDC/CI
-cannot be blanked locally; drive it over the network with `samsung-tizen` or
-`ha-passthrough`, or accept that it stays on.
+On Windows, `ddcci` is the only built-in controller for local display hardware.
+There is no `kwin-dpms` equivalent, software render fallback, or `SC_MONITORPOWER` controller.
+Without DDC/CI, use a network controller or a compatible external tool through `command`.
 
 ```toml
 [displays.main]

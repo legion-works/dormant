@@ -12,7 +12,7 @@ dormantctl doctor
 dormantctl doctor mqtt      # probe MQTT sensors
 dormantctl doctor ha        # probe HA WebSocket sensors
 dormantctl doctor usb /dev/ttyUSB0  # probe USB LD2410
-dormantctl doctor ddcci     # probe DDC/CI displays (Linux and macOS)
+dormantctl doctor ddcci     # probe DDC/CI displays (Linux, macOS, and Windows)
  dormantctl doctor config    # validate configuration
  # Live-only active wear sampler check (web Doctor view or daemon IPC)
  # There is no offline dormantctl doctor wear-sampling arm.

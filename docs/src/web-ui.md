@@ -28,9 +28,10 @@ dormant serves an optional web dashboard for live state, controls, config editin
 
 ## Enabling
 
-The web UI is gated behind the Cargo feature `web-ui`:
+For a release build from source, build the SPA first. Then enable the Cargo feature `web-ui`:
 
 ```sh
+(cd crates/dormant-web/webui && npm ci && npm run build)
 cargo build --release --features web-ui
 ```
 

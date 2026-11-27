@@ -26,7 +26,9 @@ jobs:
       # Same package set and budget as the ci.yml test job: bounded attempts
       # with retries instead of an unbounded apt-get that can stall until the
       # job cap.
-      - run: bash scripts/ci/apt_install.sh libudev-dev libwayland-dev libmpv-dev libpipewire-0.3-dev pkg-config libblas3 liblapack3
+      - uses: ./.github/actions/apt-install
+        with:
+          packages: libudev-dev libwayland-dev libmpv-dev libpipewire-0.3-dev pkg-config libblas3 liblapack3
         env:
           APT_INSTALL_TIMEOUT: 300
       - name: Run Linux daemon soak filters
@@ -107,7 +109,9 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.131
-      - run: bash scripts/ci/apt_install.sh libudev-dev libwayland-dev libpipewire-0.3-dev pkg-config mosquitto-clients
+      - uses: ./.github/actions/apt-install
+        with:
+          packages: libudev-dev libwayland-dev libpipewire-0.3-dev pkg-config mosquitto-clients
       - name: Start Mosquitto broker
         run: |
           docker run -d --name mosquitto -p 127.0.0.1::1883 eclipse-mosquitto:2 mosquitto -c /mosquitto-no-auth.conf
@@ -328,7 +332,9 @@ jobs:
       # Same package set and budget as the ci.yml test job: bounded attempts
       # with retries instead of an unbounded apt-get that can stall until the
       # job cap.
-      - run: bash scripts/ci/apt_install.sh libudev-dev libwayland-dev libmpv-dev libpipewire-0.3-dev pkg-config libblas3 liblapack3
+      - uses: ./.github/actions/apt-install
+        with:
+          packages: libudev-dev libwayland-dev libmpv-dev libpipewire-0.3-dev pkg-config libblas3 liblapack3
         env:
           APT_INSTALL_TIMEOUT: 300
       - name: Stress concurrent test binaries

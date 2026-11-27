@@ -57,7 +57,9 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: bash scripts/ci/apt_install.sh libudev-dev libwayland-dev libpipewire-0.3-dev
+      - uses: ./.github/actions/apt-install
+        with:
+          packages: libudev-dev libwayland-dev libpipewire-0.3-dev
       - run: bash scripts/gates/clippy.sh
 
   test:
@@ -85,7 +87,9 @@ jobs:
       # the wrapper's default 180s install budget assumes a small -dev set, and
       # a slow-but-working mirror kills a large download mid-fetch instead.
       # 420s keeps three attempts plus backoff inside this job's 30-minute cap.
-      - run: bash scripts/ci/apt_install.sh libudev-dev libwayland-dev libmpv-dev libpipewire-0.3-dev pkg-config libblas3 liblapack3
+      - uses: ./.github/actions/apt-install
+        with:
+          packages: libudev-dev libwayland-dev libmpv-dev libpipewire-0.3-dev pkg-config libblas3 liblapack3
         env:
           APT_INSTALL_TIMEOUT: 300
       - uses: taiki-e/install-action@v2
@@ -128,7 +132,9 @@ jobs:
       # killed mid-download. This job's 45-minute cap has room for a longer
       # budget; the tighter jobs pull a fraction of the bytes and keep the
       # default.
-      - run: bash scripts/ci/apt_install.sh libudev-dev libwayland-dev libmpv-dev libpipewire-0.3-dev pkg-config ffmpeg libavcodec-extra libblas3 liblapack3
+      - uses: ./.github/actions/apt-install
+        with:
+          packages: libudev-dev libwayland-dev libmpv-dev libpipewire-0.3-dev pkg-config ffmpeg libavcodec-extra libblas3 liblapack3
         env:
           APT_INSTALL_TIMEOUT: 450
       - uses: taiki-e/install-action@v2
@@ -242,7 +248,9 @@ jobs:
       # the wrapper's default 180s install budget assumes a small -dev set, and
       # a slow-but-working mirror kills a large download mid-fetch instead.
       # 420s keeps three attempts plus backoff inside this job's 30-minute cap.
-      - run: bash scripts/ci/apt_install.sh libudev-dev libwayland-dev libmpv-dev libpipewire-0.3-dev pkg-config libblas3 liblapack3
+      - uses: ./.github/actions/apt-install
+        with:
+          packages: libudev-dev libwayland-dev libmpv-dev libpipewire-0.3-dev pkg-config libblas3 liblapack3
         env:
           APT_INSTALL_TIMEOUT: 300
       - uses: taiki-e/install-action@v2
@@ -317,7 +325,9 @@ jobs:
         run: bash scripts/ci/reject_required_rerun.sh
       - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
-      - run: bash scripts/ci/apt_install.sh libudev-dev libwayland-dev libpipewire-0.3-dev
+      - uses: ./.github/actions/apt-install
+        with:
+          packages: libudev-dev libwayland-dev libpipewire-0.3-dev
       - run: bash scripts/gates/msrv.sh
 
   mqtt-integration:
@@ -329,7 +339,9 @@ jobs:
         run: bash scripts/ci/reject_required_rerun.sh
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: bash scripts/ci/apt_install.sh libudev-dev libwayland-dev libpipewire-0.3-dev mosquitto-clients
+      - uses: ./.github/actions/apt-install
+        with:
+          packages: libudev-dev libwayland-dev libpipewire-0.3-dev mosquitto-clients
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.131
@@ -363,7 +375,9 @@ jobs:
         run: bash scripts/ci/reject_required_rerun.sh
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: bash scripts/ci/apt_install.sh libudev-dev libwayland-dev libpipewire-0.3-dev
+      - uses: ./.github/actions/apt-install
+        with:
+          packages: libudev-dev libwayland-dev libpipewire-0.3-dev
       - run: bash scripts/gates/rustdoc.sh
 
   mdbook:
@@ -496,7 +510,9 @@ jobs:
       # failure would overrun the cap and be killed by GitHub with no step
       # diagnostic. Sized down instead of raising the cap, which would weaken a
       # guard on a job that normally finishes in about a minute.
-      - run: bash scripts/ci/apt_install.sh libudev-dev libwayland-dev libpipewire-0.3-dev
+      - uses: ./.github/actions/apt-install
+        with:
+          packages: libudev-dev libwayland-dev libpipewire-0.3-dev
         env:
           APT_UPDATE_TIMEOUT: 60
           APT_INSTALL_TIMEOUT: 60

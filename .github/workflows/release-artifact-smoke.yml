@@ -62,7 +62,9 @@ jobs:
       # omit, this step will not provide it and the smoke run fails.
       - name: Install documented runtime libraries (Linux)
         if: runner.os == 'Linux'
-        run: bash scripts/ci/apt_install.sh libpipewire-0.3-0
+        uses: ./.github/actions/apt-install
+        with:
+          packages: libpipewire-0.3-0
 
       - name: Smoke-test packaged dormantd / dormantctl (${{ matrix.triple }})
         run: |

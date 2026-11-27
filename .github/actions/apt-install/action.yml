@@ -1,0 +1,40 @@
+name: Install apt packages
+description: Install Ubuntu packages and cache their downloaded archives.
+inputs:
+  packages:
+    description: Exact list of package arguments, separated by spaces on one line.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Build apt cache key
+      id: key
+      shell: bash
+      env:
+        APT_PACKAGES: ${{ inputs.packages }}
+      run: |
+        digest=$(printf '%s' "$APT_PACKAGES" | sha256sum)
+        printf 'value=apt-debs-v1-%s-%s-%s-%s\n' \
+          "${ImageOS:?}" "${ImageVersion:?}" "${RUNNER_ARCH:?}" "${digest%% *}" >> "$GITHUB_OUTPUT"
+    - name: Restore apt archives
+      id: restore
+      continue-on-error: true
+      uses: actions/cache/restore@v5
+      with:
+        path: ${{ runner.temp }}/dormant-apt-debs
+        key: ${{ steps.key.outputs.value }}
+    - name: Install apt packages
+      id: install
+      shell: bash
+      env:
+        APT_PACKAGES: ${{ inputs.packages }}
+        APT_DEB_CACHE_DIR: ${{ runner.temp }}/dormant-apt-debs
+      run: |
+        read -r -a packages <<< "$APT_PACKAGES"
+        bash scripts/ci/apt_install.sh "${packages[@]}"
+    - name: Save apt archives
+      if: success() && steps.restore.outputs.cache-hit != 'true' && steps.install.outputs.cache-ready == 'true'
+      uses: actions/cache/save@v5
+      with:
+        path: ${{ runner.temp }}/dormant-apt-debs
+        key: ${{ steps.key.outputs.value }}

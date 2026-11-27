@@ -1579,11 +1579,19 @@ impl ViewportStateView for WaylandState {
 
 trait LiveConfigure {
     fn set_configured_size(&mut self, size: (u32, u32));
+    fn screensaver_dims(&self) -> Option<(u32, u32)>;
+    fn render_dims(&self, size: (u32, u32)) -> (u32, u32);
+    fn request_screensaver_rebuild(&mut self, size: (u32, u32), render_size: (u32, u32));
     fn set_viewport_destination(&mut self, size: (u32, u32));
     fn commit_live_surface(&mut self);
 
     fn reconfigure_live(&mut self, size: (u32, u32)) {
         self.set_configured_size(size);
+        let session_dims = self.screensaver_dims();
+        let render_size = self.render_dims(size);
+        if session_dims.is_some() && screensaver_buffers_need_rebuild(session_dims, render_size) {
+            self.request_screensaver_rebuild(size, render_size);
+        }
         self.set_viewport_destination(size);
         self.commit_live_surface();
     }
@@ -1592,6 +1600,20 @@ trait LiveConfigure {
 impl LiveConfigure for WaylandState {
     fn set_configured_size(&mut self, size: (u32, u32)) {
         self.configured_size = size;
+    }
+
+    fn screensaver_dims(&self) -> Option<(u32, u32)> {
+        self.screensaver_session
+            .as_ref()
+            .map(|session| (session.width, session.height))
+    }
+
+    fn render_dims(&self, size: (u32, u32)) -> (u32, u32) {
+        WaylandState::render_dims(self, size)
+    }
+
+    fn request_screensaver_rebuild(&mut self, size: (u32, u32), render_size: (u32, u32)) {
+        self.rebuild_screensaver_buffers(size, render_size);
     }
 
     fn set_viewport_destination(&mut self, size: (u32, u32)) {
@@ -1682,41 +1704,8 @@ impl WaylandState {
     /// pending entry.
     #[allow(clippy::too_many_lines)] // black-buffer attach fans out into shift-enabled / single-pixel / shm-fallback branches, documented inline
     pub(super) fn complete_pending_show(&mut self, configured_size: (u32, u32)) {
+        // The configure handler checks the pending surface ID before this call.
         let Some(pending) = self.pending_show.take() else {
-            // configure for a non-pending surface — the compositor may
-            // resize an existing live surface (e.g. output geometry
-            // change).  Track the new size and re-aim the viewport.
-            self.configured_size = configured_size;
-
-            // #316 (twin of #273): a live resize while the screensaver
-            // is attached must rebuild its shm pool — without this the
-            // session keeps rendering into buffers sized for the
-            // pre-resize surface and the compositor draws the stale
-            // small frame at (0, 0).  The black overlay (#273) gets the
-            // same treatment lazily on its next (re-)show via
-            // `black_buffer_needs_rebuild`; the screensaver has no
-            // re-show trigger, so the pool is rebuilt inline here.
-            let session_dims = self
-                .screensaver_session
-                .as_ref()
-                .map(|session| (session.width, session.height));
-            if session_dims.is_some() {
-                let desired = self.render_dims(configured_size);
-                if screensaver_buffers_need_rebuild(session_dims, desired) {
-                    self.rebuild_screensaver_buffers(configured_size);
-                }
-            }
-
-            if let (Some(viewport), true) = (&self.viewport, self.surface_up) {
-                self.wayland_ops.viewport_set_destination(
-                    viewport.as_ref(),
-                    configured_size.0.cast_signed(),
-                    configured_size.1.cast_signed(),
-                );
-                if let Some(surface) = &self.layer_surface {
-                    surface.commit();
-                }
-            }
             return;
         };
 
@@ -2111,7 +2100,11 @@ impl WaylandState {
     /// Any failure degrades to the existing recovery path
     /// (`fail_screensaver_to_black`) — a resize must never strand the
     /// display without a drawable surface.
-    fn rebuild_screensaver_buffers(&mut self, configured_size: (u32, u32)) {
+    fn rebuild_screensaver_buffers(
+        &mut self,
+        configured_size: (u32, u32),
+        (width, height): (u32, u32),
+    ) {
         let Some(wl_surface) = self
             .layer_surface
             .as_ref()
@@ -2125,7 +2118,6 @@ impl WaylandState {
         // differently-sized buffers until re-aimed.
         self.reset_shift();
         let shift_viewport = self.ensure_shift_viewport(&wl_surface, configured_size);
-        let (width, height) = self.render_dims(configured_size);
         let Some(stride) = width.checked_mul(4) else {
             self.fail_screensaver_to_black("resize rebuild: stride overflow");
             return;

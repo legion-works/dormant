@@ -3510,6 +3510,8 @@ impl WaylandState {
 mod live_configure_tests;
 #[cfg(test)]
 mod rebuild_tests;
+#[cfg(test)]
+mod wakeup_frame_tests;
 
 #[cfg(test)]
 mod tests {

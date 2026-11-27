@@ -13,9 +13,12 @@ runs:
       env:
         APT_PACKAGES: ${{ inputs.packages }}
       run: |
+        # The key only decides reuse: apt installs a cached .deb only when its
+        # version and hash match the package lists, so an unknown image name
+        # costs a cache miss, not a wrong package.
         digest=$(printf '%s' "$APT_PACKAGES" | sha256sum)
         printf 'value=apt-debs-v1-%s-%s-%s-%s\n' \
-          "${ImageOS:?}" "${ImageVersion:?}" "${RUNNER_ARCH:?}" "${digest%% *}" >> "$GITHUB_OUTPUT"
+          "${ImageOS:-unknown}" "${ImageVersion:-unknown}" "${RUNNER_ARCH:-unknown}" "${digest%% *}" >> "$GITHUB_OUTPUT"
     - name: Restore apt archives
       id: restore
       continue-on-error: true

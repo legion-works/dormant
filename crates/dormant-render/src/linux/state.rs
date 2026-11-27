@@ -1577,6 +1577,40 @@ impl ViewportStateView for WaylandState {
     }
 }
 
+trait LiveConfigure {
+    fn set_configured_size(&mut self, size: (u32, u32));
+    fn set_viewport_destination(&mut self, size: (u32, u32));
+    fn commit_live_surface(&mut self);
+
+    fn reconfigure_live(&mut self, size: (u32, u32)) {
+        self.set_configured_size(size);
+        self.set_viewport_destination(size);
+        self.commit_live_surface();
+    }
+}
+
+impl LiveConfigure for WaylandState {
+    fn set_configured_size(&mut self, size: (u32, u32)) {
+        self.configured_size = size;
+    }
+
+    fn set_viewport_destination(&mut self, size: (u32, u32)) {
+        if let Some(viewport) = &self.viewport {
+            self.wayland_ops.viewport_set_destination(
+                viewport.as_ref(),
+                size.0.cast_signed(),
+                size.1.cast_signed(),
+            );
+        }
+    }
+
+    fn commit_live_surface(&mut self) {
+        if let Some(surface) = &self.layer_surface {
+            surface.commit();
+        }
+    }
+}
+
 impl WaylandState {
     /// Resolve any in-flight pending show with `Err`.  Used by teardown,
     /// the configure-timeout handler, and `Event::Closed` channel closure
@@ -4541,19 +4575,7 @@ impl LayerShellHandler for WaylandState {
                 self.complete_pending_show(size);
             }
             SurfaceMatch::Live => {
-                // Re-aim viewport for an existing live surface (e.g.
-                // output geometry change).
-                self.configured_size = size;
-                if let Some(viewport) = &self.viewport {
-                    self.wayland_ops.viewport_set_destination(
-                        viewport.as_ref(),
-                        size.0.cast_signed(),
-                        size.1.cast_signed(),
-                    );
-                }
-                if let Some(surface) = &self.layer_surface {
-                    surface.commit();
-                }
+                self.reconfigure_live(size);
                 tracing::debug!(
                     event = "layer_surface_reconfigured",
                     display_id = %self.display_id,

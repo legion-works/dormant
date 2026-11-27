@@ -2382,7 +2382,7 @@ trait MpvWakeupFrame {
         }
         self.cancel_item_load_deadline();
 
-        // The timer owns the first blended commit on the arming wakeup.
+        // A subsequent tick or wakeup can commit the frame.
         if arm_pending {
             return WakeupFrameOutcome::ArmTransitionTimer;
         }
@@ -2400,8 +2400,8 @@ trait MpvWakeupFrame {
             return WakeupFrameOutcome::ArmTransitionTimer;
         }
 
-        // Blend even at t == 0 to keep the replacement frame hidden.
-        // Only the timer advances t.
+        // At `t == 0`, the mix shows only the captured frame.
+        // Only the fade timer changes `t`.
         let transition = self.transition();
         let blend_t = transition.map_or(0, |tr| tr.t);
         let capture_clone = if transition_live(transition) {
@@ -2453,7 +2453,7 @@ impl MpvWakeupFrame for WaylandWakeupFrame<'_> {
     }
 
     fn render_back_buffer(&mut self) -> Result<(), String> {
-        // Both successful render results draw the current picture.
+        // `Ok(true)` and `Ok(false)` put the current picture in the buffer.
         let back_offset = self.back_idx * self.buf_len;
         let ptr = real_pool_with_region_mut(
             self.session.pool.as_ref(),
@@ -2488,9 +2488,9 @@ impl MpvWakeupFrame for WaylandWakeupFrame<'_> {
 
     fn blend_back_buffer(&mut self, capture: &[u8], t: u16) {
         let ptr = self.rendered_ptr.expect("back buffer rendered");
-        // SAFETY: The pointer covers `buf_len` bytes from the checked mmap
-        // region. The borrowed session retains the pool, and no other pool
-        // access runs between render and blend on the Wayland thread.
+        // SAFETY: The pointer gives access to `buf_len` bytes in the checked mmap
+        // region. The session keeps the pool in memory. No other pool access occurs
+        // on the Wayland `thread` between `render_back_buffer` and this call.
         let back_slice = unsafe { std::slice::from_raw_parts_mut(ptr, self.buf_len) };
         blend::blend_in_place(capture, back_slice, t);
     }

@@ -77,6 +77,61 @@ switch_to_fallback_mirror() {
   fi
 }
 
+readonly archives_dir="${APT_ARCHIVES_DIR:-/var/cache/apt/archives}"
+archive_options=(-o APT::Keep-Downloaded-Packages=true)
+if [[ -n ${APT_ARCHIVES_DIR:-} ]]; then
+  archive_options+=(-o "Dir::Cache::archives=$archives_dir")
+fi
+
+restore_debs() (
+  [[ -n ${APT_DEB_CACHE_DIR:-} ]] || return 0
+  shopt -s nullglob
+  local debs=("$APT_DEB_CACHE_DIR"/*.deb) restored=0
+  if (( ${#debs[@]} > 0 )); then
+    if sudo install -m 0644 -- "${debs[@]}" "$archives_dir/"; then
+      restored=${#debs[@]}
+    else
+      printf '%s\n' 'apt_install: could not restore cached archives; continuing with apt' >&2
+    fi
+  fi
+  printf 'apt_install: restored %d cached .deb file(s)\n' "$restored"
+)
+
+stage_debs() (
+  [[ -n ${APT_DEB_CACHE_DIR:-} ]] || return 0
+  shopt -s nullglob
+  # A restore from an older image can bring superseded versions. autoclean
+  # removes every archive that the current package lists no longer name, so
+  # the saved cache holds only installable versions.
+  local before=("$archives_dir"/*.deb)
+  if timeout 60 sudo apt-get autoclean -y "${archive_options[@]}" >/dev/null; then
+    local after=("$archives_dir"/*.deb)
+    printf 'apt_install: autoclean removed %d superseded .deb file(s)\n' \
+      "$(( ${#before[@]} - ${#after[@]} ))"
+  else
+    printf '%s\n' 'apt_install: apt-get autoclean failed; staging all archives' >&2
+  fi
+  local debs=("$archives_dir"/*.deb)
+  (( ${#debs[@]} > 0 )) || return 0
+  local stale=()
+  if [[ -d $APT_DEB_CACHE_DIR ]]; then
+    stale=("$APT_DEB_CACHE_DIR"/*.deb)
+  fi
+  if (( ${#stale[@]} > 0 )) && ! rm -f -- "${stale[@]}"; then
+    printf '%s\n' 'apt_install: could not clear the cache directory; cache save skipped' >&2
+    return 0
+  fi
+  if ! mkdir -p -- "$APT_DEB_CACHE_DIR" || ! cp -- "${debs[@]}" "$APT_DEB_CACHE_DIR/"; then
+    printf '%s\n' 'apt_install: could not stage apt archives; cache save skipped' >&2
+    return 0
+  fi
+  printf 'apt_install: staged %d .deb file(s) for cache save\n' "${#debs[@]}"
+  if [[ -n ${GITHUB_OUTPUT:-} ]]; then
+    printf '%s\n' 'cache-ready=true' >> "$GITHUB_OUTPUT"
+  fi
+)
+
+restore_debs
 export DEBIAN_FRONTEND=noninteractive
 
 # GitHub's runner images normally retain package lists from image creation. Use
@@ -84,9 +139,10 @@ export DEBIAN_FRONTEND=noninteractive
 # already resolvable; a stale or incomplete list still falls through to update.
 initial_err_log="$(mktemp)"
 if timeout "$install_timeout" sudo -E apt-get install -y \
-  --no-install-recommends "$@" 2>"$initial_err_log"; then
+  "${archive_options[@]}" --no-install-recommends "$@" 2>"$initial_err_log"; then
   printf 'apt_install: installed %d package(s) from existing package lists; apt-get update skipped\n' "$#"
   rm -f "$initial_err_log"
+  stage_debs
   exit 0
 else
   initial_status=$?
@@ -112,9 +168,10 @@ while (( attempt <= attempts )); do
     timed_out_phase='install'
     timed_out_budget="$install_timeout"
     if timeout "$install_timeout" sudo -E apt-get install -y \
-      --no-install-recommends "$@" 2>>"$err_log"; then
+      "${archive_options[@]}" --no-install-recommends "$@" 2>>"$err_log"; then
       printf 'apt_install: installed %d package(s) on attempt %d\n' "$#" "$attempt"
       rm -f "$err_log"
+      stage_debs
       exit 0
     else
       status=$?

@@ -1,0 +1,47 @@
+name: Install apt packages
+description: Install Ubuntu packages and cache their downloaded archives.
+inputs:
+  packages:
+    description: Exact list of package arguments, separated by spaces on one line.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Build apt cache key
+      id: key
+      shell: bash
+      env:
+        APT_PACKAGES: ${{ inputs.packages }}
+      run: |
+        # The key only decides reuse: apt installs a cached .deb only when its
+        # version and hash match the package lists, so an unknown image name
+        # costs a cache miss, not a wrong package.
+        digest=$(printf '%s' "$APT_PACKAGES" | sha256sum)
+        # The image version comes last so a job on a newer image can restore
+        # the previous image's archives through the prefix below.
+        prefix="apt-debs-v2-${ImageOS:-unknown}-${RUNNER_ARCH:-unknown}-${digest%% *}-"
+        printf 'prefix=%s\n' "$prefix" >> "$GITHUB_OUTPUT"
+        printf 'value=%s%s\n' "$prefix" "${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+    - name: Restore apt archives
+      id: restore
+      continue-on-error: true
+      uses: actions/cache/restore@v5
+      with:
+        path: ${{ runner.temp }}/dormant-apt-debs
+        key: ${{ steps.key.outputs.value }}
+        restore-keys: ${{ steps.key.outputs.prefix }}
+    - name: Install apt packages
+      id: install
+      shell: bash
+      env:
+        APT_PACKAGES: ${{ inputs.packages }}
+        APT_DEB_CACHE_DIR: ${{ runner.temp }}/dormant-apt-debs
+      run: |
+        read -r -a packages <<< "$APT_PACKAGES"
+        bash scripts/ci/apt_install.sh "${packages[@]}"
+    - name: Save apt archives
+      if: success() && steps.restore.outputs.cache-hit != 'true' && steps.install.outputs.cache-ready == 'true'
+      uses: actions/cache/save@v5
+      with:
+        path: ${{ runner.temp }}/dormant-apt-debs
+        key: ${{ steps.key.outputs.value }}

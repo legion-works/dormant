@@ -2356,6 +2356,187 @@ impl ScreensaverRebuild for WaylandState {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum WakeupFrameOutcome {
+    Done,
+    ArmItemLoadTimer,
+    ArmTransitionTimer,
+    FailToBlack(String),
+}
+
+trait MpvWakeupFrame {
+    fn transition(&self) -> Option<&TransitionState>;
+    fn cancel_item_load_deadline(&mut self);
+    fn back_buffer_ready(&self) -> bool;
+    fn render_back_buffer(&mut self) -> Result<(), String>;
+    fn apply_frame_event(&mut self, event: TransitionEvent) -> StepCmd;
+    fn cancel_fade_timer(&mut self);
+    fn blend_back_buffer(&mut self, capture: &[u8], t: u16);
+    fn commit_back_buffer(&mut self) -> bool;
+    fn finish_first_frame(&mut self);
+    fn swap_back_buffer(&mut self);
+
+    fn handle_mpv_frame(&mut self, arm_pending: bool) -> WakeupFrameOutcome {
+        if should_defer_mpv_commit(self.transition()) {
+            return WakeupFrameOutcome::ArmItemLoadTimer;
+        }
+        self.cancel_item_load_deadline();
+
+        // The timer owns the first blended commit on the arming wakeup.
+        if arm_pending {
+            return WakeupFrameOutcome::ArmTransitionTimer;
+        }
+        if !self.back_buffer_ready() {
+            return WakeupFrameOutcome::Done;
+        }
+        if let Err(error) = self.render_back_buffer() {
+            return WakeupFrameOutcome::FailToBlack(error);
+        }
+        if matches!(
+            self.apply_frame_event(TransitionEvent::FrameRendered { ok: true }),
+            StepCmd::ArmTimer
+        ) {
+            self.cancel_fade_timer();
+            return WakeupFrameOutcome::ArmTransitionTimer;
+        }
+
+        // Blend even at t == 0 to keep the replacement frame hidden.
+        // Only the timer advances t.
+        let transition = self.transition();
+        let blend_t = transition.map_or(0, |tr| tr.t);
+        let capture_clone = if transition_live(transition) {
+            transition.map(|tr| tr.capture.clone()).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if !capture_clone.is_empty() {
+            self.blend_back_buffer(&capture_clone, blend_t);
+        }
+        if self.commit_back_buffer() {
+            self.finish_first_frame();
+            self.swap_back_buffer();
+        }
+        WakeupFrameOutcome::Done
+    }
+}
+
+struct WaylandWakeupFrame<'a> {
+    session: &'a mut ScreensaverSession,
+    loop_handle: Option<&'a calloop::LoopHandle<'static, WaylandState>>,
+    layer_surface: Option<&'a LayerSurface>,
+    wayland_ops: &'a dyn WaylandOps,
+    display_id: &'a DisplayId,
+    back_idx: usize,
+    buf_len: usize,
+    rendered_ptr: Option<*mut u8>,
+}
+
+impl MpvWakeupFrame for WaylandWakeupFrame<'_> {
+    fn transition(&self) -> Option<&TransitionState> {
+        self.session.transition.as_ref()
+    }
+
+    fn cancel_item_load_deadline(&mut self) {
+        cancel_item_load_timer_for(self.session, self.loop_handle);
+    }
+
+    fn back_buffer_ready(&self) -> bool {
+        if self.session.buffers_busy[self.back_idx] {
+            tracing::debug!(
+                event = "screensaver_frame_skipped_busy",
+                display_id = %self.display_id,
+                back_idx = self.back_idx,
+            );
+            return false;
+        }
+        true
+    }
+
+    fn render_back_buffer(&mut self) -> Result<(), String> {
+        // Both successful render results draw the current picture.
+        let back_offset = self.back_idx * self.buf_len;
+        let ptr = real_pool_with_region_mut(
+            self.session.pool.as_ref(),
+            back_offset,
+            self.buf_len,
+            |back_slice| {
+                back_slice.fill(0);
+                match self.session.player.render_frame_into(back_slice) {
+                    Ok(_) => Ok(back_slice.as_mut_ptr()),
+                    Err(e) => Err(format!("{e}")),
+                }
+            },
+        )?;
+        self.rendered_ptr = Some(ptr);
+        Ok(())
+    }
+
+    fn apply_frame_event(&mut self, event: TransitionEvent) -> StepCmd {
+        if self.session.transition_mode == TransitionMode::Crossfade
+            && let Some(tr) = self.session.transition.as_mut()
+        {
+            let (new_phase, _, cmd) = transition_step(tr.phase, tr.t, event);
+            tr.phase = new_phase;
+            return cmd;
+        }
+        StepCmd::NoOp
+    }
+
+    fn cancel_fade_timer(&mut self) {
+        cancel_transition_timer_for(self.session, self.loop_handle);
+    }
+
+    fn blend_back_buffer(&mut self, capture: &[u8], t: u16) {
+        let ptr = self.rendered_ptr.expect("back buffer rendered");
+        // SAFETY: The pointer covers `buf_len` bytes from the checked mmap
+        // region. The borrowed session retains the pool, and no other pool
+        // access runs between render and blend on the Wayland thread.
+        let back_slice = unsafe { std::slice::from_raw_parts_mut(ptr, self.buf_len) };
+        blend::blend_in_place(capture, back_slice, t);
+    }
+
+    fn commit_back_buffer(&mut self) -> bool {
+        let Some(layer_surface) = self.layer_surface else {
+            return false;
+        };
+        let wl_surface = layer_surface.wl_surface().clone();
+        wl_surface.damage_buffer(
+            0,
+            0,
+            self.session.width.cast_signed(),
+            self.session.height.cast_signed(),
+        );
+        let surface_handle = self.wayland_ops.surface_handle(&wl_surface);
+        self.wayland_ops.surface_attach(
+            surface_handle.as_ref(),
+            self.session.buffers[self.back_idx].as_ref(),
+            0,
+            0,
+        );
+        self.wayland_ops.surface_commit(surface_handle.as_ref());
+        self.session.buffers_busy[self.back_idx] = true;
+        true
+    }
+
+    fn finish_first_frame(&mut self) {
+        if !self.session.has_first_frame {
+            self.session.has_first_frame = true;
+            if let Some(reply) = self.session.pending_reply.take() {
+                let _ = reply.send(Ok(()));
+            }
+            if let (Some(token), Some(handle)) =
+                (self.session.first_frame_token.take(), self.loop_handle)
+            {
+                handle.remove(token);
+            }
+        }
+    }
+
+    fn swap_back_buffer(&mut self) {
+        self.session.next_render_idx = 1 - self.back_idx;
+    }
+}
+
 impl WaylandState {
     fn rebuild_session_mut(session: &mut Option<ScreensaverSession>) -> &mut ScreensaverSession {
         session.as_mut().expect("live session checked")
@@ -2422,7 +2603,6 @@ impl WaylandState {
     /// persists in `session.transition.phase` across wakeups so events
     /// spanning multiple wakeups (e.g. `ItemEnded` in one wakeup and
     /// `ItemLoaded` in a later one) still drive the lifecycle correctly.
-    #[allow(clippy::too_many_lines)] // single-method state machine: drain, render, blend, attach, advance are documented inline below
     fn on_mpv_wakeup(&mut self) {
         let wayland_ops = self.wayland_ops.clone();
         let mpv_events: Vec<MpvItemEvent> = {
@@ -2491,140 +2671,23 @@ impl WaylandState {
             cancel_transition_timer_for(session, self.loop_handle.as_ref());
         }
 
-        if should_defer_mpv_commit(session.transition.as_ref()) {
-            let r#gen = session.pending_gen;
-            self.arm_item_load_timer(r#gen);
-            return;
-        }
-        cancel_item_load_timer_for(session, self.loop_handle.as_ref());
-
-        // Early-out if we just armed: the timer takes over with the
-        // first blended tick.  Don't commit on the arming wakeup.
-        if cmds.arm_pending {
-            let r#gen = session.pending_gen;
-            self.arm_or_rearm_transition_timer(r#gen);
-            return;
-        }
-
-        // Skip-on-busy gate.
+        let r#gen = session.pending_gen;
         let back_idx = session.next_render_idx;
-        if session.buffers_busy[back_idx] {
-            tracing::debug!(
-                event = "screensaver_frame_skipped_busy",
-                display_id = %self.display_id,
-                back_idx,
-            );
-            return;
-        }
-
-        // Render mpv into the back buffer.  The SW render API always
-        // draws the current picture — that's mechanism (a) for the
-        // buffer-correctness constraint (capture state is fresh every
-        // tick).  We treat  and  identically
-        // here: the buffer is fresh either way.
-        let back_offset = back_idx * buf_len;
-        // The pool's real mmap access goes through `real_pool_with_region_mut`
-        // (test-seam #55, Task 2) — the closure returns a raw pointer
-        // that outlives the mutex guard exactly as the pre-migration
-        // code let it outlive the `&mut session.pool` borrow: the
-        // underlying pool memory is owned by `session.pool` for the
-        // rest of this function, so the pointer stays valid.
-        let render_result: Result<*mut u8, String> =
-            real_pool_with_region_mut(session.pool.as_ref(), back_offset, buf_len, |back_slice| {
-                back_slice.fill(0);
-                match session.player.render_frame_into(back_slice) {
-                    Ok(_) => Ok(back_slice.as_mut_ptr()),
-                    Err(e) => Err(format!("{e}")),
-                }
-            });
-        let mut back_buf: Option<*mut u8> = match render_result {
-            Ok(ptr) => Some(ptr),
-            Err(e) => {
-                self.fail_screensaver_to_black(&e);
-                return;
-            }
+        let mut frame = WaylandWakeupFrame {
+            session,
+            loop_handle: self.loop_handle.as_ref(),
+            layer_surface: self.layer_surface.as_ref(),
+            wayland_ops: wayland_ops.as_ref(),
+            display_id: &self.display_id,
+            back_idx,
+            buf_len,
+            rendered_ptr: None,
         };
-
-        // Phase 2 — apply FrameRendered{ok} to the state machine.
-        // (AwakeningFirstFrame → Fading arms the timer;  is NOT
-        // advanced here — that's the ticker's job per re-review.)
-        if session.transition_mode == TransitionMode::Crossfade
-            && let Some(tr) = session.transition.as_mut()
-        {
-            let (new_phase, _, cmd) =
-                transition_step(tr.phase, tr.t, TransitionEvent::FrameRendered { ok: true });
-            tr.phase = new_phase;
-            if matches!(cmd, StepCmd::ArmTimer) {
-                let r#gen = session.pending_gen;
-                cancel_transition_timer_for(session, self.loop_handle.as_ref());
-                self.arm_or_rearm_transition_timer(r#gen);
-                return;
-            }
-        }
-
-        // Snapshot the blend inputs for the visible commit (this path never
-        // advances `t`; the ticker owns that).
-        //
-        // Taken whenever a transition is LIVE, not only when `t > 0` — see
-        // [`transition_live`]. At `t == 0` the blend yields the capture
-        // unchanged, which is the frame already on screen.
-        let blend_t = session.transition.as_ref().map_or(0, |tr| tr.t);
-        let capture_clone: Vec<u8> = if transition_live(session.transition.as_ref()) {
-            session
-                .transition
-                .as_ref()
-                .map(|tr| tr.capture.clone())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-        // Commit (we always have a back_buf: render was successful).
-        if let Some(ptr) = back_buf.take() {
-            // SAFETY: back-buffer pointer from mmap + offset; valid
-            // for the lifetime of this function.
-            let back_slice = unsafe { std::slice::from_raw_parts_mut(ptr, buf_len) };
-            if !capture_clone.is_empty() {
-                blend::blend_in_place(&capture_clone, back_slice, blend_t);
-            }
-
-            // Attach + damage + commit.
-            let wl_surface = match &self.layer_surface {
-                Some(s) => s.wl_surface().clone(),
-                None => return,
-            };
-            wl_surface.damage_buffer(
-                0,
-                0,
-                session.width.cast_signed(),
-                session.height.cast_signed(),
-            );
-            let surface_handle = wayland_ops.surface_handle(&wl_surface);
-            wayland_ops.surface_attach(
-                surface_handle.as_ref(),
-                session.buffers[back_idx].as_ref(),
-                0,
-                0,
-            );
-            wayland_ops.surface_commit(surface_handle.as_ref());
-            session.buffers_busy[back_idx] = true;
-
-            // First-frame success.
-            if !session.has_first_frame {
-                session.has_first_frame = true;
-                if let Some(reply) = session.pending_reply.take() {
-                    let _ = reply.send(Ok(()));
-                }
-                if let (Some(token), Some(handle)) =
-                    (session.first_frame_token.take(), self.loop_handle.as_ref())
-                {
-                    handle.remove(token);
-                }
-            }
-
-            // Swap so the next render writes to the buffer the
-            // compositor has finished with.
-            session.next_render_idx = 1 - back_idx;
+        match frame.handle_mpv_frame(cmds.arm_pending) {
+            WakeupFrameOutcome::Done => (),
+            WakeupFrameOutcome::ArmItemLoadTimer => self.arm_item_load_timer(r#gen),
+            WakeupFrameOutcome::ArmTransitionTimer => self.arm_or_rearm_transition_timer(r#gen),
+            WakeupFrameOutcome::FailToBlack(error) => self.fail_screensaver_to_black(&error),
         }
     }
 

@@ -718,6 +718,16 @@ fn transition_live(transition: Option<&TransitionState>) -> bool {
     transition.is_some_and(|state| state.phase != TransitionPhase::Idle)
 }
 
+fn transition_blend(transition: Option<&TransitionState>) -> (u16, Vec<u8>) {
+    let t = transition.map_or(0, |tr| tr.t);
+    let capture = if transition_live(transition) {
+        transition.map(|tr| tr.capture.clone()).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    (t, capture)
+}
+
 /// Crossfade state for one screensaver session.
 ///
 /// Holds the capture buffer (allocated lazily on first `ItemEnded`),
@@ -2402,13 +2412,7 @@ trait MpvWakeupFrame {
 
         // At `t == 0`, the mix shows only the captured frame.
         // Only the fade timer changes `t`.
-        let transition = self.transition();
-        let blend_t = transition.map_or(0, |tr| tr.t);
-        let capture_clone = if transition_live(transition) {
-            transition.map(|tr| tr.capture.clone()).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        let (blend_t, capture_clone) = transition_blend(self.transition());
         if !capture_clone.is_empty() {
             self.blend_back_buffer(&capture_clone, blend_t);
         }
@@ -2420,7 +2424,7 @@ trait MpvWakeupFrame {
     }
 }
 
-struct WaylandWakeupFrame<'a> {
+struct WaylandBackBuffer<'a> {
     session: &'a mut ScreensaverSession,
     loop_handle: Option<&'a calloop::LoopHandle<'static, WaylandState>>,
     layer_surface: Option<&'a LayerSurface>,
@@ -2431,7 +2435,7 @@ struct WaylandWakeupFrame<'a> {
     rendered_ptr: Option<*mut u8>,
 }
 
-impl MpvWakeupFrame for WaylandWakeupFrame<'_> {
+impl MpvWakeupFrame for WaylandBackBuffer<'_> {
     fn transition(&self) -> Option<&TransitionState> {
         self.session.transition.as_ref()
     }
@@ -2534,6 +2538,114 @@ impl MpvWakeupFrame for WaylandWakeupFrame<'_> {
 
     fn swap_back_buffer(&mut self) {
         self.session.next_render_idx = 1 - self.back_idx;
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TransitionTickOutcome {
+    Done,
+    Complete,
+    FailToBlack(String),
+}
+
+trait TransitionTick {
+    fn session_identity(&self) -> Option<(u64, TransitionMode)>;
+    fn transition(&self) -> Option<&TransitionState>;
+    fn transition_mut(&mut self) -> Option<&mut TransitionState>;
+    fn back_buffer_ready(&self) -> bool;
+    fn render_back_buffer(&mut self) -> Result<(), String>;
+    fn blend_back_buffer(&mut self, capture: &[u8], t: u16);
+    fn commit_back_buffer(&mut self) -> bool;
+    fn swap_back_buffer(&mut self);
+    fn cancel_fade_timer(&mut self);
+
+    fn handle_transition_tick(&mut self, generation: u64) -> TransitionTickOutcome {
+        if self.session_identity() != Some((generation, TransitionMode::Crossfade)) {
+            return TransitionTickOutcome::Done;
+        }
+        let t_step = self.transition().map_or(1, |tr| tr.t_step);
+        if !self.back_buffer_ready() {
+            return TransitionTickOutcome::Done;
+        }
+        if let Err(error) = self.render_back_buffer() {
+            return TransitionTickOutcome::FailToBlack(error);
+        }
+
+        // The frame uses the old `t`, including zero on the first tick.
+        let transition = self.transition();
+        let (blend_t, capture) = transition_blend(transition);
+        let phase = transition.map_or(TransitionPhase::Idle, |tr| tr.phase);
+        let (new_phase, new_t, tick_cmd) = tick_step(phase, blend_t, t_step);
+        if let Some(tr) = self.transition_mut() {
+            tr.phase = new_phase;
+            tr.t = new_t;
+        }
+
+        if !capture.is_empty() {
+            self.blend_back_buffer(&capture, blend_t);
+        }
+        if !self.commit_back_buffer() {
+            return TransitionTickOutcome::Done;
+        }
+        self.swap_back_buffer();
+
+        if matches!(tick_cmd, TickCmd::Complete) {
+            self.cancel_fade_timer();
+            return TransitionTickOutcome::Complete;
+        }
+        TransitionTickOutcome::Done
+    }
+}
+
+struct WaylandTransitionTick<'a> {
+    frame: Option<WaylandBackBuffer<'a>>,
+}
+
+impl<'a> WaylandTransitionTick<'a> {
+    fn frame_mut(&mut self) -> &mut WaylandBackBuffer<'a> {
+        self.frame.as_mut().expect("tick has an active session")
+    }
+}
+
+impl TransitionTick for WaylandTransitionTick<'_> {
+    fn session_identity(&self) -> Option<(u64, TransitionMode)> {
+        self.frame.as_ref().map(|frame| {
+            let session = &frame.session;
+            (session.pending_gen, session.transition_mode)
+        })
+    }
+
+    fn transition(&self) -> Option<&TransitionState> {
+        self.frame.as_ref()?.session.transition.as_ref()
+    }
+
+    fn transition_mut(&mut self) -> Option<&mut TransitionState> {
+        self.frame.as_mut()?.session.transition.as_mut()
+    }
+
+    fn back_buffer_ready(&self) -> bool {
+        let frame = self.frame.as_ref().expect("tick has an active session");
+        !frame.session.buffers_busy[frame.back_idx]
+    }
+
+    fn render_back_buffer(&mut self) -> Result<(), String> {
+        self.frame_mut().render_back_buffer()
+    }
+
+    fn blend_back_buffer(&mut self, capture: &[u8], t: u16) {
+        self.frame_mut().blend_back_buffer(capture, t);
+    }
+
+    fn commit_back_buffer(&mut self) -> bool {
+        self.frame_mut().commit_back_buffer()
+    }
+
+    fn swap_back_buffer(&mut self) {
+        self.frame_mut().swap_back_buffer();
+    }
+
+    fn cancel_fade_timer(&mut self) {
+        self.frame_mut().cancel_fade_timer();
     }
 }
 
@@ -2673,7 +2785,7 @@ impl WaylandState {
 
         let r#gen = session.pending_gen;
         let back_idx = session.next_render_idx;
-        let mut frame = WaylandWakeupFrame {
+        let mut frame = WaylandBackBuffer {
             session,
             loop_handle: self.loop_handle.as_ref(),
             layer_surface: self.layer_surface.as_ref(),
@@ -2806,147 +2918,38 @@ impl WaylandState {
         }
     }
 
-    /// Per-tick blend progress.  Runs on the calloop thread when the
-    /// transition timer fires.  Renders mpv into the back buffer,
-    /// advances `t` unconditionally via `tick_step` (this is
-    /// mechanism (a) for the buffer-correctness constraint — the
-    /// SW render API always draws the current picture regardless of
-    /// update-flag), blends at the pre-advance `t` (the visible
-    /// progress for this tick), attaches + commits, then advances
-    /// `t` for the next timer fire.  On `Complete` the timer is
-    /// dropped and the phase returns to `Idle`.
-    ///
-    /// **Re-review (M2): this is the ONLY path that advances `t`.**
-    /// `on_mpv_wakeup` refreshes the source imagery (renders the
-    /// current mpv frame and blends at the live `t` if Fading) but
-    /// never moves `t` — that keeps the visible fade duration
-    /// framerate-independent.  A static image (one mpv frame ever)
-    /// completes its fade in the same `frames_for_blend` ticks as
-    /// a 60-fps video would.
+    /// Advance the fade on the calloop thread. The timer controls the fade
+    /// duration independently of the rate of mpv wakeups.
     fn on_transition_tick(&mut self, r#gen: u64) {
         let wayland_ops = self.wayland_ops.clone();
-        let Some(session) = self.screensaver_session.as_mut() else {
-            return;
-        };
-        // Gen-guard: a newer session has taken over — drop the tick.
-        if session.pending_gen != r#gen || session.transition_mode != TransitionMode::Crossfade {
-            return;
-        }
-        let t_step = session.transition.as_ref().map_or(1, |tr| tr.t_step);
-
-        // Skip-on-busy gate.
-        let back_idx = session.next_render_idx;
-        if session.buffers_busy[back_idx] {
-            return;
-        }
-
-        let stride = session.stride as usize;
-        let buf_len = stride * (session.height as usize);
-        let back_offset = back_idx * buf_len;
-
-        // Render mpv into the back buffer.  The SW render API always
-        // draws the current picture regardless of update-flag value —
-        // `Ok(false)` just signals "no novel frame since last call"
-        // (a status byte, not a render outcome).  We treat both
-        // `Ok` variants identically here: the buffer is fresh either
-        // way.  (Mechanism (a) for the buffer-correctness constraint —
-        // see module header.)
-        // See `on_mpv_wakeup`'s matching block: the pool's real mmap
-        // access goes through `real_pool_with_region_mut` (test-seam
-        // #55, Task 2); the raw pointer returned outlives the mutex
-        // guard exactly as it outlived the `&mut session.pool` borrow
-        // pre-migration.
-        let render_result: Result<*mut u8, String> =
-            real_pool_with_region_mut(session.pool.as_ref(), back_offset, buf_len, |back_slice| {
-                back_slice.fill(0);
-                match session.player.render_frame_into(back_slice) {
-                    Ok(_) => Ok(back_slice.as_mut_ptr()),
-                    Err(e) => Err(format!("{e}")),
+        let mut tick = WaylandTransitionTick {
+            frame: self.screensaver_session.as_mut().map(|session| {
+                let back_idx = session.next_render_idx;
+                let buf_len = (session.stride as usize) * (session.height as usize);
+                WaylandBackBuffer {
+                    session,
+                    loop_handle: self.loop_handle.as_ref(),
+                    layer_surface: self.layer_surface.as_ref(),
+                    wayland_ops: wayland_ops.as_ref(),
+                    display_id: &self.display_id,
+                    back_idx,
+                    buf_len,
+                    rendered_ptr: None,
                 }
-            });
-        let back_ptr = match render_result {
-            Ok(ptr) => ptr,
-            Err(e) => {
-                self.fail_screensaver_to_black(&e);
-                return;
+            }),
+        };
+        match tick.handle_transition_tick(r#gen) {
+            TransitionTickOutcome::Done => (),
+            TransitionTickOutcome::Complete => {
+                let duration_ms = tick.frame_mut().session.transition_duration.as_millis();
+                tracing::debug!(
+                    event = "screensaver_transition_complete",
+                    display_id = %self.display_id,
+                    duration_ms,
+                    "crossfade complete; resuming wakeup-driven path"
+                );
             }
-        };
-
-        // Snapshot the Fading `t` BEFORE `tick_step` advances it — we
-        // blend at the visible pre-tick value (commits show the
-        // progress this tick produced; the post-tick value is the
-        // starting point for next time).
-        //
-        // Taken whenever a transition is LIVE, including `t == 0` — see
-        // [`transition_live`]. The first tick of every fade arrives at `t == 0`
-        // with mpv's replacement already in the back buffer; without the
-        // capture it would be committed raw.
-        let blend_t = session.transition.as_ref().map_or(0, |tr| tr.t);
-        let capture_clone: Vec<u8> = if transition_live(session.transition.as_ref()) {
-            session
-                .transition
-                .as_ref()
-                .map(|tr| tr.capture.clone())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-        // Advance the phase machine via `tick_step` (no I/O).
-        let (new_phase, new_t, tick_cmd) = {
-            let tr_phase = session
-                .transition
-                .as_ref()
-                .map_or(TransitionPhase::Idle, |tr| tr.phase);
-            tick_step(tr_phase, blend_t, t_step)
-        };
-        if let Some(tr) = session.transition.as_mut() {
-            tr.phase = new_phase;
-            tr.t = new_t;
-        }
-
-        // Apply the blend in place at the pre-tick `t`.
-        // SAFETY: the back-buffer pointer came from the pool mmap +
-        // offset math; the slice remains valid until the end of this
-        // function (the mmap guard is in scope until then).
-        let back_slice = unsafe { std::slice::from_raw_parts_mut(back_ptr, buf_len) };
-        if !capture_clone.is_empty() {
-            blend::blend_in_place(&capture_clone, back_slice, blend_t);
-        }
-
-        // Attach + damage + commit.
-        let wl_surface = match &self.layer_surface {
-            Some(s) => s.wl_surface().clone(),
-            None => return,
-        };
-        wl_surface.damage_buffer(
-            0,
-            0,
-            session.width.cast_signed(),
-            session.height.cast_signed(),
-        );
-        let surface_handle = wayland_ops.surface_handle(&wl_surface);
-        wayland_ops.surface_attach(
-            surface_handle.as_ref(),
-            session.buffers[back_idx].as_ref(),
-            0,
-            0,
-        );
-        wayland_ops.surface_commit(surface_handle.as_ref());
-        session.buffers_busy[back_idx] = true;
-        session.next_render_idx = 1 - back_idx;
-
-        // On Complete: drop the timer and reset the state for the
-        // next cycle (phase → Idle, capture stays allocated).
-        if matches!(tick_cmd, TickCmd::Complete) {
-            let session_duration_ms = session.transition_duration.as_millis();
-            cancel_transition_timer_for(session, self.loop_handle.as_ref());
-            tracing::debug!(
-                event = "screensaver_transition_complete",
-                display_id = %self.display_id,
-                duration_ms = session_duration_ms,
-                "crossfade complete; resuming wakeup-driven path"
-            );
+            TransitionTickOutcome::FailToBlack(error) => self.fail_screensaver_to_black(&error),
         }
     }
 

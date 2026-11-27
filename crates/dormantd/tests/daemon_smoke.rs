@@ -1736,6 +1736,7 @@ async fn config_watch_updates_on_successful_reload_only() {
     .with_notify_sink_builder(noop_factory)
     .with_state_dir(dir.path().join("state"))
     .with_observation_hub(observations)
+    .disable_config_watcher()
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 
@@ -1879,6 +1880,7 @@ async fn creds_watch_updates_on_successful_reload_only() {
     .expect("build app")
     .with_notify_sink_builder(noop_factory)
     .with_state_dir(dir.path().join("state"))
+    .disable_config_watcher()
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
     let mut reloads = handle.subscribe_reload();
@@ -2160,6 +2162,7 @@ async fn concurrent_reload_inputs_are_delivered_exactly_once() {
     .with_notify_sink_builder(noop_factory)
     .with_state_dir(dir.path().join("state"))
     .with_test_generation_barrier_gate(gate.clone())
+    .disable_config_watcher()
     .disable_ipc()
     .start()
     .await
@@ -2769,6 +2772,7 @@ wake_retry_interval = "1s"
         .with_notify_sink_builder(noop_factory)
         .with_state_dir(dir.path().join("state"))
         .with_render_sink_builder(builder)
+        .disable_config_watcher()
         .disable_ipc();
 
         let (handle, join) = app.start().await.expect("start app");
@@ -6035,6 +6039,7 @@ async fn rollback_double_spawn_failure_cancels_root() {
     .with_state_dir(dir.path().join("state"))
     .with_test_force_reload_spawn_failure()
     .with_test_force_rebuild_old_spawn_failure()
+    .disable_config_watcher()
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 
@@ -6078,6 +6083,7 @@ async fn generation_barrier_survives_router_pause() {
     .with_notify_sink_builder(noop_factory)
     .with_state_dir(dir.path().join("state"))
     .with_test_generation_barrier_gate(gate.clone())
+    .disable_config_watcher()
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 
@@ -6146,6 +6152,7 @@ async fn generation_barrier_timeout_cancels_root() {
     .with_notify_sink_builder(noop_factory)
     .with_state_dir(dir.path().join("state"))
     .with_test_force_generation_barrier_timeout()
+    .disable_config_watcher()
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 
@@ -6275,6 +6282,7 @@ async fn rejected_reload_can_repeat_after_rollback_restore() {
     .with_state_dir(dir.path().join("state"))
     .with_test_force_reload_snapshot_timeout()
     .with_test_force_reload_spawn_failure()
+    .disable_config_watcher()
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 
@@ -6547,6 +6555,7 @@ async fn audio_playback_reload_mid_movie_refreezes_via_fresh_startup_grace() {
     .with_notify_sink_builder(noop_factory)
     .with_state_dir(dir.path().join("state"))
     .with_observation_hub(ObservationHub::new(64))
+    .disable_config_watcher()
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
     let mut observation_rx = handle.subscribe_observations();

@@ -48,10 +48,13 @@ yay -S dormant-bin
 
 ## From source
 
+The commands below are for Linux. Install Node.js and npm to build the embedded web UI.
+
 ```bash
 git clone https://github.com/legion-works/dormant.git
 cd dormant
 sudo apt install libudev-dev libwayland-dev libmpv-dev libpipewire-0.3-dev pkg-config
+(cd crates/dormant-web/webui && npm ci && npm run build)
 cargo build --release --features web-ui,render
 install -Dm755 target/release/dormantd ~/.local/bin/dormantd
 install -Dm755 target/release/dormantctl ~/.local/bin/dormantctl
@@ -236,21 +239,19 @@ using the setup script below. Windows has not yet been verified on hardware.
   tokens to `samsung-ip-tokens.json` in the state directory.
 - **User-activity inhibition**, via `GetLastInputInfo`. `idle_source = "auto"`
   selects it; `"windows"` forces it.
+- **Logon task.** The setup script can register an interactive task that starts the daemon at logon and retries up to three times after failure.
 
 ### What is absent
 
 - **No tray applet.** `dormant-tray` has Linux and macOS backends only. The Web
   UI covers the same surface.
-- **No render ladder.** `render_black` and `render_screensaver` are Wayland
-  layer-shell stages with no Windows equivalent, so there is **no software-blank
-  fallback and no screensaver**. If every display controller fails, the ladder
-  has nowhere left to go.
+- **No Wayland render stages.** Windows does not support `render_black` or `render_screensaver`. A ladder can use hardware stages with a supported controller.
 - **No `kwin-dpms` or `macos-*` controllers,** and deliberately no
   `SC_MONITORPOWER` equivalent. A DPMS-style blank tears down the output and
   takes the audio device with it, which is the one thing this project exists to
   avoid. Shipping no local fallback is better than shipping one that breaks the
   guarantee.
-- **No service supervision** (see below).
+- **No Windows service.** The logon task runs in the interactive desktop session for DDC/CI access.
 - **No wedged-daemon watchdog.** The `WATCHDOG=1` engine-liveness ping is
   systemd-only, exactly as on macOS. Crash-loop detection and last-known-good
   rollback still work — they count process starts from dormant's own state
@@ -269,7 +270,7 @@ Windows does not use XDG layout:
 | Config | `%APPDATA%\dormant\config.toml` |
 | Credentials | `%APPDATA%\dormant\credentials.toml` |
 | State (wear ledgers, last-known-good) | `%LOCALAPPDATA%\dormant\state\` |
-| IPC | named pipe `\\.\pipe\dormant-<username>` |
+| IPC | Local named pipe `\\.\pipe\dormant-<username>` with a protected access list for the current user. |
 
 `%XDG_CONFIG_HOME%` is honoured first if you set it, then `%APPDATA%`, then
 `%PROGRAMDATA%` — first existing file wins. There is no `chmod 600` step: the
@@ -291,7 +292,7 @@ It never overwrites an existing config, and `-SkipBuild` re-tests an existing
 install without recompiling. The blank/wake step is consent-gated and arms an
 independent wake process first, so a display cannot be left dark even if the
 script is interrupted. Add `-RegisterLogonTask` to have the daemon start at
-logon.
+logon. Add `-WithWebUi` to build the dashboard. This option requires Node.js and npm.
 
 Prerequisites are Rust (https://rustup.rs) and the Visual Studio Build Tools
 "Desktop development with C++" workload for the MSVC linker; the script checks
@@ -307,15 +308,11 @@ dormantd.exe
 
 It runs in the foreground and exits when the console closes.
 
-To survive logout, register a **Scheduled Task** with an "At log on" trigger
-and "Restart on failure", and clear "Stop the task if it runs longer than"
-(by default Task Scheduler stops a task after 3 days). Use Task Scheduler rather than a Windows service: a
-service runs in session 0 with no access to the interactive desktop, which
-breaks DDC/CI monitor enumeration outright.
+To start the daemon at each logon, run the setup script with `-RegisterLogonTask`.
+The task runs only in the user's session and has no execution time limit.
+Do not run the daemon as a Windows service. Session 0 has no interactive desktop for DDC/CI monitor enumeration.
 
-Only one daemon can run per user — a second start fails with `pipe
-'\\.\pipe\dormant-<user>' is already in use by a running daemon`, backed by a
-`LockFileEx` lock on the state directory.
+Only one daemon can run per user. A second start reports that another instance holds the lock. The daemon uses `LockFileEx` on `%LOCALAPPDATA%\dormant\dormant.lock` by default.
 
 ### Shell commands
 
@@ -342,19 +339,16 @@ user activity, if that affects you.
 
 ## Configuration file location
 
-dormant reads config from these paths, first match wins:
+dormant uses the first available config path in this order:
 
 1. `--config` CLI flag
 2. `$DORMANT_CONFIG` environment variable
-3. `$XDG_CONFIG_HOME/dormant/config.toml` (usually `~/.config/dormant/config.toml`)
+3. `$XDG_CONFIG_HOME/dormant/config.toml`, if `XDG_CONFIG_HOME` is set
+4. The platform defaults: `~/.config/dormant/config.toml` on Linux, `~/Library/Application Support/dormant/config.toml` on macOS, or the [Windows paths](#paths) above. Linux and macOS then try `/etc/dormant/config.toml`.
 
-MQTT credentials, HA tokens, and Samsung TV tokens go in a separate file with restricted permissions:
+Put MQTT credentials, Home Assistant tokens, and Samsung TV tokens in `credentials.toml` next to the config file.
 
-```
-$XDG_CONFIG_HOME/dormant/credentials.toml
-```
-
-Set permissions to `600` — dormant will refuse to load a credentials file readable by others:
+On Linux and macOS, set the credentials file mode to `600`. This example uses the default Linux user path:
 
 ```bash
 chmod 600 ~/.config/dormant/credentials.toml

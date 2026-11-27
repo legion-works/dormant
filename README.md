@@ -10,7 +10,7 @@
   <a href="https://github.com/legion-works/dormant/actions/workflows/ci.yml"><img src="https://github.com/legion-works/dormant/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="MSRV 1.88">
   <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License: MIT OR Apache-2.0">
-  <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS-informational" alt="Linux and macOS">
+  <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-informational" alt="Linux, macOS, and Windows (source build)">
   <a href="https://github.com/legion-works/dormant/releases/latest"><img src="https://img.shields.io/github/v/release/legion-works/dormant" alt="Latest release"></a>
 </p>
 
@@ -25,14 +25,14 @@ OLED panels burn in when they hold a static image. OS idle timers are a blunt fi
 - Blank displays when a room is empty instead of on a fixed idle timer — driven by MQTT, Home Assistant WebSocket, or USB mmWave radar sensors
 - Blank without killing audio — DDC/CI, Samsung Tizen, and gamma-table paths leave the OS output intact
 - **Soft KVM** — two machines, one monitor; pull the panel by hotkey, CLI, tray, or web.
-- Escalate through a render ladder: black Wayland overlay → muted mpv screensaver → power-off, on configurable dwell timers
+- On Linux Wayland, use a configurable render ladder with a muted mpv screensaver, a black overlay, and hardware power-off.
 - Track brightness-weighted panel on-hours per display, stored locally — no telemetry
 - **Wear-even screensavers** — order media and bias bounded pixel shifts toward cooler estimated panel regions
 - **Active wear sampling** — opt in to content-weighted OLED wear tracking from the KDE Wayland compositor.
 - **Source-gated TV wear sampling** — attribute HDMI-connected Samsung TV wear from local frames only while the TV is showing that input.
-- Configure and control through a loopback web dashboard with a validated config editor that preserves comments
+- Configure and control through a web dashboard that defaults to loopback and preserves config comments.
 - **Config section rail** — sticky per-tab section navigation with scroll-spy in the web UI
-- **Web UI v3** — full config-schema parity in the web editor (coordination, keymaps, input filters, hooks), a new shared-display switching view with live pull/push feedback, event history across reloads, doctor checks grouped by subject, panel-wear detail split by seeded/measured time, and a security-posture card with honest boundary notes.
+- Edit coordination, keymaps, input filters, and hooks in the web UI. The dashboard shows switch feedback, event history across reloads, doctor checks, and panel wear.
 - Drive the daemon from a desktop tray with global hotkeys (Linux KDE · macOS menu bar)
 - Probe every sensor and display against live hardware with `dormantctl doctor`
 - Recover from a bad config boot: automatic last-known-good rollback, a systemd watchdog, and `dormantctl emergency-wake`
@@ -57,14 +57,15 @@ Protecting OLEDs *without* the usual trade-offs — no black bars burned into th
 | Mode | OLED protection | Audio survives | Wake |
 |---|---|---|---|
 | `screen_off_audio_on` | Full | Yes | Fast |
-| `power_off` | Full | No | ~1s standby |
+| `power_off` | Full | Depends on controller and display | Depends on display |
 | `brightness_zero` | Partial — pixels stay lit | Yes | Instant |
 
-Three display paths leave the OS output alone, so audio keeps playing:
+These display paths leave the OS output enabled:
 
 - **`ddcci` `power_off`** writes VCP `0xD6` straight to the monitor's internal controller. The panel blanks; the OS output — and its audio sink — stay up.
 - **`samsung-tizen` `screen_off_audio_on`** sends `KEY_PICTURE_OFF` over WebSocket. The TV cuts its backlight; the HDMI source keeps running and the audio plays on.
-- **`samsung-tizen` `brightness_zero`** drives the TV's backlight to zero over Samsung IP Control G2 on port 1516 — a near-black dim rather than a true off, but the only mode that leaves the source's audio uninterrupted on a 2024 Samsung OLED.
+- **`samsung-tizen` `brightness_zero`** sets the backlight to zero through Samsung IP Control G2 on port 1516. Use it if `KEY_PICTURE_OFF` interrupts the source or audio.
+- **`macos-gamma-black`** sets the macOS gamma table to black without changing the display power state.
 
 Every DPMS path (`kwin-dpms` included) tears the output down and takes the audio with it, which is why it's a documented fallback, not a default.
 
@@ -80,7 +81,7 @@ Three binaries: **`dormantd`** (the daemon), **`dormantctl`** (the CLI), and **`
 | Home Assistant WebSocket | Ready |
 | USB-serial LD2410 mmWave radar | Ready |
 
-Zones fuse multiple sensors with `any` / `all` / `quorum` / `weighted` logic. A sensor that goes quiet — broker down, USB unplugged, a stale reading — resolves as *present*, never absent. dormant will not blank a room it can't see.
+Zones combine sensor states with `any`, `all`, `quorum`, or `weighted` logic. A sensor that stops reporting is unavailable. The default zone policy treats unavailable sensors as present.
 
 `dormantctl doctor` checks the configured sensors and displays. `--report-issue`
 and `--draft-feature` turn the full offline probe run into a ready-to-file
@@ -90,7 +91,7 @@ GitHub issue draft, with known config and credential values redacted.
 
 | Controller | |
 |---|---|
-| `ddcci` — DDC/CI power-off and brightness (audio-safe, Linux and macOS) | Ready |
+| `ddcci`: DDC/CI power-off and brightness (audio-safe, Linux, macOS, and Windows) | Ready |
 | `samsung-tizen` — Samsung Tizen TVs over WebSocket | Ready |
 | `kwin-dpms` — KDE Wayland DPMS (audio-unsafe fallback, Linux only) | Ready |
 | `ha-passthrough` — any Home Assistant service call | Ready |
@@ -108,9 +109,9 @@ dormant tracks brightness-weighted on-hours per display and shows them in the we
 
 ### Web dashboard and tray
 
-Build with `--features web-ui` for a loopback web dashboard: a live view of the sensor → zone → rule → display pipeline, force blank/wake, pause/resume, panel-wear tracking, failure state, and a config editor. The editor can create and delete sensors, zones, displays, and rules; its Samsung pairing wizard stores the granted token in `credentials.toml`. Config writes preserve comments and pass daemon-identical validation before they reach disk.
+Build with `--features web-ui` for a live dashboard with blank, wake, pause, resume, wear, and failure controls or status. The config editor can add and delete sensors, zones, displays, and rules. The Samsung pairing wizard stores the granted token in `credentials.toml`. Config writes preserve comments and pass the daemon's validation before they reach disk.
 
-Build with `--features render` for blanking that never touches DPMS: a fullscreen black Wayland overlay, an escalation ladder (screensaver → black → power-off on your own dwell timers), and a muted streaming screensaver driven by mpv. The screensaver applies a 2 px pixel shift every 2 minutes by default; the uniform black overlay never shifts.
+On Linux, build with `--features render` for the black Wayland overlay and muted mpv screensaver. You can configure the ladder to escalate from screensaver to black to hardware power-off. By default, the screensaver shifts by 2 px every 2 minutes. The black overlay does not shift.
 
 `dormant-tray` puts per-display status and blank/wake/pause controls in the KDE `StatusNotifierItem` tray on Linux and a native `NSStatusItem` menu-bar item on macOS. See the [installation guide](./docs/src/installation.md#tray-autostart) for systemd and launchd autostart.
 
@@ -158,12 +159,18 @@ launchctl bootstrap gui/$UID "$HOME/Library/LaunchAgents/com.legionworks.dormant
 launchctl bootstrap gui/$UID "$HOME/Library/LaunchAgents/com.legionworks.dormant-tray.plist"
 ```
 
+On Windows, build from source with [`scripts/windows-setup.ps1`](./scripts/windows-setup.ps1).
+Use `-RegisterLogonTask` to start the daemon at logon. See [Windows installation](./docs/src/installation.md#windows).
+
 ### Build from source (Linux, Rust 1.88+)
+
+Install Node.js and npm for the web UI build.
 
 ```bash
 git clone https://github.com/legion-works/dormant.git
 cd dormant
 sudo apt install libudev-dev libwayland-dev libmpv-dev libpipewire-0.3-dev pkg-config
+(cd crates/dormant-web/webui && npm ci && npm run build)
 cargo build --release --features web-ui,render
 install -Dm755 target/release/dormantd  ~/.local/bin/dormantd
 install -Dm755 target/release/dormantctl ~/.local/bin/dormantctl
@@ -204,7 +211,7 @@ Then:
 ```bash
 dormantctl validate     # check the config
 dormantd                # start the daemon
-dormantctl status       # watch the pipeline
+dormantctl status       # show the current pipeline state
 dormantctl status --json # snapshot the daemon state as JSON for scripts/dashboards
 dormantctl doctor       # diagnose sensors and displays against your hardware
 dormantctl doctor exercise monitor  # verify a real blank → wake control path
@@ -224,9 +231,11 @@ The rendered book for the latest release lives at [legion-works.github.io/dorman
 
 ## Status
 
-Running in production on the author's hardware — an AOC AGON OLED monitor and a Samsung S90D — driven by real Zigbee and mmWave presence sensors. CI covers the full workspace on Linux, macOS, and Windows; macOS (M1) is a genuinely supported target as of this milestone — DDC/CI, Quartz-gamma black, and `pmset` display-sleep controllers, a CoreGraphics idle source, launchd `LaunchAgents`, and a native menu-bar tray item. Windows supports DDC/CI through WinAPI and the `command` controller, but has no release binaries: build from source. Windows has not yet been verified on hardware; see [Installation: Windows](./docs/src/installation.md#windows) for limitations including no tray applet, no render ladder, and no service supervision. The daemon caps Tokio at two workers, calls `malloc_trim` after screensaver teardown, and sets `MALLOC_ARENA_MAX=2` in the systemd unit (Linux). The shipped watchdog restarts a wedged engine on Linux via systemd's `WatchdogSec`; macOS has no equivalent wedged-daemon detection (see [Installation: LaunchAgent (macOS)](./docs/src/installation.md#launchagent-macos)). Last-known-good rollback can recover a bad boot config on both platforms — it is supervisor-agnostic.
+The maintainer runs dormant on an AOC AGON OLED monitor and a Samsung S90D with Zigbee and mmWave presence sensors. CI runs workspace tests on Linux, macOS, and Windows with platform-specific features. Windows supports DDC/CI, session idle detection, and a user logon task. It has no release binaries, tray applet, or Wayland render fallback. See [Installation: Windows](./docs/src/installation.md#windows) for the supported controllers and setup.
 
-It's a young project with one maintainer, aimed at homelabs and single-operator setups; interfaces can still shift before 1.0, and the web dashboard binds to loopback with no authentication by design.
+The daemon uses two Tokio workers. On Linux, it calls `malloc_trim` after screensaver teardown, and the systemd unit sets `MALLOC_ARENA_MAX=2`. The systemd watchdog restarts a daemon that stops answering. Last-known-good rollback can recover a bad boot config without the systemd watchdog, including on macOS and Windows.
+
+Interfaces can change before 1.0. The web dashboard has no authentication and binds to loopback by default. Non-loopback binds require `daemon.web_allow_nonloopback = true`.
 
 ## License
 

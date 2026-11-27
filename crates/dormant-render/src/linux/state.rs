@@ -3310,6 +3310,9 @@ impl WaylandState {
 // ── SCTK delegate impls ───────────────────────────────────────────────────────
 
 #[cfg(test)]
+mod live_configure_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;

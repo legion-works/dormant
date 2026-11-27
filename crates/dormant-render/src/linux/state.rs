@@ -2067,10 +2067,53 @@ impl WaylandState {
         );
         Ok(())
     }
+}
+
+type RebuildBuffers<P, B> = (P, [B; 2]);
+
+trait ScreensaverRebuild {
+    type Surface;
+    type Viewport;
+    type Pool;
+    type Buffer;
+
+    fn rebuild_surface(&self) -> Option<Self::Surface>;
+    fn reset_rebuild_shift(&mut self);
+    fn ensure_rebuild_viewport(
+        &mut self,
+        surface: &Self::Surface,
+        size: (u32, u32),
+    ) -> Self::Viewport;
+    fn create_buffers(
+        &mut self,
+        size: (u32, u32),
+        stride: u32,
+    ) -> Result<RebuildBuffers<Self::Pool, Self::Buffer>, String>;
+    fn has_rebuild_session(&self) -> bool;
+    fn cancel_transition_timer(&mut self);
+    fn cancel_item_load_timer(&mut self);
+    fn clear_transition(&mut self);
+    fn set_output_size(&mut self, size: (u32, u32)) -> Result<(), String>;
+    fn has_first_frame(&self) -> bool;
+    fn render_current_frame(&mut self, pool: &Self::Pool, len: usize) -> Result<(), String>;
+    fn attach_damage_commit(
+        &mut self,
+        surface: &Self::Surface,
+        buffer: &Self::Buffer,
+        size: (u32, u32),
+    );
+    fn swap_session_buffers(
+        &mut self,
+        buffers: RebuildBuffers<Self::Pool, Self::Buffer>,
+        viewport: Self::Viewport,
+        size: (u32, u32),
+        stride: u32,
+    );
+    fn fail_rebuild_to_black(&mut self, reason: &str);
 
     /// Rebuild a live screensaver session's shm pool + double buffers
     /// after a compositor-initiated resize (#316, the screensaver twin of
-    /// #273).  Mirrors the install path ([`Self::complete_screensaver_show`])
+    /// #273).  Mirrors the install path ([`WaylandState::complete_screensaver_show`])
     /// minus the player/playlist/scaffold construction: re-install the
     /// shift viewport at the new `configured_size`, create fresh buffers
     /// from a retained pool sized for `render_dims(configured_size)`, re-target the mpv software
@@ -2105,43 +2148,32 @@ impl WaylandState {
         configured_size: (u32, u32),
         (width, height): (u32, u32),
     ) {
-        let Some(wl_surface) = self
-            .layer_surface
-            .as_ref()
-            .map(|surface| surface.wl_surface().clone())
-        else {
+        let Some(wl_surface) = self.rebuild_surface() else {
             return;
         };
         // Restart the shift walk at the new geometry — same as the install
         // path ordering (reset, then ensure).  `reset_shift` also unsets
         // the stale source crop, which would extend past the new,
         // differently-sized buffers until re-aimed.
-        self.reset_shift();
-        let shift_viewport = self.ensure_shift_viewport(&wl_surface, configured_size);
+        self.reset_rebuild_shift();
+        let shift_viewport = self.ensure_rebuild_viewport(&wl_surface, configured_size);
         let Some(stride) = width.checked_mul(4) else {
-            self.fail_screensaver_to_black("resize rebuild: stride overflow");
+            self.fail_rebuild_to_black("resize rebuild: stride overflow");
             return;
         };
-        let (pool, [buf0, buf1]) = match create_screensaver_buffers(
-            self.wayland_ops.as_ref(),
-            &mut self.screensaver_pool,
-            width,
-            height,
-            stride,
-        ) {
+        let (pool, [buf0, buf1]) = match self.create_buffers((width, height), stride) {
             Ok(parts) => parts,
             Err(e) => {
-                self.fail_screensaver_to_black(&format!("resize rebuild: RawPool::new: {e}"));
+                self.fail_rebuild_to_black(&format!("resize rebuild: RawPool::new: {e}"));
                 return;
             }
         };
 
-        let loop_handle = self.loop_handle.clone();
-        let Some(session) = self.screensaver_session.as_mut() else {
+        if !self.has_rebuild_session() {
             // Torn down concurrently (teardown raced this configure) —
             // the rebuilt pool simply drops here.
             return;
-        };
+        }
 
         // ── Token sweep (Must 2, fix-round 2 review) ────────────────
         // Cancel every token whose arming context the rebuild discards.
@@ -2149,18 +2181,18 @@ impl WaylandState {
         // sweep table (`rebuild_token_action`); the Retain arms
         // (first-frame deadline, pipe wakeup) are left alone on purpose.
         if rebuild_token_action(RebuildTokenKind::Transition) == RebuildTokenAction::Cancel {
-            cancel_transition_timer_for(session, loop_handle.as_ref());
+            self.cancel_transition_timer();
         }
         if rebuild_token_action(RebuildTokenKind::ItemLoad) == RebuildTokenAction::Cancel {
-            cancel_item_load_timer_for(session, loop_handle.as_ref());
+            self.cancel_item_load_timer();
         }
-        session.transition = None;
+        self.clear_transition();
 
-        if let Err(e) = session.player.set_output_size(width, height) {
+        if let Err(e) = self.set_output_size((width, height)) {
             // The new pool exists but mpv can't bind the new dims —
             // drop to black via the existing recovery path
             // (`destroy_screensaver_session` removes every armed timer).
-            self.fail_screensaver_to_black(&format!("resize rebuild: renderer resize: {e}"));
+            self.fail_rebuild_to_black(&format!("resize rebuild: renderer resize: {e}"));
             return;
         }
 
@@ -2173,21 +2205,11 @@ impl WaylandState {
         // carries the SAME image at the correct size rather than
         // black.  Render errors mirror the wakeup path: fatal for the
         // session, degrade to black.
-        if rebuild_commits_rendered_frame(session.has_first_frame) {
-            let buf_len = (stride as usize) * (height as usize);
-            let render_result: Result<(), String> =
-                real_pool_with_region_mut(pool.as_ref(), 0, buf_len, |back_slice| {
-                    back_slice.fill(0);
-                    session
-                        .player
-                        .render_frame_into(back_slice)
-                        .map(|_| ())
-                        .map_err(|e| format!("{e}"))
-                });
-            if let Err(e) = render_result {
-                self.fail_screensaver_to_black(&format!("resize rebuild: {e}"));
-                return;
-            }
+        if rebuild_commits_rendered_frame(self.has_first_frame())
+            && let Err(e) = self.render_current_frame(&pool, (stride as usize) * (height as usize))
+        {
+            self.fail_rebuild_to_black(&format!("resize rebuild: {e}"));
+            return;
         }
 
         // Attach + commit, THEN swap the session halves: the surface
@@ -2198,12 +2220,114 @@ impl WaylandState {
         // per-buffer reuse bookkeeping (`buffers_busy`); the protocol
         // itself permits destroying the previous `wl_shm_pool` once
         // the surface no longer references its buffers.
+        self.attach_damage_commit(&wl_surface, &buf0, (width, height));
+        self.swap_session_buffers(
+            (pool, [buf0, buf1]),
+            shift_viewport,
+            (width, height),
+            stride,
+        );
+    }
+}
+
+impl ScreensaverRebuild for WaylandState {
+    type Surface = WlSurface;
+    type Viewport = Option<Arc<dyn ViewportHandle>>;
+    type Pool = Arc<dyn PoolHandle>;
+    type Buffer = Arc<dyn BufferHandle>;
+
+    fn rebuild_surface(&self) -> Option<WlSurface> {
+        self.layer_surface
+            .as_ref()
+            .map(|surface| surface.wl_surface().clone())
+    }
+
+    fn reset_rebuild_shift(&mut self) {
+        ViewportStateView::reset_shift(self);
+    }
+
+    fn ensure_rebuild_viewport(&mut self, surface: &WlSurface, size: (u32, u32)) -> Self::Viewport {
+        WaylandState::ensure_shift_viewport(self, surface, size)
+    }
+
+    fn create_buffers(
+        &mut self,
+        (width, height): (u32, u32),
+        stride: u32,
+    ) -> Result<RebuildBuffers<Self::Pool, Self::Buffer>, String> {
+        create_screensaver_buffers(
+            self.wayland_ops.as_ref(),
+            &mut self.screensaver_pool,
+            width,
+            height,
+            stride,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    fn has_rebuild_session(&self) -> bool {
+        self.screensaver_session.is_some()
+    }
+
+    fn cancel_transition_timer(&mut self) {
+        let session = Self::rebuild_session_mut(&mut self.screensaver_session);
+        cancel_transition_timer_for(session, self.loop_handle.as_ref());
+    }
+
+    fn cancel_item_load_timer(&mut self) {
+        let session = Self::rebuild_session_mut(&mut self.screensaver_session);
+        cancel_item_load_timer_for(session, self.loop_handle.as_ref());
+    }
+
+    fn clear_transition(&mut self) {
+        Self::rebuild_session_mut(&mut self.screensaver_session).transition = None;
+    }
+
+    fn set_output_size(&mut self, (width, height): (u32, u32)) -> Result<(), String> {
+        Self::rebuild_session_mut(&mut self.screensaver_session)
+            .player
+            .set_output_size(width, height)
+            .map_err(|e| e.to_string())
+    }
+
+    fn has_first_frame(&self) -> bool {
+        let session = self.screensaver_session.as_ref();
+        session.expect("live session checked").has_first_frame
+    }
+
+    fn render_current_frame(&mut self, pool: &Self::Pool, buf_len: usize) -> Result<(), String> {
+        let session = Self::rebuild_session_mut(&mut self.screensaver_session);
+        real_pool_with_region_mut(pool.as_ref(), 0, buf_len, |back_slice| {
+            back_slice.fill(0);
+            session
+                .player
+                .render_frame_into(back_slice)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    fn attach_damage_commit(
+        &mut self,
+        wl_surface: &WlSurface,
+        buf0: &Self::Buffer,
+        (width, height): (u32, u32),
+    ) {
         wl_surface.attach(Some(real_buffer(buf0.as_ref())), 0, 0);
         wl_surface.damage_buffer(0, 0, width.cast_signed(), height.cast_signed());
         wl_surface.commit();
+    }
 
+    fn swap_session_buffers(
+        &mut self,
+        (pool, buffers): RebuildBuffers<Self::Pool, Self::Buffer>,
+        shift_viewport: Self::Viewport,
+        (width, height): (u32, u32),
+        stride: u32,
+    ) {
+        let session = Self::rebuild_session_mut(&mut self.screensaver_session);
         session.pool = pool;
-        session.buffers = [buf0, buf1];
+        session.buffers = buffers;
         session.width = width;
         session.height = height;
         session.stride = stride;
@@ -2225,6 +2349,16 @@ impl WaylandState {
             width,
             height,
         );
+    }
+
+    fn fail_rebuild_to_black(&mut self, reason: &str) {
+        WaylandState::fail_screensaver_to_black(self, reason);
+    }
+}
+
+impl WaylandState {
+    fn rebuild_session_mut(session: &mut Option<ScreensaverSession>) -> &mut ScreensaverSession {
+        session.as_mut().expect("live session checked")
     }
 
     /// Configure-timeout equivalent for the screensaver: fires after
@@ -3311,6 +3445,8 @@ impl WaylandState {
 
 #[cfg(test)]
 mod live_configure_tests;
+#[cfg(test)]
+mod rebuild_tests;
 
 #[cfg(test)]
 mod tests {

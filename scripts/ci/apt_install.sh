@@ -78,9 +78,14 @@ switch_to_fallback_mirror() {
 }
 
 readonly archives_dir="${APT_ARCHIVES_DIR:-/var/cache/apt/archives}"
+readonly lists_dir="${APT_LISTS_DIR:-/var/lib/apt/lists}"
 archive_options=(-o APT::Keep-Downloaded-Packages=true)
 if [[ -n ${APT_ARCHIVES_DIR:-} ]]; then
   archive_options+=(-o "Dir::Cache::archives=$archives_dir")
+fi
+list_options=()
+if [[ -n ${APT_LISTS_DIR:-} ]]; then
+  list_options+=(-o "Dir::State::lists=$lists_dir")
 fi
 
 restore_debs() (
@@ -97,14 +102,49 @@ restore_debs() (
   printf 'apt_install: restored %d cached .deb file(s)\n' "$restored"
 )
 
-stage_debs() (
+package_list_files() {
+  local directory=$1 file
+  local -n files=$2
+  for file in "$directory"/*; do
+    [[ -f $file && ! -L $file && ${file##*/} != lock ]] || continue
+    files+=("$file")
+  done
+}
+
+restore_lists() (
+  [[ -n ${APT_DEB_CACHE_DIR:-} ]] || return 0
+  local lists=() restored=0
+  package_list_files "$APT_DEB_CACHE_DIR/lists" lists
+  if (( ${#lists[@]} > 0 )); then
+    if sudo install -m 0644 -p -- "${lists[@]}" "$lists_dir/"; then
+      restored=${#lists[@]}
+    else
+      printf '%s\n' 'apt_install: could not restore cached package lists; continuing with apt' >&2
+    fi
+  fi
+  printf 'apt_install: restored package lists (%d files)\n' "$restored"
+)
+
+stage_lists() {
+  local destination="$APT_DEB_CACHE_DIR/lists" lists=() stale_lists=()
+  package_list_files "$lists_dir" lists
+  package_list_files "$destination" stale_lists
+  (( ${#lists[@]} > 0 )) || return 1
+  if (( ${#stale_lists[@]} > 0 )); then
+    rm -f -- "${stale_lists[@]}" || return 1
+  fi
+  mkdir -p -- "$destination" && cp --preserve=timestamps -- "${lists[@]}" "$destination/" || return 1
+  printf 'apt_install: staged package lists (%d files) for cache save\n' "${#lists[@]}"
+}
+
+stage_cache() (
   [[ -n ${APT_DEB_CACHE_DIR:-} ]] || return 0
   shopt -s nullglob
   # A restore from an older image can bring superseded versions. autoclean
   # removes every archive that the current package lists no longer name, so
   # the saved cache holds only installable versions.
   local before=("$archives_dir"/*.deb)
-  if timeout 60 sudo apt-get autoclean -y "${archive_options[@]}" >/dev/null; then
+  if timeout 60 sudo apt-get autoclean -y "${archive_options[@]}" "${list_options[@]}" >/dev/null; then
     local after=("$archives_dir"/*.deb)
     printf 'apt_install: autoclean removed %d superseded .deb file(s)\n' \
       "$(( ${#before[@]} - ${#after[@]} ))"
@@ -126,12 +166,17 @@ stage_debs() (
     return 0
   fi
   printf 'apt_install: staged %d .deb file(s) for cache save\n' "${#debs[@]}"
+  if ! stage_lists; then
+    printf '%s\n' 'apt_install: could not stage package lists; cache save skipped' >&2
+    return 0
+  fi
   if [[ -n ${GITHUB_OUTPUT:-} ]]; then
     printf '%s\n' 'cache-ready=true' >> "$GITHUB_OUTPUT"
   fi
 )
 
 restore_debs
+restore_lists
 export DEBIAN_FRONTEND=noninteractive
 
 # GitHub's runner images normally retain package lists from image creation. Use
@@ -139,10 +184,10 @@ export DEBIAN_FRONTEND=noninteractive
 # already resolvable; a stale or incomplete list still falls through to update.
 initial_err_log="$(mktemp)"
 if timeout "$install_timeout" sudo -E apt-get install -y \
-  "${archive_options[@]}" --no-install-recommends "$@" 2>"$initial_err_log"; then
+  "${archive_options[@]}" "${list_options[@]}" --no-install-recommends "$@" 2>"$initial_err_log"; then
   printf 'apt_install: installed %d package(s) from existing package lists; apt-get update skipped\n' "$#"
   rm -f "$initial_err_log"
-  stage_debs
+  stage_cache
   exit 0
 else
   initial_status=$?
@@ -164,14 +209,14 @@ while (( attempt <= attempts )); do
   # nothing about WHY. Keeping a tail gives the next reader the mirror host and
   # the failing URL instead of a bare "timed out".
   err_log="$(mktemp)"
-  if timeout "$update_timeout" sudo -E apt-get update 2>"$err_log"; then
+  if timeout "$update_timeout" sudo -E apt-get update "${list_options[@]}" 2>"$err_log"; then
     timed_out_phase='install'
     timed_out_budget="$install_timeout"
     if timeout "$install_timeout" sudo -E apt-get install -y \
-      "${archive_options[@]}" --no-install-recommends "$@" 2>>"$err_log"; then
+      "${archive_options[@]}" "${list_options[@]}" --no-install-recommends "$@" 2>>"$err_log"; then
       printf 'apt_install: installed %d package(s) on attempt %d\n' "$#" "$attempt"
       rm -f "$err_log"
-      stage_debs
+      stage_cache
       exit 0
     else
       status=$?

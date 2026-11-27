@@ -18,14 +18,25 @@ class AptInstallTests(unittest.TestCase):
             state = temp / "state"
             archives = temp / "archives"
             archives.mkdir()
+            lists = temp / "lists"
+            lists.mkdir()
+            (lists / "mirror_Packages").write_text("runner versions")
+            (lists / "lock").touch()
+            (lists / "partial").mkdir()
+            (lists / "partial" / "incomplete_Packages").touch()
             cache_dir = temp / "cache"
             output = temp / "output"
             output.touch()
-            if cache in ("warm", "warm_superseded"):
+            if cache in ("warm", "warm_superseded", "warm_lists"):
                 cache_dir.mkdir()
                 (cache_dir / "example.deb").write_text("cached deb")
             if cache == "warm_superseded":
                 (cache_dir / "superseded-old.deb").write_text("old deb")
+            if cache == "warm_lists":
+                cached_lists = cache_dir / "lists"
+                cached_lists.mkdir()
+                (cached_lists / "mirror_Packages").write_text("cached versions")
+                (cached_lists / "mirror_legacy_Packages").write_text("obsolete index")
             fake_sudo.write_text(
                 "#!/usr/bin/env bash\n"
                 "set -euo pipefail\n"
@@ -38,6 +49,8 @@ class AptInstallTests(unittest.TestCase):
                 "    if [[ $FAKE_SUDO_MODE == update_timeout ]]; then\n"
                 "      sleep 2\n"
                 "    fi\n"
+                "    printf 'updated versions' > \"$APT_LISTS_DIR/mirror_Packages\"\n"
+                "    rm -f -- \"$APT_LISTS_DIR/mirror_legacy_Packages\"\n"
                 "    exit 0\n"
                 "    ;;\n"
                 "  'apt-get install')\n"
@@ -47,6 +60,9 @@ class AptInstallTests(unittest.TestCase):
                 "    fi\n"
                 "    count=$((count + 1))\n"
                 "    printf '%s\\n' \"$count\" > \"$FAKE_SUDO_STATE\"\n"
+                "    if [[ $FAKE_SUDO_MODE == require_cached_lists && $count -eq 1 ]]; then\n"
+                "      [[ $(<\"$APT_LISTS_DIR/mirror_Packages\") == 'cached versions' ]] || exit 1\n"
+                "    fi\n"
                 "    if [[ -n ${APT_DEB_CACHE_DIR:-} ]]; then\n"
                 "      [[ $* == *APT::Keep-Downloaded-Packages=true* ]] || exit 2\n"
                 "      if [[ -f $APT_ARCHIVES_DIR/example.deb ]]; then\n"
@@ -80,6 +96,7 @@ class AptInstallTests(unittest.TestCase):
             environment = {
                 **os.environ,
                 "APT_ARCHIVES_DIR": str(archives),
+                "APT_LISTS_DIR": str(lists),
                 "APT_ATTEMPTS": "1",
                 "APT_DEB_CACHE_DIR": str(cache_dir) if cache else "",
                 "APT_UPDATE_TIMEOUT": "1",
@@ -101,6 +118,11 @@ class AptInstallTests(unittest.TestCase):
             deb = cache_dir / "example.deb"
             cached_deb = deb.read_text() if deb.exists() else None
             self.cache_files = sorted(path.name for path in cache_dir.glob("*.deb"))
+            cached_lists = cache_dir / "lists"
+            self.cached_lists = {
+                str(path.relative_to(cached_lists)): path.read_text() if path.is_file() else None
+                for path in cached_lists.rglob("*")
+            }
             cache_output = output.read_text()
 
         return result, commands, cached_deb, cache_output
@@ -147,6 +169,31 @@ class AptInstallTests(unittest.TestCase):
         self.assertIn("apt_install: staged 1 .deb file(s) for cache save", result.stdout)
         self.assertTrue(any("apt-get update" in command for command in commands))
         self.assertEqual(deb, "downloaded deb")
+        self.assertEqual(output, "cache-ready=true\n")
+
+    def test_warm_cache_restores_lists_before_initial_install(self):
+        result, commands, _, _ = self.run_apt_install("require_cached_lists", cache="warm_lists")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("apt-get update skipped", result.stdout)
+        self.assertIn("apt_install: restored package lists (2 files)", result.stdout)
+        self.assertIn("Need to get 0 B/1 B of archives.", result.stdout)
+        self.assertFalse(any("apt-get update" in command for command in commands))
+
+    def test_warm_cache_replaces_lists_after_fallback_update(self):
+        result, commands, _, output = self.run_apt_install("stale_lists", cache="warm_lists")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(any("apt-get update" in command for command in commands))
+        self.assertIn("apt_install: restored package lists (2 files)", result.stdout)
+        self.assertEqual(self.cached_lists, {"mirror_Packages": "updated versions"})
+        self.assertEqual(output, "cache-ready=true\n")
+
+    def test_cold_cache_stages_lists_after_success(self):
+        result, _, _, output = self.run_apt_install("install_first_success", cache="cold")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.cached_lists, {"mirror_Packages": "runner versions"})
         self.assertEqual(output, "cache-ready=true\n")
 
     def test_failed_install_does_not_stage_deb(self):

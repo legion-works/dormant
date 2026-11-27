@@ -1,5 +1,5 @@
 name: Install apt packages
-description: Install Ubuntu packages and cache their downloaded archives.
+description: Install Ubuntu packages and cache their archives and package lists.
 inputs:
   packages:
     description: Exact list of package arguments, separated by spaces on one line.
@@ -19,10 +19,10 @@ runs:
         digest=$(printf '%s' "$APT_PACKAGES" | sha256sum)
         # The image version comes last so a job on a newer image can restore
         # the previous image's archives through the prefix below.
-        prefix="apt-debs-v2-${ImageOS:-unknown}-${RUNNER_ARCH:-unknown}-${digest%% *}-"
+        prefix="apt-debs-v3-${ImageOS:-unknown}-${RUNNER_ARCH:-unknown}-${digest%% *}-"
         printf 'prefix=%s\n' "$prefix" >> "$GITHUB_OUTPUT"
         printf 'value=%s%s\n' "$prefix" "${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
-    - name: Restore apt archives
+    - name: Restore apt cache
       id: restore
       continue-on-error: true
       uses: actions/cache/restore@v5
@@ -39,7 +39,7 @@ runs:
       run: |
         read -r -a packages <<< "$APT_PACKAGES"
         bash scripts/ci/apt_install.sh "${packages[@]}"
-    - name: Save apt archives
+    - name: Save apt cache
       if: success() && steps.restore.outputs.cache-hit != 'true' && steps.install.outputs.cache-ready == 'true'
       uses: actions/cache/save@v5
       with:

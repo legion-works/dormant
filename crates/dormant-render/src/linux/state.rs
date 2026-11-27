@@ -3445,6 +3445,8 @@ impl WaylandState {
 
 #[cfg(test)]
 mod live_configure_tests;
+#[cfg(test)]
+mod rebuild_tests;
 
 #[cfg(test)]
 mod tests {

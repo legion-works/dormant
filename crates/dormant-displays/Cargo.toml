@@ -22,7 +22,7 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
-base64 = "0.22"
+base64 = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = [
   "ring",
   "tls12",

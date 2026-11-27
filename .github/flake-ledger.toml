@@ -230,3 +230,18 @@ fix_pr = ""
 proving_test = "daemon_smoke::coordinator_config_watcher_suppression_is_effective"
 soak_evidence = []
 status = "open"
+
+[[incident]]
+id = "FLAKE-2026-11-27-ROLLBACK-RECEIPT-WATCHER-RACE"
+test = "daemon_smoke::rollback_double_spawn_failure_cancels_root"
+first_seen = "2026-11-27"
+signature = "sha256:7e75c6b0c69b354573dbcfce641a0d504856b2521b1dae3fbb44d39e105ba962"
+first_run_url = ""
+last_run_url = ""
+mechanism = "The file write starts a Watcher reload. If the debounce window closes before Control joins the batch, the injected spawn and rollback failures cancel the daemon root. The run loop can exit before Control receives a receipt."
+reproduction = "On the unfixed test, wait up to two seconds for the daemon join handle after the config write and before the Control request. Then run: cargo nextest run -p dormantd --test daemon_smoke --stress-count 5 --no-fail-fast --retries 0 --flaky-result fail -E 'test(=rollback_double_spawn_failure_cancels_root)'"
+root_cause = "The test enables a real file watcher next to its explicit Control request. With Control delayed, the watcher alone caused a rejected reload and daemon exit. With the watcher off, Control received its receipt and then the daemon exited."
+fix_pr = ""
+proving_test = "daemon_smoke::rollback_double_spawn_failure_cancels_root"
+soak_evidence = []
+status = "open"

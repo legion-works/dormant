@@ -2571,7 +2571,7 @@ trait TransitionTick {
             return TransitionTickOutcome::FailToBlack(error);
         }
 
-        // The frame uses the old `t`, including zero on the first tick.
+        // The frame uses `t` from before the step. The first tick uses `t == 0`.
         let transition = self.transition();
         let (blend_t, capture) = transition_blend(transition);
         let phase = transition.map_or(TransitionPhase::Idle, |tr| tr.phase);
@@ -2918,8 +2918,8 @@ impl WaylandState {
         }
     }
 
-    /// Advance the fade on the calloop thread. The timer controls the fade
-    /// duration independently of the rate of mpv wakeups.
+    /// The timer controls the fade time.
+    /// The mpv wakeup rate does not change it.
     fn on_transition_tick(&mut self, r#gen: u64) {
         let wayland_ops = self.wayland_ops.clone();
         let mut tick = WaylandTransitionTick {

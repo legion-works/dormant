@@ -1,9 +1,9 @@
 //! Windows IPC pipe security.
 
-use std::fs::File;
 use std::io;
 use std::mem::{MaybeUninit, size_of};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::path::Path;
 use std::ptr::{self, NonNull};
 
 use anyhow::{Context, Result, ensure};
@@ -15,7 +15,19 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-pub(super) fn is_owned_by_current_user(pipe: &File) -> Result<bool> {
+pub(super) fn require_current_user_owner(pipe: &impl AsRawHandle, path: &Path) -> Result<()> {
+    // Check the open handle. A later name lookup can refer to a different pipe.
+    let owned = is_owned_by_current_user(pipe)
+        .with_context(|| format!("check owner of named pipe '{}'", path.display()))?;
+    ensure!(
+        owned,
+        "named pipe '{}' is not owned by the current user",
+        path.display()
+    );
+    Ok(())
+}
+
+fn is_owned_by_current_user(pipe: &impl AsRawHandle) -> Result<bool> {
     let user = ProcessTokenUser::query()?;
     let mut owner = ptr::null_mut();
     let mut descriptor = ptr::null_mut();

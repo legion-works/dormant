@@ -34,6 +34,8 @@ use dormant_displays::ddc_lock::PanelLocks;
 use dormant_displays::executor::{DisplayExecutor, RetrySettings};
 use dormant_displays::registry;
 use dormant_displays::registry::ControllerBuildContext;
+#[cfg(any(unix, windows))]
+use dormantctl::client::send_request_async;
 
 // Direct hardware can legitimately take longer than the IPC fast path while a
 // controller recovers a bus, but five seconds still bounds a wedged I²C call
@@ -45,7 +47,7 @@ const DIRECT_HARDWARE_WAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Arguments accepted by `dormantctl emergency-wake`.
 #[derive(clap::Parser, Debug)]
 pub struct EmergencyWakeArgs {
-    /// Path to the daemon's Unix socket (overrides the default).
+    /// Path to the daemon's socket or named pipe (overrides the default).
     #[arg(long, global = true)]
     pub socket: Option<PathBuf>,
 
@@ -329,56 +331,12 @@ fn classify_response(resp: IpcResponse) -> IpcOutcome {
     }
 }
 
-/// Async `send_request` — line-delimited JSON over a tokio `UnixStream`.
-///
-/// Mirrors `dormantctl::client::send_request` (which is sync) but is
-/// cancellable via `tokio::time::timeout` so this module can bound the IPC
-/// attempt at 2 seconds.  On non-Unix this returns the same `E_IPC` error
-/// as the sync version.
-// On non-Unix the whole body is cfg'd out, leaving no await — but the
-// function is awaited by a shared caller, so `async` has to stay. Scoped to
-// `not(unix)` so Linux and macOS keep enforcing the lint; the Windows
-// named-pipe transport (#265) puts real awaits here and retires this.
-#[cfg_attr(
-    not(unix),
-    allow(
-        clippy::unused_async,
-        reason = "async is fixed by the shared caller; the non-Unix arm has no transport yet"
-    )
-)]
-async fn send_request_async(socket_path: &Path, request: &IpcRequest) -> Result<IpcResponse> {
-    #[cfg(unix)]
-    {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        use tokio::net::UnixStream;
-
-        let mut stream = UnixStream::connect(socket_path)
-            .await
-            .with_context(|| format!("connect to {}", socket_path.display()))?;
-
-        let line = serde_json::to_string(request).context("serialize request")?;
-        stream.write_all(line.as_bytes()).await?;
-        stream.write_all(b"\n").await?;
-        stream.flush().await?;
-
-        let mut reader = BufReader::new(stream);
-        let mut response_line = String::new();
-        reader
-            .read_line(&mut response_line)
-            .await
-            .context("read response from daemon")?;
-        let trimmed = response_line.trim();
-        let resp: IpcResponse = serde_json::from_str(trimmed).context("parse daemon response")?;
-        Ok(resp)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (socket_path, request);
-        Err(anyhow::anyhow!(
-            "{}: IPC is only supported on Unix platforms in this release",
-            dormant_core::error::E_IPC
-        ))
-    }
+#[cfg(not(any(unix, windows)))]
+fn send_request_async(_: &Path, _: &IpcRequest) -> std::future::Ready<Result<IpcResponse>> {
+    std::future::ready(Err(anyhow::anyhow!(
+        "{}: IPC is only supported on Unix platforms in this release",
+        dormant_core::error::E_IPC
+    )))
 }
 
 // ── Direct-hardware fallback ──────────────────────────────────────────────────
@@ -717,6 +675,43 @@ mod gamma_restore_ordering_tests {
             credentials: None,
             lenient_keys: false,
         }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_emergency_wake_falls_back_when_pipe_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let tag = dir.path().file_name().unwrap().to_str().unwrap();
+        let pipe_name = format!(r"\\.\pipe\dormant-emergency-wake-missing-{tag}");
+        let pipe = Path::new(&pipe_name);
+        let error = send_request_async(pipe, &IpcRequest::EmergencyWake)
+            .await
+            .expect_err("no server is listening on the named pipe");
+        assert!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind)
+                == Some(std::io::ErrorKind::NotFound),
+            "expected a missing named pipe, not an unsupported transport: {error:#}"
+        );
+
+        let fallback = FakeDirectFallback::default();
+        let outcome = run_with_seams(
+            pipe,
+            &no_op_args(),
+            &FakeGammaRestore::default(),
+            &fallback,
+            IPC_TIMEOUT,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            fallback.calls(),
+            1,
+            "a missing pipe must invoke direct wake"
+        );
+        assert!(!outcome.ipc_timed_out, "a missing pipe is not a timeout");
     }
 
     /// Test 11 (Task 8 plan): `emergency_wake_restores_gamma_even_when_ipc_connect_fails`

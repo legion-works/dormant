@@ -2259,6 +2259,82 @@ mod tests {
             .expect("server task completes on disconnect");
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_emergency_wake_named_pipe_round_trip() {
+        use dormant_core::ipc_proto::IpcRequest;
+        use dormant_core::rules::EmergencyWakeReport;
+        use std::{path::Path, time::Duration};
+
+        let pipe_name = unique_pipe_name("emergency-wake");
+        let name = std::ffi::OsStr::new(&pipe_name);
+        let security = super::PipeSecurity::for_current_user().expect("build pipe security");
+        let server = super::create_first_pipe_instance(name, &security).expect("create test pipe");
+        let (ctl_tx, mut ctl_rx) = mpsc::channel(8);
+        let (reload_tx, _reload_rx) = mpsc::channel(8);
+        let doctor = fake_doctor(ctl_tx.clone());
+        let direct_switch = fake_direct_switch(ctl_tx.clone());
+        let wear_sampling = super::WearSamplingControls {
+            sampler_registry: Arc::new(std::sync::RwLock::new(
+                std::collections::BTreeMap::default(),
+            )),
+            selected_displays: Arc::new(Vec::new()),
+            compositor_output: Arc::new(|_| None),
+            consent_gate: ConsentGate::default(),
+        };
+        let cancel = CancellationToken::new();
+        let server_task = tokio::spawn(super::run_pipe(
+            server,
+            name.to_os_string(),
+            security,
+            ctl_tx,
+            dormant_core::reload::ReloadRequester::new(reload_tx),
+            doctor,
+            direct_switch,
+            cancel.clone(),
+            wear_sampling,
+        ));
+        let engine_task = tokio::spawn(async move {
+            let Some(super::ControlMsg::EmergencyWake { reply }) = ctl_rx.recv().await else {
+                panic!("daemon handler must dispatch EmergencyWake to the engine");
+            };
+            reply
+                .send(EmergencyWakeReport {
+                    operation_id: None,
+                    generation: None,
+                    paused: true,
+                    displays: vec![],
+                })
+                .expect("daemon handler still waits for the report");
+        });
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            dormantctl::client::send_request_async(
+                Path::new(&pipe_name),
+                &IpcRequest::EmergencyWake,
+            ),
+        )
+        .await
+        .expect("emergency-wake named-pipe request must return")
+        .expect("emergency-wake must reach the daemon over its named pipe");
+        assert!(
+            response.ok,
+            "daemon rejected emergency-wake: {:?}",
+            response.error
+        );
+        assert!(
+            response
+                .emergency_report
+                .expect("daemon returns the report")
+                .paused
+        );
+
+        engine_task.await.expect("engine task completes");
+        cancel.cancel();
+        server_task.await.expect("pipe listener stops");
+    }
+
     /// The single-instance guarantee: a second `first_pipe_instance(true)`
     /// create on the same name must fail with `ERROR_ACCESS_DENIED` while the
     /// first instance is held.

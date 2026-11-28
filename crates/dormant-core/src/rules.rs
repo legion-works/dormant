@@ -3650,6 +3650,24 @@ mod tests {
         assert_eq!(verdict, ExerciseVerdict::Confirmed);
     }
 
+    #[test]
+    fn restore_verdict_requires_a_baseline_observation() {
+        let post_blank = PanelState {
+            power: Some(PowerState::Standby),
+            brightness: None,
+        };
+        let post_wake = PanelState {
+            power: Some(PowerState::On),
+            brightness: None,
+        };
+
+        assert_eq!(
+            restore_verdict(&Ok(()), None, Some(&post_blank), Some(&post_wake)),
+            ExerciseVerdict::Unconfirmable,
+            "without a baseline, the wake cannot be verified as a restore"
+        );
+    }
+
     /// Wake step: state changed but did NOT return to baseline → `Failed`.
     #[test]
     fn restore_verdict_marks_panel_not_returned_as_failed() {

@@ -4,6 +4,7 @@ use super::{RebuildBuffers, ScreensaverRebuild};
 
 const CONFIGURED_SIZE: (u32, u32) = (80, 60);
 const RENDER_SIZE: (u32, u32) = (96, 76);
+const REBUILD_OFFSET: usize = 80_000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Fault {
@@ -21,7 +22,7 @@ enum Effect {
     CancelItemLoadTimer,
     ClearTransition,
     ResizePlayer,
-    Render(usize),
+    Render { offset: usize, len: usize },
     Attach,
     Damage,
     Commit,
@@ -66,7 +67,7 @@ impl ScreensaverRebuild for RebuildRecorder {
         if self.fault == Some(Fault::CreatePool) {
             return Err("pool unavailable".into());
         }
-        Ok(((), [Buffer, Buffer]))
+        Ok(((), [Buffer, Buffer], REBUILD_OFFSET))
     }
 
     fn has_rebuild_session(&self) -> bool {
@@ -97,8 +98,17 @@ impl ScreensaverRebuild for RebuildRecorder {
         self.has_first_frame
     }
 
-    fn render_current_frame(&mut self, (): &Self::Pool, len: usize) -> Result<(), String> {
-        self.effects.push(Effect::Render(len));
+    fn prepare_rebuild_frame(
+        &mut self,
+        (): &Self::Pool,
+        offset: usize,
+        len: usize,
+        render_picture: bool,
+    ) -> Result<(), String> {
+        if !render_picture {
+            return Ok(());
+        }
+        self.effects.push(Effect::Render { offset, len });
         if self.fault == Some(Fault::RenderFrame) {
             return Err("render rejected".into());
         }
@@ -148,7 +158,7 @@ fn rebuild_clears_transition_and_timers_before_render_and_commit() {
                 CancelTransitionTimer
                     | CancelItemLoadTimer
                     | ClearTransition
-                    | Render(_)
+                    | Render { .. }
                     | Attach
                     | Commit
             )
@@ -165,13 +175,25 @@ fn rebuild_clears_transition_and_timers_before_render_and_commit() {
 fn rebuild_renders_first_frame_before_attach_and_commit() {
     let effects: Vec<_> = rebuild_with_first_frame()
         .into_iter()
-        .filter(|effect| matches!(effect, Effect::Render(_) | Effect::Attach | Effect::Commit))
+        .filter(|effect| {
+            matches!(
+                effect,
+                Effect::Render { .. } | Effect::Attach | Effect::Commit
+            )
+        })
         .collect();
 
     assert_eq!(
         effects,
-        [Effect::Render(29_184), Effect::Attach, Effect::Commit],
-        "rebuild must render the current picture before attaching or committing"
+        [
+            Effect::Render {
+                offset: REBUILD_OFFSET,
+                len: 29_184
+            },
+            Effect::Attach,
+            Effect::Commit
+        ],
+        "rebuild must render into the replacement buffer before attaching or committing"
     );
 }
 
@@ -182,7 +204,12 @@ fn rebuild_does_not_render_without_first_frame() {
     let effects: Vec<_> = state
         .effects
         .into_iter()
-        .filter(|effect| matches!(effect, Effect::Render(_) | Effect::Attach | Effect::Commit))
+        .filter(|effect| {
+            matches!(
+                effect,
+                Effect::Render { .. } | Effect::Attach | Effect::Commit
+            )
+        })
         .collect();
 
     assert_eq!(
@@ -240,7 +267,7 @@ fn rebuild_fails_to_black_on_pool_creation_failure() {
     assert_rebuild_failure(
         Some(Fault::CreatePool),
         RENDER_SIZE,
-        "resize rebuild: RawPool::new: pool unavailable",
+        "resize rebuild: shm buffers: pool unavailable",
     );
 }
 

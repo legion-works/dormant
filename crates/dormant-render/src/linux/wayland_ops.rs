@@ -172,6 +172,9 @@ pub(super) trait WaylandOps: Send + Sync {
     /// only — the recorder impl never fails).
     fn create_shm_pool(&self, byte_len: usize) -> Result<Arc<dyn PoolHandle>, CreatePoolError>;
 
+    /// Grow the same pool without changing the bytes of existing buffers.
+    fn grow_shm_pool(&self, pool: &dyn PoolHandle, byte_len: usize) -> io::Result<()>;
+
     /// `wl_shm_pool.create_buffer` on `pool` at `offset`. Real impl
     /// forwards to `RawPool::create_buffer` against the `QueueHandle`
     /// captured at [`RealWaylandOps::new`] time; see the module docs
@@ -408,6 +411,16 @@ impl WaylandOps for RealWaylandOps {
     fn create_shm_pool(&self, byte_len: usize) -> Result<Arc<dyn PoolHandle>, CreatePoolError> {
         let pool = RawPool::new(byte_len, &self.shm)?;
         Ok(Arc::new(RealPoolHandle(StdMutex::new(pool))))
+    }
+
+    fn grow_shm_pool(&self, pool: &dyn PoolHandle, byte_len: usize) -> io::Result<()> {
+        pool.as_any()
+            .downcast_ref::<RealPoolHandle>()
+            .expect("RealWaylandOps always receives a RealPoolHandle it created")
+            .0
+            .lock()
+            .expect("RawPool mutex poisoned")
+            .resize(byte_len)
     }
 
     fn pool_create_buffer(
@@ -664,6 +677,18 @@ impl WaylandOps for RecordingWaylandOps {
         Ok(Arc::new(RecordingPoolHandle { id }))
     }
 
+    fn grow_shm_pool(&self, pool: &dyn PoolHandle, byte_len: usize) -> io::Result<()> {
+        let id = pool
+            .as_any()
+            .downcast_ref::<RecordingPoolHandle>()
+            .map_or(u64::MAX, |h| h.id);
+        self.call_log
+            .lock()
+            .unwrap()
+            .push(format!("grow_shm_pool(#{id}, {byte_len})"));
+        Ok(())
+    }
+
     fn pool_create_buffer(
         &self,
         pool: &dyn PoolHandle,
@@ -736,33 +761,7 @@ impl WaylandOps for RecordingWaylandOps {
 // closure-driving test still called the closure directly. Retired
 // (deleted) alongside this function landing.
 
-/// Build the screensaver's double-buffered `wl_shm` pool: a single
-/// `2 * stride * height`-byte pool (via [`WaylandOps::create_shm_pool`])
-/// holding two XRGB8888 buffers at offsets `0` and `stride * height`
-/// (via [`WaylandOps::pool_create_buffer`], twice) — `buf0` and `buf1`
-/// so mpv can ping-pong writes without overwriting a buffer the
-/// compositor is still reading. `width`/`height` are the buffer
-/// dimensions in pixels; `stride` is bytes-per-row (already validated
-/// by the caller — see `complete_screensaver_show`'s `stride` overflow
-/// check).
-///
-/// # Errors
-///
-/// Returns the underlying `wl_shm` allocation error (real impl only —
-/// the recorder impl never fails), or `CreatePoolError::Create` if
-/// `2 * stride * height` overflows `u64` — physically unreachable for
-/// any real display size, but reported gracefully rather than
-/// panicking since this runs inside the Wayland dispatch callback.
-///
-/// # Panics
-///
-/// Panics if the second buffer's offset (`stride * height`, cast to
-/// `i32`) overflows — physically unreachable for any real display
-/// size (mirrors the existing `i32::try_from(...).expect(...)`
-/// invariant this function replaces at the `create_dual_buffers` call
-/// site).
-/// The screensaver's allocated pool handle plus its two buffer
-/// handles (`buf0` at offset 0, `buf1` at offset `stride * height`).
+/// The screensaver's pool and its two adjacent buffers.
 pub(super) type ScreensaverBuffers = (Arc<dyn PoolHandle>, [Arc<dyn BufferHandle>; 2]);
 type ShmBuffer = (Arc<dyn PoolHandle>, Arc<dyn BufferHandle>);
 
@@ -821,6 +820,7 @@ pub(super) fn create_shm_buffer(
     Ok((pool, buffer))
 }
 
+/// Allocate the normal show pair at offsets zero and `stride * height`.
 pub(super) fn create_screensaver_buffers(
     ops: &dyn WaylandOps,
     retained_pool: &mut Option<ScreensaverPool>,
@@ -828,23 +828,88 @@ pub(super) fn create_screensaver_buffers(
     height: u32,
     stride: u32,
 ) -> Result<ScreensaverBuffers, CreatePoolError> {
-    let buf1_offset_bytes = dual_buf_second_offset(stride, height);
-    let pool_byte_len_bytes = buf1_offset_bytes.checked_mul(2).ok_or_else(|| {
-        CreatePoolError::Create(io::Error::other(
-            "pool byte length (2 * stride * height) overflowed u64",
-        ))
-    })?;
-    let pool_byte_len =
-        usize::try_from(pool_byte_len_bytes).expect("pool byte length must fit in usize");
-    let pool = ensure_retained_pool(ops, retained_pool, pool_byte_len)?;
+    let pair_len = screensaver_pair_len(stride, height)?;
+    check_screensaver_pool_size(pair_len)?;
+    let pool = ensure_retained_pool(ops, retained_pool, pair_len)?;
+    Ok(screensaver_buffers_at(
+        ops,
+        pool,
+        (width, height),
+        stride,
+        pair_len,
+        0,
+    ))
+}
+
+fn screensaver_pair_len(stride: u32, height: u32) -> Result<usize, CreatePoolError> {
+    dual_buf_second_offset(stride, height)
+        .checked_mul(2)
+        .and_then(|len| usize::try_from(len).ok())
+        .ok_or_else(screensaver_pool_size_error)
+}
+
+fn check_screensaver_pool_size(byte_len: usize) -> Result<(), CreatePoolError> {
+    i32::try_from(byte_len)
+        .map(|_| ())
+        .map_err(|_| screensaver_pool_size_error())
+}
+
+fn screensaver_pool_size_error() -> CreatePoolError {
+    CreatePoolError::Create(io::Error::other(
+        "screensaver pool exceeds Wayland size limit",
+    ))
+}
+
+fn screensaver_buffers_at(
+    ops: &dyn WaylandOps,
+    pool: Arc<dyn PoolHandle>,
+    (width, height): (u32, u32),
+    stride: u32,
+    pair_len: usize,
+    offset: usize,
+) -> ScreensaverBuffers {
     let fmt = wl_shm::Format::Xrgb8888;
     let w = width.cast_signed();
     let h = height.cast_signed();
     let stride_i32 = stride.cast_signed();
-    let buf0 = ops.pool_create_buffer(pool.as_ref(), 0, w, h, stride_i32, fmt);
-    let offset1 = i32::try_from(buf1_offset_bytes).expect("second buffer offset must fit in i32");
+    let offset0 = i32::try_from(offset).expect("checked pool size bounds both offsets");
+    let offset1 =
+        i32::try_from(offset + pair_len / 2).expect("checked pool size bounds both offsets");
+    let buf0 = ops.pool_create_buffer(pool.as_ref(), offset0, w, h, stride_i32, fmt);
     let buf1 = ops.pool_create_buffer(pool.as_ref(), offset1, w, h, stride_i32, fmt);
-    Ok((pool, [buf0, buf1]))
+    (pool, [buf0, buf1])
+}
+
+/// Allocate a replacement pair outside all current and unreleased ranges.
+pub(super) fn create_rebuild_buffers(
+    ops: &dyn WaylandOps,
+    retained: &mut ScreensaverPool,
+    size: (u32, u32),
+    stride: u32,
+    mut occupied: Vec<std::ops::Range<usize>>,
+) -> Result<(ScreensaverBuffers, usize), CreatePoolError> {
+    let pair_len = screensaver_pair_len(stride, size.1)?;
+    occupied.sort_unstable_by_key(|range| range.start);
+    let mut offset = 0;
+    for range in occupied {
+        if range.start.saturating_sub(offset) >= pair_len {
+            break;
+        }
+        offset = offset.max(range.end);
+    }
+    let end = offset
+        .checked_add(pair_len)
+        .ok_or_else(screensaver_pool_size_error)?;
+    check_screensaver_pool_size(end)?;
+    if end > retained.byte_len {
+        ops.grow_shm_pool(retained.pool.as_ref(), end)
+            .map_err(CreatePoolError::Create)?;
+        retained.byte_len = end;
+    }
+    Ok((
+        screensaver_buffers_at(ops, retained.pool.clone(), size, stride, pair_len, offset),
+        offset,
+    ))
 }
 
 #[cfg(test)]
@@ -918,6 +983,96 @@ mod tests {
              create_buffer requests at offsets [0, stride*height], both XRGB8888 \
              with identical width/height/stride"
         );
+    }
+
+    fn assert_rebuild_ranges_are_disjoint(new_size: (u32, u32)) {
+        let ops = RecordingWaylandOps::new();
+        let mut retained = None;
+        let (width, height, stride) = (800, 600, 3200);
+        let (old_pool, old_buffers) =
+            create_screensaver_buffers(&ops, &mut retained, width, height, stride).unwrap();
+        let old_len = (stride * height) as usize;
+        let surface = ops.seed_surface();
+        for buffer in old_buffers {
+            ops.surface_attach(surface.as_ref(), buffer.as_ref(), 0, 0);
+            ops.surface_commit(surface.as_ref());
+        }
+        ops.take_call_log();
+
+        let new_stride = new_size.0 * 4;
+        let new_len = (new_stride * new_size.1) as usize;
+        let retained = retained.as_mut().unwrap();
+        let ((new_pool, _new_buffers), offset) = create_rebuild_buffers(
+            &ops,
+            retained,
+            new_size,
+            new_stride,
+            [0..old_len, old_len..2 * old_len].to_vec(),
+        )
+        .unwrap();
+
+        assert!(
+            Arc::ptr_eq(&old_pool, &new_pool),
+            "rebuild must retain the pool"
+        );
+        let calls = ops.take_call_log();
+        let offsets: Vec<usize> = calls
+            .iter()
+            .filter_map(|call| call.split_once("offset="))
+            .map(|(_, rest)| rest.split_once(',').unwrap().0.parse().unwrap())
+            .collect();
+        assert_eq!(offsets, [offset, offset + new_len]);
+        for offset in offsets {
+            assert!(
+                offset >= 2 * old_len,
+                "replacement range {:?} overlaps old attached buffers 0..{}",
+                offset..offset + new_len,
+                2 * old_len,
+            );
+        }
+        let first_rebuild_end = 2 * old_len + 2 * new_len;
+        assert_eq!(calls[0], format!("grow_shm_pool(#0, {first_rebuild_end})"));
+        assert_eq!(retained.byte_len, first_rebuild_end);
+
+        let active = offset..first_rebuild_end;
+        let (_, next_offset) = create_rebuild_buffers(
+            &ops,
+            retained,
+            new_size,
+            new_stride,
+            vec![active.clone(), 0..offset],
+        )
+        .unwrap();
+        assert_eq!(
+            next_offset, first_rebuild_end,
+            "an older pair is still busy"
+        );
+        ops.take_call_log();
+
+        let (_, reused_offset) = create_rebuild_buffers(
+            &ops,
+            retained,
+            new_size,
+            new_stride,
+            vec![active, next_offset..next_offset + 2 * new_len],
+        )
+        .unwrap();
+        assert_eq!(reused_offset, 0, "release makes the old prefix reusable");
+        assert!(
+            ops.take_call_log()
+                .iter()
+                .all(|call| call.starts_with("create_buffer("))
+        );
+    }
+
+    #[test]
+    fn shrinking_rebuild_keeps_old_buffer_bytes_disjoint() {
+        assert_rebuild_ranges_are_disjoint((640, 480));
+    }
+
+    #[test]
+    fn same_size_rebuild_keeps_old_buffer_bytes_disjoint() {
+        assert_rebuild_ranges_are_disjoint((800, 600));
     }
 
     #[test]

@@ -487,9 +487,8 @@ pub(super) enum TickCmd {
     /// Blend + attach + commit + advance `t`.  Visual update is
     /// committed to the compositor.
     Advance,
-    /// Blend the final frame (`t=T_MAX`), commit, drop the timer,
-    /// return to `Idle` for the next cycle.  `capture` stays
-    /// allocated across cycles — only the timer + `t` go away.
+    /// Commit the new frame, stop the timer, and go to `Idle`.
+    /// Keep `capture` for the next cycle.
     Complete,
 }
 
@@ -2571,7 +2570,6 @@ trait TransitionTick {
             return TransitionTickOutcome::FailToBlack(error);
         }
 
-        // The frame uses `t` from before the step. The first tick uses `t == 0`.
         let transition = self.transition();
         let (blend_t, capture) = transition_blend(transition);
         let phase = transition.map_or(TransitionPhase::Idle, |tr| tr.phase);
@@ -2581,17 +2579,20 @@ trait TransitionTick {
             tr.t = new_t;
         }
 
-        if !capture.is_empty() {
+        // A static image can stay on the last frame until the next item.
+        let complete = matches!(tick_cmd, TickCmd::Complete);
+        if !complete && !capture.is_empty() {
             self.blend_back_buffer(&capture, blend_t);
         }
-        if !self.commit_back_buffer() {
-            return TransitionTickOutcome::Done;
+        let committed = self.commit_back_buffer();
+        if committed {
+            self.swap_back_buffer();
         }
-        self.swap_back_buffer();
-
-        if matches!(tick_cmd, TickCmd::Complete) {
+        if complete {
             self.cancel_fade_timer();
-            return TransitionTickOutcome::Complete;
+            if committed {
+                return TransitionTickOutcome::Complete;
+            }
         }
         TransitionTickOutcome::Done
     }
@@ -2811,8 +2812,7 @@ impl WaylandState {
     ///
     /// Self-repeating: arms for one tick interval (~33 ms at the
     /// 30 fps default — see [`TRANSITION_FPS`]); the callback re-arms
-    /// via `TimeoutAction::ToInstant` until [`Self::on_transition_tick`]
-    /// observes `Complete` and drops the registration.
+    /// through `TimeoutAction::ToInstant` until the terminal tick removes the timer.
     #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
     fn arm_or_rearm_transition_timer(&mut self, r#gen: u64) {
         let Some(handle) = self.loop_handle.clone() else {

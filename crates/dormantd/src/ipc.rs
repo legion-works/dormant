@@ -2278,7 +2278,7 @@ mod tests {
             sampler_registry: Arc::new(std::sync::RwLock::new(
                 std::collections::BTreeMap::default(),
             )),
-            selected_displays: Arc::new(Vec::new()),
+            selected_displays: Arc::new(Vec::new),
             compositor_output: Arc::new(|_| None),
             consent_gate: ConsentGate::default(),
         };

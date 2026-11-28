@@ -3344,6 +3344,32 @@ mod tests {
     use crate::fakes::{RecordingSink, SinkCmd};
     use crate::traits::{PanelState, PowerState};
 
+    #[test]
+    fn operation_lease_rejects_either_generation_or_kind_mismatch() {
+        let registry = OperationRegistry::default();
+        let generation = GenerationId(7);
+        let (accepted, _lease) = registry
+            .try_acquire(generation, OperationKind::EmergencyWake)
+            .expect("operation accepted");
+
+        let wrong_generation = AcceptedOperation {
+            generation: GenerationId(8),
+            ..accepted.clone()
+        };
+        let wrong_kind = AcceptedOperation {
+            kind: OperationKind::Exercise(DisplayId("oled".into())),
+            ..accepted
+        };
+        assert!(
+            registry.lease_accepted(&wrong_generation).is_none(),
+            "an accepted ID must not bypass its generation check"
+        );
+        assert!(
+            registry.lease_accepted(&wrong_kind).is_none(),
+            "an accepted ID must not bypass its kind check"
+        );
+    }
+
     #[tokio::test]
     async fn operation_registry_rejects_second_exercise_same_display() {
         let registry = OperationRegistry::default();

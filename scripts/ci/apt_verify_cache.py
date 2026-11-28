@@ -5,7 +5,6 @@ import email.utils
 import hashlib
 import pathlib
 import re
-import shlex
 import shutil
 import subprocess
 import sys
@@ -87,19 +86,7 @@ def source_keyrings(entry):
         if not all(pathlib.Path(ring).is_absolute() and ring.endswith((".gpg", ".asc")) for ring in rings):
             raise ValueError(f"unsupported Signed-By in {entry}")
         return tuple((ring, None) for ring in sorted(rings))
-    config = subprocess.check_output([
-        "apt-config", "shell", "legacy", "Dir::Etc::Trusted/f", "parts", "Dir::Etc::TrustedParts/d",
-    ], text=True)
-    paths = dict(word.rstrip(";").split("=", 1) for word in shlex.split(config))
-    rings = []
-    if (directory := paths.get("parts")) and pathlib.Path(directory).is_dir():
-        rings.extend(path for path in pathlib.Path(directory).iterdir()
-                     if path.is_file() and re.fullmatch(r"[a-zA-Z0-9_.-]+\.(?:asc|gpg)", path.name))
-    if (legacy := paths.get("legacy")) and pathlib.Path(legacy).is_file():
-        rings.append(pathlib.Path(legacy))
-    if not rings:
-        raise ValueError(f"no trusted keyrings for {entry}")
-    return tuple((str(path), None) for path in sorted(rings))
+    raise ValueError("source has no Signed-By")
 
 
 def release_hashes(path, suite, keyrings):
@@ -182,38 +169,42 @@ def read_index(path, metakey, extension, signed_hashes):
 def archive_digests(content, wanted, digests):
     # Scan only stanzas for package names in the cache. The largest Ubuntu
     # index has many more packages than a CI job installs.
+    if b"\r\n" in content:
+        content = content.replace(b"\r\n", b"\n")
     for match in wanted.finditer(content):
+        previous = content.rfind(b"\n\n", 0, match.start())
+        start = previous + 2 if previous != -1 else 0
         end = content.find(b"\n\n", match.end())
-        fields = next(paragraphs(content[match.start():None if end == -1 else end].splitlines()))
+        fields = next(paragraphs(content[start:None if end == -1 else end].splitlines()))
         package, version, arch, digest = (fields.get(field, b"") for field in
                                           (b"package", b"version", b"architecture", b"sha256"))
-        if version and arch and SHA256.fullmatch(digest):
+        if version and arch:
             name = b"_".join((package, version.replace(b":", b"%3a"), arch)) + b".deb"
-            digests.setdefault(name, set()).add(digest.lower())
+            digests.setdefault(name, set()).add(digest.lower() if SHA256.fullmatch(digest) else None)
 
 
 VERIFY_ERRORS = (OSError, ValueError, KeyError, IndexError, OverflowError, subprocess.SubprocessError)
 
 
-def verify_source(indexes, signed, wanted):
-    digests = {}
+def verify_source(indexes, signed, decoded):
+    verified = {}
     for path, metakey, extension in indexes:
         if path.is_symlink() or not path.is_file():
             raise ValueError(f"non-regular cached index: {path.name}")
         content = read_index(path, metakey, extension, signed)
-        if wanted and (metakey == "Packages" or metakey.endswith("/Packages")):
-            if content is None:
-                # The publisher's compressed file matched its signed hash.
-                content = subprocess.check_output([APT_HELPER, "cat-file", path])
-            archive_digests(content, wanted, digests)
-    return digests
+        if extension and content is not None:
+            plain = decoded / path.name.removesuffix(extension)
+            plain.write_bytes(content)
+            shutil.copystat(path, plain)
+            path = plain
+        if path.name in verified:
+            raise ValueError(f"duplicate index destination: {path.name}")
+        verified[path.name] = path
+    return list(verified.values())
 
 
-def verify_lists(files, archives):
+def verify_lists(files, decoded):
     targets, releases = apt_targets()
-    packages = sorted({path.name.split("_", 1)[0].encode() for path in archives})
-    wanted = (re.compile(rb"(?m)^Package: (?:" + b"|".join(map(re.escape, packages)) + rb")$")
-              if packages else None)
     groups = {name: [] for name in files if name.endswith("_InRelease")}
     for name, path in files.items():
         extension = next((ext for ext in COMPRESSION if name.endswith(ext)), "")
@@ -221,7 +212,6 @@ def verify_lists(files, archives):
             release, metakey = target
             groups.setdefault(release, []).append((path, metakey, extension))
     verified = []
-    digests = {}
     for release, indexes in groups.items():
         key_label = "none"
         try:
@@ -243,15 +233,28 @@ def verify_lists(files, archives):
             if not indexes:
                 raise ValueError("no configured cached indexes")
             signed = release_hashes(path, suites.pop(), keyrings)
-            source_digests = verify_source(indexes, signed, wanted)
+            source_indexes = verify_source(indexes, signed, decoded)
         except VERIFY_ERRORS as error:
-            print(f"apt_install: rejected {release} (keyring: {key_label}): {error}", file=sys.stderr)
+            print(f"apt_install: rejected {release}: {error} (keyring: {key_label})", file=sys.stderr)
             continue
         print(f"apt_install: verified {release} (keyring: {key_label}): signature and {len(indexes)} index hash(es) match")
-        verified.extend([path, *(index for index, _, _ in indexes)])
-        for name, hashes in source_digests.items():
-            digests.setdefault(name, set()).update(hashes)
-    return verified, digests
+        verified.extend([path, *source_indexes])
+    return verified
+
+
+def live_archive_digests(lists_dir, archives):
+    packages = sorted({path.name.split("_", 1)[0].encode() for path in archives})
+    if not packages:
+        return {}
+    wanted = re.compile(rb"(?im)^Package:[ \t]*(?:" + b"|".join(map(re.escape, packages)) + rb")[ \t]*$")
+    digests = {}
+    for path in lists_dir.iterdir():
+        extension = next((ext for ext in COMPRESSION if path.name.endswith(ext)), "")
+        if not path.name.removesuffix(extension).endswith("_Packages"):
+            continue
+        content = (subprocess.check_output([APT_HELPER, "cat-file", path]) if extension else path.read_bytes())
+        archive_digests(content, wanted, digests)
+    return digests
 
 
 def verify_archive(path, digests):
@@ -261,7 +264,7 @@ def verify_archive(path, digests):
     return sha256_file(path) in expected
 
 
-def restore_cache(cache, lists_dir, archives_dir):
+def restore_cache(cache, lists_dir, archives_dir, manifest, decoded):
     if cache.is_symlink():
         print("apt_install: rejected symlink for cache directory", file=sys.stderr)
         return 1
@@ -275,7 +278,7 @@ def restore_cache(cache, lists_dir, archives_dir):
         try:
             if list_cache.is_symlink():
                 raise ValueError("symlink for lists directory")
-            verified, digests = verify_lists(files, archives)
+            verified = verify_lists(files, decoded)
             if verified:
                 subprocess.run(["sudo", "install", "-m", "0644", "-p", "--", *verified,
                                 f"{lists_dir}/"], check=True)
@@ -285,6 +288,11 @@ def restore_cache(cache, lists_dir, archives_dir):
         except VERIFY_ERRORS as error:
             print(f"apt_install: rejected cached package lists ({error}); refreshing package lists", file=sys.stderr)
             rejected_lists = True
+    if restored_lists:
+        try:
+            digests = live_archive_digests(lists_dir, archives)
+        except VERIFY_ERRORS as error:
+            print(f"apt_install: could not check live package indexes: {error}", file=sys.stderr)
         else:
             for path in archives:
                 try:
@@ -297,6 +305,7 @@ def restore_cache(cache, lists_dir, archives_dir):
         print(f"apt_install: dropped {dropped} unverified cached archives", file=sys.stderr)
     restored_archives = 0
     if good_archives:
+        manifest.write_bytes(b"".join(bytes(archives_dir / path.name) + b"\0" for path in good_archives))
         if subprocess.run(["sudo", "install", "-m", "0644", "--", *good_archives,
                            f"{archives_dir}/"], check=False).returncode == 0:
             restored_archives = len(good_archives)
@@ -308,4 +317,5 @@ def restore_cache(cache, lists_dir, archives_dir):
 
 
 if __name__ == "__main__":
-    sys.exit(restore_cache(*map(pathlib.Path, sys.argv[1:])))
+    with tempfile.TemporaryDirectory() as decoded:
+        sys.exit(restore_cache(*map(pathlib.Path, sys.argv[1:]), pathlib.Path(decoded)))

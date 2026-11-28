@@ -27,8 +27,8 @@ def package_record(package, version, content):
 
 def signed_release(indexes, signature):
     checksums = "".join(
-        f" {hashlib.sha256(data).hexdigest()} {len(data)} {component}/binary-amd64/Packages\n"
-        for component, data in indexes
+        f" {hashlib.sha256(data).hexdigest()} {len(data)} {metakey}\n"
+        for metakey, data in indexes
     )
     return ("-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\n"
             f"Suite: noble\nSHA256:\n{checksums}"
@@ -50,6 +50,12 @@ class AptInstallTests(unittest.TestCase):
             (lists / "lock").touch()
             (lists / "partial").mkdir()
             (lists / "partial" / "incomplete_Packages").touch()
+            if cache == "conflicting_live_index":
+                conflict = package_record("example", "1:2.0", b"other! deb")
+                (lists / VENDOR_PACKAGES).write_bytes(conflict)
+                (lists / VENDOR_RELEASE).write_text(signed_release(
+                    [("main/binary-amd64/Packages", conflict)], "valid-signature",
+                ))
             cache_dir = temp / "cache"
             output = temp / "output"
             output.touch()
@@ -83,6 +89,7 @@ class AptInstallTests(unittest.TestCase):
                     'fi\n'
                 ),
                 "apt-helper": '[[ $1 == cat-file ]] && gzip -dc -- "$2"\n',
+                "apt-config": 'printf "legacy=\x27%s/vendor.gpg\x27;\\n" "$FAKE_APT_ROOT"\n',
             }.items():
                 path = temp / name
                 path.write_text(f"#!/usr/bin/env bash\nset -euo pipefail\n{body}")
@@ -104,14 +111,18 @@ class AptInstallTests(unittest.TestCase):
                     packages += package_record("superseded", "1", b"old deb")
                     (cache_dir / "superseded_1_amd64.deb").write_bytes(b"old deb")
                 signature = "bad-signature" if cache == "bad_signature" else "valid-signature"
+                compressed = gzip.compress(extra)
+                universe = ("universe/binary-amd64/Packages", extra) if cache in ("local_compression", "bad_index") else (
+                    "universe/binary-amd64/Packages.gz", compressed,
+                )
                 (cached_lists / RELEASE).write_text(
-                    signed_release([("main", packages), ("universe", extra)], signature)
+                    signed_release([("main/binary-amd64/Packages", packages), universe], signature)
                 )
                 (cached_lists / PACKAGES).write_bytes(packages)
                 if cache == "bad_index":
-                    extra = extra.replace(b"Package: extra", b"Package: wrong")
-                (cached_lists / f"{EXTRA_PACKAGES}.gz").write_bytes(gzip.compress(extra))
-                if cache in ("mixed_bad_signature", "removed_source", "armored_key", "inline_key"):
+                    compressed = gzip.compress(extra.replace(b"Package: extra", b"Package: wrong"))
+                (cached_lists / f"{EXTRA_PACKAGES}.gz").write_bytes(compressed)
+                if cache in ("mixed_bad_signature", "removed_source", "armored_key", "inline_key", "no_signed_by"):
                     vendor_source = "vendor.list"
                     if cache == "inline_key":
                         vendor_source = "vendor.sources"
@@ -126,11 +137,20 @@ class AptInstallTests(unittest.TestCase):
                         key.write_text(f"{KEY_HEADER}\n\nfixture\n{KEY_FOOTER}\n")
                     vendor_record = package_record("vendor", "1", b"vendor deb")
                     signature = "bad-signature" if cache == "mixed_bad_signature" else "valid-signature"
-                    (cached_lists / VENDOR_RELEASE).write_text(signed_release([("main", vendor_record)], signature))
+                    (cached_lists / VENDOR_RELEASE).write_text(signed_release(
+                        [("main/binary-amd64/Packages", vendor_record)], signature,
+                    ))
                     (cached_lists / VENDOR_PACKAGES).write_bytes(vendor_record)
                     (cache_dir / VENDOR_ARCHIVE).write_bytes(b"vendor deb")
                     if cache == "removed_source":
                         vendor_source = ""
+                    if cache == "no_signed_by":
+                        (temp / vendor_source).write_text("deb https://vendor.example noble main\n")
+                if cache == "conflicting_live_index":
+                    vendor_source = "vendor.list"
+                    (temp / vendor_source).write_text(
+                        f"deb [signed-by={temp / 'vendor.gpg'}] https://vendor.example noble main\n"
+                    )
             fake_sudo.write_text(
                 "#!/usr/bin/env bash\n"
                 "set -euo pipefail\n"
@@ -140,6 +160,9 @@ class AptInstallTests(unittest.TestCase):
                 "fi\n"
                 "case \"$1 ${2:-}\" in\n"
                 "  'apt-get update')\n"
+                f"    if [[ -e $APT_ARCHIVES_DIR/{ARCHIVE} ]]; then\n"
+                "      printf '%s\\n' 'update saw restored archive' >> \"$FAKE_SUDO_LOG\"\n"
+                "    fi\n"
                 "    if [[ $FAKE_SUDO_MODE == update_timeout ]]; then\n"
                 "      sleep 2\n"
                 "    fi\n"
@@ -182,6 +205,7 @@ class AptInstallTests(unittest.TestCase):
                 "    rm -f -- \"$APT_ARCHIVES_DIR\"/superseded_*.deb\n"
                 "    ;;\n"
                 "  'install -m') \"$@\" ;;\n"
+                "  'rm -f') \"$@\" ;;\n"
                 "  'sed -i') exit 0 ;;\n"
                 "esac\n",
                 encoding="utf-8",
@@ -278,10 +302,38 @@ class AptInstallTests(unittest.TestCase):
         self.assert_rejected_lists("bad_signature")
 
     def test_bad_source_does_not_discard_good_source(self):
-        self.assert_vendor_dropped("mixed_bad_signature", r"vendor\.gpg.*bad signature")
+        self.assert_vendor_dropped("mixed_bad_signature", r"bad signature.*vendor\.gpg")
 
     def test_removed_source_does_not_discard_good_source(self):
         self.assert_vendor_dropped("removed_source", "source is not configured")
+
+    def test_source_without_signed_by_is_dropped(self):
+        self.assert_vendor_dropped("no_signed_by", "source has no Signed-By")
+
+    def test_conflicting_runner_index_drops_archive(self):
+        result, _, deb, _ = self.run_apt_install("install_first_success", cache="conflicting_live_index")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("apt_install: dropped 1 unverified cached archives", result.stderr)
+        self.assertEqual(deb, "downloaded deb")
+
+    def test_update_removes_restored_archive_before_refresh(self):
+        result, commands, deb, _ = self.run_apt_install("stale_lists", cache="warm_lists")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("update saw restored archive", commands)
+        remove = next(i for i, command in enumerate(commands) if command.startswith("rm -f"))
+        update = next(i for i, command in enumerate(commands) if "apt-get update" in command)
+        self.assertLess(remove, update)
+        self.assertIn("removed 1 restored cached archives before apt-get update", result.stdout)
+        self.assertEqual(deb, "downloaded deb")
+
+    def test_only_authenticated_decompressed_index_is_restored(self):
+        result, _, _, _ = self.run_apt_install("install_first_success", cache="local_compression")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.cached_lists.get(EXTRA_PACKAGES), package_record("extra", "1", b"extra deb"))
+        self.assertNotIn(f"{EXTRA_PACKAGES}.gz", self.cached_lists)
 
     def assert_vendor_dropped(self, cache, reason):
         result, commands, _, _ = self.run_apt_install("install_first_success", cache=cache)
@@ -290,7 +342,7 @@ class AptInstallTests(unittest.TestCase):
         self.assertIn("apt_install: restored package lists (3 files)", result.stdout)
         self.assertIn("apt_install: restored 1 cached .deb file(s)", result.stdout)
         self.assertIn("apt_install: dropped 1 unverified cached archives", result.stderr)
-        self.assertRegex(result.stderr, rf"rejected {VENDOR_RELEASE} .*{reason}")
+        self.assertRegex(result.stderr, rf"rejected {VENDOR_RELEASE}[: ].*{reason}")
         self.assertIn(RELEASE, self.cached_lists)
         self.assertNotIn(VENDOR_RELEASE, self.cached_lists)
         self.assertNotIn(VENDOR_PACKAGES, self.cached_lists)
@@ -363,7 +415,7 @@ class AptInstallTests(unittest.TestCase):
 
     def test_stage_drops_superseded_archives_from_the_cache(self):
         result, commands, _, output = self.run_apt_install(
-            "stale_lists", cache="warm_superseded"
+            "install_first_success", cache="warm_superseded"
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)

@@ -6190,6 +6190,22 @@ mod tests {
         .expect("single-sensor engine config is valid")
     }
 
+    #[test]
+    fn sweep_period_halves_the_stale_timeout_with_a_one_second_floor() {
+        let short = engine_with_short_stale("desk", Duration::from_millis(500));
+        assert_eq!(
+            short.compute_sweep_period(),
+            Duration::from_secs(1),
+            "short stale timeouts must use the one-second sweep floor"
+        );
+        let engine = engine_with_short_stale("desk", Duration::from_secs(10));
+        assert_eq!(
+            engine.compute_sweep_period(),
+            Duration::from_secs(5),
+            "a long stale timeout must schedule a sweep at half the timeout"
+        );
+    }
+
     /// Helper: find the sensor snapshot for `id` and return its
     /// `(state, last_seen_secs_ago)`.
     fn sensor_view(snap: &StateSnapshot, id: &str) -> (SensorState, u64) {

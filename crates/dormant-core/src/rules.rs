@@ -4790,6 +4790,35 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn sensor_changed_reports_edges_not_repeated_samples() {
+        let (mut engine, _, mut events) = presence_hold_engine("desk", Duration::from_secs(30));
+        let sensor = SensorId("desk".into());
+        for state in [
+            SensorState::Present,
+            SensorState::Present,
+            SensorState::Unavailable,
+        ] {
+            engine.handle_presence_event(PresenceEvent::new(
+                sensor.clone(),
+                state,
+                Timestamp::now(),
+            ));
+        }
+
+        let changes: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event {
+                DaemonEvent::SensorChanged { state, .. } => Some(state),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            changes,
+            [SensorState::Present, SensorState::Unavailable],
+            "only sensor state changes must be broadcast"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn motion_hold_defers_absence_until_its_deadline() {
         let hold = Duration::from_secs(30);
         let mut engine = engine_with_hold_sensor("motion1", hold);

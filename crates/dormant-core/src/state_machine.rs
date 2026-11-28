@@ -3639,6 +3639,24 @@ mod ladder_tests {
     }
 
     #[test]
+    fn presence_and_input_wake_schedule_retry_after_the_interval() {
+        let now = Tick::now();
+        for input in [Input::ZonePresent(true), Input::InputWake] {
+            let mut sm = sm_with(vec![off_stage()]);
+            drive_to_entry(&mut sm);
+            feed_blank_ok(&mut sm);
+            assert_eq!(sm.phase(), &Phase::Blanked);
+
+            let wake_at = Tick(now.0 + Duration::from_secs(1));
+            let effects = sm.step(input, wake_at);
+            assert!(
+                matches!(effects.as_slice(), [.., Effect::IssueWake { .. }, Effect::ScheduleTickAt(at)] if at.0 == wake_at.0 + sm.timings.wake_retry_interval),
+                "wake must issue immediately and schedule its retry after the configured interval"
+            );
+        }
+    }
+
+    #[test]
     fn wake_from_staged_emits_teardown_not_issue_wake() {
         let mut sm = sm_with(vec![render_black_stage(30), off_stage()]);
         drive_to_staged(&mut sm);

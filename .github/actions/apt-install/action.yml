@@ -13,9 +13,8 @@ runs:
       env:
         APT_PACKAGES: ${{ inputs.packages }}
       run: |
-        # The key only decides reuse: apt installs a cached .deb only when its
-        # version and hash match the package lists, so an unknown image name
-        # costs a cache miss, not a wrong package.
+        # The key selects a cache. The install script verifies the package
+        # lists and archive hashes before it restores any cached files.
         digest=$(printf '%s' "$APT_PACKAGES" | sha256sum)
         # The image version comes last so a job on a newer image can restore
         # the previous image's archives through the prefix below.

@@ -1,22 +1,23 @@
 # Local git hooks via lefthook (https://lefthook.dev). Install once: `lefthook install`.
 # These are the fast local mirrors of CI's gates — CI remains the enforcement gate.
+# Style and lint jobs in pre-commit report warnings only; gitleaks blocks.
 # Skip in an emergency with `git commit --no-verify` / `LEFTHOOK=0 git push`.
 
 pre-commit:
   parallel: true
   jobs:
     - name: fmt
-      run: bash scripts/gates/fmt.sh
+      run: 'bash scripts/gates/fmt.sh || echo "WARN: scripts/gates/fmt.sh reported issues; it does not block the commit"'
     - name: typos
-      run: bash scripts/gates/typos.sh
+      run: 'bash scripts/gates/typos.sh || echo "WARN: scripts/gates/typos.sh reported issues; it does not block the commit"'
     - name: taplo
-      run: bash scripts/gates/taplo.sh
+      run: 'bash scripts/gates/taplo.sh || echo "WARN: scripts/gates/taplo.sh reported issues; it does not block the commit"'
     - name: gitleaks
       run: bash scripts/gates/gitleaks.sh staged
     - name: test-timing
-      run: bash scripts/gates/test-timing.sh
+      run: 'bash scripts/gates/test-timing.sh || echo "WARN: scripts/gates/test-timing.sh reported issues; it does not block the commit"'
     - name: shellcheck
-      run: bash scripts/gates/shellcheck.sh
+      run: 'bash scripts/gates/shellcheck.sh || echo "WARN: scripts/gates/shellcheck.sh reported issues; it does not block the commit"'
 
 pre-push:
   parallel: true

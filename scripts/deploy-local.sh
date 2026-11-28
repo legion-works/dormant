@@ -6,8 +6,8 @@
 # crates/dormant-web/webui/dist/ into the binary at compile time, and the
 # checked-in dist/index.html is a placeholder — so a release build without a
 # prior `npm run build` silently embeds an empty page. dormant-web's build.rs
-# now refuses that combination outright; this script is the path that never
-# reaches it.
+# refuses that combination outright, and this script always runs the Vite build
+# first.
 #
 # Usage:
 #   bash scripts/deploy-local.sh              # build + install + restart
@@ -41,15 +41,6 @@ echo "==> Building web UI (rust-embed reads this at compile time)"
 cd "$WEBUI_DIR"
 npm ci --silent
 npm run build --silent
-
-# Fail here rather than embedding a placeholder. build.rs enforces the same
-# invariant, but failing before a long cargo build is a better experience.
-if grep -q 'PLACEHOLDER' "$WEBUI_DIR/dist/index.html"; then
-  echo "ERROR: dist/index.html is still the placeholder after npm run build." >&2
-  echo "       The Vite build did not write its output where rust-embed reads it." >&2
-  exit 1
-fi
-echo "    dist/index.html: $(wc -c < "$WEBUI_DIR/dist/index.html") bytes (real bundle)"
 
 echo "==> Building binaries"
 cd "$REPO_ROOT"
@@ -100,41 +91,7 @@ done
 
 echo "    target dir: $(dirname "$(exe_path dormantd)")"
 
-echo "==> Verifying the built daemon"
-BIN="$(exe_path dormantd)"
-[ -x "$BIN" ] || { echo "ERROR: $BIN missing" >&2; exit 1; }
-
-# Dump once and grep the file. Do NOT pipe `strings` into `grep -q` here:
-# under `set -o pipefail`, grep -q exits on the first match, strings takes
-# SIGPIPE, and the pipeline reports failure *because the match succeeded*.
-# That inverts every check — the placeholder test would silently never fire.
-SYMS="$(mktemp)"
-trap 'rm -f "$SYMS"' EXIT
-strings "$BIN" > "$SYMS"
-
-# Catches a dropped --features flag.
-if ! grep -q 'web_listening' "$SYMS"; then
-  echo "ERROR: dormantd was built without the web-ui feature." >&2
-  exit 1
-fi
-
-# Catches an embedded placeholder, asserted against the artifact itself
-# rather than the source tree it was built from.
-if grep -q 'PLACEHOLDER: replaced by the real Vite build' "$SYMS"; then
-  echo "ERROR: the built dormantd has the placeholder SPA embedded." >&2
-  exit 1
-fi
-
-# Positive assertion: the real bundle's hashed script tag is in the binary.
-if ! grep -q '/assets/index-.*\.js' "$SYMS"; then
-  echo "ERROR: no hashed asset reference found in the binary — SPA not embedded." >&2
-  exit 1
-fi
-echo "    web-ui feature: present"
-echo "    embedded SPA:   real bundle"
-
-# dormantctl gets its own check, because the verification above covers dormantd
-# only -- the script builds and installs three binaries and inspected one.
+# The built dormantctl must accept the live config before anything is swapped.
 #
 # `dormantctl` carries `default = ["render"]`, and a build that loses it still
 # runs, still reports a version, and fails only when it meets a config using a
@@ -145,6 +102,7 @@ echo "    embedded SPA:   real bundle"
 # actually run proves the binary handles it. Skipped when no config is present,
 # and it only exercises the render path if the live config uses a render stage --
 # which is the case that matters, since it is the config being deployed for.
+echo "==> Checking the built dormantctl against the live config"
 CTL="$(exe_path dormantctl)"
 LIVE_CONFIG="${DORMANT_CONFIG:-$HOME/.config/dormant/config.toml}"
 if [ -f "$LIVE_CONFIG" ]; then

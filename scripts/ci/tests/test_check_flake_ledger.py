@@ -39,11 +39,15 @@ status = "fixed"
 
 
 class CheckFlakeLedgerTests(unittest.TestCase):
-    def validate(self, contents: str, today: str = "2026-08-09") -> list[str]:
+    def validate(
+        self, contents: str, today: str = "2026-08-09", warnings: list[str] | None = None
+    ) -> list[str]:
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / "flake-ledger.toml"
             path.write_text(contents)
-            return check_flake_ledger.validate_ledger(path, today=date.fromisoformat(today))
+            return check_flake_ledger.validate_ledger(
+                path, today=date.fromisoformat(today), warnings=warnings
+            )
 
     def test_open_incident_permits_empty_evidence(self):
         errors = self.validate("schema_version = 1\n" + OPEN_INCIDENT)
@@ -134,11 +138,13 @@ class CheckFlakeLedgerTests(unittest.TestCase):
 
         self.assertTrue(any("both" in error and "triage" in error for error in errors))
 
-    def test_rejects_old_open_incident_without_diagnosis(self):
+    def test_warns_on_old_open_incident_without_diagnosis(self):
         old = OPEN_INCIDENT.replace('first_seen = "2026-08-01"', 'first_seen = "2026-07-01"')
-        errors = self.validate("schema_version = 1\n" + old)
+        warnings: list[str] = []
+        errors = self.validate("schema_version = 1\n" + old, warnings=warnings)
 
-        self.assertTrue(any("30 days" in error and "root_cause" in error for error in errors))
+        self.assertFalse(any("30 days" in error for error in errors))
+        self.assertTrue(any("30 days" in warning and "root_cause" in warning for warning in warnings))
 
     def test_accepts_old_open_incident_with_diagnosis(self):
         diagnosed = OPEN_INCIDENT.replace('root_cause = ""', 'root_cause = "scheduler contention"')

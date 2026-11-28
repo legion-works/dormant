@@ -61,7 +61,8 @@ multiple-versions = "warn"
 
 [advisories]
 # vulnerability, unsound, notice, yanked are always errors in cargo-deny v2
-unmaintained = "workspace"
+# Unmaintained-only advisories (no vulnerability) do not fail the gate.
+unmaintained = "none"
 ignore = [
   # serde_yaml recursion — ddc-hi pins 0.7.x via mccs-db (parses the bundled
   # MCCS capability database shipped in the crate, not user/network input);

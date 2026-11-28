@@ -148,13 +148,12 @@ stage_cache() (
   fi
 )
 
-refresh_lists=0
 restored_archives=()
 if [[ -n ${APT_DEB_CACHE_DIR:-} ]]; then
   restored_manifest="$(mktemp)"
   if ! python3 "$(dirname -- "${BASH_SOURCE[0]}")/apt_verify_cache.py" \
     "$APT_DEB_CACHE_DIR" "$lists_dir" "$archives_dir" "$restored_manifest"; then
-    refresh_lists=1
+    printf '%s\n' 'apt_install: cache restore incomplete; trying install before update' >&2
   fi
   mapfile -d '' -t restored_archives < "$restored_manifest"
   rm -f -- "$restored_manifest"
@@ -179,7 +178,7 @@ remove_restored_archives() {
 # those first so an unrelated repository index cannot block an install that is
 # already resolvable; a stale or incomplete list still falls through to update.
 initial_err_log="$(mktemp)"
-if (( refresh_lists == 0 )) && timeout "$install_timeout" sudo -E apt-get install -y \
+if timeout "$install_timeout" sudo -E apt-get install -y \
   "${archive_options[@]}" "${list_options[@]}" --no-install-recommends "$@" 2>"$initial_err_log"; then
   printf 'apt_install: installed %d package(s) from existing package lists; apt-get update skipped\n' "$#"
   rm -f "$initial_err_log"

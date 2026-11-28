@@ -187,20 +187,30 @@ VERIFY_ERRORS = (OSError, ValueError, KeyError, IndexError, OverflowError, subpr
 
 
 def verify_source(indexes, signed, decoded):
-    verified = {}
+    representations = {}
     for path, metakey, extension in indexes:
-        if path.is_symlink() or not path.is_file():
-            raise ValueError(f"non-regular cached index: {path.name}")
-        content = read_index(path, metakey, extension, signed)
-        if extension and content is not None:
-            plain = decoded / path.name.removesuffix(extension)
-            plain.write_bytes(content)
-            shutil.copystat(path, plain)
-            path = plain
-        if path.name in verified:
-            raise ValueError(f"duplicate index destination: {path.name}")
-        verified[path.name] = path
-    return list(verified.values())
+        representations.setdefault(metakey, []).append((path, extension))
+    verified = []
+    for metakey, candidates in representations.items():
+        last_error = "no candidate"
+        for path, extension in candidates:
+            try:
+                if path.is_symlink() or not path.is_file():
+                    raise ValueError(f"non-regular cached index: {path.name}")
+                content = read_index(path, metakey, extension, signed)
+            except VERIFY_ERRORS as error:
+                last_error = str(error)
+                continue
+            if extension and content is not None:
+                plain = decoded / path.name.removesuffix(extension)
+                plain.write_bytes(content)
+                shutil.copystat(path, plain)
+                path = plain
+            verified.append(path)
+            break
+        else:
+            raise ValueError(f"no authenticated representation of {metakey}: {last_error}")
+    return verified
 
 
 def verify_lists(files, decoded):
@@ -237,7 +247,8 @@ def verify_lists(files, decoded):
         except VERIFY_ERRORS as error:
             print(f"apt_install: rejected {release}: {error} (keyring: {key_label})", file=sys.stderr)
             continue
-        print(f"apt_install: verified {release} (keyring: {key_label}): signature and {len(indexes)} index hash(es) match")
+        print(f"apt_install: verified {release} (keyring: {key_label}): "
+              f"signature and {len(source_indexes)} index hash(es) match")
         verified.extend([path, *source_indexes])
     return verified
 
@@ -264,6 +275,22 @@ def verify_archive(path, digests):
     return sha256_file(path) in expected
 
 
+def remove_index_siblings(lists_dir, verified):
+    siblings = []
+    for path in verified:
+        if path.name.endswith("_InRelease"):
+            continue
+        extension = next((ext for ext in COMPRESSION if path.name.endswith(ext)), "")
+        name = path.name.removesuffix(extension)
+        for other in ("", *COMPRESSION):
+            if other != extension:
+                sibling = lists_dir / (name + other)
+                if sibling.exists() or sibling.is_symlink():
+                    siblings.append(sibling)
+    if siblings:
+        subprocess.run(["sudo", "rm", "-f", "--", *siblings], check=True)
+
+
 def restore_cache(cache, lists_dir, archives_dir, manifest, decoded):
     if cache.is_symlink():
         print("apt_install: rejected symlink for cache directory", file=sys.stderr)
@@ -282,11 +309,12 @@ def restore_cache(cache, lists_dir, archives_dir, manifest, decoded):
             if verified:
                 subprocess.run(["sudo", "install", "-m", "0644", "-p", "--", *verified,
                                 f"{lists_dir}/"], check=True)
+                remove_index_siblings(lists_dir, verified)
                 restored_lists = len(verified)
             else:
                 rejected_lists = True
         except VERIFY_ERRORS as error:
-            print(f"apt_install: rejected cached package lists ({error}); refreshing package lists", file=sys.stderr)
+            print(f"apt_install: could not restore cached package lists: {error}", file=sys.stderr)
             rejected_lists = True
     if restored_lists:
         try:

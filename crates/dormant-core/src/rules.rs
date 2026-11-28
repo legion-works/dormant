@@ -3470,6 +3470,32 @@ mod tests {
         registry.wait_generation_empty(generation).await;
     }
 
+    #[test]
+    fn operation_lease_cancellation_waits_for_its_generation() {
+        use std::future::Future;
+        use std::task::{Context, Waker};
+
+        let registry = OperationRegistry::default();
+        let generation = GenerationId(7);
+        let (_, lease) = registry
+            .try_acquire(generation, OperationKind::EmergencyWake)
+            .unwrap();
+        registry.cancel_generation(GenerationId(8));
+        assert!(
+            !lease.is_cancelled(),
+            "an unrelated generation cannot cancel this lease"
+        );
+
+        let mut cancelled = std::pin::pin!(lease.cancelled());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(
+            cancelled.as_mut().poll(&mut cx).is_pending(),
+            "the cancellation future must wait for cancellation"
+        );
+        registry.cancel_generation(generation);
+        assert!(cancelled.as_mut().poll(&mut cx).is_ready());
+    }
+
     #[tokio::test]
     async fn panic_mid_exercise_wakes_and_restores_pause() {
         let fake = Arc::new(crate::fakes::ExerciseSink::new());

@@ -3553,6 +3553,31 @@ mod ladder_tests {
     }
 
     #[test]
+    fn staged_dwell_does_not_advance_without_ownership() {
+        let mut sm = sm_with(vec![render_black_stage(1), off_stage()]);
+        sm.step(Input::OwnershipChanged(false), t(0));
+        sm.step(Input::SoftBlank, t(100));
+        let effects = sm.step(
+            Input::RenderResult {
+                r#gen: sm.stage_gen,
+                result: Ok(()),
+            },
+            t(200),
+        );
+        let at = get_schedule_stage_tick(&effects).expect("render completion must schedule dwell");
+        assert!(matches!(sm.phase(), Phase::Staged { idx: 0, .. }));
+
+        let effects = sm.step(
+            Input::StageTick {
+                r#gen: sm.stage_gen,
+            },
+            at,
+        );
+        assert!(effects.is_empty(), "an unowned ladder must not advance");
+        assert!(matches!(sm.phase(), Phase::Staged { idx: 0, .. }));
+    }
+
+    #[test]
     fn wake_from_staged_emits_teardown_not_issue_wake() {
         let mut sm = sm_with(vec![render_black_stage(30), off_stage()]);
         drive_to_staged(&mut sm);

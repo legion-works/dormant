@@ -3382,6 +3382,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn quiescing_blocks_acceptance_until_generation_reopens() {
+        let registry = OperationRegistry::default();
+        let generation = GenerationId(7);
+        registry.begin_quiesce(generation);
+        assert!(
+            registry
+                .try_acquire(generation, OperationKind::EmergencyWake)
+                .is_err(),
+            "a quiescing generation must reject new operations"
+        );
+        registry.end_quiesce(generation);
+        assert!(
+            registry
+                .try_acquire(generation, OperationKind::EmergencyWake)
+                .is_ok(),
+            "reopening the generation must allow new operations"
+        );
+    }
+
     #[tokio::test]
     async fn operation_registry_rejects_second_exercise_same_display() {
         let registry = OperationRegistry::default();

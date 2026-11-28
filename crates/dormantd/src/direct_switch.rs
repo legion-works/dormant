@@ -2797,6 +2797,19 @@ mod tests {
     // ═══════════════════════════════════════════════════════════════════════
 
     #[test]
+    fn switch_outcome_wire_labels_distinguish_switches_from_noops() {
+        assert_eq!(switch_outcome_label(&SwitchOutcome::Switched), "switched");
+        assert_eq!(
+            switch_outcome_label(&SwitchOutcome::AlreadyLocal),
+            "already_local"
+        );
+        assert_eq!(
+            switch_outcome_label(&SwitchOutcome::AlreadyPeer),
+            "already_peer"
+        );
+    }
+
+    #[test]
     fn switch_reason_has_seven_variants() {
         let reasons = [
             SwitchReason::Activity,

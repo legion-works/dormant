@@ -1112,6 +1112,26 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn first_power_on_readback_retry_waits_half_a_second() {
+        let sink = FakeSink::new("ddcci");
+        let start = TokioInstant::now();
+        {
+            let mut inner = sink.inner.lock().unwrap();
+            inner.last_power_on = Some(start);
+            inner.input_reads = [Err("waking".into()), Ok(Some(LOCAL_READ))].into();
+        }
+        assert!(
+            DirectSwitchHandle::input_already_selected(&display_id(), &sink, LOCAL_READ, false)
+                .await
+        );
+        assert_eq!(
+            sink.inner.lock().unwrap().read_times,
+            [start, start + Duration::from_millis(500)],
+            "only the first readback retry uses the short delay"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn pull_settle_stops_at_window_end() {
         let sink = Arc::new(FakeSink::new("ddcci"));
         let start = TokioInstant::now();

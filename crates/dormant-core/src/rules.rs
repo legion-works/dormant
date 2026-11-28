@@ -5893,6 +5893,23 @@ mod tests {
     }
 
     #[test]
+    fn timed_pause_keeps_its_deadline() {
+        let display = DisplayId("oled".into());
+        let (mut engine, _) = subscribed_manual_engine(display.clone());
+        let until = Timestamp(std::time::SystemTime::now() + Duration::from_secs(10));
+        engine.handle_pause(None, Some(until));
+        assert!(
+            engine.machines[&display]
+                .overlays()
+                .paused
+                .as_ref()
+                .and_then(|pause| pause.until)
+                .is_some(),
+            "a timed pause must retain a monotonic auto-resume deadline"
+        );
+    }
+
+    #[test]
     fn pause_changed_active_display_emits_paused_true() {
         let display = DisplayId("mon".into());
         let (mut engine, mut events) = subscribed_manual_engine(display.clone());

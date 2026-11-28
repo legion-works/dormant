@@ -71,6 +71,40 @@ pub fn send_request(socket_path: &Path, request: &IpcRequest) -> Result<IpcRespo
     read_response(&stream, request)
 }
 
+/// Send one line-delimited JSON request and read one response.
+///
+/// The caller sets the deadline for the entire round trip.
+///
+/// # Errors
+///
+/// Returns connection, pipe owner, I/O, or JSON errors.
+#[cfg(any(unix, windows))]
+pub async fn send_request_async(socket_path: &Path, request: &IpcRequest) -> Result<IpcResponse> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    #[cfg(unix)]
+    let mut stream = tokio::net::UnixStream::connect(socket_path)
+        .await
+        .with_context(|| format!("connect to {}", socket_path.display()))?;
+    #[cfg(windows)]
+    let mut stream = connect_pipe_async(socket_path).await?;
+
+    let line = serde_json::to_string(request).context("serialize request")?;
+    stream.write_all(line.as_bytes()).await?;
+    stream.write_all(b"\n").await?;
+    stream.flush().await?;
+
+    let mut reader = BufReader::new(stream);
+    let mut response_line = String::new();
+    reader
+        .read_line(&mut response_line)
+        .await
+        .context("read response from daemon")?;
+    let trimmed = response_line.trim();
+    let resp: IpcResponse = serde_json::from_str(trimmed).context("parse daemon response")?;
+    Ok(resp)
+}
+
 /// The outcome of a typed IPC round-trip — distinguishes a connect-time
 /// failure (the daemon socket is not listening) from a post-connect
 /// error (the daemon accepted then dropped / garbled the response).
@@ -766,6 +800,28 @@ mod windows_tests {
         );
     }
 
+    #[tokio::test]
+    async fn windows_emergency_wake_rejects_another_owner() {
+        let pipe_name = unique_pipe_name("emergency-other-owner");
+        let server = crate::ipc_pipe_security::create_test_pipe(&pipe_name, "O:BAD:(A;;FA;;;WD)")
+            .expect(
+                "test runner must be elevated to create a pipe owned by BUILTIN\\Administrators",
+            );
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            send_request_async(Path::new(&pipe_name), &IpcRequest::EmergencyWake),
+        )
+        .await
+        .expect("reject the owner before waiting for a response")
+        .expect_err("the client must reject a pipe owned by another SID");
+        drop(server);
+        assert!(
+            error.to_string().contains("not owned by the current user"),
+            "expected named-pipe owner rejection: {error:#}"
+        );
+    }
+
     /// A missing pipe must produce the same "is the daemon running?" hint the
     /// Unix `ENOENT` path produces.
     #[test]
@@ -943,6 +999,13 @@ fn connect(socket_path: &Path) -> Result<Transport> {
     })
 }
 
+#[cfg(windows)]
+const ERROR_PIPE_BUSY: i32 = 231;
+#[cfg(windows)]
+const PIPE_BUSY_RETRIES: u32 = 5;
+#[cfg(windows)]
+const PIPE_BUSY_BACKOFF: Duration = Duration::from_millis(50);
+
 /// Connect to the daemon's named pipe.
 ///
 /// Opening a pipe can fail with `ERROR_PIPE_BUSY` (231) when every instance is
@@ -956,14 +1019,6 @@ fn connect(socket_path: &Path) -> Result<Transport> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::SECURITY_IDENTIFICATION;
 
-    /// `CreateFile` on a pipe whose instances are all busy.
-    const ERROR_PIPE_BUSY: i32 = 231;
-    /// Bounded retry budget: five attempts, 50 ms apart (~250 ms total).  The
-    /// daemon creates the next instance immediately after accepting, so a
-    /// longer wait would only delay a genuine "daemon not running" report.
-    const PIPE_BUSY_RETRIES: u32 = 5;
-    const PIPE_BUSY_BACKOFF: Duration = Duration::from_millis(50);
-
     // A server must not get an impersonation-level token before the owner check.
     // security_qos_flags adds SECURITY_SQOS_PRESENT.
     let mut options = OpenOptions::new();
@@ -975,16 +1030,7 @@ fn connect(socket_path: &Path) -> Result<Transport> {
     loop {
         match options.open(socket_path) {
             Ok(file) => {
-                // Check the open handle. The name lookup can refer to a different object later.
-                let owned = crate::ipc_pipe_security::is_owned_by_current_user(&file)
-                    .with_context(|| {
-                        format!("check owner of named pipe '{}'", socket_path.display())
-                    })?;
-                anyhow::ensure!(
-                    owned,
-                    "named pipe '{}' is not owned by the current user",
-                    socket_path.display()
-                );
+                crate::ipc_pipe_security::require_current_user_owner(&file, socket_path)?;
                 return Ok(file);
             }
             Err(error)
@@ -999,6 +1045,36 @@ fn connect(socket_path: &Path) -> Result<Transport> {
                      Start dormantd first, or check the socket path with --socket",
                     socket_path.display(),
                 )));
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+async fn connect_pipe_async(
+    socket_path: &Path,
+) -> Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    use tokio::net::windows::named_pipe::ClientOptions;
+    use windows_sys::Win32::Storage::FileSystem::SECURITY_IDENTIFICATION;
+
+    // The server must not get an impersonation-level token before the owner check.
+    let mut options = ClientOptions::new();
+    options.security_qos_flags(SECURITY_IDENTIFICATION);
+    let mut attempt = 0;
+    loop {
+        match options.open(socket_path) {
+            Ok(pipe) => {
+                crate::ipc_pipe_security::require_current_user_owner(&pipe, socket_path)?;
+                return Ok(pipe);
+            }
+            Err(error)
+                if error.raw_os_error() == Some(ERROR_PIPE_BUSY) && attempt < PIPE_BUSY_RETRIES =>
+            {
+                attempt += 1;
+                tokio::time::sleep(PIPE_BUSY_BACKOFF).await;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("connect to {}", socket_path.display()));
             }
         }
     }

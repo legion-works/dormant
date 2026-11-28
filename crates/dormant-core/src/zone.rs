@@ -535,6 +535,31 @@ mod tests {
     }
 
     #[test]
+    fn cycle_error_names_the_cyclic_zone_not_an_independent_zone() {
+        let err = ZoneEngine::new(
+            vec![
+                spec(
+                    "cycle",
+                    FusionMode::Any,
+                    vec![ZoneMember::Zone(zid("cycle"))],
+                ),
+                spec(
+                    "leaf",
+                    FusionMode::Any,
+                    vec![ZoneMember::Sensor(sid("sensor"))],
+                ),
+            ],
+            &[sid("sensor")],
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(&err, DormantError::ZoneCycle { zone } if zone == "cycle"),
+            "cycle error must name the cyclic zone, got {err}"
+        );
+    }
+
+    #[test]
     fn all_unavailable_zone_has_no_confirmed_presence() {
         let engine = ZoneEngine::new(
             vec![spec(

@@ -6276,6 +6276,38 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn availability_lease_covers_the_exact_deadline() {
+        let sensor = SensorId("desk".into());
+        let stale = Duration::from_secs(1);
+        let mut engine = engine_with_short_stale("desk", stale);
+        engine.handle_presence_event(PresenceEvent::new(
+            sensor.clone(),
+            SensorState::Present,
+            Timestamp::now(),
+        ));
+        tokio::time::advance(stale).await;
+        engine.handle_sensor_availability(SensorAvailabilityEvent::new(
+            sensor,
+            true,
+            Timestamp::now(),
+        ));
+        tokio::time::advance(stale / 2).await;
+        engine.sweep_stale_sensors();
+        assert_eq!(
+            sensor_view(&snapshot_of(&mut engine), "desk").0,
+            SensorState::Present,
+            "a live online lease must cover an older sample"
+        );
+        tokio::time::advance(stale / 2).await;
+        engine.sweep_stale_sensors();
+        assert_eq!(
+            sensor_view(&snapshot_of(&mut engine), "desk").0,
+            SensorState::Present,
+            "an online lease must cover its exact stale deadline"
+        );
+    }
+
     /// Issue #205: the `availability_online` marker is a lease bounded by
     /// `stale_timeout`. Once the lease expires, the next stale sweep must
     /// demote the sensor to `Unavailable` so a dead connection whose last

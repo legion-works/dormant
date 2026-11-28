@@ -2559,6 +2559,29 @@ mod tests {
     //  Suppression-cleanup tests
     // ═══════════════════════════════════════════════════════════════════════
 
+    #[test]
+    fn switch_suppression_deadline_extends_into_the_future() {
+        let id = display_id();
+        let (tx, mut rx) = mpsc::channel(8);
+        let start = Instant::now();
+        let _guard = SuppressionGuard::set(&tx, &id);
+        let end = Instant::now();
+
+        let Ok(dormant_core::rules::ControlMsg::SetClaimSuppression {
+            display,
+            until: Some(deadline),
+        }) = rx.try_recv()
+        else {
+            panic!("a switch must set a claim-suppression deadline");
+        };
+        assert_eq!(display, id);
+        let duration = Duration::from_secs(5);
+        assert!(
+            (start + duration..=end + duration).contains(&deadline),
+            "claim suppression must cover the switch flight"
+        );
+    }
+
     /// Collect all suppression messages in order from the channel.
     fn drain_suppression(
         rx: &mut mpsc::Receiver<dormant_core::rules::ControlMsg>,

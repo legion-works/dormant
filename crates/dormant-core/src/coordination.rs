@@ -1330,6 +1330,35 @@ mod tests {
 
     /// A read failure does not change the verdict — hold-last invariant.
     #[test]
+    fn connector_mismatch_and_peer_readback_do_not_confirm_each_other() {
+        let id = display("aoc");
+        let handle = CoordinationHandle::new([id.clone()]);
+        let al = InputCodeAliases {
+            peer_read: Some(2),
+            ..aliases(1)
+        };
+        let now = Instant::now();
+
+        let mismatch = handle.record_panel_mismatch_at(&id, 2, now);
+        assert_eq!(
+            mismatch.deferred_loss_count,
+            Some(1),
+            "one connector mismatch starts loss confirmation"
+        );
+        assert_eq!(handle.snapshot()[&id].input_code, None);
+
+        let peer = handle.record_input_observation(&id, 2, &al, 2, None);
+        assert_eq!(
+            peer.deferred_loss_count,
+            Some(1),
+            "peer readback starts its own loss confirmation"
+        );
+        assert!(handle.snapshot()[&id].owned);
+        let peer = handle.record_input_observation(&id, 2, &al, 2, None);
+        assert_eq!(peer.committed_prior_owned, Some(true));
+    }
+
+    #[test]
     fn observation_read_failure_holds_verdict() {
         let handle = CoordinationHandle::new([display("aoc")]);
         let aoc = display("aoc");

@@ -4707,6 +4707,30 @@ mod tests {
         assert_eq!(kvm.keymap.claim_hotkey.as_deref(), Some("Meta+F12"));
     }
 
+    #[test]
+    fn generation_drain_processes_buffered_sensor_and_control_inputs() {
+        let mut engine = engine_with_sensor("desk");
+        let (events_tx, mut events_rx) = mpsc::channel(1);
+        let (ctl_tx, mut ctl_rx) = mpsc::channel(1);
+        events_tx
+            .try_send(PresenceEvent::new(
+                SensorId("desk".into()),
+                SensorState::Present,
+                Timestamp::now(),
+            ))
+            .unwrap();
+        ctl_tx
+            .try_send(ControlMsg::SetPendingReload(Some("queued".into())))
+            .unwrap();
+        engine.drain_generation_inputs(&mut events_rx, &mut ctl_rx);
+        let snapshot = snapshot_of(&mut engine);
+        assert!(
+            snapshot.sensors[0].reported,
+            "the barrier must apply a buffered sensor event"
+        );
+        assert_eq!(snapshot.pending_reload.as_deref(), Some("queued"));
+    }
+
     #[tokio::test]
     async fn generation_barrier_drains_before_ack() {
         let (events_tx, events_rx) = mpsc::channel(4);

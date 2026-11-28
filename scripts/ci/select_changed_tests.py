@@ -236,10 +236,6 @@ def _support_targets(
     ]
 
 
-def _is_fixture(path: str) -> bool:
-    return path.startswith(".github/fixtures/nextest-policy/")
-
-
 def _looks_like_test_path(path: str) -> bool:
     return path.endswith(".rs") and (path.startswith("tests/") or "/tests/" in path)
 
@@ -285,7 +281,7 @@ def select_targets(
     selected: set[Target] = set()
     for change in parse_diff(diff):
         paths = change.paths()
-        if not paths or all(_is_fixture(path) for path in paths):
+        if not paths:
             continue
 
         integration_paths = [path for path in paths if INTEGRATION_TEST.match(path)]
@@ -316,8 +312,6 @@ def select_targets(
             paths.difference_update(integration_paths)
 
         for path in sorted(paths):
-            if _is_fixture(path):
-                continue
             if SUPPORT_MODULE.match(path):
                 selected.update(_support_targets(path, metadata, platform, source_files))
                 continue

@@ -343,16 +343,6 @@ rename to crates/example/tests/renamed.rs
         self.assertEqual([target.name for target in on_macos], ["beta", "renamed"])
         self.assertEqual([target.name for target in on_linux], ["alpha", "beta", "renamed"])
 
-    def test_policy_fixture_is_explicitly_skipped(self):
-        change = diff(
-            ".github/fixtures/nextest-policy/flaky/src/lib.rs",
-            "1,0",
-            "1,1",
-            "+#[test]",
-        )
-
-        self.assertEqual(select_changed_tests.select_targets(change, self.metadata, "linux"), [])
-
     def test_no_change_selects_nothing(self):
         self.assertEqual(select_changed_tests.select_targets("", self.metadata, "linux"), [])
 

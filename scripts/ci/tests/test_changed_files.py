@@ -56,8 +56,12 @@ class ChangedFilesTests(unittest.TestCase):
 
     def run_filter(self, push_line: str) -> subprocess.CompletedProcess:
         return subprocess.run(
-            ["bash", str(CHANGED_FILES), "--pattern", "*.rs", "--", "echo", "GATE-RAN"],
+            [
+                "bash", str(CHANGED_FILES), "--pattern", "*.rs", "--", "bash", "-c",
+                'echo "GATE-RAN ${DORMANT_PUSHED_SHA-<unset>}"',
+            ],
             cwd=self.work,
+            env=dict(os.environ, DORMANT_PUSHED_SHA="stale"),
             input=push_line,
             capture_output=True,
             text=True,
@@ -121,6 +125,10 @@ class ChangedFilesTests(unittest.TestCase):
         result = self.run_filter(docs_line + feature_line)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("GATE-RAN", result.stdout)
+        with self.subTest("warns about the working tree"):
+            self.assertIn("multiple distinct local SHAs; running gate on the working tree", result.stderr)
+        with self.subTest("clears the inherited SHA"):
+            self.assertEqual(result.stdout.strip(), "GATE-RAN <unset>")
 
     def test_pushed_commit_is_checked_not_the_checked_out_branch(self):
         # `git push origin feature` from another branch pushes feature's commit.
@@ -129,7 +137,20 @@ class ChangedFilesTests(unittest.TestCase):
         self.branch_from_sha("docs-only", "docs/page.md")
         result = self.run_filter(f"refs/heads/feature {feature} refs/heads/feature {ZERO}\n")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("GATE-RAN", result.stdout)
+        self.assertEqual(result.stdout.strip(), f"GATE-RAN {feature}")
+
+    def test_duplicate_pushed_sha_and_deletion_keep_sha_when_diff_is_unknown(self):
+        self.branch_from_sha("feature", "src/lib.rs")
+        feature = git(self.work, "rev-parse", "HEAD")
+        missing = "1234567890abcdef1234567890abcdef12345678"
+        result = self.run_filter(
+            f"refs/heads/feature {feature} refs/heads/feature {missing}\n"
+            f"(delete) {ZERO} refs/heads/old {self.base}\n"
+            f"refs/heads/feature {feature} refs/heads/copy {ZERO}\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Old remote commit is not available", result.stderr)
+        self.assertEqual(result.stdout.strip(), f"GATE-RAN {feature}")
 
     def test_unmatched_pushed_commit_skips_gate_while_head_matches(self):
         # The control for the test above: HEAD has a matching change, the pushed commit does not.

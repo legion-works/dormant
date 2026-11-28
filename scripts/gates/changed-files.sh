@@ -22,11 +22,18 @@ shift
 zero=0000000000000000000000000000000000000000
 gate=("$@")
 changed=()
+multiple_pushed_shas=false
+unset DORMANT_PUSHED_SHA
 list="$(mktemp)"
 trap 'rm -f -- "$list"' EXIT
 
 run_gate() {
-  printf '%s\n' "$1" >&2
+  if [[ $# -gt 0 ]]; then
+    printf '%s\n' "$1" >&2
+  fi
+  if [[ "$multiple_pushed_shas" == true ]]; then
+    printf '%s\n' 'Warning: push has multiple distinct local SHAs; running gate on the working tree.' >&2
+  fi
   rm -f -- "$list"
   exec "${gate[@]}"
 }
@@ -53,6 +60,22 @@ fi
 if [[ -n "$push_lines" ]]; then
   # git sends one line for each pushed ref: <local ref> <local sha> <remote
   # ref> <remote sha>. Check the pushed commit of every ref, not HEAD.
+  # Determine the SHA before a failed diff can run the gate early.
+  pushed_sha=""
+  while read -r _local_ref local_sha _remote_ref _remote_sha; do
+    if [[ -z "${local_sha:-}" || "$local_sha" == "$zero" ]]; then
+      continue
+    fi
+    if [[ -n "$pushed_sha" && "$local_sha" != "$pushed_sha" ]]; then
+      multiple_pushed_shas=true
+      break
+    fi
+    pushed_sha="$local_sha"
+  done <<<"$push_lines"
+  if [[ -n "$pushed_sha" && "$multiple_pushed_shas" == false ]]; then
+    export DORMANT_PUSHED_SHA="$pushed_sha"
+  fi
+
   while read -r _local_ref local_sha _remote_ref remote_sha; do
     if [[ -z "${local_sha:-}" || "$local_sha" == "$zero" ]]; then
       # A deletion pushes no commit.
@@ -83,14 +106,13 @@ else
   fi
   add_changes "$upstream"...HEAD
 fi
-rm -f -- "$list"
 
 # The guarded expansion keeps an empty list valid under `set -u` on bash 3.2.
 for path in ${changed[@]+"${changed[@]}"}; do
   for pattern in "${patterns[@]}"; do
     # shellcheck disable=SC2053 # Gate patterns are intentionally shell globs.
     if [[ "$path" == $pattern ]]; then
-      exec "${gate[@]}"
+      run_gate
     fi
   done
 done

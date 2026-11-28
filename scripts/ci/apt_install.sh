@@ -88,20 +88,6 @@ if [[ -n ${APT_LISTS_DIR:-} ]]; then
   list_options+=(-o "Dir::State::lists=$lists_dir")
 fi
 
-restore_debs() (
-  [[ -n ${APT_DEB_CACHE_DIR:-} ]] || return 0
-  shopt -s nullglob
-  local debs=("$APT_DEB_CACHE_DIR"/*.deb) restored=0
-  if (( ${#debs[@]} > 0 )); then
-    if sudo install -m 0644 -- "${debs[@]}" "$archives_dir/"; then
-      restored=${#debs[@]}
-    else
-      printf '%s\n' 'apt_install: could not restore cached archives; continuing with apt' >&2
-    fi
-  fi
-  printf 'apt_install: restored %d cached .deb file(s)\n' "$restored"
-)
-
 package_list_files() {
   local directory=$1 file
   local -n files=$2
@@ -111,34 +97,21 @@ package_list_files() {
   done
 }
 
-restore_lists() (
-  [[ -n ${APT_DEB_CACHE_DIR:-} ]] || return 0
-  local lists=() restored=0
-  package_list_files "$APT_DEB_CACHE_DIR/lists" lists
-  if (( ${#lists[@]} > 0 )); then
-    if sudo install -m 0644 -p -- "${lists[@]}" "$lists_dir/"; then
-      restored=${#lists[@]}
-    else
-      printf '%s\n' 'apt_install: could not restore cached package lists; continuing with apt' >&2
-    fi
-  fi
-  printf 'apt_install: restored package lists (%d files)\n' "$restored"
-)
-
 stage_lists() {
   local destination="$APT_DEB_CACHE_DIR/lists" lists=() stale_lists=()
+  [[ ! -L $destination ]] || return 1
   package_list_files "$lists_dir" lists
   package_list_files "$destination" stale_lists
   (( ${#lists[@]} > 0 )) || return 1
   if (( ${#stale_lists[@]} > 0 )); then
     rm -f -- "${stale_lists[@]}" || return 1
   fi
-  mkdir -p -- "$destination" && cp --preserve=timestamps -- "${lists[@]}" "$destination/" || return 1
+  mkdir -p -- "$destination" && cp --remove-destination --preserve=timestamps -- "${lists[@]}" "$destination/" || return 1
   printf 'apt_install: staged package lists (%d files) for cache save\n' "${#lists[@]}"
 }
 
 stage_cache() (
-  [[ -n ${APT_DEB_CACHE_DIR:-} ]] || return 0
+  [[ -n ${APT_DEB_CACHE_DIR:-} && ! -L $APT_DEB_CACHE_DIR ]] || return 0
   shopt -s nullglob
   # A restore from an older image can bring superseded versions. autoclean
   # removes every archive that the current package lists no longer name, so
@@ -175,9 +148,31 @@ stage_cache() (
   fi
 )
 
-restore_debs
-restore_lists
+restored_archives=()
+if [[ -n ${APT_DEB_CACHE_DIR:-} ]]; then
+  restored_manifest="$(mktemp)"
+  if ! python3 "$(dirname -- "${BASH_SOURCE[0]}")/apt_verify_cache.py" \
+    "$APT_DEB_CACHE_DIR" "$lists_dir" "$archives_dir" "$restored_manifest" "$@"; then
+    printf '%s\n' 'apt_install: cache restore incomplete; trying install before update' >&2
+  fi
+  mapfile -d '' -t restored_archives < "$restored_manifest"
+  rm -f -- "$restored_manifest"
+fi
 export DEBIAN_FRONTEND=noninteractive
+
+remove_restored_archives() {
+  local path remaining=()
+  for path in "${restored_archives[@]}"; do
+    if [[ -e $path || -L $path ]]; then
+      remaining+=("$path")
+    fi
+  done
+  if (( ${#remaining[@]} > 0 )); then
+    sudo rm -f -- "${remaining[@]}" || return 1
+    printf 'apt_install: removed %d restored cached archives before apt-get update\n' "${#remaining[@]}"
+  fi
+  restored_archives=()
+}
 
 # GitHub's runner images normally retain package lists from image creation. Use
 # those first so an unrelated repository index cannot block an install that is
@@ -200,6 +195,10 @@ rm -f "$initial_err_log"
 
 attempt=1
 while (( attempt <= attempts )); do
+  if ! remove_restored_archives; then
+    printf '%s\n' 'apt_install: could not remove restored cached archives; refusing to refresh lists' >&2
+    exit 1
+  fi
   # `status` is captured in the else branch, where $? is still the condition's
   # exit status. Reading $? after the `if` block instead yields the status of
   # the `if` statement itself — always 0 — which silently disables the timeout

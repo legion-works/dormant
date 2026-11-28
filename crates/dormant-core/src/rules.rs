@@ -3345,6 +3345,18 @@ mod tests {
     use crate::traits::{PanelState, PowerState};
 
     #[test]
+    fn operation_registry_adopts_an_accepted_operation() {
+        let registry = OperationRegistry::default();
+        let (accepted, _front_door) = registry
+            .try_acquire(GenerationId(7), OperationKind::EmergencyWake)
+            .unwrap();
+        assert!(
+            registry.lease_accepted(&accepted).is_some(),
+            "the registry must adopt an accepted operation with matching identity"
+        );
+    }
+
+    #[test]
     fn operation_lease_rejects_either_generation_or_kind_mismatch() {
         let registry = OperationRegistry::default();
         let generation = GenerationId(7);

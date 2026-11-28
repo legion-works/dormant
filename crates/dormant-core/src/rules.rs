@@ -3590,6 +3590,19 @@ mod tests {
     }
 
     #[test]
+    fn operation_lease_debug_names_its_operation() {
+        let registry = OperationRegistry::default();
+        let (accepted, lease) = registry
+            .try_acquire(GenerationId(7), OperationKind::EmergencyWake)
+            .unwrap();
+        let debug = format!("{lease:?}");
+        assert!(
+            debug.contains(&format!("id: {}", accepted.id)),
+            "debug output must identify the operation, got {debug:?}"
+        );
+    }
+
+    #[test]
     fn emergency_report_keeps_accepted_generation() {
         let operation = AcceptedOperation {
             id: 1,

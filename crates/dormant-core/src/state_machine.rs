@@ -3578,6 +3578,34 @@ mod ladder_tests {
     }
 
     #[test]
+    fn grace_remains_frozen_until_both_overlays_clear() {
+        let now = Tick::now();
+        let grace = Duration::from_millis(500);
+        let mut sm = sm_with(vec![off_stage()]);
+        sm.step(Input::InhibitorChanged(true), now);
+        sm.step(Input::Pause { until: None }, now);
+        sm.step(Input::ZonePresent(false), now);
+        assert_eq!(
+            sm.phase(),
+            &Phase::Grace {
+                until: Tick(now.0 + grace)
+            },
+            "pre-frozen grace must retain the original deadline in its phase"
+        );
+
+        let resume = Tick(now.0 + grace);
+        let effects = sm.step(Input::Resume, resume);
+        assert!(
+            effects.is_empty(),
+            "pause removal must not override an inhibitor"
+        );
+        let effects = sm.step(Input::InhibitorChanged(false), resume);
+        assert!(
+            matches!(effects.as_slice(), [Effect::ScheduleTickAt(at)] if at.0 == resume.0 + grace)
+        );
+    }
+
+    #[test]
     fn wake_from_staged_emits_teardown_not_issue_wake() {
         let mut sm = sm_with(vec![render_black_stage(30), off_stage()]);
         drive_to_staged(&mut sm);

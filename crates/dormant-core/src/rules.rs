@@ -5377,6 +5377,45 @@ mod tests {
         assert!(row.detail.as_deref().unwrap().contains("unavailable"));
     }
 
+    #[test]
+    fn restored_phase_change_emits_an_observation() {
+        use crate::state_machine::Phase;
+
+        let display = DisplayId("oled".into());
+        let generation = GenerationId(7);
+        let hub = ObservationHub::new(4);
+        let mut observations = hub.subscribe();
+        let mut engine = manual_display_engine(
+            display.clone(),
+            HashMap::new(),
+            Arc::new(crate::ownership::AlwaysOwned),
+        )
+        .with_observation_hub(generation, hub);
+        let now = Tick::now();
+        let cfg = &engine.cfg.displays[0];
+        let (restored, effects) = DisplayStateMachine::restore(
+            cfg.timings.clone(),
+            cfg.ladder.clone(),
+            Phase::Blanked,
+            1,
+            now,
+        );
+        engine.install_restored_machine(&display, restored, effects, now);
+        assert!(
+            matches!(
+                observations.try_recv(),
+                Ok(DaemonObservation::DisplayPhaseChanged {
+                    generation: observed_generation,
+                    display_id,
+                    rule_id: None,
+                    old_phase: Phase::Active,
+                    new_phase: Phase::Blanked,
+                }) if observed_generation == generation && display_id == display
+            ),
+            "restoring a different phase must report the phase change"
+        );
+    }
+
     fn manual_display_engine(
         display: DisplayId,
         executors: HashMap<DisplayId, Arc<dyn CommandSink>>,

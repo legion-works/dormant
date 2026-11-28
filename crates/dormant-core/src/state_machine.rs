@@ -3532,6 +3532,131 @@ mod ladder_tests {
     // ── Tests ─────────────────────────────────────────────────────────────
 
     #[test]
+    fn inhibitor_blocks_ladder_advance_after_controller_blank() {
+        let mut sm = sm_with(vec![
+            controller_stage(BlankMode::PowerOff, Some(Duration::from_secs(1))),
+            off_stage(),
+        ]);
+        drive_to_entry(&mut sm);
+        feed_blank_ok(&mut sm);
+        assert_eq!(sm.phase(), &Phase::Blanked);
+
+        sm.step(Input::InhibitorChanged(true), t(900));
+        let effects = sm.step(
+            Input::StageTick {
+                r#gen: sm.stage_gen,
+            },
+            t(1_800),
+        );
+        assert!(effects.is_empty(), "an inhibitor must block the next rung");
+        assert_eq!(sm.phase(), &Phase::Blanked);
+    }
+
+    #[test]
+    fn staged_dwell_does_not_advance_without_ownership() {
+        let mut sm = sm_with(vec![render_black_stage(1), off_stage()]);
+        sm.step(Input::OwnershipChanged(false), t(0));
+        sm.step(Input::SoftBlank, t(100));
+        let effects = sm.step(
+            Input::RenderResult {
+                r#gen: sm.stage_gen,
+                result: Ok(()),
+            },
+            t(200),
+        );
+        let at = get_schedule_stage_tick(&effects).expect("render completion must schedule dwell");
+        assert!(matches!(sm.phase(), Phase::Staged { idx: 0, .. }));
+
+        let effects = sm.step(
+            Input::StageTick {
+                r#gen: sm.stage_gen,
+            },
+            at,
+        );
+        assert!(effects.is_empty(), "an unowned ladder must not advance");
+        assert!(matches!(sm.phase(), Phase::Staged { idx: 0, .. }));
+    }
+
+    #[test]
+    fn grace_remains_frozen_until_both_overlays_clear() {
+        let now = Tick::now();
+        let grace = Duration::from_millis(500);
+        let mut sm = sm_with(vec![off_stage()]);
+        sm.step(Input::InhibitorChanged(true), now);
+        sm.step(Input::Pause { until: None }, now);
+        sm.step(Input::ZonePresent(false), now);
+        assert_eq!(
+            sm.phase(),
+            &Phase::Grace {
+                until: Tick(now.0 + grace)
+            },
+            "pre-frozen grace must retain the original deadline in its phase"
+        );
+
+        let resume = Tick(now.0 + grace);
+        let effects = sm.step(Input::Resume, resume);
+        assert!(
+            effects.is_empty(),
+            "pause removal must not override an inhibitor"
+        );
+        let effects = sm.step(Input::InhibitorChanged(false), resume);
+        assert!(
+            matches!(effects.as_slice(), [Effect::ScheduleTickAt(at)] if at.0 == resume.0 + grace)
+        );
+    }
+
+    #[test]
+    fn ladder_entry_reports_transition_and_current_stage() {
+        let now = Tick::now();
+        let mut sm = sm_with(vec![render_black_stage(1), off_stage()]);
+        let (_, transition) = sm.step_with_transition(Input::ZonePresent(true), now);
+        assert!(
+            transition.is_none(),
+            "unchanged phases must not generate a transition"
+        );
+
+        let (_, transition) = sm.step_with_transition(Input::SoftBlank, now);
+        assert!(
+            matches!(
+                transition,
+                Some((Phase::Active, Phase::RenderPending { idx: 0, .. }))
+            ),
+            "entering the ladder must report the new phase"
+        );
+        assert_eq!(sm.current_stage(), None);
+        sm.step(
+            Input::RenderResult {
+                r#gen: sm.stage_gen,
+                result: Ok(()),
+            },
+            now,
+        );
+        assert_eq!(
+            sm.current_stage(),
+            Some((0, StageKind::RenderBlack)),
+            "display status must include the current ladder rung"
+        );
+    }
+
+    #[test]
+    fn presence_and_input_wake_schedule_retry_after_the_interval() {
+        let now = Tick::now();
+        for input in [Input::ZonePresent(true), Input::InputWake] {
+            let mut sm = sm_with(vec![off_stage()]);
+            drive_to_entry(&mut sm);
+            feed_blank_ok(&mut sm);
+            assert_eq!(sm.phase(), &Phase::Blanked);
+
+            let wake_at = Tick(now.0 + Duration::from_secs(1));
+            let effects = sm.step(input, wake_at);
+            assert!(
+                matches!(effects.as_slice(), [.., Effect::IssueWake { .. }, Effect::ScheduleTickAt(at)] if at.0 == wake_at.0 + sm.timings.wake_retry_interval),
+                "wake must issue immediately and schedule its retry after the configured interval"
+            );
+        }
+    }
+
+    #[test]
     fn wake_from_staged_emits_teardown_not_issue_wake() {
         let mut sm = sm_with(vec![render_black_stage(30), off_stage()]);
         drive_to_staged(&mut sm);

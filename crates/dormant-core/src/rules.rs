@@ -3344,6 +3344,32 @@ mod tests {
     use crate::fakes::{RecordingSink, SinkCmd};
     use crate::traits::{PanelState, PowerState};
 
+    #[test]
+    fn operation_lease_rejects_either_generation_or_kind_mismatch() {
+        let registry = OperationRegistry::default();
+        let generation = GenerationId(7);
+        let (accepted, _lease) = registry
+            .try_acquire(generation, OperationKind::EmergencyWake)
+            .expect("operation accepted");
+
+        let wrong_generation = AcceptedOperation {
+            generation: GenerationId(8),
+            ..accepted.clone()
+        };
+        let wrong_kind = AcceptedOperation {
+            kind: OperationKind::Exercise(DisplayId("oled".into())),
+            ..accepted
+        };
+        assert!(
+            registry.lease_accepted(&wrong_generation).is_none(),
+            "an accepted ID must not bypass its generation check"
+        );
+        assert!(
+            registry.lease_accepted(&wrong_kind).is_none(),
+            "an accepted ID must not bypass its kind check"
+        );
+    }
+
     #[tokio::test]
     async fn operation_registry_rejects_second_exercise_same_display() {
         let registry = OperationRegistry::default();
@@ -3622,6 +3648,24 @@ mod tests {
             post_wake.as_ref(),
         );
         assert_eq!(verdict, ExerciseVerdict::Confirmed);
+    }
+
+    #[test]
+    fn restore_verdict_requires_a_baseline_observation() {
+        let post_blank = PanelState {
+            power: Some(PowerState::Standby),
+            brightness: None,
+        };
+        let post_wake = PanelState {
+            power: Some(PowerState::On),
+            brightness: None,
+        };
+
+        assert_eq!(
+            restore_verdict(&Ok(()), None, Some(&post_blank), Some(&post_wake)),
+            ExerciseVerdict::Unconfirmable,
+            "without a baseline, the wake cannot be verified as a restore"
+        );
     }
 
     /// Wake step: state changed but did NOT return to baseline → `Failed`.
@@ -4787,6 +4831,62 @@ mod tests {
         engine.handle_control(ControlMsg::SubscribeEvents(sub_tx));
         let events = sub_rx.try_recv().expect("subscription reply sent inline");
         (engine, zone, events)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sensor_changed_reports_edges_not_repeated_samples() {
+        let (mut engine, _, mut events) = presence_hold_engine("desk", Duration::from_secs(30));
+        let sensor = SensorId("desk".into());
+        for state in [
+            SensorState::Present,
+            SensorState::Present,
+            SensorState::Unavailable,
+        ] {
+            engine.handle_presence_event(PresenceEvent::new(
+                sensor.clone(),
+                state,
+                Timestamp::now(),
+            ));
+        }
+
+        let changes: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event {
+                DaemonEvent::SensorChanged { state, .. } => Some(state),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            changes,
+            [SensorState::Present, SensorState::Unavailable],
+            "only sensor state changes must be broadcast"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn motion_hold_defers_absence_until_its_deadline() {
+        let hold = Duration::from_secs(30);
+        let mut engine = engine_with_hold_sensor("motion1", hold);
+        let sensor = SensorId("motion1".into());
+        for state in [SensorState::Present, SensorState::Absent] {
+            engine.handle_presence_event(PresenceEvent::new(
+                sensor.clone(),
+                state,
+                Timestamp::now(),
+            ));
+        }
+
+        assert_eq!(
+            engine.zone_engine.sensor_states()[&sensor].0,
+            SensorState::Present,
+            "motion absence must be deferred while the hold is armed"
+        );
+        tokio::time::advance(hold).await;
+        engine.fire_due_timers(Tick::now());
+        assert_eq!(
+            engine.zone_engine.sensor_states()[&sensor].0,
+            SensorState::Absent,
+            "motion absence must pass at the hold deadline"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -6618,6 +6718,38 @@ fn single_rule_display_still_enters_grace_when_its_zone_vacates() {
             .phase(),
         Phase::Grace { .. }
     ));
+}
+
+#[test]
+fn unresolved_driving_zone_prevents_vacancy_and_input_wake_hold() {
+    let (mut engine, display) = vacant_multi_zone_engine();
+    engine.cfg.rules[1].zone = ZoneId("not-installed".into());
+
+    assert!(
+        engine.effective_zone_presence(&display),
+        "an unresolved driving zone must prevent a vacancy decision"
+    );
+    assert_eq!(
+        engine.effective_input_wake_hold(&display),
+        None,
+        "an unresolved driving zone must prevent a vacancy-only hold"
+    );
+}
+
+#[test]
+fn input_wake_hold_uses_shortest_vacant_rule_in_either_order() {
+    let (mut engine, display) = vacant_multi_zone_engine();
+    let shortest = Duration::from_secs(30);
+    engine.cfg.rules[0].input_wake_hold = Duration::from_secs(120);
+    engine.cfg.rules[1].input_wake_hold = shortest;
+    for _ in 0..2 {
+        assert_eq!(
+            engine.effective_input_wake_hold(&display),
+            Some(shortest),
+            "shared displays must use the shortest matching input-wake hold regardless of rule order"
+        );
+        engine.cfg.rules.swap(0, 1);
+    }
 }
 
 #[test]

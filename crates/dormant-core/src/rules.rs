@@ -5863,6 +5863,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn zero_seed_does_not_erase_outstanding_wake_failures() {
+        let display = DisplayId("oled".into());
+        let (mut engine, _) = subscribed_manual_engine(display.clone());
+        engine.seed_failure_state(&display, 2, false);
+        engine.seed_failure_state(&display, 0, false);
+        let snapshot = snapshot_of(&mut engine);
+        assert_eq!(
+            snapshot.displays[0].1.wake_attempts, 2,
+            "an empty seed must not erase outstanding wake failures"
+        );
+    }
+
     fn subscribed_manual_engine(
         display: DisplayId,
     ) -> (RulesEngine, broadcast::Receiver<DaemonEvent>) {

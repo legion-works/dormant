@@ -431,9 +431,11 @@ jobs:
       - name: Check changelog fragment (warning only)
         continue-on-error: true
         env:
-          # The PR title is author-controlled text; pass it as data, not as
-          # part of the script, so the shell never expands it.
+          # The PR title and label names are text from the pull request; pass
+          # them as data, not as part of the script, so the shell never
+          # expands them.
           PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_SKIP_CHANGELOG: ${{ contains(github.event.pull_request.labels.*.name, 'skip-changelog') }}
         run: |
           skip_flag=""
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
@@ -444,8 +446,7 @@ jobs:
             fi
             git fetch origin "$base_ref"
             revision_range="origin/$base_ref...HEAD"
-            labels='${{ toJson(github.event.pull_request.labels.*.name) }}'
-            if echo "$labels" | grep -q 'skip-changelog'; then
+            if [[ "$PR_SKIP_CHANGELOG" == "true" ]]; then
               skip_flag="--skip-label"
             fi
             python3 scripts/ci/check_changelog_fragment.py \

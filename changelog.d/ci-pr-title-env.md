@@ -4,4 +4,4 @@ surfaces: []
 issues: []
 ---
 
-Detail: The changelog check in CI receives the pull request title through an environment variable instead of an expression in the script.
+Detail: The changelog check in CI receives the pull request title and the skip-changelog label state through environment variables instead of expressions in the script.

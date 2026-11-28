@@ -1137,6 +1137,69 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn panel_replacement_reports_loss_without_fabricating_input_readback() {
+        let capture = EventCapture::default();
+        let events = capture.0.clone();
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(capture));
+        let mut cfg = panel_config();
+        cfg.coordination.loss_confirmations = 1;
+        let panel = Arc::new(ScriptedPanel {
+            found: Mutex::new(Some("SAM:TV".into())),
+            calls: Mutex::new(0),
+        });
+        let (_cfg, _exec, mut ctl, _state, cancel) =
+            setup_with_panel_reader(cfg, Arc::new(ScriptedSink::default()), panel.clone());
+
+        tick().await;
+        assert!(matches!(
+            ctl.try_recv(),
+            Ok(ControlMsg::OwnershipPoll { .. })
+        ));
+        let Ok(ControlMsg::PublishDaemonEvent(dormant_core::rules::DaemonEvent::Ownership {
+            owned,
+            observed_input_code,
+            ..
+        })) = ctl.try_recv()
+        else {
+            panic!("panel replacement must publish an ownership event");
+        };
+        assert!(!owned, "a replacement panel is not owned");
+        assert_eq!(
+            observed_input_code, None,
+            "a replacement is not an input read"
+        );
+        tick().await;
+        assert_eq!(
+            count_event(&events.lock().unwrap(), "coord_poll_ok"),
+            0,
+            "mismatch is not a successful poll"
+        );
+        assert_eq!(
+            count_event(&events.lock().unwrap(), "output_panel_mismatch"),
+            1
+        );
+        assert_eq!(
+            count_event(&events.lock().unwrap(), "output_panel_restored"),
+            0
+        );
+
+        *panel.found.lock().unwrap() = Some("AOC:AG326UZD:serial".into());
+        tick().await;
+        tick().await;
+        assert_eq!(
+            count_event(&events.lock().unwrap(), "output_panel_restored"),
+            1,
+            "restoration is reported only on the edge"
+        );
+        assert_eq!(
+            count_event(&events.lock().unwrap(), "coord_poll_ok"),
+            1,
+            "steady successful reads do not report recovery"
+        );
+        cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn panel_unknown_preserves_readback_and_wake() {
         let cfg = panel_config();
         let confirmations = cfg.coordination.loss_confirmations;

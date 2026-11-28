@@ -3606,6 +3606,39 @@ mod ladder_tests {
     }
 
     #[test]
+    fn ladder_entry_reports_transition_and_current_stage() {
+        let now = Tick::now();
+        let mut sm = sm_with(vec![render_black_stage(1), off_stage()]);
+        let (_, transition) = sm.step_with_transition(Input::ZonePresent(true), now);
+        assert!(
+            transition.is_none(),
+            "unchanged phases must not generate a transition"
+        );
+
+        let (_, transition) = sm.step_with_transition(Input::SoftBlank, now);
+        assert!(
+            matches!(
+                transition,
+                Some((Phase::Active, Phase::RenderPending { idx: 0, .. }))
+            ),
+            "entering the ladder must report the new phase"
+        );
+        assert_eq!(sm.current_stage(), None);
+        sm.step(
+            Input::RenderResult {
+                r#gen: sm.stage_gen,
+                result: Ok(()),
+            },
+            now,
+        );
+        assert_eq!(
+            sm.current_stage(),
+            Some((0, StageKind::RenderBlack)),
+            "display status must include the current ladder rung"
+        );
+    }
+
+    #[test]
     fn wake_from_staged_emits_teardown_not_issue_wake() {
         let mut sm = sm_with(vec![render_black_stage(30), off_stage()]);
         drive_to_staged(&mut sm);

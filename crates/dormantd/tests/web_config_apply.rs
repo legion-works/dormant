@@ -326,9 +326,8 @@ async fn config_apply_full_loop() {
 
 // ── Test 2: wake_command change → reloaded, not rejected ──────────────────────
 //
-// The apply endpoint writes the patched config, then waits for a reload outcome
-// from the daemon's config watcher.  A `"rejected"` outcome can only arise from
-// two paths inside `Runner::reload()`:
+// Keep the watcher off so the apply endpoint is the only reload source.
+// A `"rejected"` outcome can only arise from two paths inside `Runner::reload()`:
 //
 //  1. `load_and_assemble()` fails (config invalid or controllers un-buildable).
 //  2. A *removed* display whose verified wake fails with the OLD executor.
@@ -381,6 +380,7 @@ async fn config_apply_wake_command_change_reloads() {
     .with_notify_sink_builder(noop_factory)
     .with_observation_hub(observations)
     .with_state_dir(dir.path().join("state"))
+    .disable_config_watcher()
     .disable_ipc();
     let (handle, join) = app.start().await.expect("start app");
 

@@ -1670,6 +1670,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn reconfigure_hooks_installs_the_reloaded_publisher() {
+        let hooks = noop_hook_engine();
+        let (tx, _rx) = mpsc::channel(8);
+        let handle = build_handle(
+            display_config(),
+            Arc::new(FakeSink::new("ddcci")),
+            hooks.clone(),
+            tx,
+        );
+        let url = "mqtt://127.0.0.1:1884";
+        handle.reconfigure_hooks(Arc::new(MqttPublisher::new(url.into(), None)));
+        assert_eq!(
+            hooks.mqtt_config().0,
+            url,
+            "future switch hooks use the reloaded broker"
+        );
+    }
+
     /// A `Config` with the given display and no other rules or sensors.
     fn minimal_config(dc: cs::DisplayConfig) -> Config {
         let mut displays = indexmap::IndexMap::new();

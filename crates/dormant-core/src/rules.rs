@@ -6721,6 +6721,22 @@ fn single_rule_display_still_enters_grace_when_its_zone_vacates() {
 }
 
 #[test]
+fn unresolved_driving_zone_prevents_vacancy_and_input_wake_hold() {
+    let (mut engine, display) = vacant_multi_zone_engine();
+    engine.cfg.rules[1].zone = ZoneId("not-installed".into());
+
+    assert!(
+        engine.effective_zone_presence(&display),
+        "an unresolved driving zone must prevent a vacancy decision"
+    );
+    assert_eq!(
+        engine.effective_input_wake_hold(&display),
+        None,
+        "an unresolved driving zone must prevent a vacancy-only hold"
+    );
+}
+
+#[test]
 fn input_wake_hold_uses_shortest_vacant_rule_in_either_order() {
     let (mut engine, display) = vacant_multi_zone_engine();
     let shortest = Duration::from_secs(30);

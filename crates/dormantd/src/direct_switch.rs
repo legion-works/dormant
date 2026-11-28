@@ -2487,6 +2487,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn push_does_not_skip_a_write_when_cache_cannot_confirm_peer() {
+        let id = display_id();
+        for case in ["no cache", "loss pending", "failed read", "gain pending"] {
+            let sink = Arc::new(FakeSink::new("ddcci"));
+            sink.set_input_read_result(Ok(Some(PEER_READ)));
+            let coordination = (case != "no cache").then(|| {
+                let coord = dormant_core::coordination::CoordinationHandle::new([id.clone()]);
+                if case != "loss pending" {
+                    record_observation(&coord, PEER_READ);
+                }
+                if case == "failed read" {
+                    coord.record_failure(&id);
+                } else {
+                    let observed = if case == "loss pending" {
+                        PEER_READ
+                    } else {
+                        LOCAL_READ
+                    };
+                    let aliases = dormant_core::coordination::InputCodeAliases {
+                        local_read: LOCAL_READ,
+                        local_write: LOCAL_READ,
+                        peer_read: Some(PEER_READ),
+                        peer_write: None,
+                    };
+                    let _ = coord.record_input_observation(&id, observed, &aliases, 2, None);
+                }
+                coord
+            });
+            let (tx, _rx) = mpsc::channel(16);
+            let handle = build_handle_with_coordination(
+                idempotency_display_config(),
+                sink.clone(),
+                noop_hook_engine(),
+                tx,
+                coordination,
+            );
+            assert_eq!(
+                handle.push(id.clone(), SwitchReason::Cli, false).await,
+                SwitchOutcome::Switched,
+                "an unconfirmed peer observation cannot suppress an explicit push: {case}"
+            );
+            assert_eq!(sink.write_calls(), 1);
+        }
+    }
+
+    #[tokio::test]
     async fn forced_push_bypasses_fresh_agreeing_observation() {
         let sink = Arc::new(FakeSink::new("ddcci"));
         let runner = Arc::new(CountingHookRunner::new());

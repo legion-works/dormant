@@ -1559,6 +1559,31 @@ mod tests {
     }
 
     #[test]
+    fn contested_entry_publishes_loss_but_not_a_discarded_gain() {
+        let id = display("aoc");
+        let al = aliases(1);
+        let now = Instant::now();
+        for (threshold, codes, expected_prior) in
+            [(2, &[2, 1][..], None), (3, &[2, 1, 2][..], Some(true))]
+        {
+            let handle = CoordinationHandle::new([id.clone()]);
+            let policy = flap_policy(threshold);
+            let (&last_code, preceding) = codes.split_last().unwrap();
+            for &code in preceding {
+                assert!(!observe_at(&handle, &id, code, &al, 1, policy, now).entered_contested);
+            }
+
+            let outcome = observe_at(&handle, &id, last_code, &al, 1, policy, now);
+            assert!(outcome.entered_contested);
+            assert_eq!(
+                outcome.committed_prior_owned, expected_prior,
+                "only a net loss publishes a verdict change on contested entry"
+            );
+            assert!(!handle.snapshot()[&id].owned);
+        }
+    }
+
+    #[test]
     fn contested_hold_forces_not_owned_even_if_seeded_owned() {
         let handle = CoordinationHandle::new([display("aoc")]);
         let aoc = display("aoc");

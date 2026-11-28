@@ -4790,6 +4790,33 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn motion_hold_defers_absence_until_its_deadline() {
+        let hold = Duration::from_secs(30);
+        let mut engine = engine_with_hold_sensor("motion1", hold);
+        let sensor = SensorId("motion1".into());
+        for state in [SensorState::Present, SensorState::Absent] {
+            engine.handle_presence_event(PresenceEvent::new(
+                sensor.clone(),
+                state,
+                Timestamp::now(),
+            ));
+        }
+
+        assert_eq!(
+            engine.zone_engine.sensor_states()[&sensor].0,
+            SensorState::Present,
+            "motion absence must be deferred while the hold is armed"
+        );
+        tokio::time::advance(hold).await;
+        engine.fire_due_timers(Tick::now());
+        assert_eq!(
+            engine.zone_engine.sensor_states()[&sensor].0,
+            SensorState::Absent,
+            "motion absence must pass at the hold deadline"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn presence_sensor_with_hold_time_defers_absent() {
         let hold = Duration::from_secs(30);
         let (mut engine, zone, mut events) = presence_hold_engine("desk", hold);

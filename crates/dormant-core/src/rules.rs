@@ -6721,6 +6721,22 @@ fn single_rule_display_still_enters_grace_when_its_zone_vacates() {
 }
 
 #[test]
+fn input_wake_hold_uses_shortest_vacant_rule_in_either_order() {
+    let (mut engine, display) = vacant_multi_zone_engine();
+    let shortest = Duration::from_secs(30);
+    engine.cfg.rules[0].input_wake_hold = Duration::from_secs(120);
+    engine.cfg.rules[1].input_wake_hold = shortest;
+    for _ in 0..2 {
+        assert_eq!(
+            engine.effective_input_wake_hold(&display),
+            Some(shortest),
+            "shared displays must use the shortest matching input-wake hold regardless of rule order"
+        );
+        engine.cfg.rules.swap(0, 1);
+    }
+}
+
+#[test]
 fn input_wake_hold_requires_all_driving_zones_vacant() {
     use crate::zone::{FusionMode, ZoneMember, ZoneSpec};
 

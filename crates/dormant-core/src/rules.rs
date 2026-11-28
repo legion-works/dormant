@@ -6145,6 +6145,26 @@ mod tests {
 
     use crate::types::SensorAvailabilityEvent;
 
+    #[test]
+    fn unavailable_sample_clears_the_online_lease() {
+        let sensor = SensorId("desk".into());
+        let mut engine = engine_with_sensor("desk");
+        engine.handle_sensor_availability(SensorAvailabilityEvent::new(
+            sensor.clone(),
+            true,
+            Timestamp::now(),
+        ));
+        engine.handle_presence_event(PresenceEvent::new(
+            sensor.clone(),
+            SensorState::Unavailable,
+            Timestamp::now(),
+        ));
+        assert!(
+            !engine.availability_online.contains_key(&sensor),
+            "an unavailable sample must revoke the previous online lease"
+        );
+    }
+
     /// A minimal engine with exactly ONE sensor and a SHORT `stale_timeout`
     /// — for the availability-gating tests below, which need a sweep to fire
     /// within a few hundred milliseconds of virtual time.

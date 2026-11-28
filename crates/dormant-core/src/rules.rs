@@ -5476,6 +5476,36 @@ mod tests {
         .expect("one-display ladder engine config is valid")
     }
 
+    #[test]
+    fn claim_suppresses_ownership_loss_only_before_the_deadline() {
+        let display = DisplayId("oled".into());
+        let gate = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut engine = manual_display_engine(
+            display.clone(),
+            HashMap::new(),
+            Arc::new(FlipGate(gate.clone())),
+        );
+        let now = Tick::now();
+        let deadline = now.0 + Duration::from_secs(1);
+        engine.handle_control(ControlMsg::SetClaimSuppression {
+            display: display.clone(),
+            until: Some(deadline),
+        });
+        gate.store(false, std::sync::atomic::Ordering::Relaxed);
+        engine.feed_ownership(&display, now);
+        assert_eq!(
+            engine.last_owned.get(&display),
+            Some(&true),
+            "a claim must suppress ownership loss before the deadline"
+        );
+        engine.feed_ownership(&display, Tick(deadline));
+        assert_eq!(
+            engine.last_owned.get(&display),
+            Some(&false),
+            "the deadline itself must release ownership suppression"
+        );
+    }
+
     #[tokio::test]
     async fn ownership_poll_refeeds_changed_cached_verdict_without_timer_sweep() {
         let display = DisplayId("mon".into());

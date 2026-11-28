@@ -21,6 +21,7 @@ struct TickRecorder {
     transition: Option<TransitionState>,
     busy: bool,
     render_error: Option<&'static str>,
+    commit_succeeds: bool,
     effects: Vec<Effect>,
 }
 
@@ -37,6 +38,7 @@ impl TickRecorder {
             }),
             busy: false,
             render_error: None,
+            commit_succeeds: true,
             effects: Vec::new(),
         }
     }
@@ -75,7 +77,7 @@ impl TransitionTick for TickRecorder {
 
     fn commit_back_buffer(&mut self) -> bool {
         self.effects.push(Effect::Commit);
-        true
+        self.commit_succeeds
     }
 
     fn swap_back_buffer(&mut self) {
@@ -177,9 +179,8 @@ fn mid_fade_tick_commits_pre_step_blend_and_advances_progress() {
 }
 
 #[test]
-fn terminal_tick_commits_pre_step_blend_then_cancels_once() {
-    let pre_step = T_MAX - 3;
-    let mut tick = TickRecorder::fading(pre_step);
+fn terminal_tick_commits_unblended_frame_then_cancels_once() {
+    let mut tick = TickRecorder::fading(T_MAX - 3);
 
     let outcome = tick.handle_transition_tick(GENERATION);
 
@@ -187,12 +188,11 @@ fn terminal_tick_commits_pre_step_blend_then_cancels_once() {
         tick.effects,
         [
             Effect::Render,
-            Effect::Blend(CAPTURE.to_vec(), pre_step),
             Effect::Commit,
             Effect::Swap,
             Effect::CancelFadeTimer(TransitionPhase::Idle, T_MAX),
         ],
-        "terminal tick must commit the pre-step blend, then cancel the timer at Idle"
+        "terminal tick must commit the new frame without a blend, then cancel the timer at Idle"
     );
     assert_eq!(outcome, Complete);
     assert_eq!(tick.progress(), Some((TransitionPhase::Idle, T_MAX)));
@@ -209,6 +209,36 @@ fn terminal_tick_commits_pre_step_blend_then_cancels_once() {
     );
     assert_eq!(outcome, Done);
     assert_eq!(tick.progress(), Some((TransitionPhase::Idle, T_MAX)));
+}
+
+#[test]
+fn terminal_tick_without_surface_cancels_timer_once() {
+    let mut tick = TickRecorder::fading(T_MAX - 3);
+    tick.commit_succeeds = false;
+
+    assert_eq!(tick.handle_transition_tick(GENERATION), Done);
+    assert_eq!(tick.progress(), Some((TransitionPhase::Idle, T_MAX)));
+    assert_eq!(
+        tick.effects
+            .iter()
+            .filter(|effect| matches!(effect, Effect::CancelFadeTimer(..)))
+            .count(),
+        1,
+        "terminal tick must cancel the fade timer even without a surface"
+    );
+
+    assert_eq!(tick.handle_transition_tick(GENERATION), Done);
+    assert_eq!(
+        tick.effects,
+        [
+            Effect::Render,
+            Effect::Commit,
+            Effect::CancelFadeTimer(TransitionPhase::Idle, T_MAX),
+            Effect::Render,
+            Effect::Commit,
+        ],
+        "missing surface must prevent a swap and the later tick must not cancel again"
+    );
 }
 
 #[test]

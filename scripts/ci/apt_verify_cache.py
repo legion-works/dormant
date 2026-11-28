@@ -13,6 +13,7 @@ import tempfile
 
 COMPRESSION = (".lz4", ".gz", ".xz", ".bz2", ".zst", ".lzma")
 SHA256 = re.compile(rb"[a-fA-F0-9]{64}\Z")
+ARCHIVE_URI = re.compile(rb"'[^']+'[ \t]+([^/\s]+\.deb)[ \t]+[0-9]+[ \t]+SHA256:([a-fA-F0-9]{64})")
 SIGNED_MESSAGE = b"-----BEGIN PGP " + b"SIGNED MESSAGE-----\n"
 PUBLIC_KEY = b"-----BEGIN PGP " + b"PUBLIC KEY BLOCK-----"
 APT_HELPER = shutil.which("apt-helper") or "/usr/lib/apt/apt-helper"
@@ -166,23 +167,6 @@ def read_index(path, metakey, extension, signed_hashes):
     return content
 
 
-def archive_digests(content, wanted, digests):
-    # Scan only stanzas for package names in the cache. The largest Ubuntu
-    # index has many more packages than a CI job installs.
-    if b"\r\n" in content:
-        content = content.replace(b"\r\n", b"\n")
-    for match in wanted.finditer(content):
-        previous = content.rfind(b"\n\n", 0, match.start())
-        start = previous + 2 if previous != -1 else 0
-        end = content.find(b"\n\n", match.end())
-        fields = next(paragraphs(content[start:None if end == -1 else end].splitlines()))
-        package, version, arch, digest = (fields.get(field, b"") for field in
-                                          (b"package", b"version", b"architecture", b"sha256"))
-        if version and arch:
-            name = b"_".join((package, version.replace(b":", b"%3a"), arch)) + b".deb"
-            digests.setdefault(name, set()).add(digest.lower() if SHA256.fullmatch(digest) else None)
-
-
 VERIFY_ERRORS = (OSError, ValueError, KeyError, IndexError, OverflowError, subprocess.SubprocessError)
 
 
@@ -253,26 +237,33 @@ def verify_lists(files, decoded):
     return verified
 
 
-def live_archive_digests(lists_dir, archives):
-    packages = sorted({path.name.split("_", 1)[0].encode() for path in archives})
-    if not packages:
-        return {}
-    wanted = re.compile(rb"(?im)^Package:[ \t]*(?:" + b"|".join(map(re.escape, packages)) + rb")[ \t]*$")
+def selected_archive_digests(lists_dir, packages):
+    with tempfile.TemporaryDirectory() as empty_archives:
+        output = subprocess.check_output([
+            "apt-get", "install", "--print-uris", "-qq", "-y", "--no-install-recommends",
+            "-o", "Acquire::ForceHash=SHA256",
+            "-o", f"Dir::State::lists={lists_dir}",
+            "-o", f"Dir::Cache::archives={empty_archives}",
+            "-o", "Dir::Cache::pkgcache=", "-o", "Dir::Cache::srcpkgcache=", *packages,
+        ])
     digests = {}
-    for path in lists_dir.iterdir():
-        extension = next((ext for ext in COMPRESSION if path.name.endswith(ext)), "")
-        if not path.name.removesuffix(extension).endswith("_Packages"):
+    for line in output.splitlines():
+        if not line.strip():
             continue
-        content = (subprocess.check_output([APT_HELPER, "cat-file", path]) if extension else path.read_bytes())
-        archive_digests(content, wanted, digests)
+        match = ARCHIVE_URI.fullmatch(line)
+        if match is None:
+            raise ValueError("APT URI plan contains a line without an archive and SHA256")
+        name, digest = match.groups()
+        if digests.setdefault(name, digest.lower()) != digest.lower():
+            raise ValueError("APT URI plan contains conflicting hashes for an archive")
     return digests
 
 
 def verify_archive(path, digests):
-    expected = digests.get(path.name.encode(), set())
-    if len(expected) != 1 or path.is_symlink() or not path.is_file():
+    expected = digests.get(path.name.encode(errors="surrogateescape"))
+    if expected is None or path.is_symlink() or not path.is_file():
         return False
-    return sha256_file(path) in expected
+    return sha256_file(path) == expected
 
 
 def remove_index_siblings(lists_dir, verified):
@@ -291,7 +282,7 @@ def remove_index_siblings(lists_dir, verified):
         subprocess.run(["sudo", "rm", "-f", "--", *siblings], check=True)
 
 
-def restore_cache(cache, lists_dir, archives_dir, manifest, decoded):
+def restore_cache(cache, lists_dir, archives_dir, manifest, decoded, packages):
     if cache.is_symlink():
         print("apt_install: rejected symlink for cache directory", file=sys.stderr)
         return 1
@@ -316,11 +307,11 @@ def restore_cache(cache, lists_dir, archives_dir, manifest, decoded):
         except VERIFY_ERRORS as error:
             print(f"apt_install: could not restore cached package lists: {error}", file=sys.stderr)
             rejected_lists = True
-    if restored_lists:
+    if restored_lists and archives:
         try:
-            digests = live_archive_digests(lists_dir, archives)
+            digests = selected_archive_digests(lists_dir, packages)
         except VERIFY_ERRORS as error:
-            print(f"apt_install: could not check live package indexes: {error}", file=sys.stderr)
+            print(f"apt_install: could not verify APT's archive selection: {error}", file=sys.stderr)
         else:
             for path in archives:
                 try:
@@ -346,4 +337,4 @@ def restore_cache(cache, lists_dir, archives_dir, manifest, decoded):
 
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as decoded:
-        sys.exit(restore_cache(*map(pathlib.Path, sys.argv[1:]), pathlib.Path(decoded)))
+        sys.exit(restore_cache(*map(pathlib.Path, sys.argv[1:5]), pathlib.Path(decoded), sys.argv[5:]))

@@ -152,7 +152,7 @@ restored_archives=()
 if [[ -n ${APT_DEB_CACHE_DIR:-} ]]; then
   restored_manifest="$(mktemp)"
   if ! python3 "$(dirname -- "${BASH_SOURCE[0]}")/apt_verify_cache.py" \
-    "$APT_DEB_CACHE_DIR" "$lists_dir" "$archives_dir" "$restored_manifest"; then
+    "$APT_DEB_CACHE_DIR" "$lists_dir" "$archives_dir" "$restored_manifest" "$@"; then
     printf '%s\n' 'apt_install: cache restore incomplete; trying install before update' >&2
   fi
   mapfile -d '' -t restored_archives < "$restored_manifest"

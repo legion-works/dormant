@@ -11,6 +11,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[3]
 APT_INSTALL = ROOT / "scripts/ci/apt_install.sh"
 RELEASE = "mirror_dists_noble_InRelease"
 PACKAGES = "mirror_dists_noble_main_binary-amd64_Packages"
+VARIANT_PACKAGES = "mirror_dists_noble_main_binary-amd64v3_Packages"
 EXTRA_PACKAGES = "mirror_dists_noble_universe_binary-amd64_Packages"
 ARCHIVE = "example_1%3a2.0_amd64.deb"
 VENDOR_RELEASE = "vendor_dists_noble_InRelease"
@@ -35,6 +36,10 @@ def signed_release(indexes, signature):
             "-----BEGIN PGP " f"SIGNATURE-----\n{signature}\n-----END PGP SIGNATURE-----\n")
 
 
+def archive_uri(name, content, variant=""):
+    return f"'https://mirror.example/pool/{variant}{name}' {name} {len(content)} SHA256:{hashlib.sha256(content).hexdigest()}\n"
+
+
 class AptInstallTests(unittest.TestCase):
     def run_apt_install(self, mode: str, *, cache: str = "", runs: int = 1):
         with tempfile.TemporaryDirectory() as directory:
@@ -50,12 +55,8 @@ class AptInstallTests(unittest.TestCase):
             (lists / "lock").touch()
             (lists / "partial").mkdir()
             (lists / "partial" / "incomplete_Packages").touch()
-            if cache == "conflicting_live_index":
-                conflict = package_record("example", "1:2.0", b"other! deb")
-                (lists / VENDOR_PACKAGES).write_bytes(conflict)
-                (lists / VENDOR_RELEASE).write_text(signed_release(
-                    [("main/binary-amd64/Packages", conflict)], "valid-signature",
-                ))
+            variant_case = cache in ("variant_selected", "variant_not_selected")
+            selected = b"amd64v3 deb" if variant_case else b"cached deb"
             cache_dir = temp / "cache"
             output = temp / "output"
             output.touch()
@@ -80,10 +81,21 @@ class AptInstallTests(unittest.TestCase):
                     'printf binary-key > "$2"\n'
                 ),
                 "apt-get": (
+                    'if [[ $1 == install ]]; then\n'
+                    '  [[ $* == *--print-uris* && $* == *Acquire::ForceHash=SHA256* && $* == *--no-install-recommends* ]] || exit 2\n'
+                    '  [[ $* == *"Dir::State::lists=$APT_LISTS_DIR"* && ${!#} == libexample-dev ]] || exit 2\n'
+                    '  [[ -f "$APT_LISTS_DIR/' + RELEASE + '" ]] || exit 2\n'
+                    '  [[ $FAKE_CACHE != print_uris_failure ]] || exit 100\n'
+                    '  cat "$FAKE_APT_ROOT/uris"\n'
+                    '  exit 0\n'
+                    'fi\n'
                     '[[ $1 == indextargets && $2 == --no-release-info ]] || exit 2\n'
                     'for component in main universe; do\n'
                     '  printf "MetaKey: %s/binary-amd64/Packages\\nFilename: %s/mirror_dists_noble_%s_binary-amd64_Packages\\nRelease: noble\\nSourcesentry: %s/ubuntu.sources:1\\n\\n" "$component" "$APT_LISTS_DIR" "$component" "$FAKE_APT_ROOT"\n'
                     'done\n'
+                    'if [[ $FAKE_CACHE == variant_* ]]; then\n'
+                    '  printf "MetaKey: main/binary-amd64v3/Packages\\nFilename: %s/' + VARIANT_PACKAGES + '\\nRelease: noble\\nSourcesentry: %s/ubuntu.sources:1\\n\\n" "$APT_LISTS_DIR" "$FAKE_APT_ROOT"\n'
+                    'fi\n'
                     'if [[ -n $FAKE_VENDOR_SOURCE ]]; then\n'
                     '  printf "MetaKey: main/binary-amd64/Packages\\nFilename: %s/vendor_dists_noble_main_binary-amd64_Packages\\nRelease: noble\\nSourcesentry: %s/%s:1\\n\\n" "$APT_LISTS_DIR" "$FAKE_APT_ROOT" "$FAKE_VENDOR_SOURCE"\n'
                     'fi\n'
@@ -100,18 +112,23 @@ class AptInstallTests(unittest.TestCase):
                 "Types: deb\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n"
             )
             vendor_source = ""
+            uris = archive_uri(ARCHIVE, selected, "amd64v3/" if variant_case else "")
+            if cache == "print_uris_weak_hash":
+                uris += f"'https://mirror.example/pool/extra.deb' extra.deb 12 MD5Sum:{'0' * 32}\n"
             if cache and cache != "cold":
                 cache_dir.mkdir()
                 (cache_dir / ARCHIVE).write_bytes(
-                    b"wrong! deb" if cache == "bad_archive" else b"cached deb"
+                    b"wrong! deb" if cache == "bad_archive" else
+                    b"amd64 deb!!" if cache == "variant_not_selected" else selected
                 )
                 cached_lists = cache_dir / "lists"
                 cached_lists.mkdir()
-                packages = package_record("example", "1:2.0", b"cached deb")
+                packages = package_record("example", "1:2.0", b"amd64 deb!!" if variant_case else b"cached deb")
                 extra = package_record("extra", "1", b"extra deb")
                 if cache == "warm_superseded":
                     packages += package_record("superseded", "1", b"old deb")
                     (cache_dir / "superseded_1_amd64.deb").write_bytes(b"old deb")
+                    uris += archive_uri("superseded_1_amd64.deb", b"old deb")
                 signature = "bad-signature" if cache == "bad_signature" else "valid-signature"
                 compressed = gzip.compress(extra)
                 universe = ("universe/binary-amd64/Packages", extra) if cache in (
@@ -119,9 +136,12 @@ class AptInstallTests(unittest.TestCase):
                 ) else (
                     "universe/binary-amd64/Packages.gz", compressed,
                 )
-                (cached_lists / RELEASE).write_text(
-                    signed_release([("main/binary-amd64/Packages", packages), universe], signature)
-                )
+                indexes = [("main/binary-amd64/Packages", packages), universe]
+                if variant_case:
+                    variant = package_record("example", "1:2.0", selected)
+                    indexes.append(("main/binary-amd64v3/Packages", variant))
+                    (cached_lists / VARIANT_PACKAGES).write_bytes(variant)
+                (cached_lists / RELEASE).write_text(signed_release(indexes, signature))
                 (cached_lists / PACKAGES).write_bytes(packages)
                 if cache == "bad_index":
                     compressed = gzip.compress(extra.replace(b"Package: extra", b"Package: wrong"))
@@ -154,11 +174,9 @@ class AptInstallTests(unittest.TestCase):
                         vendor_source = ""
                     if cache == "no_signed_by":
                         (temp / vendor_source).write_text("deb https://vendor.example noble main\n")
-                if cache == "conflicting_live_index":
-                    vendor_source = "vendor.list"
-                    (temp / vendor_source).write_text(
-                        f"deb [signed-by={temp / 'vendor.gpg'}] https://vendor.example noble main\n"
-                    )
+                    if cache in ("armored_key", "inline_key"):
+                        uris += archive_uri(VENDOR_ARCHIVE, b"vendor deb")
+            (temp / "uris").write_text(uris)
             fake_sudo.write_text(
                 "#!/usr/bin/env bash\n"
                 "set -euo pipefail\n"
@@ -230,6 +248,7 @@ class AptInstallTests(unittest.TestCase):
                 "APT_INSTALL_TIMEOUT": "1",
                 "FAKE_SUDO_LOG": str(command_log),
                 "FAKE_APT_ROOT": str(temp),
+                "FAKE_CACHE": cache,
                 "FAKE_VENDOR_SOURCE": vendor_source,
                 "FAKE_SUDO_MODE": mode,
                 "FAKE_SUDO_STATE": str(state),
@@ -326,12 +345,30 @@ class AptInstallTests(unittest.TestCase):
     def test_source_without_signed_by_is_dropped(self):
         self.assert_vendor_dropped("no_signed_by", "source has no Signed-By")
 
-    def test_conflicting_runner_index_drops_archive(self):
-        result, _, deb, _ = self.run_apt_install("install_first_success", cache="conflicting_live_index")
+    def test_apt_selected_variant_hash_controls_archive_restore(self):
+        result, _, deb, _ = self.run_apt_install("install_first_success", cache="variant_selected")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("apt_install: restored package lists (4 files)", result.stdout)
+        self.assertIn("apt_install: restored 1 cached .deb file(s)", result.stdout)
+        self.assertEqual(deb, "amd64v3 deb")
+
+        result, _, deb, _ = self.run_apt_install("install_first_success", cache="variant_not_selected")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("apt_install: dropped 1 unverified cached archives", result.stderr)
         self.assertEqual(deb, "downloaded deb")
+
+    def test_incomplete_apt_uri_plan_drops_all_archives_but_keeps_lists(self):
+        for cache in ("print_uris_failure", "print_uris_weak_hash"):
+            with self.subTest(cache=cache):
+                result, commands, deb, _ = self.run_apt_install("install_first_success", cache=cache)
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("apt_install: restored package lists (3 files)", result.stdout)
+                self.assertIn("apt_install: dropped 1 unverified cached archives", result.stderr)
+                self.assertEqual(deb, "downloaded deb")
+                self.assertFalse(any("apt-get update" in command for command in commands))
 
     def test_update_removes_restored_archive_before_refresh(self):
         result, commands, deb, _ = self.run_apt_install("stale_lists", cache="warm_lists")

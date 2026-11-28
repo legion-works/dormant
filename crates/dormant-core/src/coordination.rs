@@ -1141,6 +1141,21 @@ mod tests {
     /// A Local reading with a different raw code (e.g. 0x15 write alias vs
     /// 0x10 read alias) still classifies as Local and contributes to gain.
     #[test]
+    fn first_deferred_gain_records_the_input_in_the_snapshot() {
+        let id = display("aoc");
+        let handle = CoordinationHandle::new([id.clone()]);
+        handle.record_success(&id, 2, 1, None);
+
+        let gain = handle.record_input_observation(&id, 1, &aliases(1), 2, None);
+        assert_eq!(gain.deferred_gain_count, Some(1));
+        assert_eq!(
+            handle.snapshot()[&id].pending_transition_code,
+            Some(1),
+            "the snapshot identifies the pending gain input"
+        );
+    }
+
+    #[test]
     fn observation_gain_across_local_alias_codes() {
         let handle = CoordinationHandle::new([display("aoc")]);
         let aoc = display("aoc");

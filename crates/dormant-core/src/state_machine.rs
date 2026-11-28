@@ -3532,6 +3532,27 @@ mod ladder_tests {
     // ── Tests ─────────────────────────────────────────────────────────────
 
     #[test]
+    fn inhibitor_blocks_ladder_advance_after_controller_blank() {
+        let mut sm = sm_with(vec![
+            controller_stage(BlankMode::PowerOff, Some(Duration::from_secs(1))),
+            off_stage(),
+        ]);
+        drive_to_entry(&mut sm);
+        feed_blank_ok(&mut sm);
+        assert_eq!(sm.phase(), &Phase::Blanked);
+
+        sm.step(Input::InhibitorChanged(true), t(900));
+        let effects = sm.step(
+            Input::StageTick {
+                r#gen: sm.stage_gen,
+            },
+            t(1_800),
+        );
+        assert!(effects.is_empty(), "an inhibitor must block the next rung");
+        assert_eq!(sm.phase(), &Phase::Blanked);
+    }
+
+    #[test]
     fn wake_from_staged_emits_teardown_not_issue_wake() {
         let mut sm = sm_with(vec![render_black_stage(30), off_stage()]);
         drive_to_staged(&mut sm);

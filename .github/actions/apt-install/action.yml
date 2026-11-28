@@ -16,9 +16,14 @@ runs:
         # The key selects a cache. The install script verifies the package
         # lists and archive hashes before it restores any cached files.
         digest=$(printf '%s' "$APT_PACKAGES" | sha256sum)
+        # Runners with one image version can have different apt sources
+        # (for example a pinned snapshot mirror or the regional mirror list).
+        # Archives from one source set do not match the indexes of another,
+        # so the source configuration is part of the key.
+        sources=$(cat /etc/apt/sources.list /etc/apt/sources.list.d/* /etc/apt/apt-mirrors.txt 2>/dev/null | sha256sum)
         # The image version comes last so a job on a newer image can restore
         # the previous image's archives through the prefix below.
-        prefix="apt-debs-v3-${ImageOS:-unknown}-${RUNNER_ARCH:-unknown}-${digest%% *}-"
+        prefix="apt-debs-v4-${ImageOS:-unknown}-${RUNNER_ARCH:-unknown}-${digest%% *}-${sources:0:16}-"
         printf 'prefix=%s\n' "$prefix" >> "$GITHUB_OUTPUT"
         printf 'value=%s%s\n' "$prefix" "${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
     - name: Restore apt cache

@@ -78,7 +78,11 @@ The CI jobs in `.github/workflows/ci.yml` are:
 - `mqtt-integration` — live Mosquitto tests, including retained state and availability
 - `docs` and `mdbook` — rustdoc with warnings denied, then `mdbook build docs`
 - `taplo`, `gitleaks`, and `typos`
-- `pr-title` — conventional-commit title validation on pull requests
+- `policy` — CI script checks; the shell lint, raw-sleep, changelog-fragment and gate-parity steps report warnings only
+
+Required for merge: `clippy`, `test`, `webui`, `render`, `deny`, `docs`,
+`gitleaks`, `mqtt-integration`, `windows-portability`, `macos-test` and
+`policy`. The other jobs report but do not block.
 
 Run the platform-specific and integration jobs when your change touches those
 paths. CI remains the final matrix.

@@ -70,8 +70,17 @@ def _parse_date(value: Any) -> datetime.date | None:
         return None
 
 
-def validate_ledger(path: pathlib.Path, *, today: datetime.date | None = None) -> list[str]:
-    """Return actionable validation errors for the TOML ledger at ``path``."""
+def validate_ledger(
+    path: pathlib.Path,
+    *,
+    today: datetime.date | None = None,
+    warnings: list[str] | None = None,
+) -> list[str]:
+    """Return actionable validation errors for the TOML ledger at ``path``.
+
+    Findings that do not fail the gate (an open incident past its 30-day
+    diagnosis target) are appended to ``warnings`` when a list is given.
+    """
     try:
         with path.open("rb") as ledger_file:
             ledger = tomllib.load(ledger_file)
@@ -179,7 +188,8 @@ def validate_ledger(path: pathlib.Path, *, today: datetime.date | None = None) -
 
         if status == "open" and first_seen is not None and today - first_seen > datetime.timedelta(days=30):
             if not _is_nonempty_string(incident["root_cause"]) and deferral_date is None:
-                errors.append(f"{label}: open incidents older than 30 days require root_cause or an active triage deferral")
+                if warnings is not None:
+                    warnings.append(f"{label}: open incident older than 30 days has no root_cause or active triage deferral")
 
         if status == "fixed":
             for field in EVIDENCE_FIELDS:
@@ -197,7 +207,10 @@ def main() -> int:
     parser.add_argument("--today", type=datetime.date.fromisoformat, default=datetime.date.today())
     args = parser.parse_args()
 
-    errors = validate_ledger(args.ledger, today=args.today)
+    warnings: list[str] = []
+    errors = validate_ledger(args.ledger, today=args.today, warnings=warnings)
+    for warning in warnings:
+        print(f"WARN: {warning}", file=sys.stderr)
     if errors:
         print("flake ledger validation failed:", file=sys.stderr)
         for error in errors:

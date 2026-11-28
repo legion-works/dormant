@@ -1505,6 +1505,28 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn reprobe_is_eligible_at_the_exact_interval_boundary() {
+        let cfg = config();
+        let id = DisplayId("shared".into());
+        let sink = ScriptedSink::default();
+        let mut state = HashMap::new();
+        let failures = cfg.coordination.reprobe_failure_threshold;
+        super::maybe_reprobe(&id, &sink, &cfg, failures, &mut state).await;
+        let interval = state[&id].next_interval;
+
+        tokio::time::advance(interval.checked_sub(Duration::from_millis(1)).unwrap()).await;
+        super::maybe_reprobe(&id, &sink, &cfg, failures, &mut state).await;
+        assert_eq!(sink.reprobes(), 1);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        super::maybe_reprobe(&id, &sink, &cfg, failures, &mut state).await;
+        assert_eq!(
+            sink.reprobes(),
+            2,
+            "reprobe is allowed when backoff expires"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn successful_read_resets_reprobe_backoff_to_floor() {
         let sink = Arc::new(ScriptedSink::with_inputs([
             Err("hotplugged".to_string()),

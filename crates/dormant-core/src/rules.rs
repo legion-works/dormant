@@ -4153,6 +4153,30 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn exercise_uses_the_target_displays_blank_mode() {
+        let display = DisplayId("oled".into());
+        let sink: Arc<dyn CommandSink> = Arc::new(crate::fakes::ExerciseSink::new());
+        let mut engine = manual_display_engine(
+            display.clone(),
+            HashMap::from([(display.clone(), sink)]),
+            Arc::new(crate::ownership::AlwaysOwned),
+        );
+        engine.cfg.displays[0].blank_mode = BlankMode::BrightnessZero;
+        let (reply, result) = oneshot::channel();
+        engine.handle_exercise(display, reply, None);
+        let report = result.await.expect("exercise reply");
+        assert_eq!(
+            report
+                .steps
+                .iter()
+                .find(|step| step.command == "blank")
+                .and_then(|step| step.blank_mode),
+            Some(BlankMode::BrightnessZero),
+            "exercise must use the target display's configured blank mode"
+        );
+    }
+
     /// `paused_rules` threaded through the report so callers can
     /// surface which rules were paused (engine-side resume via
     /// `ExerciseResume` guarantees the release regardless).

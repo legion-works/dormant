@@ -116,14 +116,14 @@ binary_sensor:
   # 1D distance zones: a radial partition at a runtime-tunable cutoff. The
   # LD2410C reports one target along a single axis (distance), so it cannot do
   # 2D X/Y zones like an LD2450 — but near/far is most of the value for a desk.
-  # raw_state bypasses the MQTT throttle filter so zone edges react instantly.
+  # get_raw_state() reads the value before the MQTT throttle filter delays it.
   - platform: template
     name: "${friendly_name} Desk Near"
     device_class: occupancy
     lambda: |-
       if (!id(has_tgt).state) return false;
-      if (std::isnan(id(det_dist).raw_state)) return false;
-      return id(det_dist).raw_state <= id(near_cutoff).state * 100.0f;
+      if (std::isnan(id(det_dist).get_raw_state())) return false;
+      return id(det_dist).get_raw_state() <= id(near_cutoff).state * 100.0f;
     filters:
       - delayed_off: 5s
   - platform: template
@@ -131,8 +131,8 @@ binary_sensor:
     device_class: occupancy
     lambda: |-
       if (!id(has_tgt).state) return false;
-      if (std::isnan(id(det_dist).raw_state)) return false;
-      return id(det_dist).raw_state > id(near_cutoff).state * 100.0f;
+      if (std::isnan(id(det_dist).get_raw_state())) return false;
+      return id(det_dist).get_raw_state() > id(near_cutoff).state * 100.0f;
     filters:
       - delayed_off: 5s
   # Energy-gated desk presence: the LD2410C's presence flags can read
@@ -147,14 +147,14 @@ binary_sensor:
     id: desk_seated
     device_class: occupancy
     lambda: |-
-      if (std::isnan(id(still_energy).raw_state)) return {};
+      if (std::isnan(id(still_energy).get_raw_state())) return {};
       // Energy above floor: present regardless of has_target / distance.
       // Also gate on distance when within near_cutoff (belt-and-suspenders).
-      bool energy_ok = id(still_energy).raw_state >= id(still_energy_floor).state;
+      bool energy_ok = id(still_energy).get_raw_state() >= id(still_energy_floor).state;
       if (energy_ok) return true;
       if (!id(has_tgt).state) return false;
-      if (std::isnan(id(det_dist).raw_state)) return false;
-      return id(det_dist).raw_state <= id(near_cutoff).state * 100.0f;
+      if (std::isnan(id(det_dist).get_raw_state())) return false;
+      return id(det_dist).get_raw_state() <= id(near_cutoff).state * 100.0f;
     filters:
       - delayed_off: 5s
 

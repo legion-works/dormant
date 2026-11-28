@@ -3345,6 +3345,18 @@ mod tests {
     use crate::traits::{PanelState, PowerState};
 
     #[test]
+    fn operation_registry_adopts_an_accepted_operation() {
+        let registry = OperationRegistry::default();
+        let (accepted, _front_door) = registry
+            .try_acquire(GenerationId(7), OperationKind::EmergencyWake)
+            .unwrap();
+        assert!(
+            registry.lease_accepted(&accepted).is_some(),
+            "the registry must adopt an accepted operation with matching identity"
+        );
+    }
+
+    #[test]
     fn operation_lease_rejects_either_generation_or_kind_mismatch() {
         let registry = OperationRegistry::default();
         let generation = GenerationId(7);
@@ -3367,6 +3379,26 @@ mod tests {
         assert!(
             registry.lease_accepted(&wrong_kind).is_none(),
             "an accepted ID must not bypass its kind check"
+        );
+    }
+
+    #[test]
+    fn quiescing_blocks_acceptance_until_generation_reopens() {
+        let registry = OperationRegistry::default();
+        let generation = GenerationId(7);
+        registry.begin_quiesce(generation);
+        assert!(
+            registry
+                .try_acquire(generation, OperationKind::EmergencyWake)
+                .is_err(),
+            "a quiescing generation must reject new operations"
+        );
+        registry.end_quiesce(generation);
+        assert!(
+            registry
+                .try_acquire(generation, OperationKind::EmergencyWake)
+                .is_ok(),
+            "reopening the generation must allow new operations"
         );
     }
 
@@ -3399,6 +3431,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn operation_registry_waits_only_for_the_requested_generation() {
+        use std::future::Future;
+        use std::task::{Context, Waker};
+
+        let registry = OperationRegistry::default();
+        let kind = OperationKind::Exercise(DisplayId("oled".into()));
+        let generation = GenerationId(7);
+        let (_, lease) = registry.try_acquire(generation, kind.clone()).unwrap();
+        let (_, other) = registry
+            .try_acquire(GenerationId(8), kind)
+            .expect("another generation can accept the same display");
+        let mut drained = std::pin::pin!(registry.wait_generation_empty(generation));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(
+            drained.as_mut().poll(&mut cx).is_pending(),
+            "the target generation still has a live lease"
+        );
+        drop(lease);
+        assert!(
+            drained.as_mut().poll(&mut cx).is_ready(),
+            "a lease from another generation must not delay the drain"
+        );
+        drop(other);
+    }
+
     #[tokio::test]
     async fn operation_registry_cancellation_marks_generation_operations() {
         let registry = OperationRegistry::default();
@@ -3410,6 +3468,32 @@ mod tests {
         assert!(lease.is_cancelled());
         drop(lease);
         registry.wait_generation_empty(generation).await;
+    }
+
+    #[test]
+    fn operation_lease_cancellation_waits_for_its_generation() {
+        use std::future::Future;
+        use std::task::{Context, Waker};
+
+        let registry = OperationRegistry::default();
+        let generation = GenerationId(7);
+        let (_, lease) = registry
+            .try_acquire(generation, OperationKind::EmergencyWake)
+            .unwrap();
+        registry.cancel_generation(GenerationId(8));
+        assert!(
+            !lease.is_cancelled(),
+            "an unrelated generation cannot cancel this lease"
+        );
+
+        let mut cancelled = std::pin::pin!(lease.cancelled());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(
+            cancelled.as_mut().poll(&mut cx).is_pending(),
+            "the cancellation future must wait for cancellation"
+        );
+        registry.cancel_generation(generation);
+        assert!(cancelled.as_mut().poll(&mut cx).is_ready());
     }
 
     #[tokio::test]
@@ -3503,6 +3587,19 @@ mod tests {
         assert_eq!(result.display, display);
         assert!(!result.ok);
         assert!(result.error.as_deref().unwrap().contains("panicked"));
+    }
+
+    #[test]
+    fn operation_lease_debug_names_its_operation() {
+        let registry = OperationRegistry::default();
+        let (accepted, lease) = registry
+            .try_acquire(GenerationId(7), OperationKind::EmergencyWake)
+            .unwrap();
+        let debug = format!("{lease:?}");
+        assert!(
+            debug.contains(&format!("id: {}", accepted.id)),
+            "debug output must identify the operation, got {debug:?}"
+        );
     }
 
     #[test]
@@ -3648,6 +3745,19 @@ mod tests {
             post_wake.as_ref(),
         );
         assert_eq!(verdict, ExerciseVerdict::Confirmed);
+    }
+
+    #[test]
+    fn restore_verdict_requires_the_post_wake_observation() {
+        let observed = PanelState {
+            power: Some(PowerState::Standby),
+            brightness: None,
+        };
+        assert_eq!(
+            restore_verdict(&Ok(()), Some(&observed), Some(&observed), None),
+            ExerciseVerdict::Unconfirmable,
+            "without a post-wake observation, restore is unconfirmable"
+        );
     }
 
     #[test]
@@ -4040,6 +4150,30 @@ mod tests {
             matches!(log[2], SinkCmd::Blank(BlankMode::PowerOff)),
             "restore for blanked pre-phase must issue a blank command, got {:?}",
             log[2]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exercise_uses_the_target_displays_blank_mode() {
+        let display = DisplayId("oled".into());
+        let sink: Arc<dyn CommandSink> = Arc::new(crate::fakes::ExerciseSink::new());
+        let mut engine = manual_display_engine(
+            display.clone(),
+            HashMap::from([(display.clone(), sink)]),
+            Arc::new(crate::ownership::AlwaysOwned),
+        );
+        engine.cfg.displays[0].blank_mode = BlankMode::BrightnessZero;
+        let (reply, result) = oneshot::channel();
+        engine.handle_exercise(display, reply, None);
+        let report = result.await.expect("exercise reply");
+        assert_eq!(
+            report
+                .steps
+                .iter()
+                .find(|step| step.command == "blank")
+                .and_then(|step| step.blank_mode),
+            Some(BlankMode::BrightnessZero),
+            "exercise must use the target display's configured blank mode"
         );
     }
 
@@ -4571,6 +4705,30 @@ mod tests {
         assert_eq!(kvm.switch_capable_displays, vec![DisplayId("mon".into())]);
         assert!(kvm.activity_following);
         assert_eq!(kvm.keymap.claim_hotkey.as_deref(), Some("Meta+F12"));
+    }
+
+    #[test]
+    fn generation_drain_processes_buffered_sensor_and_control_inputs() {
+        let mut engine = engine_with_sensor("desk");
+        let (events_tx, mut events_rx) = mpsc::channel(1);
+        let (ctl_tx, mut ctl_rx) = mpsc::channel(1);
+        events_tx
+            .try_send(PresenceEvent::new(
+                SensorId("desk".into()),
+                SensorState::Present,
+                Timestamp::now(),
+            ))
+            .unwrap();
+        ctl_tx
+            .try_send(ControlMsg::SetPendingReload(Some("queued".into())))
+            .unwrap();
+        engine.drain_generation_inputs(&mut events_rx, &mut ctl_rx);
+        let snapshot = snapshot_of(&mut engine);
+        assert!(
+            snapshot.sensors[0].reported,
+            "the barrier must apply a buffered sensor event"
+        );
+        assert_eq!(snapshot.pending_reload.as_deref(), Some("queued"));
     }
 
     #[tokio::test]
@@ -5219,6 +5377,45 @@ mod tests {
         assert!(row.detail.as_deref().unwrap().contains("unavailable"));
     }
 
+    #[test]
+    fn restored_phase_change_emits_an_observation() {
+        use crate::state_machine::Phase;
+
+        let display = DisplayId("oled".into());
+        let generation = GenerationId(7);
+        let hub = ObservationHub::new(4);
+        let mut observations = hub.subscribe();
+        let mut engine = manual_display_engine(
+            display.clone(),
+            HashMap::new(),
+            Arc::new(crate::ownership::AlwaysOwned),
+        )
+        .with_observation_hub(generation, hub);
+        let now = Tick::now();
+        let cfg = &engine.cfg.displays[0];
+        let (restored, effects) = DisplayStateMachine::restore(
+            cfg.timings.clone(),
+            cfg.ladder.clone(),
+            Phase::Blanked,
+            1,
+            now,
+        );
+        engine.install_restored_machine(&display, restored, effects, now);
+        assert!(
+            matches!(
+                observations.try_recv(),
+                Ok(DaemonObservation::DisplayPhaseChanged {
+                    generation: observed_generation,
+                    display_id,
+                    rule_id: None,
+                    old_phase: Phase::Active,
+                    new_phase: Phase::Blanked,
+                }) if observed_generation == generation && display_id == display
+            ),
+            "restoring a different phase must report the phase change"
+        );
+    }
+
     fn manual_display_engine(
         display: DisplayId,
         executors: HashMap<DisplayId, Arc<dyn CommandSink>>,
@@ -5277,6 +5474,36 @@ mod tests {
             ownership,
         )
         .expect("one-display ladder engine config is valid")
+    }
+
+    #[test]
+    fn claim_suppresses_ownership_loss_only_before_the_deadline() {
+        let display = DisplayId("oled".into());
+        let gate = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut engine = manual_display_engine(
+            display.clone(),
+            HashMap::new(),
+            Arc::new(FlipGate(gate.clone())),
+        );
+        let now = Tick::now();
+        let deadline = now.0 + Duration::from_secs(1);
+        engine.handle_control(ControlMsg::SetClaimSuppression {
+            display: display.clone(),
+            until: Some(deadline),
+        });
+        gate.store(false, std::sync::atomic::Ordering::Relaxed);
+        engine.feed_ownership(&display, now);
+        assert_eq!(
+            engine.last_owned.get(&display),
+            Some(&true),
+            "a claim must suppress ownership loss before the deadline"
+        );
+        engine.feed_ownership(&display, Tick(deadline));
+        assert_eq!(
+            engine.last_owned.get(&display),
+            Some(&false),
+            "the deadline itself must release ownership suppression"
+        );
     }
 
     #[tokio::test]
@@ -5592,6 +5819,19 @@ mod tests {
     /// message instead.  A subscriber attached before the publish must see
     /// the event verbatim.
     #[test]
+    fn restore_effects_keep_the_display_and_deadline() {
+        let mut engine = minimal_engine();
+        let display = DisplayId("oled".into());
+        let retry = Effect::ScheduleTickAt(Tick::now());
+        engine.apply_restore_effects(&display, vec![retry.clone()]);
+        assert_eq!(
+            engine.pending_restore,
+            vec![(display, vec![retry])],
+            "the restored retry must be queued for this display"
+        );
+    }
+
+    #[test]
     fn publish_daemon_event_reaches_subscriber_verbatim() {
         let mut engine = minimal_engine();
 
@@ -5623,6 +5863,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn zero_seed_does_not_erase_outstanding_wake_failures() {
+        let display = DisplayId("oled".into());
+        let (mut engine, _) = subscribed_manual_engine(display.clone());
+        engine.seed_failure_state(&display, 2, false);
+        engine.seed_failure_state(&display, 0, false);
+        let snapshot = snapshot_of(&mut engine);
+        assert_eq!(
+            snapshot.displays[0].1.wake_attempts, 2,
+            "an empty seed must not erase outstanding wake failures"
+        );
+    }
+
     fn subscribed_manual_engine(
         display: DisplayId,
     ) -> (RulesEngine, broadcast::Receiver<DaemonEvent>) {
@@ -5637,6 +5890,23 @@ mod tests {
             engine,
             sub_rx.try_recv().expect("subscription reply sent inline"),
         )
+    }
+
+    #[test]
+    fn timed_pause_keeps_its_deadline() {
+        let display = DisplayId("oled".into());
+        let (mut engine, _) = subscribed_manual_engine(display.clone());
+        let until = Timestamp(std::time::SystemTime::now() + Duration::from_secs(10));
+        engine.handle_pause(None, Some(until));
+        assert!(
+            engine.machines[&display]
+                .overlays()
+                .paused
+                .as_ref()
+                .and_then(|pause| pause.until)
+                .is_some(),
+            "a timed pause must retain a monotonic auto-resume deadline"
+        );
     }
 
     #[test]
@@ -5657,6 +5927,19 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn resume_releases_the_display_pause_scope() {
+        let display = DisplayId("oled".into());
+        let (mut engine, _) = subscribed_manual_engine(display.clone());
+        engine.handle_pause(None, None);
+        assert!(engine.paused_scopes.contains_key(&display));
+        engine.handle_resume(None);
+        assert!(
+            !engine.paused_scopes.contains_key(&display),
+            "resume must release the old display pause scope"
+        );
     }
 
     #[test]
@@ -5862,6 +6145,26 @@ mod tests {
 
     use crate::types::SensorAvailabilityEvent;
 
+    #[test]
+    fn unavailable_sample_clears_the_online_lease() {
+        let sensor = SensorId("desk".into());
+        let mut engine = engine_with_sensor("desk");
+        engine.handle_sensor_availability(SensorAvailabilityEvent::new(
+            sensor.clone(),
+            true,
+            Timestamp::now(),
+        ));
+        engine.handle_presence_event(PresenceEvent::new(
+            sensor.clone(),
+            SensorState::Unavailable,
+            Timestamp::now(),
+        ));
+        assert!(
+            !engine.availability_online.contains_key(&sensor),
+            "an unavailable sample must revoke the previous online lease"
+        );
+    }
+
     /// A minimal engine with exactly ONE sensor and a SHORT `stale_timeout`
     /// — for the availability-gating tests below, which need a sweep to fire
     /// within a few hundred milliseconds of virtual time.
@@ -5887,6 +6190,22 @@ mod tests {
         .expect("single-sensor engine config is valid")
     }
 
+    #[test]
+    fn sweep_period_halves_the_stale_timeout_with_a_one_second_floor() {
+        let short = engine_with_short_stale("desk", Duration::from_millis(500));
+        assert_eq!(
+            short.compute_sweep_period(),
+            Duration::from_secs(1),
+            "short stale timeouts must use the one-second sweep floor"
+        );
+        let engine = engine_with_short_stale("desk", Duration::from_secs(10));
+        assert_eq!(
+            engine.compute_sweep_period(),
+            Duration::from_secs(5),
+            "a long stale timeout must schedule a sweep at half the timeout"
+        );
+    }
+
     /// Helper: find the sensor snapshot for `id` and return its
     /// `(state, last_seen_secs_ago)`.
     fn sensor_view(snap: &StateSnapshot, id: &str) -> (SensorState, u64) {
@@ -5896,6 +6215,33 @@ mod tests {
             .find(|s| s.id == id)
             .unwrap_or_else(|| panic!("sensor {id} in snapshot"));
         (s.state, s.last_seen_secs_ago)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_stale_sweep_waits_for_the_sweep_period() {
+        let sensor = SensorId("desk".into());
+        let mut engine = engine_with_short_stale("desk", Duration::from_secs(4));
+        engine.handle_presence_event(PresenceEvent::new(
+            sensor.clone(),
+            SensorState::Present,
+            Timestamp::now(),
+        ));
+        engine
+            .sensor_last_seen_virtual
+            .insert(sensor, tokio::time::Instant::now() - Duration::from_secs(5));
+        let mut events = engine.event_tx.subscribe();
+        let (_presence_tx, presence_rx) = mpsc::channel(1);
+        let (_ctl_tx, ctl_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(engine.run(presence_rx, ctl_rx, cancel.clone()));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), events.recv())
+                .await
+                .is_err(),
+            "the first sweep must not expire a sensor before the sweep period"
+        );
+        cancel.cancel();
+        task.await.unwrap();
     }
 
     /// Issue #136 + #205: a healthy radar with a retained `online`
@@ -5957,6 +6303,38 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn availability_lease_covers_the_exact_deadline() {
+        let sensor = SensorId("desk".into());
+        let stale = Duration::from_secs(1);
+        let mut engine = engine_with_short_stale("desk", stale);
+        engine.handle_presence_event(PresenceEvent::new(
+            sensor.clone(),
+            SensorState::Present,
+            Timestamp::now(),
+        ));
+        tokio::time::advance(stale).await;
+        engine.handle_sensor_availability(SensorAvailabilityEvent::new(
+            sensor,
+            true,
+            Timestamp::now(),
+        ));
+        tokio::time::advance(stale / 2).await;
+        engine.sweep_stale_sensors();
+        assert_eq!(
+            sensor_view(&snapshot_of(&mut engine), "desk").0,
+            SensorState::Present,
+            "a live online lease must cover an older sample"
+        );
+        tokio::time::advance(stale / 2).await;
+        engine.sweep_stale_sensors();
+        assert_eq!(
+            sensor_view(&snapshot_of(&mut engine), "desk").0,
+            SensorState::Present,
+            "an online lease must cover its exact stale deadline"
+        );
+    }
+
     /// Issue #205: the `availability_online` marker is a lease bounded by
     /// `stale_timeout`. Once the lease expires, the next stale sweep must
     /// demote the sensor to `Unavailable` so a dead connection whose last
@@ -6005,6 +6383,24 @@ mod tests {
             state,
             SensorState::Absent,
             "silence must never be reported as Absent — only Unavailable (repo rule 6)"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sensor_without_lease_is_not_stale_at_the_exact_deadline() {
+        let stale = Duration::from_secs(1);
+        let mut engine = engine_with_short_stale("desk", stale);
+        engine.handle_presence_event(PresenceEvent::new(
+            SensorId("desk".into()),
+            SensorState::Present,
+            Timestamp::now(),
+        ));
+        tokio::time::advance(stale).await;
+        engine.sweep_stale_sensors();
+        assert_eq!(
+            sensor_view(&snapshot_of(&mut engine), "desk").0,
+            SensorState::Present,
+            "a sample is stale only after its deadline"
         );
     }
 

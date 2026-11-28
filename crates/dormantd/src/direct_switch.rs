@@ -1112,6 +1112,26 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn first_power_on_readback_retry_waits_half_a_second() {
+        let sink = FakeSink::new("ddcci");
+        let start = TokioInstant::now();
+        {
+            let mut inner = sink.inner.lock().unwrap();
+            inner.last_power_on = Some(start);
+            inner.input_reads = [Err("waking".into()), Ok(Some(LOCAL_READ))].into();
+        }
+        assert!(
+            DirectSwitchHandle::input_already_selected(&display_id(), &sink, LOCAL_READ, false)
+                .await
+        );
+        assert_eq!(
+            sink.inner.lock().unwrap().read_times,
+            [start, start + Duration::from_millis(500)],
+            "only the first readback retry uses the short delay"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn pull_settle_stops_at_window_end() {
         let sink = Arc::new(FakeSink::new("ddcci"));
         let start = TokioInstant::now();
@@ -1444,6 +1464,32 @@ mod tests {
         assert_eq!(input_wake_count(&mut rx), 0);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn activity_pull_can_switch_at_the_cooldown_boundary() {
+        let id = display_id();
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        let (tx, _rx) = mpsc::channel(16);
+        let handle = build_handle(display_config(), sink.clone(), noop_hook_engine(), tx);
+        assert_eq!(
+            handle.pull(id.clone(), SwitchReason::Activity, false).await,
+            SwitchOutcome::Switched
+        );
+
+        let cooldown = handle.config.borrow().coordination.cooldown;
+        advance(cooldown.checked_sub(Duration::from_millis(1)).unwrap()).await;
+        assert_eq!(
+            handle.pull(id.clone(), SwitchReason::Activity, false).await,
+            SwitchOutcome::Cooldown
+        );
+        advance(Duration::from_millis(1)).await;
+        assert_eq!(
+            handle.pull(id, SwitchReason::Activity, false).await,
+            SwitchOutcome::Switched,
+            "the exact cooldown deadline permits a new switch"
+        );
+        assert_eq!(sink.write_calls(), 2);
+    }
+
     /// A no-op hook runner — all commands succeed.
     #[derive(Clone)]
     struct NoopHookRunner;
@@ -1622,6 +1668,25 @@ mod tests {
             coordination: None,
             last_activity_pull: Mutex::new(HashMap::new()),
         }
+    }
+
+    #[test]
+    fn reconfigure_hooks_installs_the_reloaded_publisher() {
+        let hooks = noop_hook_engine();
+        let (tx, _rx) = mpsc::channel(8);
+        let handle = build_handle(
+            display_config(),
+            Arc::new(FakeSink::new("ddcci")),
+            hooks.clone(),
+            tx,
+        );
+        let url = "mqtt://127.0.0.1:1884";
+        handle.reconfigure_hooks(Arc::new(MqttPublisher::new(url.into(), None)));
+        assert_eq!(
+            hooks.mqtt_config().0,
+            url,
+            "future switch hooks use the reloaded broker"
+        );
     }
 
     /// A `Config` with the given display and no other rules or sensors.
@@ -2422,6 +2487,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn push_does_not_skip_a_write_when_cache_cannot_confirm_peer() {
+        let id = display_id();
+        for case in ["no cache", "loss pending", "failed read", "gain pending"] {
+            let sink = Arc::new(FakeSink::new("ddcci"));
+            sink.set_input_read_result(Ok(Some(PEER_READ)));
+            let coordination = (case != "no cache").then(|| {
+                let coord = dormant_core::coordination::CoordinationHandle::new([id.clone()]);
+                if case != "loss pending" {
+                    record_observation(&coord, PEER_READ);
+                }
+                if case == "failed read" {
+                    coord.record_failure(&id);
+                } else {
+                    let observed = if case == "loss pending" {
+                        PEER_READ
+                    } else {
+                        LOCAL_READ
+                    };
+                    let aliases = dormant_core::coordination::InputCodeAliases {
+                        local_read: LOCAL_READ,
+                        local_write: LOCAL_READ,
+                        peer_read: Some(PEER_READ),
+                        peer_write: None,
+                    };
+                    let _ = coord.record_input_observation(&id, observed, &aliases, 2, None);
+                }
+                coord
+            });
+            let (tx, _rx) = mpsc::channel(16);
+            let handle = build_handle_with_coordination(
+                idempotency_display_config(),
+                sink.clone(),
+                noop_hook_engine(),
+                tx,
+                coordination,
+            );
+            assert_eq!(
+                handle.push(id.clone(), SwitchReason::Cli, false).await,
+                SwitchOutcome::Switched,
+                "an unconfirmed peer observation cannot suppress an explicit push: {case}"
+            );
+            assert_eq!(sink.write_calls(), 1);
+        }
+    }
+
+    #[tokio::test]
     async fn forced_push_bypasses_fresh_agreeing_observation() {
         let sink = Arc::new(FakeSink::new("ddcci"));
         let runner = Arc::new(CountingHookRunner::new());
@@ -2447,6 +2558,29 @@ mod tests {
     // ═══════════════════════════════════════════════════════════════════════
     //  Suppression-cleanup tests
     // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn switch_suppression_deadline_extends_into_the_future() {
+        let id = display_id();
+        let (tx, mut rx) = mpsc::channel(8);
+        let start = Instant::now();
+        let _guard = SuppressionGuard::set(&tx, &id);
+        let end = Instant::now();
+
+        let Ok(dormant_core::rules::ControlMsg::SetClaimSuppression {
+            display,
+            until: Some(deadline),
+        }) = rx.try_recv()
+        else {
+            panic!("a switch must set a claim-suppression deadline");
+        };
+        assert_eq!(display, id);
+        let duration = Duration::from_secs(5);
+        assert!(
+            (start + duration..=end + duration).contains(&deadline),
+            "claim suppression must cover the switch flight"
+        );
+    }
 
     /// Collect all suppression messages in order from the channel.
     fn drain_suppression(
@@ -2661,6 +2795,19 @@ mod tests {
     // ═══════════════════════════════════════════════════════════════════════
     //  SwitchReason coverage
     // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn switch_outcome_wire_labels_distinguish_switches_from_noops() {
+        assert_eq!(switch_outcome_label(&SwitchOutcome::Switched), "switched");
+        assert_eq!(
+            switch_outcome_label(&SwitchOutcome::AlreadyLocal),
+            "already_local"
+        );
+        assert_eq!(
+            switch_outcome_label(&SwitchOutcome::AlreadyPeer),
+            "already_peer"
+        );
+    }
 
     #[test]
     fn switch_reason_has_seven_variants() {

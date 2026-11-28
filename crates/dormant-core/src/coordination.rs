@@ -774,6 +774,27 @@ mod tests {
     }
 
     #[test]
+    fn input_read_recovery_clears_the_failure_streak() {
+        let id = display("aoc");
+        let handle = CoordinationHandle::new([id.clone()]);
+        handle.record_success(&id, 1, 1, None);
+        handle.record_failure(&id);
+        handle.record_failure(&id);
+
+        assert!(
+            handle.has_successful_read(&id),
+            "the first good read remains recorded"
+        );
+        assert_eq!(
+            handle.snapshot()[&id].consecutive_failures,
+            2,
+            "both failed reads count"
+        );
+        handle.record_success(&id, 1, 1, None);
+        assert_eq!(handle.snapshot()[&id].consecutive_failures, 0);
+    }
+
+    #[test]
     fn reload_reconcile_retains_survivors_seeds_additions_and_drops_removed() {
         let aoc = display("aoc");
         let tv = display("tv");
@@ -1120,6 +1141,21 @@ mod tests {
     /// A Local reading with a different raw code (e.g. 0x15 write alias vs
     /// 0x10 read alias) still classifies as Local and contributes to gain.
     #[test]
+    fn first_deferred_gain_records_the_input_in_the_snapshot() {
+        let id = display("aoc");
+        let handle = CoordinationHandle::new([id.clone()]);
+        handle.record_success(&id, 2, 1, None);
+
+        let gain = handle.record_input_observation(&id, 1, &aliases(1), 2, None);
+        assert_eq!(gain.deferred_gain_count, Some(1));
+        assert_eq!(
+            handle.snapshot()[&id].pending_transition_code,
+            Some(1),
+            "the snapshot identifies the pending gain input"
+        );
+    }
+
+    #[test]
     fn observation_gain_across_local_alias_codes() {
         let handle = CoordinationHandle::new([display("aoc")]);
         let aoc = display("aoc");
@@ -1293,6 +1329,35 @@ mod tests {
     }
 
     /// A read failure does not change the verdict — hold-last invariant.
+    #[test]
+    fn connector_mismatch_and_peer_readback_do_not_confirm_each_other() {
+        let id = display("aoc");
+        let handle = CoordinationHandle::new([id.clone()]);
+        let al = InputCodeAliases {
+            peer_read: Some(2),
+            ..aliases(1)
+        };
+        let now = Instant::now();
+
+        let mismatch = handle.record_panel_mismatch_at(&id, 2, now);
+        assert_eq!(
+            mismatch.deferred_loss_count,
+            Some(1),
+            "one connector mismatch starts loss confirmation"
+        );
+        assert_eq!(handle.snapshot()[&id].input_code, None);
+
+        let peer = handle.record_input_observation(&id, 2, &al, 2, None);
+        assert_eq!(
+            peer.deferred_loss_count,
+            Some(1),
+            "peer readback starts its own loss confirmation"
+        );
+        assert!(handle.snapshot()[&id].owned);
+        let peer = handle.record_input_observation(&id, 2, &al, 2, None);
+        assert_eq!(peer.committed_prior_owned, Some(true));
+    }
+
     #[test]
     fn observation_read_failure_holds_verdict() {
         let handle = CoordinationHandle::new([display("aoc")]);
@@ -1490,6 +1555,31 @@ mod tests {
             assert!(!outcome.entered_contested);
             assert!(!handle.snapshot()[&aoc].owned);
             now += Duration::from_secs(2);
+        }
+    }
+
+    #[test]
+    fn contested_entry_publishes_loss_but_not_a_discarded_gain() {
+        let id = display("aoc");
+        let al = aliases(1);
+        let now = Instant::now();
+        for (threshold, codes, expected_prior) in
+            [(2, &[2, 1][..], None), (3, &[2, 1, 2][..], Some(true))]
+        {
+            let handle = CoordinationHandle::new([id.clone()]);
+            let policy = flap_policy(threshold);
+            let (&last_code, preceding) = codes.split_last().unwrap();
+            for &code in preceding {
+                assert!(!observe_at(&handle, &id, code, &al, 1, policy, now).entered_contested);
+            }
+
+            let outcome = observe_at(&handle, &id, last_code, &al, 1, policy, now);
+            assert!(outcome.entered_contested);
+            assert_eq!(
+                outcome.committed_prior_owned, expected_prior,
+                "only a net loss publishes a verdict change on contested entry"
+            );
+            assert!(!handle.snapshot()[&id].owned);
         }
     }
 
@@ -1737,6 +1827,29 @@ mod tests {
 
         assert!(!handle.snapshot()[&aoc].contested);
         assert!(handle.snapshot()[&aoc].owned);
+    }
+
+    #[test]
+    fn flap_window_includes_the_boundary_and_expires_older_transitions() {
+        let id = display("aoc");
+        let al = aliases(0x0f);
+        let policy = flap_policy(2);
+        let start = Instant::now();
+
+        for (elapsed, should_contest) in [
+            (policy.window, true),
+            (policy.window + Duration::from_millis(1), false),
+        ] {
+            let handle = CoordinationHandle::new([id.clone()]);
+            let loss = observe_at(&handle, &id, 0x10, &al, 1, policy, start);
+            assert_eq!(loss.committed_prior_owned, Some(true));
+
+            let gain = observe_at(&handle, &id, 0x0f, &al, 1, policy, start + elapsed);
+            assert_eq!(
+                gain.entered_contested, should_contest,
+                "flap window classification at {elapsed:?}"
+            );
+        }
     }
 
     #[test]

@@ -5,6 +5,7 @@ import email.utils
 import hashlib
 import pathlib
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -14,6 +15,7 @@ import tempfile
 COMPRESSION = (".lz4", ".gz", ".xz", ".bz2", ".zst", ".lzma")
 SHA256 = re.compile(rb"[a-fA-F0-9]{64}\Z")
 SIGNED_MESSAGE = b"-----BEGIN PGP " + b"SIGNED MESSAGE-----\n"
+PUBLIC_KEY = b"-----BEGIN PGP " + b"PUBLIC KEY BLOCK-----"
 APT_HELPER = shutil.which("apt-helper") or "/usr/lib/apt/apt-helper"
 UBUNTU_KEYRING = "/usr/share/keyrings/ubuntu-archive-keyring.gpg"
 
@@ -72,41 +74,58 @@ def source_keyrings(entry):
         signed_by = stanzas[int(number) - 1].get(b"signed-by", b"")
     else:
         options = re.match(rb"\s*deb(?:-src)?\s+\[([^]]*)\]", contents[int(number) - 1])
-        signed_by = next((option.partition(b"=")[2] for option in options[1].split()
-                          if option.lower().startswith(b"signed-by=")), b"") if options else b""
+        signed_by = b""
+        if options:
+            pairs = (option.partition(b"=") for option in options[1].split())
+            signed_by = {name.lower(): value for name, _, value in pairs}.get(b"signed-by", b"")
     if signed_by:
+        if signed_by.strip().startswith(PUBLIC_KEY):
+            lines = (line.strip() for line in signed_by.strip().splitlines())
+            key = b"\n".join(b"" if line == b"." else line for line in lines) + b"\n"
+            return ((f"inline Signed-By in {entry}", key),)
         rings = signed_by.replace(b",", b" ").decode().split()
-        if not all(pathlib.Path(ring).is_absolute() and ring.endswith(".gpg") for ring in rings):
+        if not all(pathlib.Path(ring).is_absolute() and ring.endswith((".gpg", ".asc")) for ring in rings):
             raise ValueError(f"unsupported Signed-By in {entry}")
-        return tuple(sorted(rings))
-    trusted = pathlib.Path("/etc/apt/trusted.gpg")
-    rings = sorted(trusted.with_suffix(".gpg.d").glob("*.gpg"))
-    if trusted.is_file():
-        rings.append(trusted)
+        return tuple((ring, None) for ring in sorted(rings))
+    config = subprocess.check_output([
+        "apt-config", "shell", "legacy", "Dir::Etc::Trusted/f", "parts", "Dir::Etc::TrustedParts/d",
+    ], text=True)
+    paths = dict(word.rstrip(";").split("=", 1) for word in shlex.split(config))
+    rings = []
+    if (directory := paths.get("parts")) and pathlib.Path(directory).is_dir():
+        rings.extend(path for path in pathlib.Path(directory).iterdir()
+                     if path.is_file() and re.fullmatch(r"[a-zA-Z0-9_.-]+\.(?:asc|gpg)", path.name))
+    if (legacy := paths.get("legacy")) and pathlib.Path(legacy).is_file():
+        rings.append(pathlib.Path(legacy))
     if not rings:
         raise ValueError(f"no trusted keyrings for {entry}")
-    return tuple(map(str, rings))
+    return tuple((str(path), None) for path in sorted(rings))
 
 
-def release_hashes(path, sources):
-    suites = {suite for suite, _ in sources}
-    rings = {source_keyrings(entry) for _, entry in sources}
-    if len(suites) != 1 or len(rings) != 1:
-        raise ValueError(f"ambiguous source for {path.name}")
+def release_hashes(path, suite, keyrings):
     with path.open("rb") as stream:
         if stream.readline(len(SIGNED_MESSAGE) + 1) != SIGNED_MESSAGE:
             raise ValueError(f"not a clear-signed Release: {path.name}")
-    command = ["gpgv", "--output", "-"]
-    keyrings = rings.pop()
-    for ring in keyrings:
-        command.extend(["--keyring", ring])
-    verified = subprocess.run([*command, "--", path], stdout=subprocess.PIPE, check=False)
+    with tempfile.TemporaryDirectory() as directory:
+        command = ["gpgv", "--output", "-"]
+        for index, (label, key) in enumerate(keyrings):
+            ring = label
+            if key is not None or label.endswith(".asc"):
+                ring = str(pathlib.Path(directory) / f"key-{index}.gpg")
+                if key is None:
+                    key = pathlib.Path(label).read_bytes()
+                result = subprocess.run([
+                    "gpg", "--no-options", "--homedir", directory, "--batch", "--dearmor", "--output", ring,
+                ], input=key, capture_output=True, check=False)
+                if result.returncode != 0:
+                    raise ValueError(f"cannot dearmor {label}")
+            command.extend(["--keyring", ring])
+        verified = subprocess.run([*command, "--", path], capture_output=True, check=False)
     if verified.returncode != 0:
         raise ValueError(f"bad signature: {path.name}")
     fields, = paragraphs(verified.stdout.splitlines())
-    suite = suites.pop()
     names = {fields.get(b"suite")}
-    if UBUNTU_KEYRING not in keyrings:
+    if (UBUNTU_KEYRING, None) not in keyrings:
         names.add(fields.get(b"codename"))
     if suite and suite not in names:
         raise ValueError(f"wrong suite: {path.name}")
@@ -173,26 +192,66 @@ def archive_digests(content, wanted, digests):
             digests.setdefault(name, set()).add(digest.lower())
 
 
-def verify_lists(files, archives):
-    targets, releases = apt_targets()
-    signed = {name: release_hashes(path, releases[name]) for name, path in files.items()
-              if name.endswith("_InRelease")}
-    packages = sorted({path.name.split("_", 1)[0].encode() for path in archives})
-    wanted = (re.compile(rb"(?m)^Package: (?:" + b"|".join(map(re.escape, packages)) + rb")$")
-              if packages else None)
+VERIFY_ERRORS = (OSError, ValueError, KeyError, IndexError, OverflowError, subprocess.SubprocessError)
+
+
+def verify_source(indexes, signed, wanted):
     digests = {}
-    for name, path in files.items():
-        if name in signed:
-            continue
-        extension = next((ext for ext in COMPRESSION if name.endswith(ext)), "")
-        release, metakey = targets[name.removesuffix(extension)]
-        content = read_index(path, metakey, extension, signed[release])
+    for path, metakey, extension in indexes:
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"non-regular cached index: {path.name}")
+        content = read_index(path, metakey, extension, signed)
         if wanted and (metakey == "Packages" or metakey.endswith("/Packages")):
             if content is None:
                 # The publisher's compressed file matched its signed hash.
                 content = subprocess.check_output([APT_HELPER, "cat-file", path])
             archive_digests(content, wanted, digests)
     return digests
+
+
+def verify_lists(files, archives):
+    targets, releases = apt_targets()
+    packages = sorted({path.name.split("_", 1)[0].encode() for path in archives})
+    wanted = (re.compile(rb"(?m)^Package: (?:" + b"|".join(map(re.escape, packages)) + rb")$")
+              if packages else None)
+    groups = {name: [] for name in files if name.endswith("_InRelease")}
+    for name, path in files.items():
+        extension = next((ext for ext in COMPRESSION if name.endswith(ext)), "")
+        if target := targets.get(name.removesuffix(extension)):
+            release, metakey = target
+            groups.setdefault(release, []).append((path, metakey, extension))
+    verified = []
+    digests = {}
+    for release, indexes in groups.items():
+        key_label = "none"
+        try:
+            sources = releases.get(release)
+            if not sources:
+                raise ValueError("source is not configured")
+            key_label = "unresolved; " + ", ".join(sorted({entry for _, entry in sources}))
+            suites = {suite for suite, _ in sources}
+            rings = {source_keyrings(entry) for _, entry in sources}
+            if len(suites) != 1 or len(rings) != 1:
+                raise ValueError("ambiguous source configuration")
+            keyrings = rings.pop()
+            key_label = ", ".join(label for label, _ in keyrings)
+            if release not in files:
+                raise ValueError("missing InRelease")
+            path = files[release]
+            if path.is_symlink() or not path.is_file():
+                raise ValueError("non-regular InRelease")
+            if not indexes:
+                raise ValueError("no configured cached indexes")
+            signed = release_hashes(path, suites.pop(), keyrings)
+            source_digests = verify_source(indexes, signed, wanted)
+        except VERIFY_ERRORS as error:
+            print(f"apt_install: rejected {release} (keyring: {key_label}): {error}", file=sys.stderr)
+            continue
+        print(f"apt_install: verified {release} (keyring: {key_label}): signature and {len(indexes)} index hash(es) match")
+        verified.extend([path, *(index for index, _, _ in indexes)])
+        for name, hashes in source_digests.items():
+            digests.setdefault(name, set()).update(hashes)
+    return verified, digests
 
 
 def verify_archive(path, digests):
@@ -214,13 +273,16 @@ def restore_cache(cache, lists_dir, archives_dir):
     rejected_lists = False
     if files:
         try:
-            if list_cache.is_symlink() or any(path.is_symlink() or not path.is_file() for path in files.values()):
-                raise ValueError("non-regular cached list")
-            digests = verify_lists(files, archives)
-            subprocess.run(["sudo", "install", "-m", "0644", "-p", "--", *files.values(),
-                            f"{lists_dir}/"], check=True)
-            restored_lists = len(files)
-        except (OSError, ValueError, KeyError, IndexError, OverflowError, subprocess.SubprocessError) as error:
+            if list_cache.is_symlink():
+                raise ValueError("symlink for lists directory")
+            verified, digests = verify_lists(files, archives)
+            if verified:
+                subprocess.run(["sudo", "install", "-m", "0644", "-p", "--", *verified,
+                                f"{lists_dir}/"], check=True)
+                restored_lists = len(verified)
+            else:
+                rejected_lists = True
+        except VERIFY_ERRORS as error:
             print(f"apt_install: rejected cached package lists ({error}); refreshing package lists", file=sys.stderr)
             rejected_lists = True
         else:

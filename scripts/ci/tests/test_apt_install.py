@@ -13,11 +13,26 @@ RELEASE = "mirror_dists_noble_InRelease"
 PACKAGES = "mirror_dists_noble_main_binary-amd64_Packages"
 EXTRA_PACKAGES = "mirror_dists_noble_universe_binary-amd64_Packages"
 ARCHIVE = "example_1%3a2.0_amd64.deb"
+VENDOR_RELEASE = "vendor_dists_noble_InRelease"
+VENDOR_PACKAGES = "vendor_dists_noble_main_binary-amd64_Packages"
+VENDOR_ARCHIVE = "vendor_1_amd64.deb"
+KEY_HEADER = "-----BEGIN PGP " + "PUBLIC KEY BLOCK-----"
+KEY_FOOTER = "-----END PGP " + "PUBLIC KEY BLOCK-----"
 
 
 def package_record(package, version, content):
     return (f"Package: {package}\nVersion: {version}\nArchitecture: amd64\n"
             f"Size: {len(content)}\nSHA256: {hashlib.sha256(content).hexdigest()}\n\n").encode()
+
+
+def signed_release(indexes, signature):
+    checksums = "".join(
+        f" {hashlib.sha256(data).hexdigest()} {len(data)} {component}/binary-amd64/Packages\n"
+        for component, data in indexes
+    )
+    return ("-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\n"
+            f"Suite: noble\nSHA256:\n{checksums}"
+            "-----BEGIN PGP " f"SIGNATURE-----\n{signature}\n-----END PGP SIGNATURE-----\n")
 
 
 class AptInstallTests(unittest.TestCase):
@@ -41,16 +56,31 @@ class AptInstallTests(unittest.TestCase):
             for name, body in {
                 "gpgv": (
                     'input=${!#}\n'
-                    '[[ $* == *"--keyring /usr/share/keyrings/ubuntu-archive-keyring.gpg"* ]] || exit 2\n'
+                    'if [[ ${input##*/} == vendor_* ]]; then\n'
+                    '  while [[ $1 != --keyring ]]; do shift; done\n'
+                    '  [[ $2 == "$FAKE_APT_ROOT/vendor.gpg" || $(<"$2") == binary-key ]] || exit 2\n'
+                    'else\n'
+                    '  [[ $* == *"--keyring /usr/share/keyrings/ubuntu-archive-keyring.gpg"* ]] || exit 2\n'
+                    'fi\n'
                     '[[ $(tail -n 1 "$input") == "-----END PGP SIGNATURE-----" ]] || exit 1\n'
                     'head -n -3 "$input" | tail -n +4\n'
                     'grep -qx valid-signature "$input"\n'
+                ),
+                "gpg": (
+                    '[[ $* == *--dearmor* ]] || exit 2\n'
+                    'while [[ $1 != --output ]]; do shift; done\n'
+                    'key=$(cat)\n'
+                    f'[[ $key == "{KEY_HEADER}"$\'\\n\\n\'fixture$\'\\n\'"{KEY_FOOTER}" ]] || exit 2\n'
+                    'printf binary-key > "$2"\n'
                 ),
                 "apt-get": (
                     '[[ $1 == indextargets && $2 == --no-release-info ]] || exit 2\n'
                     'for component in main universe; do\n'
                     '  printf "MetaKey: %s/binary-amd64/Packages\\nFilename: %s/mirror_dists_noble_%s_binary-amd64_Packages\\nRelease: noble\\nSourcesentry: %s/ubuntu.sources:1\\n\\n" "$component" "$APT_LISTS_DIR" "$component" "$FAKE_APT_ROOT"\n'
                     'done\n'
+                    'if [[ -n $FAKE_VENDOR_SOURCE ]]; then\n'
+                    '  printf "MetaKey: main/binary-amd64/Packages\\nFilename: %s/vendor_dists_noble_main_binary-amd64_Packages\\nRelease: noble\\nSourcesentry: %s/%s:1\\n\\n" "$APT_LISTS_DIR" "$FAKE_APT_ROOT" "$FAKE_VENDOR_SOURCE"\n'
+                    'fi\n'
                 ),
                 "apt-helper": '[[ $1 == cat-file ]] && gzip -dc -- "$2"\n',
             }.items():
@@ -60,6 +90,7 @@ class AptInstallTests(unittest.TestCase):
             (temp / "ubuntu.sources").write_text(
                 "Types: deb\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n"
             )
+            vendor_source = ""
             if cache and cache != "cold":
                 cache_dir.mkdir()
                 (cache_dir / ARCHIVE).write_bytes(
@@ -72,20 +103,34 @@ class AptInstallTests(unittest.TestCase):
                 if cache == "warm_superseded":
                     packages += package_record("superseded", "1", b"old deb")
                     (cache_dir / "superseded_1_amd64.deb").write_bytes(b"old deb")
-                checksums = "".join(
-                    f" {hashlib.sha256(data).hexdigest()} {len(data)} {component}/binary-amd64/Packages\n"
-                    for component, data in [("main", packages), ("universe", extra)]
-                )
                 signature = "bad-signature" if cache == "bad_signature" else "valid-signature"
                 (cached_lists / RELEASE).write_text(
-                    "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\n"
-                    f"Suite: noble\nSHA256:\n{checksums}"
-                    f"-----BEGIN PGP SIGNATURE-----\n{signature}\n-----END PGP SIGNATURE-----\n"
+                    signed_release([("main", packages), ("universe", extra)], signature)
                 )
                 (cached_lists / PACKAGES).write_bytes(packages)
                 if cache == "bad_index":
                     extra = extra.replace(b"Package: extra", b"Package: wrong")
                 (cached_lists / f"{EXTRA_PACKAGES}.gz").write_bytes(gzip.compress(extra))
+                if cache in ("mixed_bad_signature", "removed_source", "armored_key", "inline_key"):
+                    vendor_source = "vendor.list"
+                    if cache == "inline_key":
+                        vendor_source = "vendor.sources"
+                        (temp / vendor_source).write_text(
+                            f"Types: deb\nSigned-By:\n {KEY_HEADER}\n .\n fixture\n {KEY_FOOTER}\n"
+                        )
+                    else:
+                        key = temp / ("vendor.asc" if cache == "armored_key" else "vendor.gpg")
+                        (temp / vendor_source).write_text(
+                            f"deb [signed-by={key}] https://vendor.example noble main\n"
+                        )
+                        key.write_text(f"{KEY_HEADER}\n\nfixture\n{KEY_FOOTER}\n")
+                    vendor_record = package_record("vendor", "1", b"vendor deb")
+                    signature = "bad-signature" if cache == "mixed_bad_signature" else "valid-signature"
+                    (cached_lists / VENDOR_RELEASE).write_text(signed_release([("main", vendor_record)], signature))
+                    (cached_lists / VENDOR_PACKAGES).write_bytes(vendor_record)
+                    (cache_dir / VENDOR_ARCHIVE).write_bytes(b"vendor deb")
+                    if cache == "removed_source":
+                        vendor_source = ""
             fake_sudo.write_text(
                 "#!/usr/bin/env bash\n"
                 "set -euo pipefail\n"
@@ -152,6 +197,7 @@ class AptInstallTests(unittest.TestCase):
                 "APT_INSTALL_TIMEOUT": "1",
                 "FAKE_SUDO_LOG": str(command_log),
                 "FAKE_APT_ROOT": str(temp),
+                "FAKE_VENDOR_SOURCE": vendor_source,
                 "FAKE_SUDO_MODE": mode,
                 "FAKE_SUDO_STATE": str(state),
                 "GITHUB_OUTPUT": str(output),
@@ -230,6 +276,43 @@ class AptInstallTests(unittest.TestCase):
 
     def test_bad_signature_rejects_cached_lists(self):
         self.assert_rejected_lists("bad_signature")
+
+    def test_bad_source_does_not_discard_good_source(self):
+        self.assert_vendor_dropped("mixed_bad_signature", r"vendor\.gpg.*bad signature")
+
+    def test_removed_source_does_not_discard_good_source(self):
+        self.assert_vendor_dropped("removed_source", "source is not configured")
+
+    def assert_vendor_dropped(self, cache, reason):
+        result, commands, _, _ = self.run_apt_install("install_first_success", cache=cache)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("apt_install: restored package lists (3 files)", result.stdout)
+        self.assertIn("apt_install: restored 1 cached .deb file(s)", result.stdout)
+        self.assertIn("apt_install: dropped 1 unverified cached archives", result.stderr)
+        self.assertRegex(result.stderr, rf"rejected {VENDOR_RELEASE} .*{reason}")
+        self.assertIn(RELEASE, self.cached_lists)
+        self.assertNotIn(VENDOR_RELEASE, self.cached_lists)
+        self.assertNotIn(VENDOR_PACKAGES, self.cached_lists)
+        self.assertEqual(self.cache_files, [ARCHIVE])
+        self.assertFalse(any("apt-get update" in command for command in commands))
+
+    def test_armored_signed_by_key_verifies(self):
+        self.assert_vendor_restored("armored_key", "vendor.asc")
+
+    def test_inline_deb822_key_verifies(self):
+        self.assert_vendor_restored("inline_key", "vendor.sources:1")
+
+    def assert_vendor_restored(self, cache, key_label):
+        result, commands, _, _ = self.run_apt_install("install_first_success", cache=cache)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("apt_install: restored package lists (5 files)", result.stdout)
+        self.assertIn("apt_install: restored 2 cached .deb file(s)", result.stdout)
+        self.assertFalse(any("apt-get update" in command for command in commands))
+        self.assertIn(VENDOR_RELEASE, self.cached_lists)
+        self.assertIn(VENDOR_ARCHIVE, self.cache_files)
+        self.assertRegex(result.stdout, rf"verified {VENDOR_RELEASE} .*{key_label}")
 
     def test_index_hash_mismatch_rejects_all_cached_lists(self):
         self.assert_rejected_lists("bad_index")

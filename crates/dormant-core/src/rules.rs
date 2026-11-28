@@ -3431,6 +3431,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn operation_registry_waits_only_for_the_requested_generation() {
+        use std::future::Future;
+        use std::task::{Context, Waker};
+
+        let registry = OperationRegistry::default();
+        let kind = OperationKind::Exercise(DisplayId("oled".into()));
+        let generation = GenerationId(7);
+        let (_, lease) = registry.try_acquire(generation, kind.clone()).unwrap();
+        let (_, other) = registry
+            .try_acquire(GenerationId(8), kind)
+            .expect("another generation can accept the same display");
+        let mut drained = std::pin::pin!(registry.wait_generation_empty(generation));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(
+            drained.as_mut().poll(&mut cx).is_pending(),
+            "the target generation still has a live lease"
+        );
+        drop(lease);
+        assert!(
+            drained.as_mut().poll(&mut cx).is_ready(),
+            "a lease from another generation must not delay the drain"
+        );
+        drop(other);
+    }
+
     #[tokio::test]
     async fn operation_registry_cancellation_marks_generation_operations() {
         let registry = OperationRegistry::default();

@@ -509,6 +509,32 @@ mod tests {
     }
 
     #[test]
+    fn known_zone_ids_lists_children_before_parents() {
+        let engine = ZoneEngine::new(
+            vec![
+                spec(
+                    "parent",
+                    FusionMode::Any,
+                    vec![ZoneMember::Zone(zid("child"))],
+                ),
+                spec(
+                    "child",
+                    FusionMode::Any,
+                    vec![ZoneMember::Sensor(sid("sensor"))],
+                ),
+            ],
+            &[sid("sensor")],
+        )
+        .unwrap();
+
+        assert_eq!(
+            engine.known_zone_ids().cloned().collect::<Vec<_>>(),
+            [zid("child"), zid("parent")],
+            "zone inventory must include every zone in evaluation order"
+        );
+    }
+
+    #[test]
     fn all_unavailable_zone_has_no_confirmed_presence() {
         let engine = ZoneEngine::new(
             vec![spec(

@@ -6359,6 +6359,24 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn sensor_without_lease_is_not_stale_at_the_exact_deadline() {
+        let stale = Duration::from_secs(1);
+        let mut engine = engine_with_short_stale("desk", stale);
+        engine.handle_presence_event(PresenceEvent::new(
+            SensorId("desk".into()),
+            SensorState::Present,
+            Timestamp::now(),
+        ));
+        tokio::time::advance(stale).await;
+        engine.sweep_stale_sensors();
+        assert_eq!(
+            sensor_view(&snapshot_of(&mut engine), "desk").0,
+            SensorState::Present,
+            "a sample is stale only after its deadline"
+        );
+    }
+
     /// A sensor with NO availability topic keeps today's behavior: silence
     /// past `stale_timeout` marks it `Unavailable`. This is the regression
     /// guard for sensors whose bridge does not publish LWT.

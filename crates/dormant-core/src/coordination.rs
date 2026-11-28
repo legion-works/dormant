@@ -1740,6 +1740,29 @@ mod tests {
     }
 
     #[test]
+    fn flap_window_includes_the_boundary_and_expires_older_transitions() {
+        let id = display("aoc");
+        let al = aliases(0x0f);
+        let policy = flap_policy(2);
+        let start = Instant::now();
+
+        for (elapsed, should_contest) in [
+            (policy.window, true),
+            (policy.window + Duration::from_millis(1), false),
+        ] {
+            let handle = CoordinationHandle::new([id.clone()]);
+            let loss = observe_at(&handle, &id, 0x10, &al, 1, policy, start);
+            assert_eq!(loss.committed_prior_owned, Some(true));
+
+            let gain = observe_at(&handle, &id, 0x0f, &al, 1, policy, start + elapsed);
+            assert_eq!(
+                gain.entered_contested, should_contest,
+                "flap window classification at {elapsed:?}"
+            );
+        }
+    }
+
+    #[test]
     fn contested_clears_after_settle_then_next_observation_can_gain() {
         let handle = CoordinationHandle::new([display("aoc")]);
         let aoc = display("aoc");

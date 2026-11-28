@@ -1464,6 +1464,32 @@ mod tests {
         assert_eq!(input_wake_count(&mut rx), 0);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn activity_pull_can_switch_at_the_cooldown_boundary() {
+        let id = display_id();
+        let sink = Arc::new(FakeSink::new("ddcci"));
+        let (tx, _rx) = mpsc::channel(16);
+        let handle = build_handle(display_config(), sink.clone(), noop_hook_engine(), tx);
+        assert_eq!(
+            handle.pull(id.clone(), SwitchReason::Activity, false).await,
+            SwitchOutcome::Switched
+        );
+
+        let cooldown = handle.config.borrow().coordination.cooldown;
+        advance(cooldown.checked_sub(Duration::from_millis(1)).unwrap()).await;
+        assert_eq!(
+            handle.pull(id.clone(), SwitchReason::Activity, false).await,
+            SwitchOutcome::Cooldown
+        );
+        advance(Duration::from_millis(1)).await;
+        assert_eq!(
+            handle.pull(id, SwitchReason::Activity, false).await,
+            SwitchOutcome::Switched,
+            "the exact cooldown deadline permits a new switch"
+        );
+        assert_eq!(sink.write_calls(), 2);
+    }
+
     /// A no-op hook runner — all commands succeed.
     #[derive(Clone)]
     struct NoopHookRunner;

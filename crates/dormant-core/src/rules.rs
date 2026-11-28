@@ -5930,6 +5930,19 @@ mod tests {
     }
 
     #[test]
+    fn resume_releases_the_display_pause_scope() {
+        let display = DisplayId("oled".into());
+        let (mut engine, _) = subscribed_manual_engine(display.clone());
+        engine.handle_pause(None, None);
+        assert!(engine.paused_scopes.contains_key(&display));
+        engine.handle_resume(None);
+        assert!(
+            !engine.paused_scopes.contains_key(&display),
+            "resume must release the old display pause scope"
+        );
+    }
+
+    #[test]
     fn pause_changed_explicit_resume_emits_paused_false() {
         let display = DisplayId("mon".into());
         let (mut engine, mut events) = subscribed_manual_engine(display.clone());

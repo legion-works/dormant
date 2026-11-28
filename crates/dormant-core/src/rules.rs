@@ -3748,6 +3748,19 @@ mod tests {
     }
 
     #[test]
+    fn restore_verdict_requires_the_post_wake_observation() {
+        let observed = PanelState {
+            power: Some(PowerState::Standby),
+            brightness: None,
+        };
+        assert_eq!(
+            restore_verdict(&Ok(()), Some(&observed), Some(&observed), None),
+            ExerciseVerdict::Unconfirmable,
+            "without a post-wake observation, restore is unconfirmable"
+        );
+    }
+
+    #[test]
     fn restore_verdict_requires_a_baseline_observation() {
         let post_blank = PanelState {
             power: Some(PowerState::Standby),

@@ -774,6 +774,27 @@ mod tests {
     }
 
     #[test]
+    fn input_read_recovery_clears_the_failure_streak() {
+        let id = display("aoc");
+        let handle = CoordinationHandle::new([id.clone()]);
+        handle.record_success(&id, 1, 1, None);
+        handle.record_failure(&id);
+        handle.record_failure(&id);
+
+        assert!(
+            handle.has_successful_read(&id),
+            "the first good read remains recorded"
+        );
+        assert_eq!(
+            handle.snapshot()[&id].consecutive_failures,
+            2,
+            "both failed reads count"
+        );
+        handle.record_success(&id, 1, 1, None);
+        assert_eq!(handle.snapshot()[&id].consecutive_failures, 0);
+    }
+
+    #[test]
     fn reload_reconcile_retains_survivors_seeds_additions_and_drops_removed() {
         let aoc = display("aoc");
         let tv = display("tv");

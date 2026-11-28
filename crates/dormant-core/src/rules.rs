@@ -6217,6 +6217,33 @@ mod tests {
         (s.state, s.last_seen_secs_ago)
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn first_stale_sweep_waits_for_the_sweep_period() {
+        let sensor = SensorId("desk".into());
+        let mut engine = engine_with_short_stale("desk", Duration::from_secs(4));
+        engine.handle_presence_event(PresenceEvent::new(
+            sensor.clone(),
+            SensorState::Present,
+            Timestamp::now(),
+        ));
+        engine
+            .sensor_last_seen_virtual
+            .insert(sensor, tokio::time::Instant::now() - Duration::from_secs(5));
+        let mut events = engine.event_tx.subscribe();
+        let (_presence_tx, presence_rx) = mpsc::channel(1);
+        let (_ctl_tx, ctl_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(engine.run(presence_rx, ctl_rx, cancel.clone()));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), events.recv())
+                .await
+                .is_err(),
+            "the first sweep must not expire a sensor before the sweep period"
+        );
+        cancel.cancel();
+        task.await.unwrap();
+    }
+
     /// Issue #136 + #205: a healthy radar with a retained `online`
     /// availability signal must not be marked `Unavailable` by the stale
     /// sweep just because the state topic is silent (occupant seated, no

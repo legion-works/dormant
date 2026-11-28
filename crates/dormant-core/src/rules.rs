@@ -5819,6 +5819,19 @@ mod tests {
     /// message instead.  A subscriber attached before the publish must see
     /// the event verbatim.
     #[test]
+    fn restore_effects_keep_the_display_and_deadline() {
+        let mut engine = minimal_engine();
+        let display = DisplayId("oled".into());
+        let retry = Effect::ScheduleTickAt(Tick::now());
+        engine.apply_restore_effects(&display, vec![retry.clone()]);
+        assert_eq!(
+            engine.pending_restore,
+            vec![(display, vec![retry])],
+            "the restored retry must be queued for this display"
+        );
+    }
+
+    #[test]
     fn publish_daemon_event_reaches_subscriber_verbatim() {
         let mut engine = minimal_engine();
 
